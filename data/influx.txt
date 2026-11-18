@@ -1,0 +1,58 @@
+# Sunnyworld edge influx — migrants cross declared boundary zones. DATA ONLY:
+# the engine runs one generic loop; an empty file (or a zone with no
+# templates) means the world stays empty after collapse. A zone fires when
+# hash(world_seed, zone, tick) % interval == 0 — irregular but deterministic —
+# and only while fewer than `capacity` migrant-kind entities live inside
+# `bounds`. Each migrant template is a full phenotype: material, props,
+# genome loci (`gene`), and optional `innate` verbs — a sapient migrant is
+# born with an AgentMind holding ONLY those instincts; everything else
+# (craft, writing, the old tribe's mistakes) must be learned by contact or
+# rediscovered among the ruins.
+#
+# Format:
+#   influx_zone <name>
+#     bounds <x0> <y0> <x1> <y1>
+#     interval <ticks>
+#     capacity <n>
+#     migrants <n>
+#     migrant <name>
+#       kind <kind_name>
+#       material <material_name>     # optional
+#       prop <name> <value>          # repeatable
+#       gene <prop_name> <allele>    # repeatable
+#       innate <verb>                # repeatable
+
+# Northern pass — a fertile neighbouring valley sends forager bands.
+# Genome loci match the founder set so migrants stay reproductively
+# compatible with any surviving lineages.
+influx_zone northern_pass
+  bounds 2000 -600 2600 600
+  interval 2000
+  capacity 8
+  migrants 3
+  migrant forager
+    kind forager
+    prop hunger 0
+    prop thirst 0
+    prop fatigue 0
+    prop metabolism 2000
+    prop speed 8000
+    prop sight_range 800
+    prop reach 300
+    prop energy 300000
+    prop max_energy 300000
+    prop integrity 800
+    prop age 0
+    prop adult_age 120
+    prop fertility 120
+    prop mutation_rate 50
+    prop communicate_range 250
+    gene speed 8000
+    gene metabolism 2000
+    gene sight_range 800
+    gene fertility 120
+    gene mutation_rate 50
+    innate consume
+    innate reproduce
+    innate rest
+    innate move

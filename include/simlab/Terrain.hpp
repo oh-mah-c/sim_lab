@@ -1,0 +1,66 @@
+#pragma once
+#include <cstdint>
+#include <vector>
+#include "Types.hpp"
+
+namespace simlab {
+
+// ---- Terrain grid -----------------------------------------------------------
+// The world's continuous fields, stored per-cell as integers (deterministic).
+// Units:
+//   elevation   metres, 0..~500
+//   moisture    permille 0..1000
+//   temperature deci-°C (300 = 30.0 °C)
+//   water       0=land 1=sea/lake 2=river
+//   vegetation  permille 0..1000 — plant growth potential
+//   slope       metres of max elevation difference to 4-neighbours
+struct TerrainGrid {
+    int w = 0, h = 0;          // cells
+    int cell = 16;             // map units per cell
+    int ox = 0, oy = 0;        // GLOBAL cell coords of local cell (0,0)
+
+    std::vector<std::int32_t> elevation;
+    std::vector<std::int32_t> moisture;
+    std::vector<std::int32_t> temperature;
+    std::vector<std::uint8_t> water;        // 0=land, 1=sea/lake, 2=river
+    std::vector<std::int32_t> vegetation;
+    std::vector<std::int32_t> slope;
+    std::vector<std::int32_t> wind_x;       // permille-ish wind vector (-1024..1024)
+    std::vector<std::int32_t> wind_y;
+    std::vector<std::int32_t> water_table;  // metres below surface to groundwater
+
+    bool empty() const { return w == 0 || h == 0; }
+    // Position -> global cell (floor division, safe for negative coords).
+    static int cell_of(std::int32_t v, int cell) {
+        return v >= 0 ? v / cell : (v - cell + 1) / cell;
+    }
+    // Global cell coords covered by this grid.
+    bool contains(Vec2 p) const {
+        const int gx = cell_of(p.x, cell) - ox, gy = cell_of(p.y, cell) - oy;
+        return gx >= 0 && gy >= 0 && gx < w && gy < h;
+    }
+    std::size_t index(Vec2 p) const {
+        const int gx = cell_of(p.x, cell) - ox, gy = cell_of(p.y, cell) - oy;
+        return static_cast<std::size_t>(gy) * w + gx;
+    }
+    // Map-unit position of a GLOBAL cell's centre.
+    Vec2 cell_center(int gx, int gy) const {
+        return {gx * cell + cell / 2, gy * cell + cell / 2};
+    }
+    // Local cell indices for a global cell coord (false if outside grid).
+    bool local_cell(int gx, int gy, int& lx, int& ly) const {
+        lx = gx - ox; ly = gy - oy;
+        return lx >= 0 && ly >= 0 && lx < w && ly < h;
+    }
+
+    std::int32_t elev_at(Vec2 p) const { return elevation[index(p)]; }
+    std::int32_t moist_at(Vec2 p) const { return moisture[index(p)]; }
+    std::int32_t temp_at(Vec2 p) const { return temperature[index(p)]; }
+    bool is_water(Vec2 p) const { return water[index(p)] != 0; }
+    std::int32_t veg_at(Vec2 p) const { return vegetation[index(p)]; }
+    std::int32_t slope_at(Vec2 p) const { return slope[index(p)]; }
+    std::int32_t water_table_at(Vec2 p) const { return water_table[index(p)]; }
+    bool near_water(Vec2 p, int radius_cells = 1) const;
+};
+
+}  // namespace simlab

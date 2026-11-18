@@ -1,0 +1,24 @@
+# Sunnyworld process registry — processing recipes are DATA (TODO §9.5).
+# A process declares its real conditions; the engine enforces them.
+# Fails when inputs/fuel/temperature are missing — no free products.
+#
+# Format:
+#   process <name>
+#     input <material> <qty>      # consumed from targets
+#     fuel <material> <qty>       # consumed from targets (optional)
+#     min_temperature <deci-°C>   # best participant `temperature` must reach it
+#     ticks <n>                   # simulated duration (recorded in event)
+#     output <material> <qty>     # produced at actor position
+#     waste <material> <qty>      # produced too — keeps mass accounted
+
+# Smelt copper ore into metal. Needs ~1000°C (10000 deci-°C) on some
+# participant (a furnace charge carries `temperature`), charcoal fuel, 24 ticks.
+# Run only just at the minimum, part of the metal is lost to slag (see
+# ProcessingModel efficiency); hotter charges recover more.
+process smelt_copper
+  input copper_ore 400
+  fuel charcoal 50
+  min_temperature 10000
+  ticks 24
+  output copper_metal 300
+  waste slag 100

@@ -1,0 +1,162 @@
+# Sunnyworld species / ecology registry — WORLD TRUTH habitat data (TODO §2.1 Ecology).
+# A species is a habitat rule: where an organism can live, not a spawn list.
+# Worldgen places an individual only where EVERY condition holds (analytic
+# climate/terrain fields) and a per-cell hash passes `density`.
+#
+# Format:
+#   species <name>
+#     kind flora|fauna          # flora: one per cell (first matching species wins)
+#     material <material_name>
+#     density <permille>        # chance per eligible cell
+#     condition <field> <lo> <hi>
+#         fields: elevation moisture temperature slope near_water
+#                 vegetation water_table fault
+#     <prop_name> <value>       # any registered property, applied to the entity
+#
+# Names containing "tree" are conventionally woody plants.
+
+# Berry bush — the base of the food chain. TWO LAYERS:
+#   body : living_wood (integrity 1000, decay_rate 0) — dies only to physical
+#          or thermal damage, never because its fruit is eaten or spoils.
+#   fruit: `fruit_material wild_berries` hanging as `fruit_count` (cap
+#          `max_fruit`). `consume` reads nutrition/hydration from the FRUIT
+#          material and takes one fruit; a bare bush refuses `consume`.
+# Fruit drift (World::drift_needs, exact under dormant-LOD batching):
+#   + fruit_regrow_rate milli-fruit/tick x local moisture*temperature
+#     suitability (500/1000 without a terrain field), capped at max_fruit
+#   - fruit_spoil_rate milli-fruit/tick (old fruit drops), floored at 0
+# Regrowth must outpace spoilage in good habitat or the bush stays bare:
+# 120 x 0.5 - 15 = +45 milli/tick -> a stripped bush is full again in ~900
+# ticks; at the habitat fringe (low suitability) fruiting stays sparse.
+species berry_bush
+  kind flora
+  material living_wood
+  fruit_material wild_berries
+  fruit_count 40
+  max_fruit 40
+  fruit_regrow_rate 120
+  fruit_spoil_rate 15
+  death_drops dormant_seed=4,wood_debris=1
+  density 120
+  condition temperature -100 400
+  condition moisture 300 1000
+  condition vegetation 400 1000
+
+species boreal_tree
+  kind flora
+  material dry_wood
+  density 350
+  condition temperature -200 120
+  condition moisture 250 1000
+  condition vegetation 500 1000
+
+species temperate_tree
+  kind flora
+  material dry_wood
+  density 350
+  condition temperature 80 300
+  condition moisture 350 1000
+  condition vegetation 500 1000
+
+species tropical_tree
+  kind flora
+  material dry_wood
+  density 350
+  condition temperature 250 450
+  condition moisture 550 1000
+  condition vegetation 500 1000
+
+species grazer
+  kind fauna
+  material flesh
+  density 15
+  condition temperature 0 330
+  condition moisture 300 1000
+  condition slope 0 25
+  condition vegetation 400 1000
+  sight_range 400
+  speed 6000
+  metabolism 1800
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 500
+  adult_age 200
+  mutation_rate 30
+  energy 60000
+  max_energy 100000
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  # neural tuning (Nhịp 1): mind_* props are this grazer's SpeciesMindParams;
+  # the two gene loci let memory traits drift under selection heritably.
+  mind_base_clarity 400
+  mind_max_clarity 1000
+  mind_base_stability 15
+  mind_max_stability 10000
+  mind_decay_rate 10
+  mind_imprint_threshold 500
+  mind_imprint_base_stability 2000
+  mind_amygdala_multiplier 5
+  mind_rehearsal_stability_bonus 50
+  mind_detail_blur_threshold 300
+  mind_sleep_prune_threshold 50
+  mind_rehearsal_interval 100
+  gene mind_base_stability
+  gene mind_rehearsal_stability_bonus
+  # four neural axes (Nhịp 2-3): all heritable loci — trauma shifts them
+  # per individual via allostasis, selection acts on the offspring.
+  mind_threat_gain 1000
+  mind_reward_gain 1000
+  mind_pattern_coupling 1000
+  mind_empathy_coupling 1000
+  mind_executive_override_threshold 750
+  mind_emotion_decay 10
+  gene mind_threat_gain
+  gene mind_reward_gain
+  gene mind_pattern_coupling
+  gene mind_empathy_coupling
+  # cognitive aptitudes (Nhịp 4): heritable processing traits — the four
+  # loci drift under selection; brain cost is a species constant (every
+  # grazer pays the same price per unit of cognitive surplus).
+  mind_plan_horizon 2
+  mind_abstraction_gain 1000
+  mind_motor_precision 1000
+  mind_theory_of_mind 1000
+  mind_brain_metabolic_cost 15
+  gene mind_plan_horizon
+  gene mind_abstraction_gain
+  gene mind_motor_precision
+  gene mind_theory_of_mind
+  # social bonding (Nhịp 4.5): all three heritable — some lineages bond,
+  # guard mates jealously, or imprint hard on their young; others don't.
+  mind_pair_bond_gain 1000
+  mind_jealousy_gain 1000
+  mind_parental_drive 1000
+  gene mind_pair_bond_gain
+  gene mind_jealousy_gain
+  gene mind_parental_drive
+  # primitive social psychology (Nhịp 5): heritable temperament for
+  # conformity, out-group wariness, and ego-defense style.
+  mind_conformity_gain 1000
+  mind_xenophobia_bias 1000
+  mind_ego_defense_gain 1000
+  gene mind_conformity_gain
+  gene mind_xenophobia_bias
+  gene mind_ego_defense_gain
+
+species nightshade_patch
+  kind flora
+  material living_wood
+  fruit_material nightshade
+  fruit_count 25
+  max_fruit 25
+  fruit_regrow_rate 90
+  fruit_spoil_rate 10
+  death_drops dormant_seed=4,wood_debris=1
+  density 60
+  condition temperature -50 350
+  condition moisture 350 1000
+  condition vegetation 450 1000

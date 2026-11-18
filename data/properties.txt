@@ -1,0 +1,170 @@
+# Sunnyworld property registry — declarative definitions.
+# Format: name TYPE unit [range LO HI] [domain=TAG]
+#   TYPE: integer | fixed | boolean | text | ref
+#   range applies to integer/fixed raw payloads only.
+# Values stored on materials/entities are raw payloads of this type.
+
+# ---- physical domain ---------------------------------------------------------
+hardness        integer  mohs        range 0 1000   domain=physical
+brittleness     integer  permille     range 0 1000   domain=physical
+mass            integer  grams       range 0 100000000 domain=physical
+density         fixed    kg/m3       range 0 10000000 domain=physical
+integrity       integer  permille     range 0 1000   domain=physical
+flammability    integer  permille     range 0 1000   domain=physical
+thermal_mass    integer  J/K         range 0 1000000 domain=physical
+conductivity    integer  W/mK        range 0 10000   domain=physical
+
+# ---- biological domain -------------------------------------------------------
+fertility       integer  permille     range 0 1000   domain=biological
+metabolism      integer  kcal/day     range 0 100000 domain=biological
+sight_range     integer  m           range 0 100000  domain=biological
+speed           integer  m/s*1000     range 0 100000  domain=biological
+age             integer  ticks       range 0 1000000000 domain=biological
+adult_age       integer  ticks       range 0 1000000 domain=biological
+mutation_rate   integer  permille     range 0 1000   domain=biological
+repro_cooldown  integer  ticks       range 0 1000000 domain=biological   # min ticks between births (default 200)
+last_reproduce  integer  ticks       range 0 1000000000 domain=biological # clock tick of last birth (internal timer)
+max_energy      integer  milliJ      range 0 1000000000 domain=physical   # energy storage ceiling (default 500000)
+max_quantity    integer  units       range 0 100000000 domain=physical   # flora regrowth ceiling
+regrow_rate     integer  milli-units/tick range 0 1000000 domain=physical # flora regrowth speed at ideal conditions
+regrow_credit   integer  milli-units  range -1000000000 1000000000 domain=physical # signed sub-unit stock accumulator (internal)
+fruit_material  text     material_name domain=observable   # material name this flora bears ("" = none) — two-layer food: body vs fruit
+fruit_count     integer  units       range 0 1000000    domain=observable   # fruit currently on the branch
+max_fruit       integer  units       range 0 1000000    domain=biological
+fruit_regrow_rate integer milli-units/tick range 0 1000000 domain=biological # new fruit per tick (milli-units)
+fruit_spoil_rate  integer milli-units/tick range 0 1000000 domain=biological # fruit rots off branch per tick (milli-units)
+fruit_credit    integer  milli-units  range -1000000000 1000000000 domain=physical # signed fruit accumulator (internal)
+decay_rate      integer  permille/tick range 0 1000 domain=physical     # integrity rot speed (material fallback; 0 = never spoils)
+decay_credit    integer  milli-integrity range 0 1000000000 domain=physical # sub-point decay accumulator (internal)
+toxicity        integer  permille     range 0 1000   domain=physical     # integrity-scale damage per unit consumed (0 = safe)
+fruit_decay_rate integer  milli-units/tick range 0 1000000 domain=physical # fruit rot on the branch: drains quantity only, never kills the plant (0 = fruit never spoils)
+
+# ---- resource / deposit domain ----------------------------------------------
+reserve          integer  units       range 0 100000000 domain=physical
+deposit_remaining integer units      range 0 100000000 domain=physical
+quantity         integer  units       range 0 100000000 domain=physical
+exposed          boolean  -          domain=observable
+surface_color    integer  enum        range 0 15  domain=observable   # visible stain/colour class of an outcrop
+surface_trace    integer  permille    range 0 1000 domain=observable uncertainty=300  # strength of visible trace minerals
+yield_rate       integer  permille    range 0 1000     domain=physical
+min_force        integer  milliJ      range 0 1000000000 domain=physical
+dig_resistance   integer  permille    range 0 1000     domain=physical
+formation_chance integer  permille    range 0 1000     domain=physical
+lithology         integer  class       range 0 3       domain=geological
+soil_texture      integer  class       range 0 3       domain=geological   # 1=sand 2=loam 3=clay
+temperature       integer  deci-°C     range -5000 20000 domain=physical
+energy            integer  milliJ      range 0 1000000000 domain=physical
+reach             integer  map_units   range 0 100000  domain=physical
+length            integer  map_units   range 0 100000  domain=physical
+edge              integer  permille     range 0 1000   domain=physical
+thrust_range      integer  map_units   range 0 100000  domain=physical
+made_of           text     provenance   domain=physical
+contained         boolean  -          domain=physical
+geom_type         integer  enum        range 0 3      domain=physical
+geom_orient       integer  turn_permille range 0 999   domain=physical
+geom_len          integer  map_units   range 0 1000000 domain=physical
+geom_wid          integer  map_units   range 0 1000000 domain=physical
+geom_thk          integer  map_units   range 0 1000000 domain=physical
+residue           text     material_name domain=physical   # what remains when it burns away (material name)
+residue_share     integer  permille     range 0 1000 domain=physical   # share of its mass that remains as residue
+tensile           integer  permille     range 0 1000   domain=physical
+joint_type        text     enum        domain=physical
+
+# ---- informational domain ----------------------------------------------------
+opacity         integer  permille     range 0 1000   domain=informational
+
+# ---- need / physiology domain ------------------------------------------------
+# Agent body-state: hunger/thirst/fatigue are private (domain=need — never
+# observable to other entities). nutrition/hydration/rest_recovery are
+# material traits consumed by the physiology laws — World Truth data.
+hunger         integer  permille     range 0 1000   domain=need
+thirst         integer  permille     range 0 1000   domain=need
+fatigue        integer  permille     range 0 1000   domain=need
+nutrition      integer  permille     range 0 1000   domain=biological
+hydration      integer  permille     range 0 1000   domain=biological
+rest_recovery  integer  permille     range 0 1000   domain=biological
+
+# ---- social / informational domain (Phase 8) ---------------------------------
+inscription      text     record       domain=informational   # carved knowledge payload
+collective       boolean  -           domain=social           # entity is a group/institution
+communicate_range integer  m          range 0 100000 domain=social
+taboo_harm       boolean  -           domain=social           # member-caused harm is a rule violation
+ration_share     integer  permille     range 0 1000   domain=social           # collective tithe on member harvests
+
+# ---- ecology domain: seed bank & edge influx --------------------------------
+# Rotting flora leaves propagules; dormant_seed entities germinate where the
+# local habitat (terrain moisture/temperature) suits their species; influx
+# zones (data/influx.txt) seed migration at the world edge. All bookkeeping
+# is internal — never observable to agents.
+death_drops        text    manifest      domain=physical   # "material=count,..." spawned where entity dies
+death_drops_done   integer flag          range 0 1        domain=physical   # drops already spawned (internal)
+sprout_target      text    species_name  domain=physical   # dormant_seed: kind/species it becomes
+sprout_material    text    material_name domain=physical   # fallback material if target isn't a species
+sprout_since       integer ticks        range 0 1000000000 domain=physical  # germination credit start (internal)
+sprout_rate        integer permille/tick range 0 1000     domain=physical   # germination speed (material default)
+sprout_moisture_min integer permille    range 0 1000      domain=physical   # min local moisture to germinate
+sprout_temp_min    integer deci-°C      range -1000 2000  domain=physical   # germination temperature band
+sprout_temp_max    integer deci-°C      range -1000 2000  domain=physical
+
+# ---- cognitive domain: Ebbinghaus memory params (Nhịp 1) ----------------------
+# Per-mind neural tuning, read via mind_params() with these spec defaults
+# when absent. Species/material defaults live on the entity; `gene mind_*`
+# loci let heredity nudge them per individual. domain=cognitive is private —
+# one agent's neural hardware is not observable to others.
+mind_base_clarity          integer permille     range 0 1000    domain=cognitive
+mind_max_clarity           integer units        range 0 1000    domain=cognitive
+mind_base_stability        integer milli-ticks  range 0 100000 domain=cognitive
+mind_max_stability         integer milli-ticks  range 0 100000 domain=cognitive
+mind_decay_rate            integer milli/tick   range 0 100000 domain=cognitive
+mind_imprint_threshold     integer permille     range 0 1000    domain=cognitive
+mind_imprint_base_stability integer milli-ticks range 0 100000 domain=cognitive
+mind_amygdala_multiplier   integer x1000        range 0 1000    domain=cognitive
+mind_rehearsal_stability_bonus integer milli-ticks range 0 100000 domain=cognitive
+mind_detail_blur_threshold integer clarity     range 0 1000    domain=cognitive
+mind_sleep_prune_threshold integer clarity     range 0 1000    domain=cognitive
+mind_rehearsal_interval    integer ticks       range 0 100000 domain=cognitive
+
+# ---- cognitive domain: 4 neural axes & psychopathology emergence (Nhịp 2-3) --
+# The four heritable axes (default 1000 = neutral, range 0..3000) plus
+# epigenetic-shock thresholds. NO disease flags exist anywhere: every
+# "disorder" is a phase-shift of these axes produced by trauma or genes.
+mind_threat_gain          integer permille     range 0 3000    domain=cognitive  # amplifies negative charge & panic
+mind_reward_gain          integer permille     range 0 3000    domain=cognitive  # amplifies positive charge & goal drive
+mind_pattern_coupling     integer permille     range 0 3000    domain=cognitive  # spurious cause-effect binding
+mind_empathy_coupling     integer permille     range 0 3000    domain=cognitive  # mirrors kin pain/death into self
+mind_low_light_bias       integer permille     range 0 3000    domain=cognitive  # sensory locus: dim-light wariness
+mind_isolation_bias       integer permille     range 0 3000    domain=cognitive  # sensory locus: solitude sensitivity
+mind_executive_override_threshold integer permille range 0 1000 domain=cognitive  # panic/rage above -> reflex hijack
+mind_emotion_decay        integer permille/tick range 0 1000  domain=cognitive  # panic/rage/grief fade rate
+mind_trauma_charge        integer permille     range 0 1000    domain=cognitive  # |charge| that counts as shock
+mind_inherit_charge       integer permille     range 0 1000    domain=cognitive  # |charge| required for epigenetic mark
+mind_inherit_stability    integer milli-ticks  range 0 100000 domain=cognitive  # stability required to transmit
+mind_mark_clarity         integer clarity      range 0 1000    domain=cognitive  # born-mark initial clarity
+mind_mark_stability       integer milli-ticks  range 0 100000 domain=cognitive  # born-mark initial stability
+mind_mark_charge_permille integer permille     range 0 1000    domain=cognitive  # inherited charge = parent * this /1000
+mind_flashback_charge     integer permille     range 0 1000    domain=cognitive  # |charge| trauma that can flash back
+mind_flashback_stability  integer milli-ticks  range 0 100000 domain=cognitive  # stability floor for flashback
+mind_paranoia_coupling    integer permille     range 0 3000    domain=cognitive  # pattern_coupling needed for false memories
+mind_paranoia_panic       integer permille     range 0 1000    domain=cognitive  # panic floor for false memories
+mind_paranoia_charge      integer permille     range 0 1000    domain=cognitive  # |charge| written onto innocent bystanders
+
+# ---- cognitive domain: heritable processing aptitudes (Nhịp 4) ------------
+# Four continuous axes — NO talent labels exist. A "strategist", an
+# "inventor", an "artisan" or a "leader" is just where the genome lands on
+# these numbers; selection, not a table, produces the phenotype.
+mind_plan_horizon        integer steps        range 1 6      domain=cognitive  # lookahead depth & branch budget in plan_multi
+mind_abstraction_gain    integer permille     range 200 2500 domain=cognitive  # generalization across shared physical traits
+mind_motor_precision     integer permille     range 200 2500 domain=cognitive  # craft/extract fidelity, skill consolidation
+mind_theory_of_mind      integer permille     range 0 2500   domain=cognitive  # infer conspecific state from observed motion
+mind_brain_metabolic_cost integer milliJ/tick range 0 1000  domain=cognitive  # energy price per unit of cognitive surplus
+mind_brain_accum        integer milliJ*permille range 0 100000000 domain=cognitive  # sub-unit metabolic remainder (Euclid LOD)
+
+# ---- social bonding domain: pair-bond, jealousy, parental imprint (4.5) --
+mind_pair_bond_gain     integer permille     range 0 2500   domain=cognitive  # strength of positive engrams from proximity/reproduction
+mind_jealousy_gain      integer permille     range 0 2500   domain=cognitive  # rage when a bonded partner reproduces/intimates with a rival
+mind_parental_drive     integer permille     range 0 2500   domain=cognitive  # imprint strength on offspring at birth
+
+# ---- primitive social psychology domain (Nhịp 5) --------------------------
+mind_conformity_gain      integer permille     range 0 2500   domain=cognitive  # herd-pressure: bonus for joining >=3 familiar actors' shared action
+mind_xenophobia_bias      integer permille     range 0 2500   domain=cognitive  # stranger wariness on first sight of a conspecific
+mind_ego_defense_gain     integer permille     range 0 2500   domain=cognitive  # scapegoating/sublimation when grief or rage has no clear target

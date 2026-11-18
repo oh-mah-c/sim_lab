@@ -1,0 +1,136 @@
+# Sunnyworld deposit registry — WORLD TRUTH data (TODO §2, §9).
+# A deposit is a natural occurrence: composition, physical properties,
+# accessibility, and FORMATION CONDITIONS (where it may exist).
+# Agents must DISCOVER it; nothing here is agent knowledge.
+#
+# Format:
+#   deposit <name>
+#     substance <material_name> <share_permille>   # shares must sum to 1000
+#     accessibility surface|buried
+#     depth <metres>
+#     condition <field> <lo> <hi>                  # repeatable
+#         fields: elevation(m) moisture(‰) temperature(deci-°C)
+#                slope(m) near_water(0/1) vegetation(‰) water_table(m)
+#                lithology(class) fault(0/1) placer_site(0/1)
+#     <prop_name> <value>                          # any registered property
+#
+# reserve            total extractable units (depletes via extraction, Phase 3)
+# yield_rate         extraction yield per 1000 force units (Phase 3)
+# min_force          minimum force to break material loose (Phase 3)
+# dig_resistance     force needed to expose a buried deposit (Phase 3)
+# formation_chance   permille per eligible cell during worldgen
+
+# Copper: forms in elevated, dry-ish terrain — hydrothermal veins.
+deposit copper_ore_body
+  substance copper_ore 700
+  substance host_rock 300
+  accessibility buried
+  depth 8
+  evidence surface_color 3     # green stain on weathered rock
+  evidence surface_trace 300
+  condition elevation 150 500
+  condition moisture 0 800
+  condition temperature -100 300
+  hardness 650
+  brittleness 400
+  mass 4000
+  reserve 24000
+  yield_rate 8
+  min_force 4000
+  dig_resistance 600
+  formation_chance 18
+
+# Iron: deeper, wider elevation band.
+deposit iron_ore_seam
+  substance iron_ore 600
+  substance host_rock 400
+  accessibility buried
+  depth 15
+  condition elevation 100 450
+  condition temperature -150 350
+  hardness 700
+  brittleness 350
+  mass 4500
+  reserve 30000
+  yield_rate 6
+  min_force 5000
+  dig_resistance 700
+  formation_chance 15
+
+# Clay: weathers near water in lowlands.
+deposit surface_clay
+  substance host_rock 1000
+  accessibility surface
+  depth 0
+  condition elevation 80 300
+  condition moisture 300 1000
+  condition near_water 1
+  hardness 300
+  brittleness 600
+  mass 1500
+  reserve 50000
+  yield_rate 12
+  min_force 1500
+  dig_resistance 0
+  formation_chance 30
+
+# Coal: buried seams inside sedimentary strata of low, once-wet terrain.
+deposit coal_seam
+  substance coal 900
+  substance shale 100
+  accessibility buried
+  depth 25
+  evidence surface_color 1     # black smudge
+  evidence surface_trace 200
+  condition elevation 80 350
+  condition moisture 350 1000
+  condition lithology 2 2
+  hardness 300
+  brittleness 650
+  mass 2500
+  reserve 60000
+  yield_rate 20
+  min_force 1200
+  dig_resistance 400
+  formation_chance 10
+
+# Gold placer: END of the §2.4 chain — fault-vein gold eroded, transported
+# by the stream, dropped where the channel slows (placer_site field: river
+# cell + low slope + fault-bearing upstream catchment).
+deposit gold_placer
+  substance gold_placer 800
+  substance host_rock 200
+  accessibility surface
+  depth 0
+  condition elevation 80 400
+  condition moisture 300 1000
+  condition placer_site 1 1
+  hardness 400
+  brittleness 550
+  mass 2200
+  reserve 8000
+  yield_rate 15
+  min_force 800
+  dig_resistance 0
+  formation_chance 80
+
+# Hydrothermal gold vein: hot fluids rose along FAULTS and precipitated in
+# quartz. Buried; where uplift+erosion has stripped the cover (steep slopes)
+# the vein outcrops (worldgen exposes it — no hand placement).
+deposit hydrothermal_gold_vein
+  substance gold_quartz 350
+  substance host_rock 650
+  accessibility buried
+  depth 12
+  evidence surface_color 6     # rusty gossan staining
+  evidence surface_trace 450
+  condition fault 1
+  condition elevation 120 520
+  hardness 700
+  brittleness 450
+  mass 3800
+  reserve 12000
+  yield_rate 5
+  min_force 5500
+  dig_resistance 750
+  formation_chance 350

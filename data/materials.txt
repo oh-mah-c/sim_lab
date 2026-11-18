@@ -1,0 +1,599 @@
+# Sunnyworld material registry — data only, no engine code.
+# Format:
+#   material <name>
+#     <prop_name> <raw_value>
+# Raw values follow the property's declared type (see properties.txt):
+#   integer -> whole units, fixed -> milli-units, boolean -> 0/1,
+#   text -> string, ref -> id.
+#
+# integrity 0..1000: structural soundness; reaching 0 destroys the entity.
+
+material dry_wood
+  hardness 350
+  brittleness 650
+  mass 800
+  density 500000
+  integrity 450
+  flammability 800
+  thermal_mass 1200
+  conductivity 120
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 400
+  geom_type 1
+  geom_len 1200
+  geom_wid 80
+  geom_thk 80
+  edge 250
+  length 1200
+  residue charcoal
+  residue_share 250
+
+material hardwood
+  hardness 500
+  brittleness 400
+  mass 1200
+  density 750000
+  integrity 700
+  flammability 650
+  thermal_mass 1800
+  conductivity 160
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 550
+  geom_type 1
+  geom_len 1500
+  geom_wid 120
+  geom_thk 120
+  edge 150
+  length 1500
+  residue charcoal
+  residue_share 250
+
+material stone
+  hardness 800
+  brittleness 300
+  mass 3000
+  density 2600000
+  integrity 900
+  flammability 0
+  thermal_mass 2100
+  conductivity 200
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 700
+  geom_type 3
+  geom_len 120
+  geom_wid 120
+  geom_thk 120
+  edge 500
+  length 0
+
+material flint
+  hardness 950
+  brittleness 850
+  mass 200
+  density 2600000
+  integrity 350
+  flammability 0
+  thermal_mass 800
+  conductivity 90
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 300
+  geom_type 2
+  geom_len 200
+  geom_wid 100
+  geom_thk 50
+  edge 900
+  length 0
+
+material obsidian
+  hardness 980
+  brittleness 900
+  mass 400
+  density 2700000
+  integrity 300
+  flammability 0
+  thermal_mass 900
+  conductivity 80
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 350
+  geom_type 2
+  geom_len 150
+  geom_wid 80
+  geom_thk 40
+  edge 700
+  length 0
+
+# ---- raw substances (natural occurrences yield these before processing) ------
+material copper_ore
+  hardness 600
+  brittleness 500
+  mass 2500
+  density 4000000
+  integrity 800
+  flammability 0
+  thermal_mass 900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 3
+  geom_len 100
+  geom_wid 100
+  geom_thk 100
+
+material iron_ore
+  hardness 700
+  brittleness 450
+  mass 2800
+  density 4500000
+  integrity 850
+  flammability 0
+  thermal_mass 950
+  conductivity 50
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 3
+  geom_len 100
+  geom_wid 100
+  geom_thk 100
+
+material host_rock
+  hardness 750
+  brittleness 350
+  mass 3000
+  density 2700000
+  integrity 950
+  flammability 0
+  thermal_mass 2000
+  conductivity 180
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+
+# ---- geological materials (lithology: 1=igneous 2=sedimentary 3=metamorphic) --
+material granite
+  hardness 900
+  brittleness 250
+  mass 2700
+  density 2700000
+  integrity 950
+  flammability 0
+  thermal_mass 2000
+  conductivity 280
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 1
+
+material basalt
+  hardness 950
+  brittleness 300
+  mass 2900
+  density 2900000
+  integrity 900
+  flammability 0
+  thermal_mass 1600
+  conductivity 200
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 1
+
+material sandstone
+  hardness 650
+  brittleness 500
+  mass 2400
+  density 2400000
+  integrity 700
+  flammability 0
+  thermal_mass 1700
+  conductivity 250
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 2
+
+material limestone
+  hardness 800
+  brittleness 400
+  mass 2500
+  density 2500000
+  integrity 750
+  flammability 0
+  thermal_mass 1900
+  conductivity 150
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 2
+
+material shale
+  hardness 500
+  brittleness 600
+  mass 2300
+  density 2300000
+  integrity 600
+  flammability 0
+  thermal_mass 1400
+  conductivity 120
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 2
+
+material marble
+  hardness 850
+  brittleness 350
+  mass 2700
+  density 2700000
+  integrity 800
+  flammability 0
+  thermal_mass 1800
+  conductivity 220
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  lithology 3
+
+# ---- soils (top stratum; type follows parent rock + climate) -------------------
+material soil_sand
+  hardness 150
+  brittleness 800
+  mass 1400
+  density 1500000
+  integrity 300
+  flammability 0
+  thermal_mass 1300
+  conductivity 100
+  fertility 200
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  soil_texture 1
+
+material soil_loam
+  hardness 200
+  brittleness 700
+  mass 1500
+  density 1600000
+  integrity 400
+  flammability 0
+  thermal_mass 1400
+  conductivity 110
+  fertility 500
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  soil_texture 2
+
+material soil_clay
+  hardness 250
+  brittleness 650
+  mass 1600
+  density 1700000
+  integrity 500
+  flammability 0
+  thermal_mass 1500
+  conductivity 90
+  fertility 600
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  soil_texture 3
+
+# ---- organic / energy substances ----------------------------------------------
+material coal
+  hardness 250
+  brittleness 700
+  mass 1300
+  density 1400000
+  integrity 400
+  flammability 950
+  thermal_mass 1200
+  conductivity 80
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 500
+  geom_type 3
+  geom_len 80
+  geom_wid 80
+  geom_thk 80
+
+material gold_placer
+  hardness 400
+  brittleness 550
+  mass 2200
+  density 6000000
+  integrity 500
+  flammability 0
+  thermal_mass 500
+  conductivity 300
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+# Quartz-hosted gold: hydrothermal vein fill (forms along faults, see deposits.txt).
+material gold_quartz
+  hardness 700
+  brittleness 450
+  mass 2600
+  density 3800000
+  integrity 700
+  flammability 0
+  thermal_mass 700
+  conductivity 250
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+# Animal body (fauna species in species.txt are made of it).
+material flesh
+  hardness 30
+  brittleness 100
+  mass 40000
+  density 1050000
+  integrity 600
+  decay_rate 400
+  flammability 200
+  thermal_mass 3500
+  conductivity 50
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 700
+  hydration 300
+  tensile 250
+
+# ---- processed / fuel / waste materials (Phase 3 processing outputs) ----------
+material copper_metal
+  hardness 700
+  brittleness 300
+  mass 8900
+  density 8900000
+  integrity 900
+  flammability 0
+  thermal_mass 380
+  conductivity 390
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 800
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+material charcoal
+  hardness 100
+  brittleness 800
+  mass 250
+  density 500000
+  integrity 300
+  flammability 900
+  thermal_mass 800
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 150
+  geom_type 1
+  geom_len 300
+  geom_wid 60
+  geom_thk 60
+
+material slag
+  hardness 800
+  brittleness 200
+  mass 3500
+  density 3000000
+  integrity 950
+  flammability 0
+  thermal_mass 1100
+  conductivity 40
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 3
+  geom_len 80
+  geom_wid 80
+  geom_thk 80
+
+material iron_blade
+  hardness 900
+  brittleness 200
+  mass 900
+  density 7800000
+  integrity 850
+  flammability 0
+  thermal_mass 450
+  conductivity 800
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 850
+
+# ---- forageable wild food (physiology: nutrition/hydration are World Truth --
+# agents must discover edibility by consuming or by witness, never by lookup)
+material wild_berries
+  hardness 50
+  brittleness 900
+  mass 100
+  density 800000
+  integrity 200
+  decay_rate 200
+  flammability 600
+  thermal_mass 900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 400
+  hydration 500
+  tensile 100
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+# poisonous look-alike: edible-ish but toxic — consuming damages the eater's
+# integrity. Learned the hard way: taste-test, death, witnessed taboo.
+material nightshade
+  hardness 50
+  brittleness 900
+  mass 100
+  density 800000
+  integrity 200
+  decay_rate 200
+  flammability 600
+  thermal_mass 900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 150
+  hydration 100
+  toxicity 250
+  tensile 100
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+# living bush wood: the BODY of fruiting flora (berry_bush etc). Tough and
+# effectively non-perishing — it dies only to physical damage (strike/heat),
+# never because its fruit was eaten or spoiled.
+material living_wood
+  hardness 200
+  brittleness 300
+  mass 400
+  density 900000
+  integrity 1000
+  decay_rate 0
+  flammability 500
+  thermal_mass 1400
+  conductivity 100
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 300
+  geom_type 3
+  geom_len 80
+  geom_wid 80
+  geom_thk 80
+
+# Dormant propagule — the seed-bank layer. Left behind where a fruiting plant
+# dies (see `death_drops` on species). It is World Truth biomass: light,
+# inedible, slowly rotting, and it GERMINATES on its own once
+# sprout_rate x elapsed ticks reaches 1000 permille-ticks AND the local
+# terrain moisture/temperature satisfy the sprout_* band (material defaults,
+# instance-overridable). sprout_target on the instance names the species it
+# becomes; sprout_material is the fallback when the target is not a species.
+material dormant_seed
+  hardness 50
+  brittleness 900
+  mass 5
+  density 800000
+  integrity 200
+  decay_rate 1
+  flammability 400
+  thermal_mass 200
+  conductivity 50
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  sprout_rate 2
+  sprout_moisture_min 300
+  sprout_temp_min -200
+  sprout_temp_max 450
+
+# Dead-wood litter — the non-living half of a plant's death_drops manifest.
+# Pure debris: no sprout_* props, so it only rots away.
+material wood_debris
+  hardness 80
+  brittleness 950
+  mass 200
+  density 400000
+  integrity 100
+  decay_rate 4
+  flammability 600
+  thermal_mass 400
+  conductivity 80
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
