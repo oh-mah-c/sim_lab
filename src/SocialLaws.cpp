@@ -407,6 +407,25 @@ PredictionResult predict_engrave(const World& w, const InteractionContext& ctx) 
                     is.props.set(p_l2, Value::integer(cls[1].lang));
             }
         }
+        // Phase 12.3: a legitimate, abstract-minded authority may codify
+        // the community's dominant taboo as a Law Inscription — the
+        // carving carries [action]->[sanction] for any literate reader.
+        {
+            const PropId p_la = pid(w, "law_action");
+            const PropId p_ls = pid(w, "law_sanction");
+            const PropId p_lv = pid(w, "law_aversion");
+            std::string lact; std::int64_t lav = 0;
+            const MindParams lmp = mind_params(w, *actor);
+            if (p_la != kNoProp && p_ls != kNoProp && p_lv != kNoProp &&
+                pol_legitimacy(w, ctx.actor) >= 700 &&
+                lmp.abstraction_gain >= 1100 &&
+                pol_dominant_norm(w, ctx.actor, &lact, &lav)) {
+                is.props.set(p_la, Value::text(lact));
+                is.props.set(p_ls, Value::text(
+                    lav >= 800 ? "ostracism" : "restitution"));
+                is.props.set(p_lv, Value::integer(lav));
+            }
+        }
         is.rel_from.push_back({"inscribed_on", t->id});
         r.spawns.push_back(is);
     }
@@ -511,9 +530,37 @@ PredictionResult predict_share(const World& w, const InteractionContext& ctx) {
         r.failure = "target store would overflow"; return r;
     }
     if (!in_reach(w, *actor, *t, reach, 0, &r)) { r.failure = "target out of reach"; return r; }
+    if (pol_ostracism(w, ctx.actor, t->id) >= 500) {
+        r.failure = "ostracized by the community"; return r;
+    }
     if (!charge_energy(*actor, energy, kShareCost, r)) return r;
     set_change(r, actor->id, qty, av->i, 0);
     set_change(r, t->id, qty, tv->i, tv->i + av->i);
+    // Phase 12.3: a mandated leader dispensing the public pool in scarcity
+    // converts charity into legitimacy and stamps the relief tick.
+    const PropId p_pool = pid(w, "public_pool");
+    const PropId p_leg = pid(w, "social_legitimacy");
+    const PropId p_lrt = pid(w, "last_relief_tick");
+    const PropId p_hun = pid(w, "hunger");
+    if (p_pool != kNoProp && p_leg != kNoProp &&
+        pol_holds_mandate(w, ctx.actor) &&
+        w.prop_int(*actor, p_pool, 0) > 0 &&
+        p_hun != kNoProp && w.prop_int(*t, p_hun, 0) > 600) {
+        const std::int64_t pool0 = w.prop_int(*actor, p_pool, 0);
+        const std::int64_t leg0 = pol_legitimacy(w, ctx.actor);
+        set_change(r, actor->id, p_pool, pool0,
+                   std::max<std::int64_t>(0, pool0 - 100));
+        if (p_lrt != kNoProp)
+            set_change(r, actor->id, p_lrt,
+                w.prop_int(*actor, p_lrt, 0),
+                static_cast<std::int64_t>(w.clock_.tick()));
+        set_change(r, actor->id, p_leg, leg0,
+                   std::min<std::int64_t>(2000, leg0 + 20));
+        const std::int64_t h0 = w.prop_int(*t, p_hun, 0);
+        set_change(r, t->id, p_hun, h0,
+                   std::max<std::int64_t>(0, h0 - 50));
+        r.notes.push_back("scarcity relief from the mandate");
+    }
     r.possible = true; r.ticks = 1;
     r.notes.push_back("share " + std::to_string(av->i) + " units");
     return r;
@@ -763,6 +810,27 @@ PredictionResult predict_take(const World& w, const InteractionContext& ctx,
             const std::int64_t rep = w.prop_int(*actor, p_rep, 1000);
             set_change(r, ctx.actor, p_rep, rep,
                        std::max<std::int64_t>(0, rep - 200));
+            // Phase 12.3: a witnessed grab hardens the communal norm
+            // ledger against theft and scars the thief's legitimacy.
+            const EntityId comm = econ_community_of(w, ctx.actor);
+            const PropId p_nt = pid(w, "norm_table");
+            if (comm != kNoEntity && p_nt != kNoProp) {
+                const Entity* ce = w.find(comm);
+                const Value* cur = ce ? w.prop_of(*ce, p_nt) : nullptr;
+                const std::string before =
+                    cur && cur->type == ValType::Text ? cur->s : "";
+                const std::string after = pol_table_bump_text(
+                    before, "steal", 400);
+                if (after != before)
+                    set_change_v(r, comm, p_nt, Value::text(before),
+                                 Value::text(after));
+            }
+            const PropId p_leg = pid(w, "social_legitimacy");
+            if (p_leg != kNoProp)
+                set_change(r, ctx.actor, p_leg,
+                    pol_legitimacy(w, ctx.actor),
+                    std::max<std::int64_t>(0,
+                        pol_legitimacy(w, ctx.actor) - 100));
             r.notes.push_back("theft witnessed");
         } else if (!seen) {
             r.notes.push_back("theft unseen — exposure window armed");
@@ -787,6 +855,9 @@ PredictionResult predict_trade(const World& w, const InteractionContext& ctx) {
     if (!partner) return r;
     if (!in_reach(w, *actor, *partner, p_reach, 0, &r)) {
         r.failure = "trading partner out of reach"; return r;
+    }
+    if (pol_ostracism(w, ctx.actor, partner->id) >= 500) {
+        r.failure = "ostracized by the community"; return r;
     }
     TradeTerms tt = parse_trade_note(w, ctx.parameters.note);
     if (!tt.ok) { r.failure = "malformed trade terms"; return r; }
@@ -981,6 +1052,246 @@ PredictionResult predict_repay(const World& w, const InteractionContext& ctx) {
     return r;
 }
 
+
+// ---- Phase 12.3: political & legal base -------------------------------------
+// adjudicate/tribute — authority is never assigned: the mandate holder is
+// whoever the community's defer_to beliefs converge on (pol_holds_mandate).
+// Every verdict rides StateChanges; mental aftermath lands in
+// political_from_event.
+
+constexpr std::int64_t kAdjCost = 40;
+constexpr std::int64_t kTribCost = 20;
+
+// contested property: an item the offender holds while some OTHER mind
+// still claims "<victim> owns <item>" from before the grab. Returns victim.
+EntityId pol_contested_victim(const World& w, EntityId offender,
+                              EntityId item) {
+    const std::string prefix = "owns:" +
+        std::to_string(static_cast<std::uint64_t>(item)) + ":";
+    EntityId best_v = kNoEntity; std::int64_t best_c = 300;
+    for (const auto& [wid, m] : w.minds_) {
+        (void)m;
+        const AgentMind* mm = w.find_mind(wid);
+        if (!mm || wid == offender) continue;
+        for (const auto& [k, b] : mm->beliefs) {
+            if (k.rfind(prefix, 0) != 0 || b.confidence <= best_c)
+                continue;
+            try {
+                const EntityId v = static_cast<EntityId>(
+                    std::stoull(k.substr(prefix.size())));
+                if (v != offender && w.find_mind(v)) {
+                    best_c = b.confidence; best_v = v;
+                }
+            } catch (...) {}
+        }
+    }
+    return best_v;
+}
+
+// defaulted obligations count as proven harm even when goods are gone.
+std::int64_t pol_defaulted_debts(const World& w, EntityId debtor) {
+    const PropId p_ds = pid(w, "debt_status");
+    const PropId p_db = pid(w, "debtor_id");
+    if (p_ds == kNoProp || p_db == kNoProp) return 0;
+    std::int64_t n = 0;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "debt_obligation") continue;
+        if (w.prop_int(e, p_ds, 0) == 2 &&
+            w.prop_int(e, p_db, 0) ==
+                static_cast<std::int64_t>(debtor)) ++n;
+    }
+    return n;
+}
+
+PredictionResult predict_adjudicate(const World& w,
+                                    const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_leg = pid(w, "social_legitimacy");
+    const PropId p_reach = pid(w, "reach");
+    const PropId p_ot = pid(w, "ostracism_table");
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* offender = single_target(w, ctx, r, contained);
+    if (!offender) return r;
+    if (offender->id == ctx.actor) {
+        r.failure = "cannot adjudicate oneself"; return r;
+    }
+    if (!in_reach(w, *actor, *offender, p_reach, 0, &r)) {
+        r.failure = "offender out of reach"; return r;
+    }
+    // only the community's mandated arbiter may sit in judgment
+    if (!pol_holds_mandate(w, ctx.actor)) {
+        r.failure = "no mandate to adjudicate"; return r;
+    }
+    if (!charge_energy(*actor, energy, kAdjCost, r)) return r;
+
+    const bool pardon =
+        ctx.parameters.note.find("pardon") != std::string::npos;
+    // gather contested goods the offender still holds
+    std::vector<std::pair<EntityId, EntityId>> contested;  // item -> victim
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || p_poss == kNoProp) continue;
+        if (w.prop_int(e, p_poss, 0) !=
+            static_cast<std::int64_t>(offender->id)) continue;
+        const EntityId v = pol_contested_victim(w, offender->id, e.id);
+        if (v != kNoEntity) contested.push_back({e.id, v});
+    }
+    const std::int64_t defaults =
+        pol_defaulted_debts(w, offender->id);
+    const bool proven = !contested.empty() || defaults > 0;
+
+    if (pardon && proven) {
+        // mercy for a proven wrong: the arbiter's own standing pays for it
+        r.notes.push_back("unjust pardon");
+        for (const auto& [it, v] : contested)
+            r.notes.push_back("victim:" +
+                std::to_string(static_cast<std::uint64_t>(v)));
+        if (p_leg != kNoProp)
+            set_change(r, actor->id, p_leg,
+                pol_legitimacy(w, ctx.actor),
+                std::max<std::int64_t>(0,
+                    pol_legitimacy(w, ctx.actor) - 300));
+        r.possible = true; r.ticks = kAdjCost;
+        r.notes.push_back("pardoned a proven wrong");
+        return r;
+    }
+    if (contested.empty()) {
+        // nothing to restore — but proven harm without goods means the
+        // offender keeps offending: the community outlaws them instead
+        if (!proven) { r.failure = "no grounds for judgment"; return r; }
+        const EntityId comm = econ_community_of(w, ctx.actor);
+        if (comm == kNoEntity || p_ot == kNoProp) {
+            r.failure = "no community to enforce the verdict"; return r;
+        }
+        const Entity* ce = w.find(comm);
+        const Value* cur = ce ? w.prop_of(*ce, p_ot) : nullptr;
+        const std::string before = cur && cur->type == ValType::Text
+            ? cur->s : std::string();
+        const std::string key = std::to_string(
+            static_cast<std::uint64_t>(offender->id));
+        const std::string after = pol_table_bump_text(before, key, 1000);
+        if (after != before)
+            set_change_v(r, comm, p_ot, Value::text(before),
+                         Value::text(after));
+        if (p_leg != kNoProp) {
+            set_change(r, actor->id, p_leg,
+                pol_legitimacy(w, ctx.actor),
+                std::min<std::int64_t>(2000,
+                    pol_legitimacy(w, ctx.actor) + 60));
+            set_change(r, offender->id, p_leg,
+                pol_legitimacy(w, offender->id),
+                std::max<std::int64_t>(0,
+                    pol_legitimacy(w, offender->id) - 150));
+        }
+        r.possible = true; r.ticks = kAdjCost;
+        r.notes.push_back("ostracized repeat offender");
+        return r;
+    }
+    // restitution: every contested item goes back to its proven owner
+    for (const auto& [it, v] : contested) {
+        const Entity* ie = w.find(it);
+        if (!ie) continue;
+        set_change(r, it, p_poss,
+            static_cast<std::int64_t>(offender->id),
+            static_cast<std::int64_t>(v));
+    }
+    if (p_leg != kNoProp) {
+        set_change(r, actor->id, p_leg,
+            pol_legitimacy(w, ctx.actor),
+            std::min<std::int64_t>(2000,
+                pol_legitimacy(w, ctx.actor) + 80));
+        set_change(r, offender->id, p_leg,
+            pol_legitimacy(w, offender->id),
+            std::max<std::int64_t>(0,
+                pol_legitimacy(w, offender->id) - 80));
+    }
+    r.possible = true; r.ticks = kAdjCost;
+    r.notes.push_back("restitution of " +
+        std::to_string(contested.size()) + " contested items");
+    return r;
+}
+
+PredictionResult predict_tribute(const World& w,
+                                 const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_reach = pid(w, "reach");
+    const PropId p_leg = pid(w, "social_legitimacy");
+    const PropId p_pool = pid(w, "public_pool");
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* leader = single_target(w, ctx, r, contained);
+    if (!leader) return r;
+    if (leader->id == ctx.actor) {
+        r.failure = "cannot tribute oneself"; return r;
+    }
+    if (!in_reach(w, *actor, *leader, p_reach, 0, &r)) {
+        r.failure = "leader out of reach"; return r;
+    }
+    // tribute flows along allegiance — no defer_to, no obligation
+    const AgentMind* am = w.find_mind(ctx.actor);
+    if (!am || pol_defer_conf(*am, leader->id) < 300) {
+        r.failure = "no allegiance to this leader"; return r;
+    }
+    // payment terms: "MAT:QTY" or the single most valuable held stack
+    MaterialId pmat = kNoMaterial; std::int64_t pqty = 0;
+    {
+        const std::string& n = ctx.parameters.note;
+        const std::size_t c = n.find(':');
+        if (c != std::string::npos) {
+            try {
+                const MaterialId m = w.materials.id_of(n.substr(0, c));
+                const std::int64_t qq =
+                    std::stoll(n.substr(c + 1));
+                if (m != kNoMaterial && qq > 0) { pmat = m; pqty = qq; }
+            } catch (...) {}
+        }
+    }
+    if (pmat == kNoMaterial) {
+        std::int64_t best_v = -1; EntityId best = kNoEntity;
+        const PropId p_poss2 = pid(w, "possessed_by");
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (!e.alive || e.material == kNoMaterial ||
+                p_poss2 == kNoProp) continue;
+            if (w.prop_int(e, p_poss2, 0) !=
+                static_cast<std::int64_t>(ctx.actor)) continue;
+            const std::int64_t v = econ_total_value(w, ctx.actor,
+                                                   e.material) *
+                                   econ_qty_local(w, e);
+            if (v > best_v) { best_v = v; best = e.id; }
+        }
+        if (best == kNoEntity) { r.failure = "nothing to tribute"; return r; }
+        const Entity* be = w.find(best);
+        pmat = be->material;
+        pqty = econ_qty_local(w, *be);
+    }
+    if (!charge_energy(*actor, energy, kTribCost, r)) return r;
+    if (!econ_transfer(r, w, ctx.actor, leader->id, pmat, pqty,
+                       leader->pos)) {
+        r.failure = "cannot part with the goods"; return r;
+    }
+    const std::int64_t paid_val =
+        econ_total_value(w, ctx.actor, pmat) * pqty;
+    const std::int64_t pool0 = pol_pool(w, leader->id);
+    const std::int64_t leg0 = pol_legitimacy(w, leader->id);
+    if (p_pool != kNoProp)
+        set_change(r, leader->id, p_pool, pool0,
+                   std::min<std::int64_t>(1000000000, pool0 + paid_val));
+    if (p_leg != kNoProp)
+        set_change(r, leader->id, p_leg, leg0,
+                   std::min<std::int64_t>(2000, leg0 + 5));
+    r.possible = true; r.ticks = kTribCost;
+    r.notes.push_back("tribute " + std::to_string(paid_val) + " value");
+    return r;
+}
+
 }  // namespace
 
 LawId SocialModel::id() const { return 8; }
@@ -991,7 +1302,8 @@ bool SocialModel::supports(const World& w, const InteractionContext& ctx) const 
     if (a == "found") return ctx.targets.empty();
     if (a == "communicate" || a == "engrave" || a == "read" ||
         a == "join" || a == "leave" || a == "share" || a == "withdraw" ||
-        a == "take" || a == "steal" || a == "trade" || a == "repay")
+        a == "take" || a == "steal" || a == "trade" || a == "repay" ||
+        a == "adjudicate" || a == "tribute")
         return ctx.targets.size() == 1;
     return false;
 }
@@ -1011,6 +1323,8 @@ PredictionResult SocialModel::predict(const World& w,
     if (a == "steal")      return predict_take(w, ctx, true);
     if (a == "trade")      return predict_trade(w, ctx);
     if (a == "repay")      return predict_repay(w, ctx);
+    if (a == "adjudicate") return predict_adjudicate(w, ctx);
+    if (a == "tribute")    return predict_tribute(w, ctx);
     PredictionResult r; r.law = id(); r.law_name = name();
     r.failure = "unsupported social action";
     return r;

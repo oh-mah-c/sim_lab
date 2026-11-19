@@ -402,6 +402,10 @@ private:
     // batch-exact for any dt, so per-tick and dormant-tick paths agree.
     // clarity == 0 erases the entry (forgetting releases the RAM).
     void decay_minds(std::int64_t n);
+    // Phase 12.3: per-mind political cadence — defer_to recomputation,
+    // grievance drift, revolt. Accumulator-exact like decay_minds; prop
+    // consequences ride one ledgered CausalEvent per call.
+    void political_drift(std::int64_t n);
     // Causal parents of an interaction: caller-supplied + the last event that
     // touched each target / wielded tool (automatic provenance chain).
     std::vector<EventId> auto_parents(const InteractionContext& ctx) const;

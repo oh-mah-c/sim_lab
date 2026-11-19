@@ -390,3 +390,15 @@ debt_status         integer units        range 0 10     domain=social     # debt
 # language/community entity: "mid:fixedpoint;..." store-of-value consensus.
 # fixedpoint = permille * 64 — the fraction IS the Euclid accumulator.
 monetary_consensus  text     none                     domain=social     # community: per-material money candidacy (0..64000)
+
+# ---- political/legal domain: emergent norms, authority, credit of office ----
+social_legitimacy    integer units         range 0 2000   domain=social   # agent: political/moral standing (absent = 500)
+public_pool          integer units         range 0 1000000000 domain=social # agent: tribute stock held for the community
+last_relief_tick     integer ticks         range 0 1000000000 domain=social # agent: last scarcity relief dispatched
+# inscription entity: codified communal norm — [action] -> [sanction]
+law_action           text     none                     domain=social     # inscription: taboo action key this carving binds
+law_sanction         text     none                     domain=social     # inscription: sanction class (restitution/ostracism)
+law_aversion         integer permille     range 0 1000   domain=social     # inscription: aversion level the law enforces
+# language entity: communal political memory (like monetary_consensus)
+norm_table           text     none                     domain=social     # community: "action:fixed;" taboo aversion ledger
+ostracism_table      text     none                     domain=social     # community: "agent_id:fixed;" collective outlaw ledger

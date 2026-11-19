@@ -473,7 +473,7 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
 void World::advance_ticks(std::int64_t n) {
     for (std::int64_t i = 0; i < n; ++i) clock_.advance();
     if (n > 0) { metabolize(n); dissipate_heat(n); ecology_tick(n);
-                 language_tick(clock_.tick()); decay_minds(n); }
+                 language_tick(clock_.tick()); decay_minds(n); political_drift(n); }
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -4561,6 +4561,7 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     if (const CausalEvent* sev = ledger.find(res.event)) {
         social_from_event(*this, ctx.actor, ctx.targets, *sev);
         simlab::econ_from_event(*this, ctx.actor, ctx.targets, *sev);
+        simlab::political_from_event(*this, ctx.actor, ctx.targets, *sev);
     }
     return res;
 }
@@ -5067,6 +5068,7 @@ std::uint64_t World::state_hash() const {
             mixs(act); mix(static_cast<std::uint64_t>(cnt));
         }
         mix(static_cast<std::uint64_t>(m.ostracism_accum));
+        mix(static_cast<std::uint64_t>(m.political_accum));
     }
     return h;
 }
@@ -5078,7 +5080,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 15;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum
+constexpr std::uint32_t kSaveFormat = 16;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum
 
 struct Writer {
     std::ofstream f;
@@ -5364,6 +5366,7 @@ bool World::save(const std::string& path, std::string* err) const {
             w.str(act); w.put(static_cast<std::uint64_t>(cnt));
         }
         w.put(static_cast<std::int64_t>(m.ostracism_accum));
+        w.put(static_cast<std::int64_t>(m.political_accum));
     }
     // rng stream counters; v5: event failed/failure/conditions (v4): stochastic laws must replay after load
     w.put(seed);
@@ -5787,6 +5790,9 @@ bool World::load(const std::string& path, std::string* err) {
                 std::int64_t oa = 0;
                 if (!r.get(oa)) return fail("truncated ostracism_accum");
                 m.ostracism_accum = oa;
+                std::int64_t pa2 = 0;
+                if (!r.get(pa2)) return fail("truncated political_accum");
+                m.political_accum = pa2;
             }
             minds_[nid] = std::move(m);
         }
@@ -6385,6 +6391,109 @@ void World::econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                 setp(e, p_theft, std::max<std::int64_t>(0, flag - pending));
             }
         }
+    }
+}
+
+
+// ---- Phase 12.3: political cadence ------------------------------------------
+// One accumulator-exact pass per advance, same contract as decay_minds:
+// fires = floor((accum+n)/200) is identical for dt=1 xN and dt=N; every
+// condition read (defer beliefs, public_pool, last_relief_tick,
+// perceived_abundance beliefs, legitimacy) is interact-stable, so the
+// per-fire deltas compose linearly and the final state matches exactly.
+void World::political_drift(std::int64_t n) {
+    if (n <= 0) return;
+    constexpr std::int64_t kPeriod = 200;
+    const std::uint64_t now = clock_.tick();
+    CausalEvent ev;
+    ev.tick = now;
+    ev.action = "political_drift";
+    bool ledgered = false;
+    const PropId p_leg = props.find_name("social_legitimacy")
+        ? props.find_name("social_legitimacy")->id : kNoProp;
+    for (auto& [eid, mind] : minds_) {
+        Entity* e = find(eid);
+        if (!e || !e->alive) continue;
+        mind.political_accum += n;
+        std::int64_t fires = mind.political_accum / kPeriod;
+        const std::int64_t rem = mind.political_accum % kPeriod;
+        mind.political_accum = rem;
+        // Per-fire loop, NOT fires*delta batching: the revolt threshold is
+        // nonlinear, so each period must be replayed in order — identical
+        // to what dt=1 xN produces across separate decay_minds calls. Each
+        // fire is evaluated at ITS historical tick so time-gated conditions
+        // (relief freshness) match the ticked replay exactly.
+        while (fires-- > 0) {
+            const std::int64_t ftick = std::max<std::int64_t>(0,
+                static_cast<std::int64_t>(now) - rem -
+                fires * kPeriod);
+            // (b) deference network refresh
+            pol_update_defer(*this, eid);
+
+            // current allegiance target (top-confidence defer_to belief)
+            EntityId tyr = kNoEntity;
+            std::int64_t best_conf = 0;
+            for (const auto& [k, b] : mind.beliefs) {
+                if (k.rfind("defer_to:", 0) != 0 ||
+                    b.confidence <= best_conf) continue;
+                try {
+                    tyr = static_cast<EntityId>(std::stoull(k.substr(9)));
+                    best_conf = b.confidence;
+                } catch (...) {}
+            }
+            Belief& g = mind.belief("grievance");
+            std::int64_t delta = -2;                // slow natural cooling
+            if (tyr != kNoEntity) {
+                const Entity* te = find(tyr);
+                const std::int64_t pool = te
+                    ? pol_prop(*this, *te, "public_pool", 0) : 0;
+                const std::int64_t relief = te
+                    ? pol_prop(*this, *te, "last_relief_tick", 0) : 0;
+                bool scarce = false;
+                for (const auto& [bk, bv] : mind.beliefs)
+                    if (bk.rfind("pa:", 0) == 0 &&
+                        bv.confidence < 300) { scarce = true; break; }
+                if (pool > 500 && scarce && ftick > relief + 1000)
+                    delta += 60;  // hoarded tribute while pots run thin
+                else if (pool > 0 && relief > 0 && ftick <= relief + 1000)
+                    delta -= 80;  // fresh relief cools resentment fast
+            }
+            g.confidence = std::clamp<std::int64_t>(
+                g.confidence + delta, 0, 1000);
+            g.last_tick = static_cast<std::uint64_t>(ftick);
+
+            // (d) revolt: grievance past threshold withdraws allegiance and
+            // bleeds the tyrant's legitimacy — ledgered once per call.
+            if (g.confidence >= 700) {
+                std::vector<std::string> stale;
+                for (const auto& [k, b] : mind.beliefs)
+                    if (k.rfind("defer_to:", 0) == 0)
+                        stale.push_back(k);
+                for (const auto& k : stale) mind.beliefs.erase(k);
+                g.confidence = 400;                  // hysteresis band
+                if (tyr != kNoEntity && p_leg != kNoProp) {
+                    if (Entity* te = find(tyr)) {
+                        const std::int64_t leg =
+                            prop_int(*te, p_leg, 500);
+                        const Value* old = prop_of(*te, p_leg);
+                        StateChange ch;
+                        ch.entity = te->id; ch.prop = p_leg;
+                        ch.had_before = old != nullptr;
+                        ch.before = old ? *old : Value::integer(500);
+                        ch.after = Value::integer(std::max<
+                            std::int64_t>(0, leg - 50));
+                        te->props.set(p_leg, ch.after);
+                        ev.changes.push_back(ch);
+                        ev.participants.push_back(tyr);
+                        ledgered = true;
+                    }
+                }
+            }
+        }
+    }
+    if (ledgered) {
+        ev.evidence = "deference network & grievance drift; ";
+        ledger.append(std::move(ev));
     }
 }
 

@@ -2748,6 +2748,28 @@ void social_from_event(World& w, EntityId actor,
                     ++n;
                 }
             }
+            // Phase 12.3: a comprehensible Law Inscription teaches its
+            // bound taboo directly — newcomers inherit the norm without
+            // ever witnessing the crime it condemns.
+            if (insc_e && comprehensible) {
+                const PropId p_la = s_pid(w, "law_action");
+                const PropId p_lv = s_pid(w, "law_aversion");
+                if (p_la != kNoProp && p_lv != kNoProp) {
+                    const Value* lav = w.prop_of(*insc_e, p_la);
+                    const Value* lv2 = w.prop_of(*insc_e, p_lv);
+                    if (lav && lav->type == ValType::Text &&
+                        !lav->s.empty() &&
+                        lv2 && lv2->type == ValType::Integer) {
+                        Belief& nb = w.mind(actor).belief(
+                            "norm_aversion:" + lav->s);
+                        nb.confidence = std::max<std::int64_t>(
+                            nb.confidence,
+                            std::min<std::int64_t>(1000, lv2->i));
+                        nb.status = BeliefStatus::Observed;
+                        nb.last_tick = ev.tick;
+                    }
+                }
+            }
         }
     } else if (ev.action == "reproduce") {
         // pair-bond the parents AND imprint the newborn — all through the
@@ -3367,4 +3389,454 @@ std::int64_t econ_aptitude_bonus(const World& w, EntityId npc,
     return std::clamp<std::int64_t>(bonus, -800, 1200);
 }
 
+
+// ---- Phase 12.3: political & legal base -------------------------------------
+// Communal ledgers (norm_table / ostracism_table) are text props on the
+// `language` registry entity — "key:fixed;" with fixed = permille*64, the
+// same encoding monetary_consensus uses. Personal politics (defer_to,
+// grievance) are beliefs; legitimacy/pool are entity props mutated only
+// through causal changes or the ledgered political_drift event.
+
+PropId pol_pid(const World& w, const char* name) {
+    const PropertyDef* d = w.props.find_name(name);
+    return d ? d->id : kNoProp;
+}
+
+std::int64_t pol_prop(const World& w, const Entity& e, const char* name,
+                      std::int64_t fallback) {
+    const PropId p = pol_pid(w, name);
+    return p != kNoProp ? w.prop_int(e, p, fallback) : fallback;
+}
+
+EntityId pol_community_of(const World& w, EntityId agent) {
+    const PropId p_lang = pol_pid(w, "language_id");
+    const PropId p_lname = pol_pid(w, "language_name");
+    if (p_lang == kNoProp || p_lname == kNoProp) return kNoEntity;
+    const Entity* ae = w.find(agent);
+    if (!ae) return kNoEntity;
+    const std::int64_t lang = w.prop_int(*ae, p_lang, 0);
+    if (lang <= 0) return kNoEntity;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (e.alive && e.kind_name == "language" &&
+            w.prop_int(e, p_lname, 0) == lang)
+            return e.id;
+    }
+    return kNoEntity;
+}
+
+std::int64_t pol_legitimacy(const World& w, EntityId agent) {
+    const Entity* e = w.find(agent);
+    if (!e) return 500;
+    return std::clamp<std::int64_t>(
+        pol_prop(w, *e, "social_legitimacy", 500), 0, 2000);
+}
+
+// coercive_power is never stored — it is recomputed from what a witness
+// could see: bodily condition, weapons in hand, and the size of the
+// armed following (defer beliefs already held by others).
+std::int64_t pol_coercive(const World& w, EntityId agent) {
+    const Entity* e = w.find(agent);
+    if (!e || !e->alive) return 0;
+    std::int64_t score = pol_prop(w, *e, "integrity", 500) * 3 / 4;
+    // wielded hardware: hardest tool in hand adds deterrence
+    const PropId p_hard = pol_pid(w, "hardness");
+    for (const Relation& rel : w.relations_of(agent, "wielding")) {
+        if (rel.a != agent) continue;
+        const Entity* te = w.find(rel.b);
+        if (te && te->alive && p_hard != kNoProp)
+            score += w.prop_int(*te, p_hard, 0) / 4;
+    }
+    // armed following: each deferent adds muscle to the show of force
+    score += pol_defer_count(w, agent) * 120;
+    return std::clamp<std::int64_t>(score, 0, 2000);
+}
+
+std::int64_t pol_grievance(const AgentMind* m) {
+    if (!m) return 0;
+    const Belief* b = m->find_belief("grievance");
+    return b ? std::clamp<std::int64_t>(b->confidence, 0, 1000) : 0;
+}
+
+std::int64_t pol_pool(const World& w, EntityId agent) {
+    const Entity* e = w.find(agent);
+    if (!e) return 0;
+    return std::max<std::int64_t>(0,
+        pol_prop(w, *e, "public_pool", 0));
+}
+
+// "key:fixed;" text ledger helpers — fixed = permille * 64.
+static std::map<std::string, std::int64_t>
+pol_table_parse(const std::string& s) {
+    std::map<std::string, std::int64_t> tab;
+    std::size_t pos = 0;
+    while (pos <= s.size()) {
+        const std::size_t semi = s.find(';', pos);
+        const std::string ent = s.substr(pos, semi == std::string::npos
+            ? std::string::npos : semi - pos);
+        const std::size_t colon = ent.find(':');
+        if (colon != std::string::npos && colon > 0) {
+            try {
+                tab[ent.substr(0, colon)] =
+                    std::stoll(ent.substr(colon + 1));
+            } catch (...) {}
+        }
+        if (semi == std::string::npos) break;
+        pos = semi + 1;
+    }
+    return tab;
+}
+static std::string pol_table_render(
+    const std::map<std::string, std::int64_t>& tab) {
+    std::string out;
+    for (const auto& [k, v] : tab) {
+        if (!out.empty()) out.push_back(';');
+        out += k + ":" + std::to_string(v);
+    }
+    return out;
+}
+// exported for SocialLaws predict paths (proper causal changes)
+std::string pol_table_bump_text(const std::string& cur,
+                                const std::string& key,
+                                std::int64_t delta_permille) {
+    auto tab = pol_table_parse(cur);
+    std::int64_t& fx = tab[key];
+    fx = std::clamp<std::int64_t>(
+        fx + delta_permille * 64, 0, 64000);
+    return pol_table_render(tab);
+}
+std::int64_t pol_table_get(const std::string& cur,
+                           const std::string& key) {
+    const auto tab = pol_table_parse(cur);
+    const auto it = tab.find(key);
+    return it == tab.end() ? 0 : std::min<std::int64_t>(1000, it->second / 64);
+}
+
+std::int64_t pol_norm_aversion(const World& w, EntityId viewer,
+                               const std::string& action) {
+    std::int64_t v = 0;
+    const EntityId comm = pol_community_of(w, viewer);
+    if (comm != kNoEntity) {
+        const Entity* ce = w.find(comm);
+        const PropId p_nt = pol_pid(w, "norm_table");
+        if (ce && p_nt != kNoProp) {
+            const Value* tv = w.prop_of(*ce, p_nt);
+            if (tv && tv->type == ValType::Text)
+                v = pol_table_get(tv->s, action);
+        }
+    }
+    // private conviction (set by witnessed harm or reading a law stone)
+    // can only reinforce the communal reading, never contradict it here
+    if (const AgentMind* m = w.find_mind(viewer)) {
+        const Belief* b = m->find_belief("norm_aversion:" + action);
+        if (b) v = std::max<std::int64_t>(v, b->confidence);
+    }
+    return std::clamp<std::int64_t>(v, 0, 1000);
+}
+
+std::int64_t pol_ostracism(const World& w, EntityId viewer,
+                           EntityId agent) {
+    const EntityId comm = pol_community_of(w, viewer);
+    if (comm == kNoEntity) return 0;
+    const Entity* ce = w.find(comm);
+    const PropId p_ot = pol_pid(w, "ostracism_table");
+    if (!ce || p_ot == kNoProp) return 0;
+    const Value* tv = w.prop_of(*ce, p_ot);
+    if (!tv || tv->type != ValType::Text) return 0;
+    return pol_table_get(tv->s, std::to_string(
+        static_cast<std::uint64_t>(agent)));
+}
+
+bool pol_dominant_norm(const World& w, EntityId viewer,
+                       std::string* action, std::int64_t* aversion) {
+    const EntityId comm = pol_community_of(w, viewer);
+    if (comm == kNoEntity) return false;
+    const Entity* ce = w.find(comm);
+    const PropId p_nt = pol_pid(w, "norm_table");
+    if (!ce || p_nt == kNoProp) return false;
+    const Value* tv = w.prop_of(*ce, p_nt);
+    if (!tv || tv->type != ValType::Text) return false;
+    const auto tab = pol_table_parse(tv->s);
+    std::string best; std::int64_t bestv = 600;   // taboo threshold
+    for (const auto& [k, fx] : tab) {
+        const std::int64_t v = fx / 64;
+        if (v > bestv || (v == bestv && k < best)) {
+            bestv = v; best = k;
+        }
+    }
+    if (best.empty()) return false;
+    if (action) *action = best;
+    if (aversion) *aversion = std::min<std::int64_t>(1000, bestv);
+    return true;
+}
+
+std::int64_t pol_defer_count(const World& w, EntityId leader) {
+    std::int64_t n = 0;
+    const std::string key = "defer_to:" +
+        std::to_string(static_cast<std::uint64_t>(leader));
+    for (const auto& [wid, m] : w.minds_) {
+        (void)m;
+        const AgentMind* mm = w.find_mind(wid);
+        const Belief* b = mm ? mm->find_belief(key) : nullptr;
+        if (b && b->confidence >= 400) ++n;
+    }
+    return n;
+}
+
+std::int64_t pol_defer_conf(const AgentMind& m, EntityId leader) {
+    const Belief* b = m.find_belief("defer_to:" +
+        std::to_string(static_cast<std::uint64_t>(leader)));
+    return b ? b->confidence : 0;
+}
+
+// influence score: legitimacy carries the day for empathetic minds;
+// the fearful weight coercion instead. empathy axis = mind_empathy_coupling
+// (0..2000 heritable); fear_w = 1000 - legit_w keeps the split integer.
+static void pol_update_defer_impl(World& w, AgentMind& mind,
+                                  EntityId self) {
+    const Entity* se = w.find(self);
+    if (!se || !se->alive) return;
+    const PropId p_lang = pol_pid(w, "language_id");
+    const std::int64_t lang = p_lang != kNoProp
+        ? w.prop_int(*se, p_lang, 0) : 0;
+    // drop stale defer beliefs first — allegiance is recomputed wholesale
+    std::vector<std::string> stale;
+    for (const auto& [k, b] : mind.beliefs)
+        if (k.rfind("defer_to:", 0) == 0) stale.push_back(k);
+    for (const std::string& k : stale) mind.beliefs.erase(k);
+    if (lang <= 0) return;                      // no speech community, no mandate
+    const std::int64_t empathy = std::clamp<std::int64_t>(
+        pol_prop(w, *se, "mind_empathy_coupling", 1000), 0, 2000);
+    const std::int64_t legit_w = empathy / 2;   // 0..1000
+    const std::int64_t fear_w = 1000 - legit_w;
+    EntityId best = kNoEntity; std::int64_t best_score = 0;
+    for (const auto& [cid, cm] : w.minds_) {
+        (void)cm;
+        if (cid == self) continue;
+        const Entity* ce = w.find(cid);
+        if (!ce || !ce->alive) continue;
+        if (p_lang == kNoProp ||
+            w.prop_int(*ce, p_lang, 0) != lang) continue;
+        const std::int64_t leg = pol_legitimacy(w, cid);
+        const std::int64_t coer = pol_coercive(w, cid);
+        const std::int64_t score =
+            (leg * legit_w + coer * fear_w) / 1000;
+        if (score > best_score ||
+            (score == best_score && score > 0 &&
+             static_cast<std::uint64_t>(cid) <
+             static_cast<std::uint64_t>(best))) {
+            best_score = score; best = cid;
+        }
+    }
+    if (best == kNoEntity || best_score <= 0) return;
+    Belief& b = mind.belief("defer_to:" +
+        std::to_string(static_cast<std::uint64_t>(best)));
+    b.status = BeliefStatus::Observed;
+    b.confidence = std::min<std::int64_t>(1000, best_score);
+    b.evidence_for += 50;
+    b.last_tick = w.clock_.tick();
+}
+
+void pol_update_defer(World& w, EntityId mind_id) {
+    if (!w.find_mind(mind_id)) return;
+    AgentMind& m = w.mind(mind_id);
+    pol_update_defer_impl(w, m, mind_id);
+}
+
+// mandate = strictly the most deferents; ties break to the lowest id so
+// the "speaker of the community" is always deterministic.
+bool pol_holds_mandate(const World& w, EntityId agent) {
+    const Entity* ae = w.find(agent);
+    if (!ae) return false;
+    const PropId p_lang = pol_pid(w, "language_id");
+    const std::int64_t lang = p_lang != kNoProp
+        ? w.prop_int(*ae, p_lang, 0) : 0;
+    std::map<std::uint64_t, std::int64_t> counts;
+    for (const auto& [wid, m] : w.minds_) {
+        (void)m;
+        const AgentMind* mm = w.find_mind(wid);
+        if (!mm) continue;
+        // the mandate is a community office: only same-language minds vote
+        if (lang > 0) {
+            const Entity* we = w.find(wid);
+            if (!we || w.prop_int(*we, p_lang, 0) != lang) continue;
+        }
+        for (const auto& [k, b] : mm->beliefs) {
+            if (k.rfind("defer_to:", 0) != 0 || b.confidence < 400)
+                continue;
+            try {
+                counts[std::stoull(k.substr(9))]++;
+            } catch (...) {}
+        }
+    }
+    if (counts.empty()) return false;
+    std::uint64_t top = 0; std::int64_t topn = -1; bool tie = false;
+    for (const auto& [id, n] : counts) {
+        if (n > topn) { topn = n; top = id; tie = false; }
+        else if (n == topn) tie = true;
+    }
+    if (tie) {
+        // lowest id among the tied leaders holds the mandate
+        std::uint64_t low = ~0ull;
+        for (const auto& [id, n] : counts)
+            if (n == topn && id < low) low = id;
+        top = low;
+    }
+    return top == static_cast<std::uint64_t>(agent) && topn >= 2;
+}
+
+// communal norm bump helper for post-commit consequences (witnessed harm
+// that no single predict could foresee — e.g. integrity damage inside
+// physics/impact laws). Writes the language entity's ledger directly, the
+// same post-commit sanction adjust_tie already uses for relations.
+static void pol_norm_bump_communal(World& w, EntityId agent,
+                                   const std::string& action,
+                                   std::int64_t delta_permille) {
+    const EntityId comm = pol_community_of(w, agent);
+    if (comm == kNoEntity) return;
+    Entity* ce = w.find(comm);
+    const PropId p_nt = pol_pid(w, "norm_table");
+    if (!ce || p_nt == kNoProp) return;
+    const Value* cur = w.prop_of(*ce, p_nt);
+    const std::string before = cur && cur->type == ValType::Text
+        ? cur->s : std::string();
+    const std::string after = pol_table_bump_text(before, action,
+                                                delta_permille);
+    if (after != before) ce->props.set(p_nt, Value::text(after));
+}
+
+void political_from_event(World& w, EntityId actor,
+                          const std::vector<EntityId>& targets,
+                          const CausalEvent& ev) {
+    if (actor == kNoEntity) return;
+    const std::string& act = ev.action;
+
+    // ---- generic witnessed harm -> communal norm aversion ---------------
+    // Any causal event that damaged integrity on a bystander is a public
+    // wrong: the community ledger hardens against that action key.
+    {
+        const PropId integ = pol_pid(w, "integrity");
+        bool harm = false;
+        if (integ != kNoProp) {
+            for (const StateChange& ch : ev.changes) {
+                if (ch.prop != integ || ch.entity == actor ||
+                    !ch.had_before) continue;
+                if (ch.after.type == ValType::Integer &&
+                    ch.before.type == ValType::Integer &&
+                    ch.after.i < ch.before.i) { harm = true; break; }
+            }
+        }
+        if (harm && !act.empty())
+            pol_norm_bump_communal(w, actor, act, 200);
+    }
+
+    // ---- witnessed theft -> personal norm conviction ----------------------
+    // The communal ledger (predict-time change) records the taboo; each
+    // onlooker also forms a PRIVATE conviction — that is what a law stone
+    // later transmits to minds that never saw the crime.
+    if (act == "steal") {
+        const PropId p_rep = pol_pid(w, "trade_reputation");
+        bool witnessed = false;
+        if (p_rep != kNoProp) {
+            for (const StateChange& ch : ev.changes)
+                if (ch.entity == actor && ch.prop == p_rep &&
+                    ch.after.type == ValType::Integer &&
+                    ch.before.type == ValType::Integer &&
+                    ch.after.i < ch.before.i) { witnessed = true; break; }
+        }
+        if (witnessed) {
+            const Entity* ae = w.find(actor);
+            const PropId sight = pol_pid(w, "sight_range");
+            for (auto& [wid, wm] : w.minds_) {
+                if (wid == actor) continue;
+                const Entity* we = w.find(wid);
+                if (!we || !we->alive || !ae) continue;
+                const std::int64_t range = sight != kNoProp
+                    ? w.prop_int(*we, sight, 0) : 0;
+                if (range <= 0 ||
+                    dist2(we->pos, ae->pos) > range * range) continue;
+                Belief& b = wm.belief("norm_aversion:steal");
+                b.confidence = std::min<std::int64_t>(1000,
+                    b.confidence + 300);
+                b.status = BeliefStatus::Observed;
+                b.last_tick = ev.tick;
+            }
+        }
+    }
+
+    // ---- allegiance refresh after social contact --------------------------
+    // defer_to is a belief, so it may be rewritten post-commit freely.
+    if (act == "communicate" || act == "trade" || act == "share" ||
+        act == "repay" || act == "adjudicate" || act == "tribute") {
+        pol_update_defer(w, actor);
+        for (EntityId t : targets) pol_update_defer(w, t);
+    }
+
+    // ---- tribute: grievance bookkeeping is mental, so it lives in beliefs --
+    if (act == "tribute" && targets.size() == 1) {
+        AgentMind& am = w.mind(actor);
+        const std::int64_t leg = pol_legitimacy(w, targets.front());
+        Belief& g = am.belief("grievance");
+        if (leg < 300) {
+            // tribute to a discredited leader reads as extortion
+            g.confidence = std::min<std::int64_t>(
+                1000, g.confidence + 30);
+        } else {
+            g.confidence = std::max<std::int64_t>(
+                0, g.confidence - 10);
+        }
+        g.last_tick = ev.tick;
+    }
+
+    // ---- relief received: shared food under the mandate cools grievance ---
+    if (act == "share") {
+        bool relief = false;
+        const PropId p_pool = pol_pid(w, "public_pool");
+        for (const StateChange& ch : ev.changes)
+            if (ch.prop == p_pool && ch.after.type == ValType::Integer &&
+                ch.before.type == ValType::Integer &&
+                ch.after.i < ch.before.i) { relief = true; break; }
+        if (relief) {
+            for (EntityId t : targets) {
+                if (!w.find_mind(t)) continue;
+                Belief& g = w.mind(t).belief("grievance");
+                g.confidence = 0;
+                g.last_tick = ev.tick;
+            }
+        }
+    }
+
+    // ---- unjust adjudication: victims remember the miscarriage ------------
+    // predict_adjudicate embeds "victim:<id>" markers in its notes (which
+    // land in ev.evidence) when a mandate-holder pardons a proven wrong.
+    if (act == "adjudicate" &&
+        ev.evidence.find("unjust pardon") != std::string::npos) {
+        std::size_t pos = 0;
+        while ((pos = ev.evidence.find("victim:", pos)) !=
+               std::string::npos) {
+            pos += 7;
+            std::size_t e = pos;
+            while (e < ev.evidence.size() &&
+                   (std::isdigit(ev.evidence[e]) || ev.evidence[e] == ';' ||
+                    ev.evidence[e] == ' ')) ++e;
+            // ids are plain digits; parse until non-digit
+            std::size_t d = pos;
+            while (d < ev.evidence.size() &&
+                   std::isdigit(ev.evidence[d])) ++d;
+            try {
+                const EntityId vid = static_cast<EntityId>(
+                    std::stoull(ev.evidence.substr(pos, d - pos)));
+                if (w.find_mind(vid)) {
+                    Belief& g = w.mind(vid).belief("grievance");
+                    g.confidence = std::min<std::int64_t>(
+                        1000, g.confidence + 250);
+                    g.last_tick = ev.tick;
+                }
+            } catch (...) {}
+            pos = e > pos ? e : pos + 1;
+        }
+    }
+}
+
 }  // namespace simlab
+

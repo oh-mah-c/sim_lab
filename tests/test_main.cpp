@@ -7214,58 +7214,353 @@ static void test_inductive_economy_currency_inflation_and_credit() {
     }
 }
 
-int main() {
-    test_registries();
-    test_new_material_data_only();
-    test_physics_property_driven();
-    test_unknown_interaction();
-    test_causal_chain();
-    test_determinism();
-    test_deposits();
-    test_relations();
-    test_worldgen();
-    test_worldgen_validation_catches_bad();
-    test_seed_system();
-    test_extraction();
-    test_processing();
-    test_fracture();
-    test_budgets_clock_thermal();
-    test_composition();
-    test_wielding();
-    test_geometry();
-    test_binding_types();
-    test_cognition();
-    test_phase5_needs_cognition();
-    test_phase1_audit();
-    test_phase2_complete();
-    test_phase2_placer();
-    test_phase3_complete();
-    test_phase6_discovery();
-    test_phase6_completion();
-    test_phase6_selfdefence();
-    test_phase7_biology();
-    test_phase8_social();
-    test_phase9_world();
-    test_fruit_cycle();
-    test_seed_bank();
-    test_edge_influx();
-    test_memory_engram();
-    test_cognitive_aptitudes();
-    test_attachment_and_parental_care();
-    test_primitive_social_psychology();
 
-    test_anatomical_trauma_and_bleeding();
-    test_lumen_mechanics_and_organ_coupling();
-    test_thermoregulation_immunity_neoplasm_and_epidemiology();
-    test_zoonosis_sterilization_and_burial();
-    test_plant_blight_monoculture_and_soil_cleansing();
-    test_vector_ecology_selection_and_herd_immunity();
-    test_causal_language_dialect_drift_and_inscriptions();
-    test_causal_language_syntax_rosetta_and_inscriptions();
-    test_inductive_economy_currency_inflation_and_credit();
-    test_infection_and_primitive_medicine();
-    test_neuro_psychopathology();
-    test_phase9_autonomous_civilization();
+// ================= Phase 12.3: political & legal base ==========================
+static void test_political_legal_base_core_norms_authority_and_revolt() {
+    // ---- A+B: emergent norms, codified law, deference network -------------
+    {
+        World w(401, "data");
+        // speech community: everyone vocal -> one language_id
+        const EntityId L  = econ_person(w, {0, 0});
+        const EntityId M1 = econ_person(w, {30, 0});
+        const EntityId M2 = econ_person(w, {35, 0});
+        const EntityId O  = econ_person(w, {10, 0});
+        const EntityId T  = econ_person(w, {15, 0});
+        for (EntityId id : {L, M1, M2, O, T})
+            lang_person(w, id, "person", 500, 2);
+        tseti(*w.find(L), w, "social_legitimacy", 800);
+        tseti(*w.find(M1), w, "mind_empathy_coupling", 1500);
+        tseti(*w.find(M2), w, "mind_empathy_coupling", 1500);
+        w.mind(L).discoveries["m"] = mk_record("m", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);   // language entity + language_id
+
+        // two witnessed thefts -> communal norm_aversion("steal") >= 600
+        const EntityId it1 = mk_goods(w, "copper_metal", 5, {12, 0}, O);
+        const EntityId it2 = mk_goods(w, "copper_metal", 5, {13, 0}, O);
+        CHECK(econ_act(w, T, {it1}, "steal").completed);
+        CHECK(econ_act(w, T, {it2}, "steal").completed);
+        CHECK(pol_norm_aversion(w, M1, "steal") >= 600);
+        CHECK(pol_norm_aversion(w, M2, "steal") >= 600);
+
+        // deference: after one political cadence everyone drifts to L
+        w.advance_ticks_for_test(250);
+        const Belief* d1 = w.find_mind(M1)->find_belief(
+            "defer_to:" + std::to_string(
+                static_cast<std::uint64_t>(L)));
+        CHECK(d1 && d1->confidence >= 400);
+        CHECK(pol_holds_mandate(w, L));
+        // a fearful mind (low empathy) weights coercion over legitimacy:
+        // the strong bully with a hard tool wins their allegiance instead
+        const EntityId B  = econ_person(w, {60, 0});
+        const EntityId F  = econ_person(w, {65, 0});
+        lang_person(w, B, "person", 500, 2);
+        lang_person(w, F, "person", 500, 2);
+        tseti(*w.find(F), w, "mind_empathy_coupling", 0);   // pure fear
+        tseti(*w.find(B), w, "integrity", 1000);
+        tseti(*w.find(B), w, "social_legitimacy", 500);
+        const EntityId club = mk_goods(w, "obsidian", 1, {61, 0});
+        const EntityId club2 = mk_goods(w, "obsidian", 1, {62, 0});
+        w.relate(B, "wielding", club);
+        w.relate(B, "wielding", club2);
+        w.advance_ticks_for_test(250);
+        bool f_to_bully = false;
+        for (const auto& [k, b] : w.find_mind(F)->beliefs)
+            if (k.rfind("defer_to:", 0) == 0 &&
+                b.confidence >= 400 &&
+                k == "defer_to:" + std::to_string(
+                    static_cast<std::uint64_t>(B))) f_to_bully = true;
+        CHECK(f_to_bully);
+
+        // codified law: legitimate abstractionist carves the dominant taboo
+        const EntityId rock = w.create_entity("rock",
+            w.materials.id_of("stone"), {20, 5}, PropertyBag{});
+        tseti(*w.find(L), w, "mind_abstraction_gain", 1500);
+        tseti(*w.find(L), w, "hardness", 900);
+        InteractionResult er = econ_act(w, L, {rock}, "engrave");
+        CHECK(er.completed);
+        EntityId law_insc = kNoEntity;
+        // law_action is a TEXT prop — read via prop_of
+        for (EntityId sid : er.spawned) {
+            const Entity* se = w.find(sid);
+            if (!se || se->kind_name != "inscription") continue;
+            const PropId pla = tpid(w, "law_action");
+            const Value* v = pla != kNoProp ? se->prop(w, pla) : nullptr;
+            if (v && v->type == ValType::Text && v->s == "steal")
+                law_insc = sid;
+        }
+        CHECK(law_insc != kNoEntity);
+
+        // a newcomer who reads the law stone inherits the taboo
+        const EntityId N = econ_person(w, {25, 0});
+        lang_person(w, N, "person", 500, 2);
+        w.advance_ticks_for_test(1);
+        const Belief* nb0 = w.find_mind(N)->find_belief(
+            "norm_aversion:steal");
+        CHECK(!nb0 || nb0->confidence < 600);            // naive before
+        CHECK(econ_act(w, N, {rock}, "read").completed);
+        const Belief* nb1 = w.find_mind(N)->find_belief(
+            "norm_aversion:steal");
+        CHECK(nb1 && nb1->confidence >= 600);
+    }
+
+    // ---- C+D: adjudication, restitution, ostracism --------------------------
+    {
+        World w(402, "data");
+        const EntityId L  = econ_person(w, {0, 0});
+        const EntityId M1 = econ_person(w, {30, 0});
+        const EntityId M2 = econ_person(w, {35, 0});
+        const EntityId O  = econ_person(w, {10, 0});
+        const EntityId T  = econ_person(w, {15, 0});
+        for (EntityId id : {L, M1, M2, O, T})
+            lang_person(w, id, "person", 500, 2);
+        tseti(*w.find(L), w, "social_legitimacy", 800);
+        w.advance_ticks_for_test(1);
+        w.advance_ticks_for_test(250);   // defer network forms -> L mandated
+
+        // witnessed theft leaves contested evidence for the arbiter —
+        // the owner claims it openly first so bystanders record "O owns it"
+        const EntityId it = mk_goods(w, "copper_metal", 5, {12, 0});
+        CHECK(econ_act(w, O, {it}, "take").completed);
+        CHECK(econ_act(w, T, {it}, "steal").completed);
+        const std::int64_t leg_l0 = tint(*w.find(L), w, "social_legitimacy", 500);
+        const std::int64_t leg_t0 = tint(*w.find(T), w, "social_legitimacy", 500);
+        CHECK(econ_act(w, L, {T}, "adjudicate").completed);
+        CHECK(tint(*w.find(it), w, "possessed_by") ==
+              static_cast<std::int64_t>(O));       // restitution
+        CHECK(tint(*w.find(L), w, "social_legitimacy", 500) > leg_l0);
+        CHECK(tint(*w.find(T), w, "social_legitimacy", 500) < leg_t0);
+
+        // repeat offender with a defaulted debt and nothing to restore
+        // -> collective outlaw; the community then refuses them outright
+        const EntityId R = econ_person(w, {50, 0});
+        lang_person(w, R, "person", 500, 2);
+        PropertyBag db;
+        db.set(tpid(w, "debt_value"), Value::integer(100));
+        db.set(tpid(w, "due_tick"), Value::integer(1));
+        db.set(tpid(w, "debtor_id"), Value::integer(
+            static_cast<std::int64_t>(R)));
+        db.set(tpid(w, "creditor_id"), Value::integer(
+            static_cast<std::int64_t>(L)));
+        db.set(tpid(w, "debt_status"), Value::integer(2));   // already defaulted
+        w.create_entity("debt_obligation", kNoMaterial, {51, 0}, db);
+        w.advance_ticks_for_test(1);
+        CHECK(econ_act(w, L, {R}, "adjudicate").completed);
+        CHECK(pol_ostracism(w, M1, R) >= 500);
+        mk_goods(w, "salt", 20, {52, 0}, M1);
+        InteractionResult tr = econ_act(w, M1, {R}, "trade",
+            "give:salt:2|get:wild_berries:5");
+        CHECK(!tr.completed);                       // ostracized: no trade
+        tseti(*w.find(M1), w, "quantity", 50);
+        tseti(*w.find(R), w, "quantity", 50);
+        InteractionResult sh = econ_act(w, M1, {R}, "share");
+        CHECK(!sh.completed);                       // ostracized: no share
+    }
+
+    // ---- E+F: tribute, scarcity relief, tyranny and revolt ------------------
+    {
+        World w(403, "data");
+        const EntityId L  = econ_person(w, {0, 0});
+        const EntityId M1 = econ_person(w, {30, 0});
+        const EntityId M2 = econ_person(w, {35, 0});
+        for (EntityId id : {L, M1, M2})
+            lang_person(w, id, "person", 500, 2);
+        tseti(*w.find(L), w, "social_legitimacy", 800);
+        w.advance_ticks_for_test(1);
+        w.advance_ticks_for_test(250);   // L mandated
+        // tribute flows along allegiance into the public pool
+        mk_goods(w, "salt", 30, {28, 0}, M1);
+        const std::int64_t leg_l0 = tint(*w.find(L), w, "social_legitimacy", 500);
+        CHECK(econ_act(w, M1, {L}, "tribute", "salt:5").completed);
+        CHECK(tint(*w.find(L), w, "public_pool") > 0);
+        CHECK(tint(*w.find(L), w, "social_legitimacy", 500) > leg_l0);
+
+        // scarcity relief: the mandated leader shares the pool to the
+        // hungry -> legitimacy soars, pool drains, relief stamped
+        tseti(*w.find(M2), w, "quantity", 50);
+        tseti(*w.find(M2), w, "hunger", 800);
+        tseti(*w.find(L), w, "quantity", 50);
+        tseti(*w.find(L), w, "public_pool", 500);
+        w.mind(M2).belief("grievance").confidence = 400;
+        const std::int64_t leg_pre = tint(*w.find(L), w, "social_legitimacy", 500);
+        CHECK(econ_act(w, L, {M2}, "share").completed);
+        CHECK(tint(*w.find(L), w, "public_pool") <= 400);
+        CHECK(tint(*w.find(L), w, "social_legitimacy", 500) > leg_pre);
+        CHECK(tint(*w.find(L), w, "last_relief_tick") > 0);
+        CHECK(tint(*w.find(M2), w, "hunger") < 800);
+        const Belief* g2 = w.find_mind(M2)->find_belief("grievance");
+        CHECK(g2 && g2->confidence == 0);
+    }
+
+    // ---- F2: tyranny — hoarded tribute + famine -> emergent revolt ---------
+    {
+        World w(404, "data");
+        const EntityId Y  = econ_person(w, {0, 0});
+        const EntityId R2 = econ_person(w, {40, 0});
+        const EntityId M1 = econ_person(w, {30, 0});
+        const EntityId M2 = econ_person(w, {35, 0});
+        for (EntityId id : {Y, R2, M1, M2})
+            lang_person(w, id, "person", 500, 2);
+        tseti(*w.find(Y), w, "social_legitimacy", 950);
+        tseti(*w.find(R2), w, "social_legitimacy", 900);
+        w.advance_ticks_for_test(1);
+        w.advance_ticks_for_test(250);   // members defer to Y (950 > 900)
+        // the tyrant sits on a hoarded pool while members see thin supplies
+        tseti(*w.find(Y), w, "public_pool", 5000);
+        const MaterialId BERRY = w.materials.id_of("wild_berries");
+        for (EntityId id : {M1, M2})
+            w.mind(id).belief("pa:" + std::to_string(BERRY))
+                .confidence = 100;                    // felt scarcity
+        // ~26 qualifying fires: grievance crosses 700, revolt cycles bleed
+        // the tyrant's legitimacy ~50 per uprising until the rival's
+        // 900 legitimacy finally wins the community's allegiance.
+        // Chunked advances keep perceive()-driven abundance beliefs on
+        // the same cadence as the ticked reference path.
+        for(int i = 0; i < 6; ++i) w.advance_ticks_for_test(1000);
+        // revolt: allegiance withdrawn, mandate migrates to the rival,
+        // and the tyrant's legitimacy has been bled by the uprising
+        bool m1_to_rival = false, m1_to_y = false;
+        for (const auto& [k, b] : w.find_mind(M1)->beliefs) {
+            if (k.rfind("defer_to:", 0) != 0 || b.confidence < 400)
+                continue;
+            if (k == "defer_to:" + std::to_string(
+                    static_cast<std::uint64_t>(R2))) m1_to_rival = true;
+            if (k == "defer_to:" + std::to_string(
+                    static_cast<std::uint64_t>(Y))) m1_to_y = true;
+        }
+        CHECK(m1_to_rival);
+        CHECK(!m1_to_y);
+        CHECK(tint(*w.find(Y), w, "social_legitimacy", 950) < 900);
+        CHECK(pol_grievance(w.find_mind(M1)) < 700 ||
+              !w.find_mind(M1)->find_belief(
+                  "defer_to:" + std::to_string(
+                      static_cast<std::uint64_t>(Y))));
+    }
+
+    // ---- G: LOD invariance + save/load ---------------------------------------
+    {
+        auto build = [](World& w) {
+            const EntityId a = econ_person(w, {0, 0});
+            const EntityId b = econ_person(w, {30, 0});
+            lang_person(w, a, "person", 500, 2);
+            lang_person(w, b, "person", 500, 2);
+            w.advance_ticks_for_test(1);
+            w.advance_ticks_for_test(250);   // defer network + a fire
+            tseti(*w.find(a), w, "social_legitimacy", 800);
+            tseti(*w.find(a), w, "public_pool", 700);
+            // mid-period accumulator + open grievance + communal ledgers
+            w.mind(a).political_accum = 150;
+            w.mind(b).belief("grievance").confidence = 300;
+            // seed communal tables directly (as prior events would have)
+            EntityId comm = pol_community_of(w, a);
+            CHECK(comm != kNoEntity);
+            Entity* ce = w.find(comm);   // find() non-const on World&
+            (void)ce;
+            const PropId p_nt = tpid(w, "norm_table");
+            const PropId p_ot = tpid(w, "ostracism_table");
+            if (p_nt != kNoProp)
+                ce->props.set(p_nt, Value::text("steal:38400"));
+            if (p_ot != kNoProp)
+                ce->props.set(p_ot, Value::text("777:32000"));
+            return std::pair<EntityId, EntityId>{a, b};
+        };
+        World wt(405, "data"), wb(405, "data");
+        const auto [a_t, b_t] = build(wt);
+        const auto [a_b, b_b] = build(wb);
+        for (int i = 0; i < 450; ++i) wt.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(450);
+        auto snap = [&](World& w, EntityId a, EntityId b) {
+            std::vector<std::string> v;
+            v.push_back(std::to_string(w.find_mind(a)->political_accum));
+            v.push_back(std::to_string(w.find_mind(b)->political_accum));
+            for (const auto& [k, bb] : w.find_mind(b)->beliefs)
+                if (k == "grievance" || k.rfind("defer_to:", 0) == 0)
+                    v.push_back(k + "=" + std::to_string(bb.confidence));
+            for (const auto& ep : w.entities)
+                if (ep->alive && ep->kind_name == "language") {
+                    const PropId p_nt = tpid(w, "norm_table");
+                    const PropId p_ot = tpid(w, "ostracism_table");
+                    const Value* nv = p_nt != kNoProp
+                        ? ep->prop(w, p_nt) : nullptr;
+                    const Value* ov = p_ot != kNoProp
+                        ? ep->prop(w, p_ot) : nullptr;
+                    v.push_back(nv && nv->type == ValType::Text
+                        ? nv->s : "-");
+                    v.push_back(ov && ov->type == ValType::Text
+                        ? ov->s : "-");
+                }
+            v.push_back(std::to_string(
+                tint(*w.find(a), w, "social_legitimacy", 500)));
+            v.push_back(std::to_string(
+                tint(*w.find(a), w, "public_pool")));
+            return v;
+        };
+        CHECK(snap(wt, a_t, b_t) == snap(wb, a_b, b_b));
+
+        const std::uint64_t h = wt.state_hash();
+        CHECK(wt.save("/tmp/simlab_pol_save.bin"));
+        World wl(405, "data");
+        CHECK(wl.load("/tmp/simlab_pol_save.bin"));
+        CHECK(wl.state_hash() == h);
+    }
+}
+
+int main(int argc, char** argv) {
+    // optional filter: ./tests <name> runs a single suite for fast iteration
+    const char* only = argc > 1 ? argv[1] : nullptr;
+#define RUN(t) do { if (!only || std::string(only) == #t) t(); } while (0)
+    RUN(test_registries);
+    RUN(test_new_material_data_only);
+    RUN(test_physics_property_driven);
+    RUN(test_unknown_interaction);
+    RUN(test_causal_chain);
+    RUN(test_determinism);
+    RUN(test_deposits);
+    RUN(test_relations);
+    RUN(test_worldgen);
+    RUN(test_worldgen_validation_catches_bad);
+    RUN(test_seed_system);
+    RUN(test_extraction);
+    RUN(test_processing);
+    RUN(test_fracture);
+    RUN(test_budgets_clock_thermal);
+    RUN(test_composition);
+    RUN(test_wielding);
+    RUN(test_geometry);
+    RUN(test_binding_types);
+    RUN(test_cognition);
+    RUN(test_phase5_needs_cognition);
+    RUN(test_phase1_audit);
+    RUN(test_phase2_complete);
+    RUN(test_phase2_placer);
+    RUN(test_phase3_complete);
+    RUN(test_phase6_discovery);
+    RUN(test_phase6_completion);
+    RUN(test_phase6_selfdefence);
+    RUN(test_phase7_biology);
+    RUN(test_phase8_social);
+    RUN(test_phase9_world);
+    RUN(test_fruit_cycle);
+    RUN(test_seed_bank);
+    RUN(test_edge_influx);
+    RUN(test_memory_engram);
+    RUN(test_cognitive_aptitudes);
+    RUN(test_attachment_and_parental_care);
+    RUN(test_primitive_social_psychology);
+
+    RUN(test_anatomical_trauma_and_bleeding);
+    RUN(test_lumen_mechanics_and_organ_coupling);
+    RUN(test_thermoregulation_immunity_neoplasm_and_epidemiology);
+    RUN(test_zoonosis_sterilization_and_burial);
+    RUN(test_plant_blight_monoculture_and_soil_cleansing);
+    RUN(test_vector_ecology_selection_and_herd_immunity);
+    RUN(test_causal_language_dialect_drift_and_inscriptions);
+    RUN(test_causal_language_syntax_rosetta_and_inscriptions);
+    RUN(test_inductive_economy_currency_inflation_and_credit);
+    RUN(test_political_legal_base_core_norms_authority_and_revolt);
+    RUN(test_infection_and_primitive_medicine);
+    RUN(test_neuro_psychopathology);
+    RUN(test_phase9_autonomous_civilization);
+#undef RUN
     std::printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

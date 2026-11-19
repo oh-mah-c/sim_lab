@@ -277,6 +277,7 @@ struct AgentMind {
     std::deque<WitnessedAct> recent_witnessed;
     std::map<std::string, std::int64_t> sublimation_relief;
     std::int64_t ostracism_accum = 0;             // Euclid remainder (LOD)
+    std::int64_t political_accum = 0;             // defer/grievance Euclid remainder (LOD)
     std::deque<Observation> observations;          // FIFO, capped
     std::map<std::string, Belief> beliefs;
     std::map<std::string, DiscoveryRecord> discoveries;  // §11.5 records
@@ -445,5 +446,41 @@ void econ_from_event(World& w, EntityId actor,
 std::int64_t econ_aptitude_bonus(const World& w, EntityId npc,
                                  const AgentMind& mind,
                                  const InteractionContext& c);
+
+// ---- Phase 12.3: political & legal base --------------------------------------
+// Communal political state lives on the `language` registry entity as text
+// ledgers (norm_table / ostracism_table), mirroring monetary_consensus.
+// Personal political state (defer_to:<id>, grievance) lives in beliefs —
+// both serialize with the mind and decay LOD-exact inside political_drift.
+EntityId pol_community_of(const World& w, EntityId agent);
+PropId pol_pid(const World& w, const char* name);
+std::int64_t pol_prop(const World& w, const Entity& e, const char* name,
+                      std::int64_t fallback);
+std::int64_t pol_legitimacy(const World& w, EntityId agent);   // absent = 500
+std::int64_t pol_coercive(const World& w, EntityId agent);     // computed
+std::int64_t pol_grievance(const AgentMind* m);                // belief, 0..1000
+std::int64_t pol_pool(const World& w, EntityId agent);         // prop, 0..1e9
+std::int64_t pol_norm_aversion(const World& w, EntityId viewer,
+                               const std::string& action);     // 0..1000
+std::int64_t pol_ostracism(const World& w, EntityId viewer,
+                           EntityId agent);                    // 0..1000
+std::int64_t pol_defer_conf(const AgentMind& m, EntityId leader);
+// recompute one mind's defer_to:<top> belief toward the community's most
+// influential member (legitimacy vs coercion weighted by empathy/fear).
+void pol_update_defer(World& w, EntityId mind_id);
+// does `agent` currently hold the community's defer mandate? (top count)
+bool pol_holds_mandate(const World& w, EntityId agent);
+// strongest communal taboo: fills action key + aversion permille (0..1000).
+bool pol_dominant_norm(const World& w, EntityId viewer,
+                       std::string* action, std::int64_t* aversion);
+std::string pol_table_bump_text(const std::string& cur,
+                                const std::string& key,
+                                std::int64_t delta_permille);
+std::int64_t pol_table_get(const std::string& cur,
+                           const std::string& key);
+std::int64_t pol_defer_count(const World& w, EntityId leader);
+void political_from_event(World& w, EntityId actor,
+                          const std::vector<EntityId>& targets,
+                          const CausalEvent& ev);
 
 }  // namespace simlab
