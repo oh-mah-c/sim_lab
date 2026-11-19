@@ -2262,6 +2262,96 @@ void gratitude_engram(World& w, EntityId who, EntityId benefactor,
     imprint_engram(w, who, benefactor, tick, charge, mp, 8500);
 }
 
+
+// ---- Phase 12 base core: compositional lexicon --------------------------------
+// Familiarity bump + knows_word edge in one place. The "lex:<id>" belief is
+// the per-mind knows_word store (beliefs serialize/hash already); the
+// relation edge makes the same fact visible to the social graph.
+void lex_boost(World& w, EntityId who, AgentMind& m, EntityId entry,
+               std::int64_t gain, std::uint64_t tick) {
+    Belief& b = m.belief(std::string("lex:") + std::to_string(entry));
+    if (b.status == BeliefStatus::Unknown)
+        b.status = BeliefStatus::Observed;
+    b.confidence = std::min<std::int64_t>(1000, b.confidence + gain);
+    b.last_tick = tick;
+    w.relations.relate(who, "knows_word", entry);
+}
+
+std::int64_t lex_fam(const AgentMind& m, EntityId entry) {
+    const Belief* b = m.find_belief(std::string("lex:") + std::to_string(entry));
+    return b ? b->confidence : 0;
+}
+
+// Semantic drift target: the lexical_entry naming the NEIGHBORING atom of
+// the same kind (sorted atom_key order, direction from the entry's drift
+// seed). Returns kNoEntity when the word names no atom (whole-concept
+// entries have no neighbors — they don't drift semantically).
+EntityId lex_neighbor_entry(const World& w, EntityId entry) {
+    const Entity* le = w.find(entry);
+    if (!le || !le->alive || le->kind_name != "lexical_entry")
+        return kNoEntity;
+    const PropId p_ckey = s_pid(w, "concept_key");
+    const PropId p_lang = s_pid(w, "language_id");
+    const PropId p_akey = s_pid(w, "atom_key");
+    const PropId p_akind = s_pid(w, "atom_kind");
+    const Value* ck = p_ckey != kNoProp ? w.prop_of(*le, p_ckey) : nullptr;
+    if (!ck || ck->type != ValType::Text) return kNoEntity;
+    const std::int64_t elang = p_lang != kNoProp
+        ? w.prop_int(*le, p_lang, 0) : 0;
+    // which atom does this word name, and of what kind?
+    std::string akey; std::int64_t akind = -1;
+    for (const auto& ep : w.entities) {
+        const Entity& a = *ep;
+        if (!a.alive || a.kind_name != "semantic_atom") continue;
+        const Value* av = p_akey != kNoProp ? w.prop_of(a, p_akey) : nullptr;
+        if (av && av->type == ValType::Text && av->s == ck->s) {
+            akey = av->s;
+            const Value* kv = p_akind != kNoProp
+                ? w.prop_of(a, p_akind) : nullptr;
+            akind = kv && kv->type == ValType::Integer ? kv->i : -1;
+            break;
+        }
+    }
+    if (akey.empty() || akind < 0) return kNoEntity;
+    // sibling atoms of the same kind, sorted by atom_key
+    std::vector<std::string> sibs;
+    for (const auto& ep : w.entities) {
+        const Entity& a = *ep;
+        if (!a.alive || a.kind_name != "semantic_atom") continue;
+        const Value* kv = p_akind != kNoProp
+            ? w.prop_of(a, p_akind) : nullptr;
+        const Value* av = p_akey != kNoProp
+            ? w.prop_of(a, p_akey) : nullptr;
+        if (kv && kv->type == ValType::Integer && kv->i == akind &&
+            av && av->type == ValType::Text)
+            sibs.push_back(av->s);
+    }
+    if (sibs.size() < 2) return kNoEntity;
+    std::sort(sibs.begin(), sibs.end());
+    sibs.erase(std::unique(sibs.begin(), sibs.end()), sibs.end());
+    const auto it = std::find(sibs.begin(), sibs.end(), akey);
+    if (it == sibs.end() || sibs.size() < 2) return kNoEntity;
+    // direction from the entry's own identity — deterministic per word
+    const std::size_t pos = static_cast<std::size_t>(it - sibs.begin());
+    const bool fwd = (static_cast<std::uint64_t>(entry) * 2654435761ull >> 8) & 1;
+    const std::size_t npos = fwd ? (pos + 1) % sibs.size()
+                                 : (pos + sibs.size() - 1) % sibs.size();
+    const std::string& nkey = sibs[npos];
+    // the neighbor word in the SAME language
+    EntityId best = kNoEntity;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "lexical_entry") continue;
+        const Value* ck2 = p_ckey != kNoProp ? w.prop_of(e, p_ckey) : nullptr;
+        const Value* lv  = p_lang != kNoProp ? w.prop_of(e, p_lang) : nullptr;
+        if (!ck2 || ck2->type != ValType::Text || ck2->s != nkey ||
+            !lv || lv->type != ValType::Integer || lv->i != elang)
+            continue;
+        if (best == kNoEntity || e.id < best) best = e.id;
+    }
+    return best;
+}
+
 void social_from_event(World& w, EntityId actor,
                        const std::vector<EntityId>& targets,
                        const CausalEvent& ev) {
@@ -2323,9 +2413,24 @@ void social_from_event(World& w, EntityId actor,
             std::int64_t tom = 1000;
             if (const Entity* td = w.find(actor))
                 tom = mind_params(w, *td).theory_of_mind;
+            // Phase 12: speech-community barrier — two speakers of different
+            // language_id understand each other at a quarter rate until
+            // bilingual familiarity bridges the gap.
+            std::int64_t lang_a = 0, lang_b = 0;
+            {
+                const PropId pl = s_pid(w, "language_id");
+                const Entity* ae = w.find(actor);
+                const Entity* be = w.find(learner_id);
+                if (pl != kNoProp) {
+                    if (ae) lang_a = w.prop_int(*ae, pl, 0);
+                    if (be) lang_b = w.prop_int(*be, pl, 0);
+                }
+            }
+            const bool barrier = lang_a > 0 && lang_b > 0 && lang_a != lang_b;
             // trust -> how many verified claims transfer (0 trust: 1, 500: 3, 1000: 5)
-            const std::int64_t k = std::clamp<std::int64_t>(
+            std::int64_t k = std::clamp<std::int64_t>(
                 (trust + 250) / 250 * tom / 1000, 0, 8);
+            if (barrier) k = std::max<std::int64_t>(1, k / 4);
             std::size_t done = 0, fresh = 0;
             for (const DiscoveryRecord* d : teachable_records(teacher)) {
                 if (done >= static_cast<std::size_t>(k)) break;
@@ -2352,14 +2457,244 @@ void social_from_event(World& w, EntityId actor,
                 if (na >= 16) break;
                 if (learner.known_actions.insert(a).second) ++na;
             }
+            // Phase 12 lexicon flow: the speaker's words cross the air.
+            // Same-language exposure teaches fast; a foreign tongue is
+            // picked up slowly — ostensive contact is what makes a mind
+            // bilingual (familiarity >= bilingual_familiarity on entries
+            // of the OTHER language_id).
+            {
+                const PropId pl = s_pid(w, "language_id");
+                const PropId pbf = s_pid(w, "bilingual_familiarity");
+                const std::int64_t bf = pbf != kNoProp
+                    ? w.prop_int(*w.find(learner_id), pbf, 500) : 500;
+                std::size_t ne = 0;
+                for (const auto& [bk, bv] : teacher.beliefs) {
+                    if (ne >= 24) break;
+                    if (bk.rfind("lex:", 0) != 0) continue;
+                    EntityId eid = kNoEntity;
+                    try { eid = static_cast<EntityId>(
+                        std::stoull(bk.substr(4))); } catch (...) { continue; }
+                    const Entity* le = w.find(eid);
+                    if (!le || !le->alive) continue;
+                    const std::int64_t lel = pl != kNoProp
+                        ? w.prop_of(*le, pl) && w.prop_of(*le, pl)->type == ValType::Integer
+                          ? w.prop_of(*le, pl)->i : 0 : 0;
+                    const bool same_lang = lel == lang_b;
+                    const std::int64_t gain = same_lang ? 250 : 60;
+                    // oral semantic drift: with no script to anchor the word,
+                    // a rare deterministic slip lands the familiarity on the
+                    // neighboring atom instead (mythogenesis, ~5%).
+                    EntityId tgt = eid;
+                    const std::uint64_t oh =
+                        static_cast<std::uint64_t>(eid) ^
+                        (static_cast<std::uint64_t>(ev.tick) << 17) ^
+                        (static_cast<std::uint64_t>(actor) << 33);
+                    if ((oh % 1000) < 50) {
+                        const EntityId nb = lex_neighbor_entry(w, eid);
+                        if (nb != kNoEntity) tgt = nb;
+                    }
+                    lex_boost(w, learner_id, learner, tgt, gain, ev.tick);
+                    (void)bf;
+                    ++ne;
+                }
+            }
         }
     } else if (ev.action == "read" && targets.size() == 1) {
         const EntityId src = targets.front();
         const PropId ins = s_pid(w, "inscription");
         const Entity* se = w.find(src);
+        // Phase 12: if the surface carries a carved Inscription entity, its
+        // language_id gates comprehension — same speech community reads
+        // freely, a bilingual scholar decodes, anyone else sees glyphs.
+        EntityId insc_id = kNoEntity;
+        const Entity* insc_e = nullptr;
+        std::int64_t insc_lang = 0;
+        {
+            for (const Relation& rel : w.relations_of(src, "inscribed_on")) {
+                if (rel.a != src) continue;
+                const Entity* ie = w.find(rel.b);
+                if (ie && ie->alive && ie->kind_name == "inscription") {
+                    insc_id = rel.b;
+                    insc_e = ie;
+                    const PropId pl = s_pid(w, "language_id");
+                    if (pl != kNoProp) {
+                        const Value* lv = w.prop_of(*ie, pl);
+                        if (lv && lv->type == ValType::Integer) insc_lang = lv->i;
+                    }
+                    break;
+                }
+            }
+        }
         if (ins != kNoProp && se) {
             const Value* iv = w.prop_of(*se, ins);
-            if (iv && iv->type == ValType::Text && !iv->s.empty()) {
+            bool comprehensible = true;
+            if (insc_id != kNoEntity && insc_lang > 0) {
+                const PropId pl = s_pid(w, "language_id");
+                const PropId pbf = s_pid(w, "bilingual_familiarity");
+                const std::int64_t rl = pl != kNoProp
+                    ? w.prop_int(*se, pl, 0) : 0;   // placeholder, fixed below
+                (void)rl;
+                const Entity* re = w.find(actor);
+                const std::int64_t reader_lang = pl != kNoProp && re
+                    ? w.prop_int(*re, pl, 0) : 0;
+                if (reader_lang == insc_lang) {
+                    comprehensible = true;
+                } else {
+                    // bilingual check: familiarity >= threshold on ANY entry
+                    // of the inscription's language
+                    const std::int64_t bf = pbf != kNoProp && re
+                        ? w.prop_int(*re, pbf, 500) : 500;
+                    AgentMind& rm = w.mind(actor);
+                    comprehensible = false;
+                    for (const auto& [bk, bv] : rm.beliefs) {
+                        if (bk.rfind("lex:", 0) != 0 || bv.confidence < bf)
+                            continue;
+                        EntityId eid = kNoEntity;
+                        try { eid = static_cast<EntityId>(
+                            std::stoull(bk.substr(4))); } catch (...) { continue; }
+                        const Entity* le = w.find(eid);
+                        if (!le) continue;
+                        const Value* lv = pl != kNoProp
+                            ? w.prop_of(*le, pl) : nullptr;
+                        if (lv && lv->type == ValType::Integer &&
+                            lv->i == insc_lang) { comprehensible = true; break; }
+                    }
+                }
+                if (!comprehensible) {
+                    // exposure still teaches the SHAPE of the foreign words:
+                    // small familiarity gain on that language's entries.
+                    AgentMind& rm = w.mind(actor);
+                    std::size_t ne = 0;
+                    for (const auto& ep : w.entities) {
+                        if (ne >= 8) break;
+                        const Entity& ee = *ep;
+                        if (!ee.alive || ee.kind_name != "lexical_entry") continue;
+                        const Value* lv = pl != kNoProp
+                            ? w.prop_of(ee, pl) : nullptr;
+                        if (!lv || lv->type != ValType::Integer ||
+                            lv->i != insc_lang) continue;
+                        lex_boost(w, actor, rm, ee.id, 40, ev.tick);
+                        ++ne;
+                    }
+                }
+            }
+            // Phase 12 base core: CausalClause payload — ordered atom words
+            // per language. A readable clause grants comprehension even when
+            // the legacy language_id gate failed; an unreadable second clause
+            // on a comprehensible carving is a Rosetta stone: its words map
+            // onto meaning the reader already has, so they transfer fast.
+            const PropId p_clause = s_pid(w, "clause_atoms");
+            const PropId p_eros   = s_pid(w, "erosion_level");
+            const PropId p_ssd    = s_pid(w, "semantic_shift_seed");
+            if (insc_e && p_clause != kNoProp) {
+                const Value* cv = w.prop_of(*insc_e, p_clause);
+                if (cv && cv->type == ValType::Text && !cv->s.empty()) {
+                    struct Clause { std::int64_t lang;
+                                    std::vector<EntityId> ids; };
+                    std::vector<Clause> clauses;
+                    std::istringstream css(cv->s);
+                    std::string seg;
+                    while (std::getline(css, seg, ';')) {
+                        const auto colon = seg.find(':');
+                        if (colon == std::string::npos) continue;
+                        Clause cl;
+                        try { cl.lang = std::stoll(seg.substr(0, colon)); }
+                        catch (...) { continue; }
+                        std::istringstream is(seg.substr(colon + 1));
+                        std::string num;
+                        while (std::getline(is, num, ',')) {
+                            try { cl.ids.push_back(
+                                static_cast<EntityId>(std::stoull(num))); }
+                            catch (...) {}
+                        }
+                        if (!cl.ids.empty()) clauses.push_back(cl);
+                    }
+                    if (!clauses.empty()) {
+                        const Entity* re = w.find(actor);
+                        const PropId pl2 = s_pid(w, "language_id");
+                        const PropId pbf2 = s_pid(w, "bilingual_familiarity");
+                        const std::int64_t rlang = pl2 != kNoProp && re
+                            ? w.prop_int(*re, pl2, 0) : 0;
+                        const std::int64_t bf = pbf2 != kNoProp && re
+                            ? w.prop_int(*re, pbf2, 500) : 500;
+                        AgentMind& rm = w.mind(actor);
+                        const std::int64_t er = p_eros != kNoProp
+                            ? w.prop_int(*insc_e, p_eros, 0) : 0;
+                        // pass 1: which clauses can this reader parse?
+                        std::vector<bool> rdv(clauses.size(), false);
+                        bool clause_read = false;
+                        for (std::size_t ci = 0; ci < clauses.size(); ++ci) {
+                            const Clause& cl = clauses[ci];
+                            bool rd = cl.lang > 0 && rlang == cl.lang;
+                            if (!rd) {
+                                for (EntityId id : cl.ids) {
+                                    if (lex_fam(rm, id) >= bf) {
+                                        rd = true; break;
+                                    }
+                                }
+                            }
+                            rdv[ci] = rd;
+                            if (rd) clause_read = true;
+                        }
+                        // pass 2: mapped words of READABLE clauses land
+                        // (with semantic drift on weathered text); unreadable
+                        // clauses on a comprehensible carving are Rosetta.
+                        for (std::size_t ci = 0; ci < clauses.size(); ++ci) {
+                            const Clause& cl = clauses[ci];
+                            const bool rd = rdv[ci];
+                            if (rd) {
+                                clause_read = true;
+                                for (EntityId id : cl.ids) {
+                                    // semantic drift: weathered text (>400)
+                                    // can be misread onto the neighboring
+                                    // atom — the seed of myth and tabu.
+                                    EntityId tgt = id;
+                                    if (er > 400) {
+                                        const Entity* te = w.find(id);
+                                        std::uint64_t salt = 0;
+                                        if (te && p_ssd != kNoProp) {
+                                            const Value* sv =
+                                                w.prop_of(*te, p_ssd);
+                                            if (sv && sv->type ==
+                                                ValType::Integer)
+                                                salt = static_cast<
+                                                    std::uint64_t>(sv->i);
+                                        }
+                                        const std::uint64_t h =
+                                            static_cast<std::uint64_t>(id) ^
+                                            salt ^
+                                            (static_cast<std::uint64_t>(
+                                                ev.tick) << 20) ^
+                                            (static_cast<std::uint64_t>(
+                                                actor) << 40);
+                                        if ((h % 1000) < 200) {
+                                            const EntityId nb =
+                                                lex_neighbor_entry(w, id);
+                                            if (nb != kNoEntity) tgt = nb;
+                                        }
+                                    }
+                                    // mapped words land nearly native;
+                                    // drifted ones only faintly.
+                                    const std::int64_t gain =
+                                        (tgt != id) ? 140 : 300;
+                                    lex_boost(w, actor, rm, tgt, gain,
+                                              ev.tick);
+                                }
+                            } else if (clause_read || comprehensible) {
+                                // Rosetta: an unreadable clause on a carving
+                                // the reader CAN read — the words are
+                                // anchored to known meaning, learn fast.
+                                for (EntityId id : cl.ids)
+                                    lex_boost(w, actor, rm, id, 300,
+                                              ev.tick);
+                            }
+                        }
+                        if (clause_read) comprehensible = true;
+                    }
+                }
+            }
+            if (iv && iv->type == ValType::Text && !iv->s.empty() &&
+                comprehensible) {
                 AgentMind& learner = w.mind(actor);
                 std::istringstream lines(iv->s);
                 std::string line;

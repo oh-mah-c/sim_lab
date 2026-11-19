@@ -279,6 +279,10 @@ species reservoir_beast
   symbiont_waterborne_rate 350
   symbiont_contact_rate 450
   symbiont_incubation_ticks 300
+  # proto-language acoustics (Phase 12): a wild grazer vocalizes poorly.
+  vocal_capability 150
+  phoneme_harshness 600
+  syllable_length_bias 2
   gene speed
   gene metabolism
   gene fertility
@@ -361,9 +365,78 @@ species vector_midge
   vector_fecundity 250
   vector_carrier_load 120
   vector_brood_cap 24
+  # proto-language acoustics (Phase 12): midges barely vocalize, harshly.
+  vocal_capability 80
+  phoneme_harshness 800
+  syllable_length_bias 1
   gene speed
   gene metabolism
   gene fertility
   gene immune_power_base
   gene dna_repair_gain
   gene reservoir_tolerance
+
+# Sapient tool-user — a vocal, stone-working fauna. This is the species the
+# causal proto-language layer was built for: vocal_capability >= 500 lets
+# verified discoveries crystallize into words; phoneme_harshness/syllable_
+# length_bias shape every coined phoneme_seed; hardness 650 lets it carve
+# ore/stone surfaces (carving_hardness_req <= 650 materials only).
+species sapient
+  kind fauna
+  material flesh
+  density 6
+  condition temperature 50 400
+  condition moisture 250 1000
+  condition slope 0 30
+  condition vegetation 200 1000
+  sight_range 600
+  speed 5500
+  metabolism 1600
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 400
+  adult_age 250
+  mutation_rate 40
+  energy 80000
+  max_energy 120000
+  blood_volume 1000
+  blood_accum 0
+  pain_level 0
+  consciousness 1000
+  bleed_rate 0
+  bleed_accum 0
+  undigested_mass 0
+  undigested_fluid 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1100
+  immune_power_base 1100
+  dna_repair_gain 900
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  communicate_range 500
+  reach 250
+  vocal_capability 900
+  phoneme_harshness 450
+  syllable_length_bias 3
+  glyph_angularity 700
+  hardness 650
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain

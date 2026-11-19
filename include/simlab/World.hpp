@@ -149,6 +149,8 @@ public:
     // Advance n ticks with no action (used by long-horizon tests/tools).
     void advance_ticks_for_test(std::int64_t n) { advance_ticks(n); }
     std::uint64_t state_hash() const;      // FNV-1a over all persistent state
+    // Phase 12.1d: deterministic lexicon codex export (public API).
+    std::string export_lexicon_codex() const;
     // ORDER-INDEPENDENT digest of world CONTENT (alive entities without ids,
     // terrain, subsurface): identical for any worldgen region materialization
     // order, unlike state_hash() which also covers entity ids/vector order.
@@ -358,6 +360,29 @@ private:
     // flips mid-window replay tick-wise (LOD-exact); steady windows batch.
     void vector_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                       CausalEvent& ev, std::vector<SpawnSpec>& out);
+    // Phase 12.1 causal proto-language: per-advance coinage pass. Every
+    // mind holding a Supported/Verified discovery whose concept has no
+    // LexicalEntry in the speaker's language gets one coined — concept +
+    // entry entities spawned through the causal spawn path with seeds
+    // derived from world_seed, language_id, concept_key and the species'
+    // acoustic props. Individuals with vocal_capability >= 500 and no
+    // language_id yet are assigned one deterministically from
+    // (world_seed, kind_name). All writes ride one "language" causal event.
+    void language_tick(std::uint64_t now);
+    // Per-entity language drift inside metabolize: `language` entities
+    // accumulate dialect_drift_accum (rate x isolation multiplier); each
+    // dialect_drift_threshold worth of accum advances dialect_drift_rolls
+    // and XOR-shifts every LexicalEntry phoneme_seed of that language by a
+    // mask derived from the roll index — cumulative XOR makes the final
+    // seed depend only on the roll COUNT, so batched windows are exact.
+    // `inscription` entities erode by (1000 - durability) permille/tick
+    // into erosion_level; at 1000 the glyph/concept payload is illegible.
+    void language_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                        CausalEvent& ev);
+    // Phase 12.1d lexicon codex: deterministic text export — per language,
+    // every LexicalEntry rendered as raw phoneme/glyph strings (seeds ->
+    // syllable stream via species acoustics) with the objective chronicle
+    // of its concept and the community's deciphered_ratio (0..1000).
     // Herd immunity: does `host` carry immune memory matching the antigen
     // of the strain entity `strain_id`? Used by every transmission route.
     bool host_immune_to(EntityId host, std::int64_t strain_id) const;

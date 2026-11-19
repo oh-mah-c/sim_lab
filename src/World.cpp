@@ -2,6 +2,7 @@
 #include "simlab/WorldGen.hpp"   // kGeneratorVersion for save compatibility
 #include "simlab/Geometry.hpp"
 #include "simlab/Cognition.hpp"
+#include "simlab/Discovery.hpp"
 #include <algorithm>
 #include <limits>
 #include <fstream>
@@ -22,7 +23,10 @@ const char* const kEnvPropNames[] = {
     "is_disease_vector", "vector_dormant", "vector_bite_accum",
     "vector_breed_accum", "vector_bite_rolls",
     "stagnation_hist_level", "stagnation_hist_acc",
-    "stagnation_hist_rate", "stagnation_hist_start"};
+    "stagnation_hist_rate", "stagnation_hist_start",
+    "language_name", "dialect_drift_accum", "dialect_drift_rate",
+    "dialect_drift_iso", "dialect_drift_rolls", "dialect_drift_threshold",
+    "erosion_level", "erosion_accum", "inscription_durability"};
 }  // namespace
 
 
@@ -468,7 +472,8 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
 
 void World::advance_ticks(std::int64_t n) {
     for (std::int64_t i = 0; i < n; ++i) clock_.advance();
-    if (n > 0) { metabolize(n); dissipate_heat(n); ecology_tick(n); decay_minds(n); }
+    if (n > 0) { metabolize(n); dissipate_heat(n); ecology_tick(n);
+                 language_tick(clock_.tick()); decay_minds(n); }
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -2681,6 +2686,7 @@ void World::metabolize(std::int64_t dt) {
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
                 flora_drift(e, 1, sub_now, ev, drift_spawns);
                 if (is_vec) vector_drift(e, 1, sub_now, ev, drift_spawns);
+                language_drift(e, 1, sub_now, ev);
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -2692,6 +2698,7 @@ void World::metabolize(std::int64_t dt) {
                         drift_spawns);
             vector_drift(e, static_cast<std::int64_t>(pending), now, ev,
                          drift_spawns);
+            language_drift(e, static_cast<std::int64_t>(pending), now, ev);
         }
         // Phase 11: standing water fouls into a stagnation reservoir on the
         // same batched, accumulator-exact contract as every other drift.
@@ -5784,6 +5791,603 @@ bool World::load(const std::string& path, std::string* err) {
     r.f.close();
     if (!r.ok()) return fail("read failed");
     return true;
+}
+
+
+// ================= Phase 12.1 — causal proto-language =========================
+namespace {
+
+std::uint32_t lang_prop_id(const World& w, const char* n) {
+    const PropertyDef* d = w.props.find_name(n);
+    return d ? d->id : kNoProp;
+}
+
+// Deterministic u32 seed: FNV-style mix over a composed key. Every "random"
+// looking value in the language layer derives from (world_seed, key parts) —
+// nothing is stored as literal vocabulary.
+std::uint32_t lang_seed(std::uint64_t world_seed, const std::string& key) {
+    std::uint64_t h = Rng::hash(key) ^ (world_seed * 0x9E3779B97F4A7C15ull);
+    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+    h *= 0x94D049BB133111EBull; h ^= h >> 29;
+    return static_cast<std::uint32_t>(h & 0xFFFFFFFFull);
+}
+
+// Render a seed as a deterministic pseudo-word: syllable_length_bias
+// syllables, each 1-2 chars drawn from a seed-derived alphabet. This is a
+// display codec only — the alphabet is generated per-seed, never a stored
+// vocabulary list.
+std::string render_seed(std::uint32_t seed, std::int64_t syllables,
+                        std::uint64_t world_seed) {
+    if (seed == 0 || syllables <= 0) return "";
+    std::string out;
+    std::uint64_t h = seed;
+    const int nsyl = static_cast<int>(std::clamp<std::int64_t>(syllables, 1, 4));
+    for (int i = 0; i < nsyl; ++i) {
+        h ^= h >> 13; h *= 0x5DEECE66Dull; h ^= h >> 16;
+        const int len = 1 + static_cast<int>((h ^ (h >> 20)) % 2);
+        for (int j = 0; j < len; ++j) {
+            h ^= h >> 11; h *= 0x2545F4914Full; h ^= h >> 15;
+            const char base = static_cast<char>('a' +
+                static_cast<int>((h ^ world_seed) % 26));
+            out.push_back(base);
+        }
+        if (i + 1 < nsyl) out.push_back('-');
+    }
+    return out;
+}
+
+bool lang_is_lang_entity(const Entity& e) { return e.kind_name == "language"; }
+bool lang_is_entry(const Entity& e)    { return e.kind_name == "lexical_entry"; }
+bool lang_is_concept(const Entity& e)  { return e.kind_name == "semantic_concept"; }
+bool lang_is_atom(const Entity& e)    { return e.kind_name == "semantic_atom"; }
+bool lang_is_inscription(const Entity& e){ return e.kind_name == "inscription"; }
+
+// Familiarity an NPC holds for a lexical_entry entity, stored as an ordinary
+// belief keyed "lex:<entry_id>" — beliefs already serialize, decay-adjacent
+// and stay inside agent knowledge (never World Truth).
+constexpr const char* kLexBeliefPrefix = "lex:";
+std::string lex_belief_key(EntityId entry) {
+    return std::string(kLexBeliefPrefix) + std::to_string(entry);
+}
+std::int64_t lex_familiarity(const AgentMind& m, EntityId entry) {
+    const Belief* b = m.find_belief(lex_belief_key(entry));
+    return b ? b->confidence : 0;
+}
+
+}  // namespace
+
+void World::language_tick(std::uint64_t now) {
+    const PropId p_lang   = lang_prop_id(*this, "language_id");
+    const PropId p_vocal  = lang_prop_id(*this, "vocal_capability");
+    const PropId p_harsh  = lang_prop_id(*this, "phoneme_harshness");
+    const PropId p_syl    = lang_prop_id(*this, "syllable_length_bias");
+    const PropId p_ckey   = lang_prop_id(*this, "concept_key");
+    const PropId p_ckind  = lang_prop_id(*this, "concept_kind");
+    const PropId p_cause  = lang_prop_id(*this, "cause_key");
+    const PropId p_chron  = lang_prop_id(*this, "chronicle");
+    const PropId p_pseed  = lang_prop_id(*this, "phoneme_seed");
+    const PropId p_gseed  = lang_prop_id(*this, "glyph_seed");
+    const PropId p_lname  = lang_prop_id(*this, "language_name");
+    const PropId p_dacc   = lang_prop_id(*this, "dialect_drift_accum");
+    const PropId p_drate  = lang_prop_id(*this, "dialect_drift_rate");
+    const PropId p_diso   = lang_prop_id(*this, "dialect_drift_iso");
+    const PropId p_droll  = lang_prop_id(*this, "dialect_drift_rolls");
+    const PropId p_dthr   = lang_prop_id(*this, "dialect_drift_threshold");
+    const PropId p_akey   = lang_prop_id(*this, "atom_key");
+    const PropId p_akind  = lang_prop_id(*this, "atom_kind");
+    const PropId p_ang    = lang_prop_id(*this, "glyph_angularity");
+    const PropId p_ssd    = lang_prop_id(*this, "semantic_shift_seed");
+    if (p_lang == kNoProp || p_ckey == kNoProp || p_pseed == kNoProp ||
+        p_gseed == kNoProp)
+        return;
+
+    // Index existing language-world entities once per pass.
+    std::map<std::string, EntityId> concepts;           // concept_key -> id
+    std::map<std::string, EntityId> atoms;              // atom_key -> id
+    std::set<std::string> entries;                      // "lang|ckey" covered
+    std::set<std::int64_t> langs_seen;
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive) continue;
+        if (lang_is_concept(e)) {
+            const Value* v = prop_of(e, p_ckey);
+            if (v && v->type == ValType::Text && !v->s.empty())
+                concepts.emplace(v->s, e.id);
+        } else if (lang_is_atom(e)) {
+            const Value* v = p_akey != kNoProp ? prop_of(e, p_akey) : nullptr;
+            if (v && v->type == ValType::Text && !v->s.empty())
+                atoms.emplace(v->s, e.id);
+        } else if (lang_is_entry(e)) {
+            const Value* ck = prop_of(e, p_ckey);
+            const Value* lv = prop_of(e, p_lang);
+            if (ck && ck->type == ValType::Text && lv &&
+                lv->type == ValType::Integer)
+                entries.insert(std::to_string(lv->i) + "|" + ck->s);
+            if (lv && lv->type == ValType::Integer) langs_seen.insert(lv->i);
+        } else if (lang_is_lang_entity(e)) {
+            const Value* lv = prop_of(e, p_lname);
+            if (lv && lv->type == ValType::Integer) langs_seen.insert(lv->i);
+        }
+    }
+
+    CausalEvent ev;
+    ev.tick = now;
+    ev.action = "language";
+    ev.applied_laws.push_back(8);
+    bool any = false;
+    std::size_t coined = 0;
+    constexpr std::size_t kMaxCoinagePerPass = 64;
+    // verb vocabulary of the whole community: a decomposed token matching a
+    // known action is an action atom (kind 2), everything else kind 1.
+    std::set<std::string> verbs;
+    for (const auto& [mid, m] : minds_)
+        for (const std::string& a : m.known_actions) verbs.insert(a);
+
+    for (auto& [mid, m] : minds_) {
+        if (coined >= kMaxCoinagePerPass) break;
+        Entity* e = find(mid);
+        if (!e || !e->alive) continue;
+        const std::int64_t vocal = p_vocal != kNoProp ? prop_int(*e, p_vocal, 0) : 0;
+        if (vocal < 500) continue;                    // cannot coin words
+        std::int64_t lang = p_lang != kNoProp ? prop_int(*e, p_lang, 0) : 0;
+        if (lang <= 0) {
+            // Community identity: same species/kind on the same world seed
+            // converges on one language_id — a real "speech community".
+            lang = 1 + static_cast<std::int64_t>(
+                lang_seed(world_seed, "language|" + e->kind_name) % 1000000000ull);
+            const Value* old = prop_of(*e, p_lang);
+            StateChange ch;
+            ch.entity = e->id; ch.prop = p_lang; ch.had_before = old != nullptr;
+            ch.before = old ? *old : Value::integer(0);
+            ch.after = Value::integer(lang);
+            e->props.set(p_lang, Value::integer(lang));
+            ev.changes.push_back(ch);
+            any = true;
+        }
+        // lazily found one `language` registry entity per community
+        if (!langs_seen.count(lang)) {
+            PropertyBag lb;
+            if (p_lname != kNoProp) lb.set(p_lname, Value::integer(lang));
+            if (p_dacc  != kNoProp) lb.set(p_dacc,  Value::integer(0));
+            if (p_drate != kNoProp) lb.set(p_drate, Value::integer(50));
+            if (p_diso  != kNoProp) lb.set(p_diso,  Value::integer(400));
+            if (p_droll != kNoProp) lb.set(p_droll, Value::integer(0));
+            if (p_dthr  != kNoProp) lb.set(p_dthr,  Value::integer(20000));
+            const EntityId lid = create_entity("language", kNoMaterial,
+                                               e->pos, lb);
+            if (lid != kNoEntity) {
+                ev.spawned.push_back(lid);
+                ev.evidence += "language " + std::to_string(lang) + " id " +
+                               std::to_string(lid) + "; ";
+                langs_seen.insert(lang);
+                any = true;
+            }
+        }
+
+        const std::int64_t harsh = p_harsh != kNoProp ? prop_int(*e, p_harsh, 500) : 500;
+        const std::int64_t syl   = p_syl   != kNoProp ? prop_int(*e, p_syl,   2)   : 2;
+        const std::int64_t ang   = p_ang   != kNoProp ? prop_int(*e, p_ang,   500) : 500;
+        for (const auto& [dkey, d] : m.discoveries) {
+            if (coined >= kMaxCoinagePerPass) break;
+            if (d.status != DiscoveryStatus::Supported &&
+                d.status != DiscoveryStatus::Verified) continue;
+            const std::string& ck = d.key;
+            if (ck.empty()) continue;
+            const std::string hk = std::to_string(lang) + "|" + ck;
+            if (entries.count(hk)) continue;         // community already has it
+
+            // SemanticConcept: one per causal key, shared across languages.
+            EntityId cid = kNoEntity;
+            const auto ci = concepts.find(ck);
+            if (ci != concepts.end()) cid = ci->second;
+            else {
+                PropertyBag cb;
+                cb.set(p_ckey, Value::text(ck));
+                if (p_ckind != kNoProp) cb.set(p_ckind, Value::integer(4));
+                if (p_cause != kNoProp) cb.set(p_cause, Value::text(ck));
+                if (p_chron != kNoProp) cb.set(p_chron, Value::text(d.claim));
+                cid = create_entity("semantic_concept", kNoMaterial, e->pos, cb);
+                if (cid == kNoEntity) continue;
+                ev.spawned.push_back(cid);
+                ev.evidence += "concept " + ck + " id " + std::to_string(cid) + "; ";
+                concepts.emplace(ck, cid);
+                any = true;
+            }
+            // LexicalEntry: phoneme seed folds species acoustics (harshness,
+            // syllable bias); glyph seed stays purely (seed, lang, concept).
+            const std::uint32_t ps = lang_seed(world_seed,
+                "phoneme|" + std::to_string(lang) + "|" + ck + "|" +
+                std::to_string(harsh) + "|" + std::to_string(syl));
+            const std::uint32_t gs = lang_seed(world_seed,
+                "glyph|" + std::to_string(lang) + "|" + ck + "|" +
+                std::to_string(ang));
+            PropertyBag eb;
+            eb.set(p_ckey,  Value::text(ck));
+            eb.set(p_lang,  Value::integer(lang));
+            eb.set(p_pseed, Value::integer(static_cast<std::int64_t>(ps)));
+            eb.set(p_gseed, Value::integer(static_cast<std::int64_t>(gs)));
+            if (p_ssd != kNoProp)
+                eb.set(p_ssd, Value::integer(static_cast<std::int64_t>(
+                    lang_seed(world_seed, "shift|" + std::to_string(lang) +
+                              "|" + ck))));
+            const EntityId eid = create_entity("lexical_entry", kNoMaterial,
+                                               e->pos, eb);
+            if (eid == kNoEntity) continue;
+            relations.relate(eid, "names", cid);
+            ev.spawned.push_back(eid);
+            ev.evidence += "lexeme " + ck + " lang " + std::to_string(lang) +
+                           " id " + std::to_string(eid) + "; ";
+            entries.insert(hk);
+            // the coiner knows their own word well
+            Belief& b = m.belief(lex_belief_key(eid));
+            b.status = BeliefStatus::Verified;
+            b.confidence = 800;
+            b.last_tick = now;
+            relations.relate(mid, "knows_word", eid);
+            ++coined;
+            any = true;
+
+            // Compositional layer: decompose the causal key into SemanticAtoms
+            // and coin one word per atom — CausalClauses recombine these at
+            // inscription time instead of minting a word per situation.
+            if (p_akey != kNoProp) {
+                const std::vector<AtomRef> ats = decompose_key(d.key, verbs);
+                for (const AtomRef& at : ats) {
+                    if (coined >= kMaxCoinagePerPass) break;
+                    const std::string ahk =
+                        std::to_string(lang) + "|" + at.key;
+                    if (entries.count(ahk)) continue;
+                    EntityId aid = kNoEntity;
+                    const auto ai = atoms.find(at.key);
+                    if (ai != atoms.end()) aid = ai->second;
+                    else {
+                        PropertyBag ab;
+                        ab.set(p_akey, Value::text(at.key));
+                        if (p_akind != kNoProp)
+                            ab.set(p_akind, Value::integer(at.kind));
+                        if (p_ckind != kNoProp)
+                            ab.set(p_ckind, Value::integer(at.kind));
+                        if (p_chron != kNoProp)
+                            ab.set(p_chron, Value::text(d.claim));
+                        aid = create_entity("semantic_atom", kNoMaterial,
+                                            e->pos, ab);
+                        if (aid == kNoEntity) continue;
+                        ev.spawned.push_back(aid);
+                        atoms.emplace(at.key, aid);
+                        any = true;
+                    }
+                    const std::uint32_t aps = lang_seed(world_seed,
+                        "phoneme|" + std::to_string(lang) + "|" + at.key +
+                        "|" + std::to_string(harsh) + "|" +
+                        std::to_string(syl));
+                    const std::uint32_t ags = lang_seed(world_seed,
+                        "glyph|" + std::to_string(lang) + "|" + at.key +
+                        "|" + std::to_string(ang));
+                    PropertyBag aeb;
+                    aeb.set(p_ckey, Value::text(at.key));
+                    aeb.set(p_lang, Value::integer(lang));
+                    aeb.set(p_pseed,
+                        Value::integer(static_cast<std::int64_t>(aps)));
+                    aeb.set(p_gseed,
+                        Value::integer(static_cast<std::int64_t>(ags)));
+                    if (p_ssd != kNoProp)
+                        aeb.set(p_ssd, Value::integer(
+                            static_cast<std::int64_t>(lang_seed(world_seed,
+                                "shift|" + std::to_string(lang) + "|" +
+                                at.key))));
+                    const EntityId aeid = create_entity("lexical_entry",
+                        kNoMaterial, e->pos, aeb);
+                    if (aeid == kNoEntity) continue;
+                    relations.relate(aeid, "names", aid);
+                    ev.spawned.push_back(aeid);
+                    entries.insert(ahk);
+                    Belief& bb = m.belief(lex_belief_key(aeid));
+                    bb.status = BeliefStatus::Verified;
+                    bb.confidence = 800;
+                    bb.last_tick = now;
+                    relations.relate(mid, "knows_word", aeid);
+                    ++coined;
+                    any = true;
+                }
+            }
+        }
+    }
+    if (any) ledger.append(std::move(ev));
+}
+
+void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*/,
+                           CausalEvent& ev) {
+    if (pending <= 0 || !e.alive) return;
+    const PropId p_lname = lang_prop_id(*this, "language_name");
+    const PropId p_dacc  = lang_prop_id(*this, "dialect_drift_accum");
+    const PropId p_drate = lang_prop_id(*this, "dialect_drift_rate");
+    const PropId p_diso  = lang_prop_id(*this, "dialect_drift_iso");
+    const PropId p_droll = lang_prop_id(*this, "dialect_drift_rolls");
+    const PropId p_dthr  = lang_prop_id(*this, "dialect_drift_threshold");
+    const PropId p_lang  = lang_prop_id(*this, "language_id");
+    const PropId p_ps    = lang_prop_id(*this, "phoneme_seed");
+    const PropId p_lvl   = lang_prop_id(*this, "erosion_level");
+    const PropId p_cktxt = lang_prop_id(*this, "concept_keys");
+    const PropId p_eacc  = lang_prop_id(*this, "erosion_accum");
+    const PropId p_dur   = lang_prop_id(*this, "inscription_durability");
+    const PropId p_gtxt  = lang_prop_id(*this, "glyph_text");
+
+    if (lang_is_lang_entity(e)) {
+        if (p_lname == kNoProp || p_dacc == kNoProp || p_drate == kNoProp ||
+            p_droll == kNoProp || p_dthr == kNoProp)
+            return;
+        const std::int64_t lang = prop_int(e, p_lname, 0);
+        if (lang <= 0) return;
+        // isolation: the community counts as isolated when NO member has a
+        // fellow speaker inside communicate_range. Positions do not move
+        // during metabolize, so the flag is constant across the window.
+        const PropId p_crange = lang_prop_id(*this, "communicate_range");
+        const std::int64_t crange = p_crange != kNoProp
+            ? prop_int(e, p_crange, 400) : 400;
+        bool isolated = true;
+        {
+            std::vector<EntityId> members;
+            for (const auto& ep : entities) {
+                const Entity& o = *ep;
+                if (!o.alive || o.id == e.id) continue;
+                if (o.kind_name == "language" || o.kind_name == "lexical_entry" ||
+                    o.kind_name == "semantic_concept" ||
+                    o.kind_name == "inscription") continue;
+                if (p_lang != kNoProp && prop_int(o, p_lang, 0) == lang)
+                    members.push_back(o.id);
+            }
+            for (EntityId mid : members) {
+                const Entity* me = find(mid);
+                if (!me) continue;
+                bool near = false;
+                for (const EntityId nid : entities_near(me->pos, crange)) {
+                    if (nid == mid) continue;
+                    const Entity* ne = find(nid);
+                    if (!ne || !ne->alive) continue;
+                    if (ne->kind_name == "language" ||
+                        ne->kind_name == "lexical_entry" ||
+                        ne->kind_name == "semantic_concept" ||
+                        ne->kind_name == "inscription") continue;
+                    if (p_lang != kNoProp && prop_int(*ne, p_lang, 0) == lang) {
+                        near = true; break;
+                    }
+                }
+                if (near) { isolated = false; break; }
+            }
+        }
+        const std::int64_t rate = prop_int(e, p_drate, 50);
+        const std::int64_t iso  = prop_int(e, p_diso, 400);
+        const std::int64_t mult = isolated ? iso : 1000;
+        const std::int64_t acc0 = prop_int(e, p_dacc, 0);
+        const std::int64_t nacc = acc0 + pending * rate * mult / 1000;
+        const std::int64_t thr  = std::max<std::int64_t>(
+            prop_int(e, p_dthr, 20000), 1);
+        const std::int64_t rolls0 = prop_int(e, p_droll, 0);
+        const std::int64_t rolls1 = rolls0 + nacc / thr;
+        const std::int64_t rem = nacc % thr;
+        auto setp = [&](PropId p, std::int64_t v) {
+            if (p == kNoProp) return;
+            const Value* old = prop_of(e, p);
+            StateChange ch;
+            ch.entity = e.id; ch.prop = p; ch.had_before = old != nullptr;
+            ch.before = old ? *old : Value::integer(0);
+            ch.after = Value::integer(v);
+            e.props.set(p, Value::integer(v));
+            ev.changes.push_back(ch);
+        };
+        setp(p_dacc, rem);
+        if (rolls1 != rolls0) {
+            setp(p_droll, rolls1);
+            // cumulative XOR drift: roll r shifts each entry's phoneme_seed
+            // by mask(lang, entry, r). Final seed depends only on roll COUNT
+            // -> dt=1 x N and dt=N produce identical words.
+            if (p_ps != kNoProp && p_lang != kNoProp) {
+                for (const auto& ep : entities) {
+                    Entity& le = *ep;
+                    if (!le.alive || !lang_is_entry(le)) continue;
+                    if (prop_int(le, p_lang, 0) != lang) continue;
+                    const PropId lps = p_ps;
+                    const Value* sv = prop_of(le, lps);
+                    if (!sv || sv->type != ValType::Integer) continue;
+                    std::uint32_t seed = static_cast<std::uint32_t>(sv->i);
+                    for (std::int64_t r = rolls0 + 1; r <= rolls1; ++r) {
+                        const std::uint32_t m = lang_seed(world_seed,
+                            "drift|" + std::to_string(lang) + "|" +
+                            std::to_string(le.id) + "|" + std::to_string(r));
+                        seed ^= m;
+                    }
+                    const Value* old = prop_of(le, lps);
+                    StateChange ch;
+                    ch.entity = le.id; ch.prop = lps; ch.had_before = true;
+                    ch.before = *old; ch.after = Value::integer(
+                        static_cast<std::int64_t>(seed));
+                    le.props.set(lps, Value::integer(
+                        static_cast<std::int64_t>(seed)));
+                    ev.changes.push_back(ch);
+                }
+            }
+            ev.participants.push_back(e.id);
+        }
+        return;
+    }
+
+    if (lang_is_inscription(e)) {
+        if (p_lvl == kNoProp || p_eacc == kNoProp || p_dur == kNoProp)
+            return;
+        // rate: (1000 - durability) permille-ish per tick, scaled x1000 into
+        // the milli accumulator; 1000 accum = 1 erosion_level permille.
+        const std::int64_t dur = prop_int(e, p_dur, 0);
+        const std::int64_t acc0 = prop_int(e, p_eacc, 0);
+        const std::int64_t nacc = acc0 + pending * std::max<std::int64_t>(0, 1000 - dur);
+        const std::int64_t lvl0 = prop_int(e, p_lvl, 0);
+        std::int64_t lvl1 = lvl0 + nacc / 1000;
+        const std::int64_t rem = nacc % 1000;
+        if (lvl1 > 1000) lvl1 = 1000;
+        auto setp = [&](PropId p, std::int64_t v) {
+            if (p == kNoProp) return;
+            const Value* old = prop_of(e, p);
+            StateChange ch;
+            ch.entity = e.id; ch.prop = p; ch.had_before = old != nullptr;
+            ch.before = old ? *old : Value::integer(0);
+            ch.after = Value::integer(v);
+            e.props.set(p, Value::integer(v));
+            ev.changes.push_back(ch);
+        };
+        setp(p_eacc, rem);
+        if (lvl1 != lvl0) setp(p_lvl, lvl1);
+        // illegible: glyph stream and concept mapping are erased for good.
+        // Monotonic — ticked and batched reach the same terminal state.
+        if (lvl1 >= 1000 && (p_gtxt != kNoProp || p_cktxt != kNoProp)) {
+            const Value* gv = p_gtxt != kNoProp ? prop_of(e, p_gtxt) : nullptr;
+            const Value* kv = p_cktxt != kNoProp ? prop_of(e, p_cktxt) : nullptr;
+            const bool gone = (!gv || (gv->type == ValType::Text && gv->s.empty())) &&
+                              (!kv || (kv->type == ValType::Text && kv->s.empty()));
+            if (!gone) {
+                if (p_gtxt != kNoProp) {
+                    StateChange ch; ch.entity = e.id; ch.prop = p_gtxt;
+                    ch.had_before = gv != nullptr; ch.before = gv ? *gv : Value::text("");
+                    ch.after = Value::text("");
+                    e.props.set(p_gtxt, Value::text(""));
+                    ev.changes.push_back(ch);
+                }
+                if (p_cktxt != kNoProp) {
+                    StateChange ch; ch.entity = e.id; ch.prop = p_cktxt;
+                    ch.had_before = kv != nullptr; ch.before = kv ? *kv : Value::text("");
+                    ch.after = Value::text("");
+                    e.props.set(p_cktxt, Value::text(""));
+                    ev.changes.push_back(ch);
+                }
+            }
+        }
+        if (lvl1 != lvl0 || rem != acc0) ev.participants.push_back(e.id);
+    }
+}
+
+std::string World::export_lexicon_codex() const {
+    const PropId p_ckey  = lang_prop_id(*this, "concept_key");
+    const PropId p_lang  = lang_prop_id(*this, "language_id");
+    const PropId p_ps    = lang_prop_id(*this, "phoneme_seed");
+    const PropId p_gs    = lang_prop_id(*this, "glyph_seed");
+    const PropId p_chron = lang_prop_id(*this, "chronicle");
+    const PropId p_lvl   = lang_prop_id(*this, "erosion_level");
+    const PropId p_gtxt  = lang_prop_id(*this, "glyph_text");
+    const PropId p_auth  = lang_prop_id(*this, "inscription_author");
+    const PropId p_itk   = lang_prop_id(*this, "inscription_tick");
+    const PropId p_akey  = lang_prop_id(*this, "atom_key");
+    const PropId p_akind = lang_prop_id(*this, "atom_kind");
+    const PropId p_cl    = lang_prop_id(*this, "clause_atoms");
+    const PropId p_l2    = lang_prop_id(*this, "language_id2");
+    const PropId p_port  = lang_prop_id(*this, "portable_surface");
+    if (p_ckey == kNoProp) return "";
+
+    // chronicle per concept_key (World Truth — written at coinage)
+    std::map<std::string, std::string> chronicles;
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive || !lang_is_concept(e)) continue;
+        const Value* ck = prop_of(e, p_ckey);
+        const Value* ch = p_chron != kNoProp ? prop_of(e, p_chron) : nullptr;
+        if (ck && ck->type == ValType::Text && ch && ch->type == ValType::Text)
+            chronicles[ck->s] = ch->s;
+    }
+    // per-language familiarity: best confidence any mind holds per entry
+    std::map<std::int64_t, std::int64_t> lang_known, lang_total;
+    struct LexRow { EntityId id; std::int64_t lang; std::uint32_t ps, gs;
+                    std::string ck; std::int64_t deciphered; };
+    std::vector<LexRow> rows;
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive || !lang_is_entry(e)) continue;
+        const Value* ck = prop_of(e, p_ckey);
+        const Value* lv = p_lang != kNoProp ? prop_of(e, p_lang) : nullptr;
+        const Value* pv = p_ps   != kNoProp ? prop_of(e, p_ps)   : nullptr;
+        const Value* gv = p_gs   != kNoProp ? prop_of(e, p_gs)   : nullptr;
+        if (!ck || ck->type != ValType::Text || !lv ||
+            lv->type != ValType::Integer) continue;
+        LexRow r; r.id = e.id; r.lang = lv->i; r.ck = ck->s;
+        r.ps = pv && pv->type == ValType::Integer
+            ? static_cast<std::uint32_t>(pv->i) : 0;
+        r.gs = gv && gv->type == ValType::Integer
+            ? static_cast<std::uint32_t>(gv->i) : 0;
+        r.deciphered = 0;
+        for (const auto& [mid, m] : minds_) {
+            (void)mid;
+            r.deciphered = std::max<std::int64_t>(
+                r.deciphered, lex_familiarity(m, r.id));
+        }
+        rows.push_back(r);
+        lang_total[r.lang]++;
+        if (r.deciphered >= 500) lang_known[r.lang]++;
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const LexRow& a, const LexRow& b){ return a.id < b.id; });
+
+    std::ostringstream o;
+    o << "# lexicon codex — world_seed " << world_seed << "\n";
+    // per language: raw phoneme/glyph renderings + objective chronicles +
+    // community deciphered_ratio (permille of entries known >=500 fam)
+    std::set<std::int64_t> langs;
+    for (const auto& r : rows) langs.insert(r.lang);
+    for (std::int64_t lg : langs) {
+        const std::int64_t tot = lang_total[lg];
+        const std::int64_t kn  = lang_known[lg];
+        const std::int64_t ratio = tot > 0 ? kn * 1000 / tot : 0;
+        o << "LANG " << lg << " deciphered_ratio " << ratio << "\n";
+        for (const auto& r : rows) {
+            if (r.lang != lg) continue;
+            // syllable length from the species acoustics is unknowable for a
+            // dead language — render at the community-neutral default 2.
+            const std::string ph = render_seed(r.ps, 2, world_seed);
+            const std::string gl = render_seed(r.gs, 2, world_seed);
+            const auto ci = chronicles.find(r.ck);
+            const std::string chron = ci != chronicles.end() ? ci->second : "";
+            o << "  ENTRY " << r.id << " phonemes=" << ph
+              << " glyphs=" << gl << " concept=" << r.ck
+              << " deciphered=" << r.deciphered
+              << " chronicle=" << chron << "\n";
+        }
+    }
+    // semantic atoms: the atomic meanings words name (compositional layer)
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive || !lang_is_atom(e)) continue;
+        const Value* ak = p_akey  != kNoProp ? prop_of(e, p_akey)  : nullptr;
+        const Value* ai = p_akind != kNoProp ? prop_of(e, p_akind) : nullptr;
+        const Value* ac = p_chron != kNoProp ? prop_of(e, p_chron) : nullptr;
+        o << "ATOM " << e.id
+          << " key=" << (ak && ak->type == ValType::Text ? ak->s : "")
+          << " kind=" << (ai && ai->type == ValType::Integer ? ai->i : 0)
+          << " chronicle=" << (ac && ac->type == ValType::Text ? ac->s : "")
+          << "\n";
+    }
+    // inscriptions: raw carved glyph stream + which language + erosion
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive || !lang_is_inscription(e)) continue;
+        const Value* gt = p_gtxt  != kNoProp ? prop_of(e, p_gtxt)  : nullptr;
+        const Value* lv = p_lang  != kNoProp ? prop_of(e, p_lang)  : nullptr;
+        const Value* el = p_lvl    != kNoProp ? prop_of(e, p_lvl)   : nullptr;
+        const Value* au = p_auth   != kNoProp ? prop_of(e, p_auth)  : nullptr;
+        const Value* tk = p_itk    != kNoProp ? prop_of(e, p_itk)   : nullptr;
+        const std::string glyphs = gt && gt->type == ValType::Text ? gt->s : "";
+        const std::int64_t lg = lv && lv->type == ValType::Integer ? lv->i : 0;
+        const std::int64_t er = el && el->type == ValType::Integer ? el->i : 0;
+        const std::int64_t dr = lg > 0 && lang_total.count(lg)
+            ? (lang_known[lg] * 1000 / lang_total[lg]) : 0;
+        const Value* cl = p_cl   != kNoProp ? prop_of(e, p_cl)   : nullptr;
+        const Value* l2 = p_l2   != kNoProp ? prop_of(e, p_l2)   : nullptr;
+        const Value* po = p_port != kNoProp ? prop_of(e, p_port) : nullptr;
+        o << "INSCRIPTION " << e.id << " lang " << lg
+          << " erosion " << er << " deciphered_ratio " << dr
+          << " author " << (au && au->type == ValType::Integer ? au->i : 0)
+          << " tick " << (tk && tk->type == ValType::Integer ? tk->i : 0)
+          << " glyphs=" << glyphs
+          << " lang2=" << (l2 && l2->type == ValType::Integer ? l2->i : 0)
+          << " portable=" << (po && po->type == ValType::Integer ? po->i : 0)
+          << " clause=" << (cl && cl->type == ValType::Text ? cl->s : "")
+          << "\n";
+    }
+    return o.str();
 }
 
 }  // namespace simlab

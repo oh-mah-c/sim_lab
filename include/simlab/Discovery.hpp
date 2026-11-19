@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <set>
 #include "Cognition.hpp"
 #include "Types.hpp"
 
@@ -129,5 +130,25 @@ DiscoveryStatus food_method_status(const World& w, EntityId npc,
 // hard-won failed_conditions boundary.
 void note_harmful_method(World& w, EntityId npc, const std::string& verb,
                          MaterialId m, bool fruiting, const std::string& claim);
+
+// ---- compositional proto-language (Phase 12 base core) -------------------------
+// One atomic unit of meaning decomposed out of a causal key: a content token
+// (object/action/state — kind 1/2) or a relation operator (CAUSE/NEGATE/AND —
+// kind 4). Atoms are what lexical_entries actually name; CausalClauses are
+// ordered atom sequences, so a community coins a small vocabulary once and
+// recombines it forever instead of minting a word per situation.
+struct AtomRef {
+    std::string key;      // stable atom id (content token or "rel:<op>")
+    std::int64_t kind = 1;// 1 object/state, 2 action verb, 4 relation
+};
+
+// Deterministically decompose a causal key ("heat+stagnant_water->fever")
+// into ordered atoms. `verbs` = the community's known action names: a token
+// matching one is an action atom (kind 2), anything else is a content atom
+// (kind 1). Operators become relation atoms (kind 4): '+'->rel:and,
+// '->'/'>->'->rel:causes, '!'->rel:not. Pure function — same key + same verb
+// set always yields the same clause skeleton.
+std::vector<AtomRef> decompose_key(const std::string& key,
+                                   const std::set<std::string>& verbs);
 
 }  // namespace simlab

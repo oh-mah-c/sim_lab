@@ -25,6 +25,7 @@
 
 #include "simlab/Laws.hpp"
 #include "simlab/World.hpp"
+#include "simlab/Discovery.hpp"
 #include "simlab/Cognition.hpp"
 #include "simlab/Causal.hpp"
 #include "LawUtil.hpp"
@@ -91,6 +92,144 @@ bool in_comm_range(const World& w, const Entity& actor, const Entity& target,
 // ---- record selection + inscription codec ------------------------------------
 // Line format (one per record): R|key|status|efor|eagainst|trials|claim
 // claim is sanitized ('|' and newlines -> space) so parsing is unambiguous.
+// Phase 12: does this entity's MATERIAL declare the prop? Instance props
+// and material defaults both feed prop_of, but rules like "can this surface
+// hold a carving" only bite on materials that opt in — legacy blank rocks
+// (kNoMaterial) keep the old always-engrave behavior.
+bool material_has_prop(const World& w, const Entity& e, PropId p) {
+    if (p == kNoProp || e.material == kNoMaterial) return false;
+    const auto& defs = w.materials.defs();
+    if (e.material - 1 >= defs.size()) return false;
+    return defs[e.material - 1].props.count(p) != 0;
+}
+
+// Deterministic pseudo-glyph renderer — same codec World::export_lexicon_
+// codex uses for raw strings. Display only; the alphabet is seed-derived.
+std::string render_glyph_seed(std::uint32_t seed, std::int64_t syllables,
+                              std::uint64_t world_seed) {
+    if (seed == 0 || syllables <= 0) return "";
+    std::string out;
+    std::uint64_t h = seed;
+    const int nsyl = static_cast<int>(std::clamp<std::int64_t>(syllables, 1, 4));
+    for (int i = 0; i < nsyl; ++i) {
+        h ^= h >> 13; h *= 0x5DEECE66Dull; h ^= h >> 16;
+        const int len = 1 + static_cast<int>((h ^ (h >> 20)) % 2);
+        for (int j = 0; j < len; ++j) {
+            h ^= h >> 11; h *= 0x2545F4914Full; h ^= h >> 15;
+            out.push_back(static_cast<char>('a' +
+                static_cast<int>((h ^ world_seed) % 26)));
+        }
+        if (i + 1 < nsyl) out.push_back('-');
+    }
+    return out;
+}
+
+// LexicalEntries the actor would carve for `concept_key`: same-language
+// entries first, then any — capped, in deterministic entity order.
+struct CarveEntry { EntityId id; std::string ck; std::uint32_t gs; };
+std::vector<CarveEntry> gather_carvings(const World& w, EntityId actor,
+                                        const std::string& concept_key) {
+    const PropId p_ckey = pid(w, "concept_key");
+    const PropId p_lang = pid(w, "language_id");
+    const PropId p_gs   = pid(w, "glyph_seed");
+    const Entity* ae = w.find(actor);
+    const std::int64_t alang = ae && p_lang != kNoProp
+        ? w.prop_int(*ae, p_lang, 0) : 0;
+    std::vector<CarveEntry> same, other;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "lexical_entry") continue;
+        const Value* ck = p_ckey != kNoProp ? w.prop_of(e, p_ckey) : nullptr;
+        if (!ck || ck->type != ValType::Text || ck->s != concept_key) continue;
+        const Value* gv = p_gs != kNoProp ? w.prop_of(e, p_gs) : nullptr;
+        const Value* lv = p_lang != kNoProp ? w.prop_of(e, p_lang) : nullptr;
+        CarveEntry ce;
+        ce.id = e.id; ce.ck = ck->s;
+        ce.gs = gv && gv->type == ValType::Integer
+            ? static_cast<std::uint32_t>(gv->i) : 0;
+        const std::int64_t el = lv && lv->type == ValType::Integer ? lv->i : 0;
+        (el == alang && alang > 0 ? same : other).push_back(ce);
+        if (same.size() + other.size() >= 8) break;
+    }
+    std::vector<CarveEntry> out = same;
+    for (const auto& c : other) { if (out.size() >= 8) break; out.push_back(c); }
+    return out;
+}
+
+
+// Familiarity an agent holds for a lexical_entry — the "lex:<id>" belief is
+// the knows_word store (beliefs serialize/hash with the mind already).
+std::int64_t lex_fam_of(const AgentMind* m, EntityId e) {
+    if (!m) return 0;
+    const Belief* b = m->find_belief(std::string("lex:") + std::to_string(e));
+    return b ? b->confidence : 0;
+}
+
+struct ClauseOut { std::int64_t lang; std::vector<EntityId> entries; };
+
+// Compose the CausalClause(s) for a discovery key: decompose into atoms,
+// resolve each atom to this community's lexical_entry, and — when the author
+// is bilingual — add a second clause in the best-covered other language
+// (the Rosetta layer: same meaning, two scripts side by side).
+std::vector<ClauseOut> compose_clause(const World& w, const AgentMind* mind,
+                                      EntityId actor,
+                                      const std::string& key) {
+    const PropId p_ckey = pid(w, "concept_key");
+    const PropId p_lang = pid(w, "language_id");
+    const PropId p_bf   = pid(w, "bilingual_familiarity");
+    const Entity* ae = w.find(actor);
+    const std::int64_t alang = ae && p_lang != kNoProp
+        ? w.prop_int(*ae, p_lang, 0) : 0;
+    const std::int64_t bf = ae && p_bf != kNoProp
+        ? w.prop_int(*ae, p_bf, 500) : 500;
+    const std::vector<AtomRef> ats = decompose_key(key, {});
+    if (ats.empty() || p_ckey == kNoProp) return {};
+    // entries per atom: atom_key -> lang -> entry ids (sorted, deduped)
+    std::map<std::string,
+             std::map<std::int64_t, std::vector<EntityId>>> by_atom;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "lexical_entry") continue;
+        const Value* ck = w.prop_of(e, p_ckey);
+        const Value* lv = p_lang != kNoProp ? w.prop_of(e, p_lang) : nullptr;
+        if (!ck || ck->type != ValType::Text || !lv ||
+            lv->type != ValType::Integer) continue;
+        by_atom[ck->s][lv->i].push_back(e.id);
+    }
+    ClauseOut primary; primary.lang = alang;
+    std::map<std::int64_t, ClauseOut> seconds;
+    for (const AtomRef& at : ats) {
+        const auto ai = by_atom.find(at.key);
+        if (ai == by_atom.end()) continue;
+        // primary: author's own language first, else lowest-lang fallback
+        EntityId pick = kNoEntity;
+        const auto same = ai->second.find(alang);
+        if (same != ai->second.end() && !same->second.empty())
+            pick = same->second.front();
+        else if (!ai->second.empty()) pick = ai->second.begin()->second.front();
+        if (pick != kNoEntity) primary.entries.push_back(pick);
+        // secondary: any OTHER language whose entry the author knows well
+        for (const auto& [lg, ids] : ai->second) {
+            if (lg == primary.lang || lg == 0 || ids.empty()) continue;
+            if (lex_fam_of(mind, ids.front()) < bf) continue;
+            seconds[lg].lang = lg;
+            seconds[lg].entries.push_back(ids.front());
+        }
+    }
+    if (primary.entries.empty()) return {};
+    std::vector<ClauseOut> out{primary};
+    // Rosetta cap: at most ONE second language — the one covering most atoms
+    // (ties -> lowest language_id for determinism).
+    if (!seconds.empty()) {
+        auto best = seconds.begin();
+        for (auto it = seconds.begin(); it != seconds.end(); ++it)
+            if (it->second.entries.size() > best->second.entries.size())
+                best = it;
+        if (!best->second.entries.empty()) out.push_back(best->second);
+    }
+    return out;
+}
+
 std::string sanitize(std::string s) {
     for (char& c : s)
         if (c == '|' || c == '\n' || c == '\r') c = ' ';
@@ -158,6 +297,26 @@ PredictionResult predict_engrave(const World& w, const InteractionContext& ctx) 
     if (!t) return r;
     const PropId reach = pid(w, "reach");
     if (!in_reach(w, *actor, *t, reach, 0, &r)) { r.failure = "target out of reach"; return r; }
+    // Phase 12: inscription-capable materials opt in via data props. When
+    // the target's material declares them, durability must be > 0 and the
+    // carver's effective hardness (own + wielded tools) must meet the req.
+    const PropId p_dur = pid(w, "inscription_durability");
+    const PropId p_hreq = pid(w, "carving_hardness_req");
+    if (material_has_prop(w, *t, p_dur) || material_has_prop(w, *t, p_hreq)) {
+        const std::int64_t dur = p_dur != kNoProp ? w.prop_int(*t, p_dur, 0) : 0;
+        const std::int64_t hreq = p_hreq != kNoProp ? w.prop_int(*t, p_hreq, 0) : 0;
+        if (dur <= 0) { r.failure = "surface cannot hold a carving"; return r; }
+        if (hreq > 0) {
+            std::int64_t hard = w.prop_int(*actor, pid(w, "hardness"), 0);
+            for (const Relation& rel : w.relations_of(ctx.actor, "wielding")) {
+                if (rel.a != ctx.actor) continue;
+                const Entity* te = w.find(rel.b);
+                if (te && te->alive)
+                    hard = std::max(hard, w.prop_int(*te, pid(w, "hardness"), 0));
+            }
+            if (hard < hreq) { r.failure = "tool too soft to carve"; return r; }
+        }
+    }
     const AgentMind* mind = w.find_mind(ctx.actor);
     if (!mind) { r.failure = "actor has no knowledge to record"; return r; }
     std::string why;
@@ -170,6 +329,87 @@ PredictionResult predict_engrave(const World& w, const InteractionContext& ctx) 
     if (neu.size() > kMaxInscription) { r.failure = "inscription archive full"; return r; }
     if (!charge_energy(*actor, energy, kEngraveCost, r)) return r;
     set_change_v(r, t->id, ins, Value::text(old), Value::text(neu));
+    // Phase 12: also raise an Inscription entity bound to the surface —
+    // glyph stream + concept keys + provenance + erosion state. Legacy
+    // text payload stays for backward compatibility.
+    {
+        const PropId p_lang = pid(w, "language_id");
+        const PropId p_gtxt = pid(w, "glyph_text");
+        const PropId p_cktxt = pid(w, "concept_keys");
+        const PropId p_auth = pid(w, "inscription_author");
+        const PropId p_itk  = pid(w, "inscription_tick");
+        const PropId p_dur2 = pid(w, "inscription_durability");
+        const PropId p_lvl  = pid(w, "erosion_level");
+        const PropId p_ea   = pid(w, "erosion_accum");
+        const std::int64_t alang = p_lang != kNoProp && actor
+            ? w.prop_int(*actor, p_lang, 0) : 0;
+        const auto carv = gather_carvings(w, ctx.actor, rec->key);
+        std::string glyphs, ckeys;
+        for (const auto& c : carv) {
+            if (!glyphs.empty()) glyphs.push_back(' ');
+            glyphs += render_glyph_seed(c.gs, 2, w.world_seed);
+            if (!ckeys.empty()) ckeys.push_back('|');
+            ckeys += c.ck;
+        }
+        if (glyphs.empty()) {
+            // concept has no coined word yet — carve a deterministic
+            // fallback glyph so the record is still externalized memory.
+            glyphs = render_glyph_seed(
+                std::uint32_t(ckeys.empty() ? 0 :
+                    (std::uint64_t)rec->key.size() * 2654435761ull), 2,
+                w.world_seed);
+        }
+        SpawnSpec is;
+        is.kind = "inscription";
+        is.pos = t->pos;
+        if (p_lang != kNoProp)  is.props.set(p_lang, Value::integer(alang));
+        if (p_gtxt != kNoProp)  is.props.set(p_gtxt, Value::text(glyphs));
+        if (p_cktxt != kNoProp) is.props.set(p_cktxt,
+            Value::text(ckeys.empty() ? rec->key : ckeys));
+        if (p_auth != kNoProp)  is.props.set(p_auth,
+            Value::integer(static_cast<std::int64_t>(ctx.actor)));
+        if (p_itk != kNoProp)   is.props.set(p_itk,
+            Value::integer(static_cast<std::int64_t>(w.clock_.tick())));
+        if (p_lvl != kNoProp)   is.props.set(p_lvl, Value::integer(0));
+        if (p_ea  != kNoProp)   is.props.set(p_ea,  Value::integer(0));
+        if (p_dur2 != kNoProp) {
+            const std::int64_t dur = p_dur != kNoProp
+                ? w.prop_int(*t, p_dur, 0) : 0;
+            is.props.set(p_dur2, Value::integer(dur));
+        }
+        // portable medium: clay tablets / bone can be carried off and traded —
+        // the Inscription rides the surface entity wherever it goes.
+        const PropId p_port = pid(w, "portable_surface");
+        if (p_port != kNoProp) {
+            const std::int64_t pv = material_has_prop(w, *t, p_port)
+                ? w.prop_int(*t, p_port, 0) : 0;
+            is.props.set(p_port, Value::integer(pv));
+        }
+        // CausalClause payload: ordered atom-entry ids per language —
+        // "lang:id1,id2;lang2:g1,g2" (second clause = Rosetta layer).
+        {
+            const PropId p_cl  = pid(w, "clause_atoms");
+            const PropId p_l2  = pid(w, "language_id2");
+            const std::vector<ClauseOut> cls =
+                compose_clause(w, mind, ctx.actor, rec->key);
+            if (p_cl != kNoProp && !cls.empty()) {
+                std::string cs;
+                for (const ClauseOut& c : cls) {
+                    if (!cs.empty()) cs.push_back(';');
+                    cs += std::to_string(c.lang) + ":";
+                    for (std::size_t i = 0; i < c.entries.size(); ++i) {
+                        if (i) cs.push_back(',');
+                        cs += std::to_string(c.entries[i]);
+                    }
+                }
+                is.props.set(p_cl, Value::text(cs));
+                if (cls.size() > 1 && p_l2 != kNoProp)
+                    is.props.set(p_l2, Value::integer(cls[1].lang));
+            }
+        }
+        is.rel_from.push_back({"inscribed_on", t->id});
+        r.spawns.push_back(is);
+    }
     r.possible = true; r.ticks = kEngraveTicks;
     r.notes.push_back("engraved " + rec->key);
     return r;

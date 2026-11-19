@@ -6334,6 +6334,575 @@ static void test_vector_ecology_selection_and_herd_immunity() {
 }
 
 
+
+// ================= Phase 12.1 — causal proto-language =========================
+static std::vector<EntityId> kinds_of(World& w, const char* kn) {
+    std::vector<EntityId> out;
+    for (const auto& ep : w.entities)
+        if (ep->alive && ep->kind_name == kn) out.push_back(ep->id);
+    return out;
+}
+static EntityId first_kind(World& w, const char* kn) {
+    for (const auto& ep : w.entities)
+        if (ep->alive && ep->kind_name == kn) return ep->id;
+    return kNoEntity;
+}
+static void lang_person(World& w, EntityId id, const char* kind,
+                        std::int64_t harsh, std::int64_t syl) {
+    Entity* e = w.find(id);
+    tseti(*e, w, "metabolism", 50);   // slow needs: language tests run long
+    tseti(*e, w, "vocal_capability", 900);
+    tseti(*e, w, "phoneme_harshness", harsh);
+    tseti(*e, w, "syllable_length_bias", syl);
+    tseti(*e, w, "hardness", 900);
+    (void)kind;
+}
+
+static void test_causal_language_dialect_drift_and_inscriptions() {
+    // ---- A: causal coinage — discovery -> SemanticConcept + LexicalEntry ----
+    {
+        World w(101, "data");
+        const EntityId p1 = mk_person(w, {0, 0});
+        lang_person(w, p1, "person", 800, 3);
+        w.mind(p1).discoveries["method:fire>water>steam"] =
+            mk_record("method:fire>water>steam", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);
+        const PropId pl = tpid(w, "language_id");
+        const PropId pck = tpid(w, "concept_key");
+        const PropId pps = tpid(w, "phoneme_seed");
+        const PropId pgs = tpid(w, "glyph_seed");
+        const PropId pchr = tpid(w, "chronicle");
+        CHECK(tint(*w.find(p1), w, "language_id") > 0);
+        const EntityId cpt = first_kind(w, "semantic_concept");
+        const EntityId entry = first_kind(w, "lexical_entry");
+        const EntityId lang = first_kind(w, "language");
+        CHECK(cpt != kNoEntity);
+        CHECK(entry != kNoEntity);
+        CHECK(lang != kNoEntity);
+        Entity* ce = w.find(cpt);
+        Entity* ee = w.find(entry);
+        CHECK(tint(*ce, w, "concept_key") >= 0);
+        const Value* ckv = w.prop_of(*ce, pck);
+        CHECK(ckv && ckv->type == ValType::Text &&
+              ckv->s == "method:fire>water>steam");
+        const Value* chv = w.prop_of(*ce, pchr);
+        CHECK(chv && chv->type == ValType::Text &&
+              chv->s.find("verified method") != std::string::npos);
+        const std::int64_t ps1 = tint(*ee, w, "phoneme_seed");
+        const std::int64_t gs1 = tint(*ee, w, "glyph_seed");
+        CHECK(ps1 != 0 && gs1 != 0);
+        // phoneme seed reflects species acoustics: same world seed, same
+        // language (same kind), different harshness -> different phoneme,
+        // IDENTICAL glyph (glyph seed is acoustics-free = more stable).
+        World w2(101, "data");
+        const EntityId q1 = mk_person(w2, {0, 0});
+        lang_person(w2, q1, "person", 200, 3);
+        w2.mind(q1).discoveries["method:fire>water>steam"] =
+            mk_record("method:fire>water>steam", DiscoveryStatus::Verified);
+        w2.advance_ticks_for_test(1);
+        const EntityId e2 = first_kind(w2, "lexical_entry");
+        CHECK(e2 != kNoEntity);
+        CHECK(tint(*w2.find(e2), w2, "phoneme_seed") != ps1);
+        CHECK(tint(*w2.find(e2), w2, "glyph_seed") == gs1);
+        // coinage is deterministic across replays
+        World w3(101, "data");
+        const EntityId r1 = mk_person(w3, {0, 0});
+        lang_person(w3, r1, "person", 800, 3);
+        w3.mind(r1).discoveries["method:fire>water>steam"] =
+            mk_record("method:fire>water>steam", DiscoveryStatus::Verified);
+        w3.advance_ticks_for_test(1);
+        CHECK(tint(*w3.find(first_kind(w3, "lexical_entry")), w3,
+                   "phoneme_seed") == ps1);
+        CHECK(tint(*w3.find(first_kind(w3, "lexical_entry")), w3,
+                   "glyph_seed") == gs1);
+        (void)pl; (void)pck; (void)pps; (void)pgs;
+    }
+
+    // ---- B: engrave on granite -> same-language heir reads the lesson ------
+    EntityId sage, stone_s, reader, stone_w;
+    {
+        World w(202, "data");
+        sage = mk_person(w, {0, 0});
+        lang_person(w, sage, "person", 600, 2);
+        w.mind(sage).discoveries["method:x"] =
+            mk_record("method:x", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);           // coins the word
+        const MaterialId granite = w.materials.id_of("granite");
+        const MaterialId drywood = w.materials.id_of("dry_wood");
+        stone_s = w.create_entity("slab", granite, {10, 0});
+        stone_w = w.create_entity("plank", drywood, {30, 0});
+        CHECK(stone_s != kNoEntity && stone_w != kNoEntity);
+        CHECK(w.interact(mk_ctx(sage, {stone_s}, "engrave", 0,
+                                "method:x")).completed);
+        CHECK(w.interact(mk_ctx(sage, {stone_w}, "engrave", 0,
+                                "method:x")).completed);
+        // Inscription entities exist, bound to their surfaces
+        std::size_t ninsc = 0;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription") ++ninsc;
+        CHECK(ninsc == 2);
+        const PropId p_auth = tpid(w, "inscription_author");
+        const PropId p_itk  = tpid(w, "inscription_tick");
+        const PropId p_lvl  = tpid(w, "erosion_level");
+        const PropId p_gtxt = tpid(w, "glyph_text");
+        const PropId p_ckt  = tpid(w, "concept_keys");
+        const PropId p_lang = tpid(w, "language_id");
+        const PropId p_dur  = tpid(w, "inscription_durability");
+        Entity* ins_e = nullptr;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription" &&
+                ep->pos.x == 10) { ins_e = ep.get(); break; }
+        CHECK(ins_e != nullptr);
+        CHECK(tint(*ins_e, w, "inscription_author") ==
+              static_cast<std::int64_t>(sage));
+        CHECK(tint(*ins_e, w, "inscription_tick") > 0);
+        CHECK(tint(*ins_e, w, "erosion_level") == 0);
+        const Value* g = w.prop_of(*ins_e, p_gtxt);
+        CHECK(g && g->type == ValType::Text && !g->s.empty());
+        const Value* ck = w.prop_of(*ins_e, p_ckt);
+        CHECK(ck && ck->type == ValType::Text &&
+              ck->s.find("method:x") != std::string::npos);
+        CHECK(tint(*ins_e, w, "inscription_durability") == 950);
+        CHECK(tint(*ins_e, w, "language_id") ==
+              tint(*w.find(sage), w, "language_id"));
+        (void)p_auth; (void)p_itk; (void)p_lvl; (void)p_lang; (void)p_dur;
+
+        // same-community heir reads the carved lesson without the accident
+        reader = mk_person(w, {20, 0});
+        lang_person(w, reader, "person", 600, 2);
+        w.mind(reader);                  // agent exists -> may hold a language
+        w.advance_ticks_for_test(1);
+        CHECK(w.interact(mk_ctx(reader, {stone_s}, "read", 0)).completed);
+        const AgentMind* rm = w.find_mind(reader);
+        CHECK(rm && rm->discoveries.count("method:x") == 1);
+        CHECK(rm->discoveries.at("method:x").status == DiscoveryStatus::Open);
+
+        // a speaker of a DIFFERENT language sees glyphs, not meaning
+        PropertyBag ab;
+        auto asp = [&](const char* n, std::int64_t v) {
+            const PropId p = pid(w, n);
+            if (p != kNoProp) ab.set(p, Value::integer(v));
+        };
+        asp("age", 300); asp("adult_age", 100); asp("fertility", 500);
+        asp("mutation_rate", 30); asp("metabolism", 50);
+        asp("hunger", 100); asp("thirst", 100); asp("fatigue", 0);
+        asp("energy", 100000); asp("integrity", 1000); asp("reach", 200);
+        asp("communicate_range", 400);
+        const EntityId alien2 = w.create_entity("sapient_b", kNoMaterial,
+                                                {45, 0}, ab);
+        lang_person(w, alien2, "sapient_b", 400, 2);
+        w.mind(alien2);   // ensure mind exists
+        w.advance_ticks_for_test(1);
+        CHECK(w.interact(mk_ctx(alien2, {stone_s}, "read", 0)).completed);
+        const AgentMind* am = w.find_mind(alien2);
+        CHECK(am == nullptr || am->discoveries.count("method:x") == 0);
+        // repeated alien<->sage contact builds foreign familiarity -> bilingual
+        for (int i = 0; i < 9; ++i)
+            w.interact(mk_ctx(sage, {alien2}, "communicate", 0));
+        std::int64_t best = 0;
+        for (const auto& [bk, bv] : w.find_mind(alien2)->beliefs)
+            if (bk.rfind("lex:", 0) == 0) best = std::max(best, bv.confidence);
+        CHECK(best >= 500);      // bilingual threshold crossed
+        // erosion: wood fades, granite endures — same window, both exact
+        w.advance_ticks_for_test(1300);
+        Entity* wi = nullptr; Entity* si = nullptr;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive || ep->kind_name != "inscription") continue;
+            if (ep->pos.x == 30) wi = ep.get();
+            if (ep->pos.x == 10) si = ep.get();
+        }
+        CHECK(wi && si);
+        CHECK(tint(*wi, w, "erosion_level") >= 1000);
+        const Value* wg = w.prop_of(*wi, p_gtxt);
+        CHECK(wg && wg->type == ValType::Text && wg->s.empty());
+        CHECK(tint(*si, w, "erosion_level") < 1000);
+        const Value* sg = w.prop_of(*si, p_gtxt);
+        CHECK(sg && sg->type == ValType::Text && !sg->s.empty());
+        // codex export: raw glyphs + objective chronicle + decipher ratio
+        const std::string codex = w.export_lexicon_codex();
+        CHECK(codex.find("LANG ") != std::string::npos);
+        CHECK(codex.find("ENTRY ") != std::string::npos);
+        CHECK(codex.find("phonemes=") != std::string::npos);
+        CHECK(codex.find("glyphs=") != std::string::npos);
+        CHECK(codex.find("chronicle=") != std::string::npos);
+        CHECK(codex.find("verified method method:x") != std::string::npos);
+        CHECK(codex.find("deciphered_ratio") != std::string::npos);
+        CHECK(codex.find("INSCRIPTION ") != std::string::npos);
+        // save/load roundtrip preserves the whole language world
+        const std::uint64_t h = w.state_hash();
+        const std::string path = "/tmp/simlab_lang_test.sav";
+        CHECK(w.save(path));
+        World w2(202, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+    }
+
+    // ---- C/D: dialect drift LOD-exactness + bilingual threshold -------------
+    {
+        auto build = [](World& w) {
+            const EntityId a = mk_person(w, {0, 0});
+            lang_person(w, a, "person", 700, 2);
+            w.mind(a).discoveries["method:d"] =
+                mk_record("method:d", DiscoveryStatus::Verified);
+            PropertyBag bb;
+            auto bsp = [&](const char* n, std::int64_t v) {
+                const PropId p = pid(w, n);
+                if (p != kNoProp) bb.set(p, Value::integer(v));
+            };
+            bsp("age", 300); bsp("adult_age", 100); bsp("fertility", 500);
+            bsp("mutation_rate", 30); bsp("metabolism", 50);
+            bsp("hunger", 100); bsp("thirst", 100); bsp("fatigue", 0);
+            bsp("energy", 100000); bsp("integrity", 1000); bsp("reach", 200);
+            bsp("communicate_range", 400);
+            bsp("vocal_capability", 900); bsp("phoneme_harshness", 500);
+            bsp("syllable_length_bias", 2); bsp("hardness", 500);
+            const EntityId b = w.create_entity("sapient_b", kNoMaterial,
+                                              {500, 0}, bb);
+            w.mind(b);
+            w.advance_ticks_for_test(1);
+            return std::pair<EntityId, EntityId>{a, b};
+        };
+        World wt(404, "data"), wb(404, "data");
+        build(wt); build(wb);
+        const PropId p_dacc = tpid(wt, "dialect_drift_accum");
+        const PropId p_droll = tpid(wt, "dialect_drift_rolls");
+        const PropId p_ps    = tpid(wt, "phoneme_seed");
+        const PropId p_gs    = tpid(wt, "glyph_seed");
+        const auto snap = [&](World& w) {
+            std::vector<std::int64_t> v;
+            for (const auto& ep : w.entities) {
+                if (!ep->alive) continue;
+                if (ep->kind_name == "language") {
+                    v.push_back(tint(*ep, w, "dialect_drift_accum"));
+                    v.push_back(tint(*ep, w, "dialect_drift_rolls"));
+                } else if (ep->kind_name == "lexical_entry") {
+                    v.push_back(tint(*ep, w, "phoneme_seed"));
+                    v.push_back(tint(*ep, w, "glyph_seed"));
+                }
+            }
+            return v;
+        };
+        // two isolated single-member languages drift; 1200 ticks > 1 roll
+        for (int i = 0; i < 600; ++i) wt.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(600);
+        CHECK(snap(wt) == snap(wb));       // LOD: dt=1 x 600 == dt=600
+        for (int i = 0; i < 600; ++i) wt.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(600);
+        CHECK(snap(wt) == snap(wb));       // and again to 1200
+        // drift actually happened: at least one language rolled
+        bool rolled = false;
+        for (const auto& ep : wb.entities)
+            if (ep->alive && ep->kind_name == "language" &&
+                tint(*ep, wb, "dialect_drift_rolls") > 0) rolled = true;
+        CHECK(rolled);
+        // glyph seeds untouched by dialect drift (stable script)
+        // (phoneme seeds differ from coinage-time only via rolls; glyph equal
+        //  across wt/wb was already proven by snap equality)
+        (void)p_dacc; (void)p_droll; (void)p_ps; (void)p_gs;
+    }
+}
+
+// Phase 12 base core: compositional atoms/clauses, portable + Rosetta
+// inscriptions, semantic drift, per-entry decipherment, LOD, save.
+static void test_causal_language_syntax_rosetta_and_inscriptions() {
+    const char* DKEY = "heat+stagnant_water->fever";
+
+    // ---- A: atomic coinage — atoms + relation atoms + per-atom entries ----
+    {
+        World w(111, "data");
+        const EntityId a = mk_person(w, {0, 0});
+        lang_person(w, a, "person", 800, 3);
+        w.mind(a).known_actions.insert("heat");
+        w.mind(a).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);
+        // semantic_atom entities exist with atom_key/atom_kind
+        std::size_t natom = 0, nentry = 0;
+        bool saw_rel = false, saw_heat_kind2 = false;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive) continue;
+            if (ep->kind_name == "semantic_atom") {
+                ++natom;
+                const std::string ak = tint(*ep, w, "atom_key") < 0 ? ""
+                    : ([&]{ const Value* v=w.prop_of(*ep,tpid(w,"atom_key"));
+                            return v&&v->type==ValType::Text?v->s:std::string(); })();
+                const std::int64_t kd = tint(*ep, w, "atom_kind");
+                if (ak == "rel:causes" && kd == 4) saw_rel = true;
+                if (ak == "heat" && kd == 2) saw_heat_kind2 = true;
+            } else if (ep->kind_name == "lexical_entry") ++nentry;
+        }
+        CHECK(natom >= 4);            // heat, stagnant_water, fever, rel:causes
+        CHECK(saw_rel);
+        CHECK(saw_heat_kind2);        // 'heat' is a known action -> kind 2
+        CHECK(nentry >= natom + 1);   // atom words + whole-concept word
+        // every lexical_entry carries a semantic_shift_seed
+        bool all_ssd = true;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive || ep->kind_name != "lexical_entry") continue;
+            if (tint(*ep, w, "semantic_shift_seed") == 0) all_ssd = false;
+        }
+        CHECK(all_ssd);
+        // glyph seed folds glyph_angularity: same seed/lang/atom, different
+        // angularity -> different glyph, same phoneme
+        World wa(111, "data"), wb(111, "data");
+        const EntityId pa = mk_person(wa, {0, 0});
+        lang_person(wa, pa, "person", 800, 3);
+        tseti(*wa.find(pa), wa, "glyph_angularity", 100);
+        wa.mind(pa).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        const EntityId pb = mk_person(wb, {0, 0});
+        lang_person(wb, pb, "person", 800, 3);
+        tseti(*wb.find(pb), wb, "glyph_angularity", 950);
+        wb.mind(pb).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        wa.advance_ticks_for_test(1); wb.advance_ticks_for_test(1);
+        // compare the atom-entry glyph seeds (concept_key == "heat")
+        auto find_atom_entry = [](World& ww, const char* ck) -> EntityId {
+            const PropId pck = tpid(ww, "concept_key");
+            for (const auto& ep : ww.entities) {
+                if (!ep->alive || ep->kind_name != "lexical_entry") continue;
+                const Value* v = ww.prop_of(*ep, pck);
+                if (v && v->type == ValType::Text && v->s == ck)
+                    return ep->id;
+            }
+            return kNoEntity;
+        };
+        const EntityId ea = find_atom_entry(wa, "heat");
+        const EntityId eb = find_atom_entry(wb, "heat");
+        CHECK(ea != kNoEntity && eb != kNoEntity);
+        CHECK(tint(*wa.find(ea), wa, "glyph_seed") !=
+              tint(*wb.find(eb), wb, "glyph_seed"));
+        CHECK(tint(*wa.find(ea), wa, "phoneme_seed") ==
+              tint(*wb.find(eb), wb, "phoneme_seed"));
+    }
+
+    // ---- B: portable clay inscription carries a CausalClause; heir reads --
+    EntityId clay, sage2, heir2;
+    {
+        World w(222, "data");
+        sage2 = mk_person(w, {0, 0});
+        lang_person(w, sage2, "person", 700, 2);
+        w.mind(sage2).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        // a second rule sharing atoms: coins "cold"/"cramp" too, so semantic
+        // drift has neighbors OUTSIDE the carved clause to land on.
+        w.mind(sage2).discoveries["cold+stagnant_water->cramp"] =
+            mk_record("cold+stagnant_water->cramp", DiscoveryStatus::Verified);
+        w.mind(sage2).discoveries["ice+heat->melt"] =
+            mk_record("ice+heat->melt", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);
+        const MaterialId claym = w.materials.id_of("soil_clay");
+        clay = w.create_entity("tablet", claym, {50, 0});
+        CHECK(clay != kNoEntity);
+        CHECK(w.interact(mk_ctx(sage2, {clay}, "engrave", 0, DKEY)).completed);
+        // find the Inscription on the clay
+        Entity* ins = nullptr;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription") ins = ep.get();
+        CHECK(ins != nullptr);
+        const Value* cl = w.prop_of(*ins, tpid(w, "clause_atoms"));
+        CHECK(cl && cl->type == ValType::Text && !cl->s.empty());
+        CHECK(cl->s.find(':') != std::string::npos);   // "lang:id,.." form
+        CHECK(tint(*ins, w, "portable_surface") == 1000);
+        CHECK(tint(*ins, w, "language_id2") == 0);     // monolingual so far
+        // heir of the same speech community reads -> discovery + word fam
+        heir2 = mk_person(w, {80, 0});
+        lang_person(w, heir2, "person", 700, 2);
+        w.mind(heir2);
+        w.advance_ticks_for_test(1);
+        CHECK(w.interact(mk_ctx(heir2, {clay}, "read", 0)).completed);
+        const AgentMind* hm = w.find_mind(heir2);
+        CHECK(hm && hm->discoveries.count(DKEY) == 1);
+        std::int64_t lexhits = 0;
+        for (const auto& [bk, bv] : hm->beliefs)
+            if (bk.rfind("lex:", 0) == 0 && bv.confidence >= 200) ++lexhits;
+        CHECK(lexhits >= 2);      // clause words transferred, not just glyphs
+        // ---- C: erosion + semantic drift on the weathered tablet ----------
+        w.advance_ticks_for_test(1400);   // clay (dur 600) crosses erosion 400
+        Entity* ins2 = nullptr;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription") ins2 = ep.get();
+        CHECK(ins2 != nullptr);
+        CHECK(tint(*ins2, w, "erosion_level") > 400);
+        // repeated reads of the SAME weathered text at different ticks:
+        // deterministic semantic drift spills familiarity onto a NEIGHBOR
+        // atom's word — a word that is NOT in the clause.
+        std::set<EntityId> clause_ids;
+        if (cl && cl->type == ValType::Text) {
+            // parse "lang:ids" segment
+            const auto colon = cl->s.find(':');
+            const auto semi = cl->s.find(';');
+            const std::string seg = cl->s.substr(
+                colon + 1, semi == std::string::npos
+                    ? std::string::npos : semi - colon - 1);
+            std::istringstream is(seg); std::string num;
+            while (std::getline(is, num, ','))
+                try { clause_ids.insert(static_cast<EntityId>(
+                    std::stoull(num))); } catch (...) {}
+        }
+        for (int i = 0; i < 24; ++i) {
+            w.advance_ticks_for_test(1);
+            w.interact(mk_ctx(heir2, {clay}, "read", 0));
+        }
+        bool drifted = false;
+        for (const auto& [bk, bv] : hm->beliefs) {
+            if (bk.rfind("lex:", 0) != 0 || bv.confidence < 60) continue;
+            try {
+                const EntityId eid = static_cast<EntityId>(
+                    std::stoull(bk.substr(4)));
+                if (!clause_ids.count(eid)) { drifted = true; break; }
+            } catch (...) {}
+        }
+        CHECK(drifted);   // neighbor-atom reinterpretation actually happened
+        // codex shows atoms, per-entry decipherment, clause payload
+        const std::string codex = w.export_lexicon_codex();
+        CHECK(codex.find("ATOM ") != std::string::npos);
+        CHECK(codex.find("deciphered=") != std::string::npos);
+        CHECK(codex.find("clause=") != std::string::npos);
+        CHECK(codex.find("portable=1000") != std::string::npos);
+    }
+
+    // ---- D/E: Rosetta — bilingual author carves two languages; a reader
+    // who knows only one auto-learns the other's words --------------------
+    {
+        World w(333, "data");
+        // lang A speaker and lang B speaker, BOTH holding the same discovery
+        const EntityId aA = mk_person(w, {0, 0});
+        lang_person(w, aA, "person", 600, 2);
+        w.mind(aA).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        PropertyBag bb;
+        auto bsp = [&](const char* n, std::int64_t v) {
+            const PropId p = pid(w, n);
+            if (p != kNoProp) bb.set(p, Value::integer(v));
+        };
+        bsp("age", 300); bsp("adult_age", 100); bsp("fertility", 500);
+        bsp("mutation_rate", 30); bsp("metabolism", 50);
+        bsp("hunger", 100); bsp("thirst", 100); bsp("fatigue", 0);
+        bsp("energy", 100000); bsp("integrity", 1000); bsp("reach", 200);
+        bsp("communicate_range", 400);
+        bsp("vocal_capability", 900); bsp("phoneme_harshness", 400);
+        bsp("syllable_length_bias", 2); bsp("hardness", 900);
+        bsp("communicate_range", 4000);
+        const EntityId bB = w.create_entity("sapient_b", kNoMaterial,
+                                           {300, 0}, bb);
+        w.mind(bB).discoveries[DKEY] =
+            mk_record(DKEY, DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);
+        // B teaches A its words until A is bilingual on B's entries
+        for (int i = 0; i < 12; ++i)
+            w.interact(mk_ctx(bB, {aA}, "communicate", 0));
+        std::int64_t bfamA_on_B = 0;
+        {
+            const PropId pl = tpid(w, "language_id");
+            const std::int64_t langB = tint(*w.find(bB), w, "language_id");
+            const AgentMind* am = w.find_mind(aA);
+            for (const auto& [bk, bv] : am->beliefs) {
+                if (bk.rfind("lex:", 0) != 0) continue;
+                try {
+                    const EntityId eid = static_cast<EntityId>(
+                        std::stoull(bk.substr(4)));
+                    const Entity* le = w.find(eid);
+                    if (le && le->alive &&
+                        w.prop_int(*le, pl, 0) == langB)
+                        bfamA_on_B = std::max(bfamA_on_B, bv.confidence);
+                } catch (...) {}
+            }
+        }
+        CHECK(bfamA_on_B >= 500);    // A is bilingual in B's tongue
+        // A carves the same clause in BOTH languages (Rosetta stone)
+        const MaterialId claym = w.materials.id_of("soil_clay");
+        const EntityId tablet = w.create_entity("tablet", claym, {30, 0});
+        CHECK(w.interact(mk_ctx(aA, {tablet}, "engrave", 0, DKEY)).completed);
+        Entity* rins = nullptr;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription") rins = ep.get();
+        CHECK(rins != nullptr);
+        const Value* cl2 = w.prop_of(*rins, tpid(w, "clause_atoms"));
+        CHECK(cl2 && cl2->type == ValType::Text);
+        CHECK(cl2->s.find(';') != std::string::npos);   // two clauses
+        CHECK(tint(*rins, w, "language_id2") > 0);
+        // reader C speaks only lang A — reads, learns the lesson AND B's words
+        const EntityId cC = mk_person(w, {60, 0});
+        lang_person(w, cC, "person", 600, 2);
+        w.mind(cC);
+        w.advance_ticks_for_test(1);
+        CHECK(w.interact(mk_ctx(cC, {tablet}, "read", 0)).completed);
+        const AgentMind* cm = w.find_mind(cC);
+        CHECK(cm && cm->discoveries.count(DKEY) == 1);
+        // Rosetta payoff: familiarity on lang-B clause entries (second segment)
+        const PropId pl = tpid(w, "language_id");
+        const std::int64_t langB = tint(*w.find(bB), w, "language_id");
+        std::int64_t rosetta_hits = 0;
+        for (const auto& [bk, bv] : cm->beliefs) {
+            if (bk.rfind("lex:", 0) != 0 || bv.confidence < 250) continue;
+            try {
+                const EntityId eid = static_cast<EntityId>(
+                    std::stoull(bk.substr(4)));
+                const Entity* le = w.find(eid);
+                if (le && le->alive &&
+                    w.prop_int(*le, pl, 0) == langB) ++rosetta_hits;
+            } catch (...) {}
+        }
+        CHECK(rosetta_hits >= 1);   // words of the UNKNOWN language learned
+        (void)pl;
+    }
+
+    // ---- F: LOD invariance + save roundtrip on the new machinery ---------
+    {
+        auto build = [&](World& w) {
+            const EntityId a = mk_person(w, {0, 0});
+            lang_person(w, a, "person", 700, 2);
+            w.mind(a).known_actions.insert("heat");
+            w.mind(a).discoveries[DKEY] =
+                mk_record(DKEY, DiscoveryStatus::Verified);
+            const MaterialId claym = w.materials.id_of("soil_clay");
+            const EntityId tab = w.create_entity("tablet", claym, {20, 0});
+            w.interact(mk_ctx(a, {tab}, "engrave", 0, DKEY));
+            // coinage must land BEFORE the compared window: language_tick
+            // runs once per advance_ticks call, so a batched advance would
+            // otherwise birth the language entity at the window's end.
+            w.advance_ticks_for_test(1);
+            // keep the language registry inside the LOD radius of its mind
+            // so drift accrues per-tick identically in both modes (a dormant
+            // entity legitimately holds a <kDormantStride backlog).
+            for (const auto& ep : w.entities)
+                if (ep->alive && ep->kind_name == "language")
+                    ep->pos = {0, 0};
+            return tab;
+        };
+        World wt(555, "data"), wb(555, "data");
+        build(wt); build(wb);
+        // influx migrants legitimately spawn mid-window (ecology spawn-commit
+        // class) and birth their own language community — compare only the
+        // entities that already existed, whose drift must be LOD-exact.
+        std::set<EntityId> pre;
+        for (const auto& ep : wt.entities) if (ep->alive) pre.insert(ep->id);
+        const auto snap = [&](World& w) {
+            std::vector<std::int64_t> v;
+            for (const auto& ep : w.entities) {
+                if (!ep->alive || !pre.count(ep->id)) continue;
+                if (ep->kind_name == "language")
+                    v.push_back(tint(*ep, w, "dialect_drift_accum"));
+                else if (ep->kind_name == "inscription")
+                    v.push_back(tint(*ep, w, "erosion_level"));
+                else if (ep->kind_name == "lexical_entry")
+                    v.push_back(tint(*ep, w, "semantic_shift_seed"));
+            }
+            return v;
+        };
+        for (int i = 0; i < 300; ++i) wt.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(300);
+        CHECK(snap(wt) == snap(wb));
+        const std::uint64_t h = wb.state_hash();
+        const std::string path = "/tmp/simlab_lang2_test.sav";
+        CHECK(wb.save(path));
+        World w2(555, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+    }
+}
+
 int main() {
     test_registries();
     test_new_material_data_only();
@@ -6380,6 +6949,8 @@ int main() {
     test_zoonosis_sterilization_and_burial();
     test_plant_blight_monoculture_and_soil_cleansing();
     test_vector_ecology_selection_and_herd_immunity();
+    test_causal_language_dialect_drift_and_inscriptions();
+    test_causal_language_syntax_rosetta_and_inscriptions();
     test_infection_and_primitive_medicine();
     test_neuro_psychopathology();
     test_phase9_autonomous_civilization();

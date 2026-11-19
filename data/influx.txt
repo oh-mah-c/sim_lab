@@ -47,6 +47,10 @@ influx_zone northern_pass
     prop fertility 120
     prop mutation_rate 50
     prop communicate_range 250
+    prop vocal_capability 900
+    prop phoneme_harshness 450
+    prop syllable_length_bias 3
+    prop hardness 650
     gene speed 8000
     gene metabolism 2000
     gene sight_range 800
@@ -56,3 +60,136 @@ influx_zone northern_pass
     innate reproduce
     innate rest
     innate move
+    innate wield
+    innate unwield
+    innate dig
+    innate chop
+    innate strike
+    innate impact
+    innate process
+    innate heat
+    innate assemble
+    innate disassemble
+    innate treat
+    innate evacuate
+    innate communicate
+    innate read
+    innate engrave
+
+  # A second migrant line — same `forager` kind (same language_id) but a
+  # narrower instinct set. Differing known_actions is exactly what makes the
+  # Driver's communicate reflex fire, so knowledge and vocabulary flow
+  # from the tool-bearers to the innocents (ostensive transmission).
+  migrant straggler
+    kind forager
+    prop hunger 0
+    prop thirst 0
+    prop fatigue 0
+    prop metabolism 2000
+    prop speed 8000
+    prop sight_range 800
+    prop reach 300
+    prop energy 300000
+    prop max_energy 300000
+    prop integrity 800
+    prop age 0
+    prop adult_age 120
+    prop fertility 120
+    prop mutation_rate 50
+    prop communicate_range 250
+    prop vocal_capability 900
+    prop phoneme_harshness 450
+    prop syllable_length_bias 3
+    prop hardness 650
+    gene speed 8000
+    gene metabolism 2000
+    gene sight_range 800
+    gene fertility 120
+    gene mutation_rate 50
+    innate consume
+    innate reproduce
+    innate rest
+    innate move
+    innate communicate
+
+influx_zone inland_band
+  bounds 500 500 1500 1500
+  interval 2000
+  capacity 8
+  migrants 3
+  migrant forager
+    kind forager
+    prop hunger 0
+    prop thirst 0
+    prop fatigue 0
+    prop metabolism 2000
+    prop speed 8000
+    prop sight_range 800
+    prop reach 300
+    prop energy 300000
+    prop max_energy 300000
+    prop integrity 800
+    prop age 0
+    prop adult_age 120
+    prop fertility 120
+    prop mutation_rate 50
+    prop communicate_range 250
+    prop vocal_capability 900
+    prop phoneme_harshness 450
+    prop syllable_length_bias 3
+    prop hardness 650
+    gene speed 8000
+    gene metabolism 2000
+    gene sight_range 800
+    gene fertility 120
+    gene mutation_rate 50
+    innate consume
+    innate reproduce
+    innate rest
+    innate move
+    innate wield
+    innate unwield
+    innate dig
+    innate chop
+    innate strike
+    innate impact
+    innate process
+    innate heat
+    innate assemble
+    innate disassemble
+    innate treat
+    innate evacuate
+    innate communicate
+    innate read
+    innate engrave
+  migrant straggler
+    kind forager
+    prop hunger 0
+    prop thirst 0
+    prop fatigue 0
+    prop metabolism 2000
+    prop speed 8000
+    prop sight_range 800
+    prop reach 300
+    prop energy 300000
+    prop max_energy 300000
+    prop integrity 800
+    prop age 0
+    prop adult_age 120
+    prop fertility 120
+    prop mutation_rate 50
+    prop communicate_range 250
+    prop vocal_capability 900
+    prop phoneme_harshness 450
+    prop syllable_length_bias 3
+    prop hardness 650
+    gene speed 8000
+    gene metabolism 2000
+    gene sight_range 800
+    gene fertility 120
+    gene mutation_rate 50
+    innate consume
+    innate reproduce
+    innate rest
+    innate move
+    innate communicate

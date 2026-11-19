@@ -31,6 +31,8 @@ material dry_wood
   length 1200
   residue charcoal
   residue_share 250
+  inscription_durability 150
+  carving_hardness_req 150
 
   absorbency 400
   contamination 200
@@ -57,6 +59,8 @@ material hardwood
   length 1500
   residue charcoal
   residue_share 250
+  inscription_durability 250
+  carving_hardness_req 250
 
   absorbency 300
   contamination 250
@@ -81,6 +85,8 @@ material stone
   geom_thk 120
   edge 500
   length 0
+  inscription_durability 900
+  carving_hardness_req 700
 
   contamination 300
 material flint
@@ -104,6 +110,8 @@ material flint
   geom_thk 50
   edge 900
   length 0
+  inscription_durability 800
+  carving_hardness_req 750
 
   contamination 350
 material obsidian
@@ -127,6 +135,8 @@ material obsidian
   geom_thk 40
   edge 700
   length 0
+  inscription_durability 750
+  carving_hardness_req 800
 
 # ---- raw substances (natural occurrences yield these before processing) ------
   contamination 400
@@ -150,6 +160,8 @@ material copper_ore
   geom_thk 100
 
   contamination 500
+  inscription_durability 750
+  carving_hardness_req 500
 material iron_ore
   hardness 700
   brittleness 450
@@ -168,6 +180,8 @@ material iron_ore
   geom_len 100
   geom_wid 100
   geom_thk 100
+  inscription_durability 800
+  carving_hardness_req 550
 
   contamination 600
 material host_rock
@@ -187,6 +201,8 @@ material host_rock
 
 # ---- geological materials (lithology: 1=igneous 2=sedimentary 3=metamorphic) --
   contamination 400
+  inscription_durability 850
+  carving_hardness_req 650
 material granite
   hardness 900
   brittleness 250
@@ -202,6 +218,8 @@ material granite
   speed 0
   opacity 1000
   lithology 1
+  inscription_durability 950
+  carving_hardness_req 800
 
   contamination 300
 material basalt
@@ -287,6 +305,8 @@ material marble
   speed 0
   opacity 1000
   lithology 3
+  inscription_durability 850
+  carving_hardness_req 650
 
 # ---- soils (top stratum; type follows parent rock + climate) -------------------
   contamination 350
@@ -350,6 +370,9 @@ material soil_clay
   speed 0
   opacity 1000
   soil_texture 3
+  inscription_durability 600
+  carving_hardness_req 400
+  portable_surface 1000
 
 # ---- organic / energy substances ----------------------------------------------
   contamination 800
@@ -414,6 +437,8 @@ material gold_quartz
   geom_len 60
   geom_wid 60
   geom_thk 60
+  inscription_durability 700
+  carving_hardness_req 500
 
 # Animal body (fauna species in species.txt are made of it).
   contamination 500
@@ -441,6 +466,8 @@ material flesh
   nutrition 700
   hydration 300
   tensile 250
+  inscription_durability 60
+  carving_hardness_req 30
 
 # ---- processed / fuel / waste materials (Phase 3 processing outputs) ----------
   contamination 300
@@ -464,6 +491,8 @@ material copper_metal
   geom_len 60
   geom_wid 60
   geom_thk 60
+  inscription_durability 700
+  carving_hardness_req 500
 
   contamination 250
 material charcoal
@@ -486,6 +515,8 @@ material charcoal
   geom_len 300
   geom_wid 60
   geom_thk 60
+  inscription_durability 300
+  carving_hardness_req 200
 
   mutagenic 250
 
@@ -527,6 +558,8 @@ material iron_blade
   speed 0
   opacity 1000
   tensile 850
+  inscription_durability 800
+  carving_hardness_req 600
 
 # ---- forageable wild food (physiology: nutrition/hydration are World Truth --
 # agents must discover edibility by consuming or by witness, never by lookup)
@@ -610,6 +643,8 @@ material living_wood
   geom_len 80
   geom_wid 80
   geom_thk 80
+  inscription_durability 200
+  carving_hardness_req 200
 
 # Dormant propagule — the seed-bank layer. Left behind where a fruiting plant
 # dies (see `death_drops` on species). It is World Truth biomass: light,
@@ -659,6 +694,8 @@ material wood_debris
   sight_range 0
   speed 0
   opacity 1000
+  inscription_durability 100
+  carving_hardness_req 100
 
 # ---- biological tissue & body fluids (Phase 10 anatomy) -------------------
 # Layered body materials: skin resists cuts, muscle transmits force,
@@ -690,6 +727,8 @@ material skin
   hydration 600
   tensile 400
   edge 100
+  inscription_durability 80
+  carving_hardness_req 50
 
   absorbency 400
   contamination 250
@@ -739,6 +778,9 @@ material bone
   hydration 100
   tensile 900
   edge 300
+  inscription_durability 500
+  carving_hardness_req 400
+  portable_surface 1000
 
   contamination 150
 material organ
@@ -948,3 +990,5 @@ material ash
   burial_medium 900
   contamination 0
   sterilization_temp 0
+  inscription_durability 50
+  carving_hardness_req 10

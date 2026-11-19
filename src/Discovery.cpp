@@ -1134,4 +1134,47 @@ bool discover_step(World& w, EntityId npc, ExploreGoal* out_explore) {
     return false;
 }
 
+// ---- compositional proto-language --------------------------------------------
+std::vector<AtomRef> decompose_key(const std::string& key,
+                                   const std::set<std::string>& verbs) {
+    std::vector<AtomRef> out;
+    std::string tok;
+    auto flush = [&]() {
+        if (tok.empty()) return;
+        AtomRef a;
+        a.key = tok;
+        a.kind = verbs.count(tok) ? 2 : 1;
+        // collapse immediate duplicates ("a+a" -> one atom)
+        if (out.empty() || out.back().key != a.key || out.back().kind != a.kind)
+            out.push_back(a);
+        tok.clear();
+    };
+    auto op = [&](const char* rel) {
+        flush();
+        const std::string rk = std::string("rel:") + rel;
+        if (out.empty() || out.back().key != rk) {
+            AtomRef a; a.key = rk; a.kind = 4; out.push_back(a);
+        }
+    };
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        const char c = key[i];
+        if (c == ' ' || c == '\t' || c == ',' || c == ';' || c == '|') { flush(); continue; }
+        if (c == '+') { op("and"); continue; }
+        if (c == '!') { op("not"); continue; }
+        if (c == '-' && i + 1 < key.size() && key[i + 1] == '>') {
+            op("causes"); ++i; continue;
+        }
+        if (c == '>') { op("causes"); continue; }
+        if (c == '<' && i + 1 < key.size() && key[i + 1] == '-') {
+            op("caused_by"); ++i; continue;
+        }
+        if (c == '<') { op("caused_by"); continue; }
+        if (c == '=') { flush(); continue; }
+        tok.push_back(c);
+    }
+    flush();
+    return out;
+}
+
+
 }  // namespace simlab

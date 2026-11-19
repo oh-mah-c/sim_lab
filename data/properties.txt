@@ -330,3 +330,39 @@ immune_cost_permille integer permille    range 0 1000     domain=biological # me
 immune_cost_accum    integer  milli-units range 0 100000000 domain=physical # immune-cost energy drain remainder (internal)
 passive_sig_count    integer  units        range 0 8       domain=biological # leading immune_sig slots borrowed from the mother (cleared on expiry)
 repro_mutation_rolls integer  units        range 0 1000000000 domain=biological # monotonic per-actor reproduction counter (internal)
+
+# ---- causal proto-language, dialects & inscriptions (Phase 12.1) ----
+vocal_capability     integer  permille     range 0 1000    domain=biological # species: ability to produce structured vocalization (0 plants, ~150 beasts, 800+ sapient)
+phoneme_harshness    integer  permille     range 0 1000    domain=biological # species: consonant harshness bias folded into phoneme seeds
+syllable_length_bias integer  units        range 1 4       domain=biological # species: mean syllable count per coined word
+glyph_angularity       integer  permille     range 0 1000    domain=biological # species: angularity bias folded into glyph seeds (high = rune-like strokes)
+language_id          integer  units        range 0 1000000000 domain=social  # individual: speech community id (0 = no language yet)
+concept_key          text     none       domain=social     # semantic_concept/lexical_entry: stable causal concept id (discovery key or cause>action>effect signature)
+concept_kind         integer  units        range 0 10      domain=social     # semantic_concept: 1 object, 2 action, 3 bio-state, 4 causal-rule
+cause_key            text     none       domain=social     # semantic_concept (rule): cause side of the causal signature
+action_key           text     none       domain=social     # semantic_concept: action verb of the causal signature
+effect_key           text     none       domain=social     # semantic_concept (rule): effect side of the causal signature
+chronicle            text     none       domain=social     # semantic_concept: objective World-Truth description of the fact
+phoneme_seed         integer  units        range 0 4294967295 domain=social  # lexical_entry: spoken form seed (drifts with dialect)
+glyph_seed           integer  units        range 0 4294967295 domain=social  # lexical_entry: written form seed (stable once script is fixed)
+glyph_text           text     none       domain=social     # inscription: rendered glyph string carved on the surface
+concept_keys         text     none       domain=social     # inscription: '|'-joined concept keys in glyph order
+language_name        integer  units        range 0 1000000000 domain=social  # language: community id this registry entity tracks
+dialect_drift_accum  integer  milli-units  range 0 100000000 domain=physical  # language: drift quantum remainder (internal)
+dialect_drift_rate   integer  milli-units/tick range 0 1000 domain=social    # language: base drift rate while members stay in contact
+dialect_drift_iso    integer  permille     range 0 1000    domain=social     # language: isolation multiplier when no two members are in comm range
+dialect_drift_rolls  integer  units        range 0 1000000000 domain=physical # language: monotonic dialect-shift counter (internal)
+bilingual_familiarity integer permille     range 0 1000    domain=social     # mind-side threshold (species/material): familiarity that counts as bilingual
+inscription_durability integer permille    range 0 1000    domain=physical   # material/entity: how long carved glyphs survive weathering
+carving_hardness_req integer  units        range 0 1000    domain=physical   # material: minimum tool hardness needed to carve it
+erosion_level        integer  permille     range 0 1000    domain=physical   # inscription: 0 pristine .. 1000 illegible
+erosion_accum        integer  milli-units  range 0 100000000 domain=physical   # inscription: erosion quantum remainder (internal)
+semantic_shift_seed  integer  units        range 0 4294967295 domain=social  # lexical_entry: accumulated oral-semantic drift seed (neighbor-atom reinterpretation)
+atom_key              text     none       domain=social     # semantic_atom: stable atomic-meaning id (object/action/state/relation signature)
+atom_kind             integer  units        range 0 10      domain=social     # semantic_atom: 1 object, 2 action, 3 bio-state, 4 relation (CAUSE/NEGATE/RESULT)
+clause_atoms          text     none       domain=social     # inscription: ';'-joined causal clauses, each "lang:entryId,entryId,..." in clause order
+language_id2          integer  units        range 0 1000000000 domain=social  # inscription: second language_id for bilingual (Rosetta) carvings
+portable_surface      integer  permille     range 0 1000    domain=physical   # material/entity: may be carried as a mobile inscription medium (clay tablet, bone)
+inscription_author   integer  units                     domain=social  # inscription: entity id of the carver (kNoEntity=0 when unknown)
+inscription_tick     integer  ticks        range 0 1000000000 domain=social  # inscription: world tick the carving was made
+dialect_drift_threshold integer milli-units range 1 100000000 domain=social # language: accum per phoneme-shift roll
