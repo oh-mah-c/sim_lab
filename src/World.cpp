@@ -2595,6 +2595,12 @@ void World::metabolize(std::int64_t dt) {
         }
     }
 
+    // Phase 12.2: entities carrying ONLY economic props still need a pass
+    const PropId econ_poss = props.find_name("possessed_by")
+        ? props.find_name("possessed_by")->id : kNoProp;
+    const PropId econ_theft = props.find_name("theft_flag")
+        ? props.find_name("theft_flag")->id : kNoProp;
+
     CausalEvent ev;
     ev.tick = now;
     ev.action = "metabolize";
@@ -2662,6 +2668,12 @@ void World::metabolize(std::int64_t dt) {
                     const PropertyDef* ed = props.find_name(en);
                     if (ed && e.props.get(ed->id)) { maybe = true; break; }
                 }
+            if (!maybe && (econ_poss != kNoProp &&
+                           e.props.get(econ_poss)) ||
+                          (econ_theft != kNoProp &&
+                           e.props.get(econ_theft)) ||
+                          e.kind_name == "debt_obligation")
+                maybe = true;
             if (!maybe && e.material != kNoMaterial &&
                 e.material - 1 < mat_need_flags_.size() &&
                 mat_need_flags_[e.material - 1])
@@ -2687,6 +2699,7 @@ void World::metabolize(std::int64_t dt) {
                 flora_drift(e, 1, sub_now, ev, drift_spawns);
                 if (is_vec) vector_drift(e, 1, sub_now, ev, drift_spawns);
                 language_drift(e, 1, sub_now, ev);
+                econ_drift(e, 1, sub_now, ev);
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -2699,6 +2712,7 @@ void World::metabolize(std::int64_t dt) {
             vector_drift(e, static_cast<std::int64_t>(pending), now, ev,
                          drift_spawns);
             language_drift(e, static_cast<std::int64_t>(pending), now, ev);
+            econ_drift(e, static_cast<std::int64_t>(pending), now, ev);
         }
         // Phase 11: standing water fouls into a stagnation reservoir on the
         // same batched, accumulator-exact contract as every other drift.
@@ -4544,8 +4558,10 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     }
     // social consequences (Phase 8): knowledge transfer for communicate/
     // read, trust penalties for rule violations — all post-commit, minds only
-    if (const CausalEvent* sev = ledger.find(res.event))
+    if (const CausalEvent* sev = ledger.find(res.event)) {
         social_from_event(*this, ctx.actor, ctx.targets, *sev);
+        simlab::econ_from_event(*this, ctx.actor, ctx.targets, *sev);
+    }
     return res;
 }
 
@@ -6260,6 +6276,115 @@ void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*
             }
         }
         if (lvl1 != lvl0 || rem != acc0) ev.participants.push_back(e.id);
+    }
+}
+
+
+void World::econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                       CausalEvent& ev) {
+    if (pending <= 0 || !e.alive) return;
+    const PropId p_poss  = props.find_name("possessed_by")
+        ? props.find_name("possessed_by")->id : kNoProp;
+    const PropId p_ptick = props.find_name("possession_ticks")
+        ? props.find_name("possession_ticks")->id : kNoProp;
+    const PropId p_theft = props.find_name("theft_flag")
+        ? props.find_name("theft_flag")->id : kNoProp;
+    const PropId p_ds    = props.find_name("debt_status")
+        ? props.find_name("debt_status")->id : kNoProp;
+    const PropId p_due   = props.find_name("due_tick")
+        ? props.find_name("due_tick")->id : kNoProp;
+    const PropId p_dv    = props.find_name("debt_value")
+        ? props.find_name("debt_value")->id : kNoProp;
+    const PropId p_db    = props.find_name("debtor_id")
+        ? props.find_name("debtor_id")->id : kNoProp;
+    const PropId p_rep   = props.find_name("trade_reputation")
+        ? props.find_name("trade_reputation")->id : kNoProp;
+    auto setp = [&](Entity& ent, PropId p, std::int64_t v) {
+        if (p == kNoProp) return;
+        const Value* old = prop_of(ent, p);
+        StateChange ch;
+        ch.entity = ent.id; ch.prop = p; ch.had_before = old != nullptr;
+        ch.before = old ? *old : Value::integer(0);
+        ch.after = Value::integer(v);
+        ent.props.set(p, Value::integer(v));
+        ev.changes.push_back(ch);
+    };
+
+    // ---- debt_obligation overdue -> default --------------------------------
+    if (e.kind_name == "debt_obligation" && p_ds != kNoProp &&
+        p_due != kNoProp) {
+        const std::int64_t st = prop_int(e, p_ds, 0);
+        const std::int64_t due = prop_int(e, p_due, 0);
+        if (st == 0 && static_cast<std::int64_t>(now) > due) {
+            setp(e, p_ds, 2);
+            setp(e, p_dv, 0);
+            const std::int64_t debtor = p_db != kNoProp
+                ? prop_int(e, p_db, 0) : 0;
+            if (debtor != 0 && p_rep != kNoProp) {
+                if (Entity* de = find(static_cast<EntityId>(debtor))) {
+                    const std::int64_t rep = prop_int(*de, p_rep, 1000);
+                    // default: reputation collapses below the credit floor
+                    setp(*de, p_rep, std::max<std::int64_t>(0, rep - 650));
+                }
+            }
+            ev.participants.push_back(e.id);
+            ev.evidence += "debt defaulted; ";
+        }
+        return;   // obligations carry no possession state
+    }
+
+    // ---- possession bookkeeping --------------------------------------------
+    if (p_poss != kNoProp) {
+        const std::int64_t holder = prop_int(e, p_poss, 0);
+        if (holder != 0) {
+            if (p_ptick != kNoProp) {
+                const std::int64_t t0 = prop_int(e, p_ptick, 0);
+                setp(e, p_ptick, std::min<std::int64_t>(
+                    1000000000, t0 + pending));
+            }
+        }
+    }
+    // ---- theft exposure window ----------------------------------------------
+    if (p_theft != kNoProp) {
+        const std::int64_t flag = prop_int(e, p_theft, 0);
+        if (flag > 0 && p_poss != kNoProp) {
+            const std::int64_t holder = prop_int(e, p_poss, 0);
+            // exposure = any OTHER minded agent within sight of the item.
+            // Positions are constant across a metabolize window, so the
+            // witness set is identical ticked vs batched: evaluate ONCE
+            // against flag>0 (pre-decrement) to stay LOD-exact.
+            bool exposed = false;
+            if (holder != 0) {
+                const PropId sight = props.find_name("sight_range")
+                    ? props.find_name("sight_range")->id : kNoProp;
+                for (const auto& [wid, wm] : minds_) {
+                    (void)wm;
+                    if (wid == static_cast<EntityId>(holder)) continue;
+                    const Entity* we = find(wid);
+                    if (!we || !we->alive) continue;
+                    const std::int64_t range = sight != kNoProp
+                        ? prop_int(*we, sight, 0) : 0;
+                    if (range > 0 &&
+                        dist2(we->pos, e.pos) <= range * range) {
+                        exposed = true; break;
+                    }
+                }
+            }
+            if (exposed) {
+                // caught holding the hot item: reputation hit, flag spent
+                setp(e, p_theft, 0);
+                if (holder != 0 && p_rep != kNoProp) {
+                    if (Entity* he = find(static_cast<EntityId>(holder))) {
+                        const std::int64_t rep = prop_int(*he, p_rep, 1000);
+                        setp(*he, p_rep,
+                             std::max<std::int64_t>(0, rep - 200));
+                    }
+                }
+                ev.evidence += "theft exposed; ";
+            } else {
+                setp(e, p_theft, std::max<std::int64_t>(0, flag - pending));
+            }
+        }
     }
 }
 

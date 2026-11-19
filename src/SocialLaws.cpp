@@ -556,6 +556,431 @@ PredictionResult predict_withdraw(const World& w, const InteractionContext& ctx)
     return r;
 }
 
+
+// ---- Phase 12.2: inductive economy -----------------------------------------
+// take/steal/trade/repay — every price is computed at predict time from the
+// two agents' SUBJUCTIVE valuations (Cognition.hpp econ_*); consequences
+// that are World Truth (possession, stacks, obligations, consensus) ride
+// the committed StateChange/SpawnSpec set; consequences that are private
+// (ownership beliefs, shame engrams) land post-commit in econ_from_event.
+
+constexpr std::int64_t kTakeCost = 15;
+constexpr std::int64_t kStealCost = 15;
+constexpr std::int64_t kTradeCost = 30;
+constexpr std::int64_t kRepayCost = 20;
+constexpr std::int64_t kTheftExposureTicks = 300;   // unwitnessed-grab window
+constexpr std::int64_t kDefaultCreditTerm = 400;
+constexpr std::int64_t kCreditFloorRep = 400;       // below: no more credit
+
+// community registry entity for an agent's language_id (0 = none).
+EntityId econ_community_of(const World& w, EntityId agent) {
+    const PropId p_lang = pid(w, "language_id");
+    const PropId p_lname = pid(w, "language_name");
+    if (p_lang == kNoProp || p_lname == kNoProp) return kNoEntity;
+    const Entity* ae = w.find(agent);
+    if (!ae) return kNoEntity;
+    const std::int64_t lang = w.prop_int(*ae, p_lang, 0);
+    if (lang <= 0) return kNoEntity;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (e.alive && e.kind_name == "language" &&
+            w.prop_int(e, p_lname, 0) == lang)
+            return e.id;
+    }
+    return kNoEntity;
+}
+
+// goods-like check: an entity that can be owned/traded.
+bool econ_is_goods(const World& w, const Entity& e) {
+    if (e.material != kNoMaterial) return true;
+    const PropId q = pid(w, "quantity");
+    if (q != kNoProp) {
+        const Value* v = w.prop_of(e, q);
+        if (v && v->type == ValType::Integer && v->i > 0) return true;
+    }
+    return false;
+}
+
+// transfer `qty` units of `mat` from `from` to `to`: decrements the source
+// held stack, tops up an existing destination stack or spawns a new one at
+// the recipient's feet. Returns false when the source cannot cover.
+bool econ_transfer(PredictionResult& r, const World& w,
+                   EntityId from, EntityId to, MaterialId mat,
+                   std::int64_t qty, const Vec2& to_pos) {
+    const EntityId src = econ_held_stack(w, from, mat, qty);
+    if (src == kNoEntity) return false;
+    const Entity* se = w.find(src);
+    if (!se) return false;
+    const PropId p_qty = pid(w, "quantity");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_integ = pid(w, "integrity");
+    const std::int64_t sq = p_qty != kNoProp ? w.prop_int(*se, p_qty, 1) : 1;
+    // source side
+    if (sq == qty && p_poss != kNoProp) {
+        // hand over the WHOLE stack — possession simply changes hands
+        set_change(r, src, p_poss, w.prop_int(*se, p_poss, 0),
+                   static_cast<std::int64_t>(to));
+    } else {
+        set_change(r, src, p_qty, sq, sq - qty);
+    }
+    // destination side: merge into a same-material held stack or spawn
+    const EntityId dst = econ_held_stack(w, to, mat, 1);
+    const Entity* de = dst != kNoEntity ? w.find(dst) : nullptr;
+    if (de && dst != src) {
+        const std::int64_t dq = p_qty != kNoProp ? w.prop_int(*de, p_qty, 1) : 1;
+        const std::int64_t cap = 100000000;
+        set_change(r, dst, p_qty, dq, std::min(cap, dq + qty));
+    } else {
+        SpawnSpec sp;
+        sp.kind = se->kind_name;
+        sp.material = mat;
+        sp.pos = to_pos;
+        if (p_qty != kNoProp) sp.props.set(p_qty, Value::integer(qty));
+        if (p_poss != kNoProp)
+            sp.props.set(p_poss, Value::integer(
+                static_cast<std::int64_t>(to)));
+        r.spawns.push_back(sp);
+    }
+    (void)p_integ;
+    return true;
+}
+
+// bump a community's monetary_consensus for a store-of-value receipt —
+// committed as a StateChange so the ledger records the money supply shift.
+void econ_consensus_commit(PredictionResult& r, const World& w,
+                           EntityId community, MaterialId mat,
+                           std::int64_t qty) {
+    if (community == kNoEntity || !econ_is_store_of_value(w, mat)) return;
+    const PropId p_mc = pid(w, "monetary_consensus");
+    if (p_mc == kNoProp) return;
+    const Entity* ce = w.find(community);
+    if (!ce) return;
+    const Value* cur = w.prop_of(*ce, p_mc);
+    const std::string before = cur && cur->type == ValType::Text
+        ? cur->s : std::string();
+    const std::string after = econ_consensus_bump_text(before, mat, qty);
+    if (after != before)
+        set_change_v(r, community, p_mc, Value::text(before),
+                     Value::text(after));
+}
+
+// parse "give:MAT:QTY|get:MAT:QTY" (+ optional "|defer" "|contract")
+struct TradeTerms {
+    MaterialId give = kNoMaterial, get = kNoMaterial;
+    std::int64_t give_qty = 0, get_qty = 0;
+    bool defer = false, contract = false;
+    bool ok = false;
+};
+TradeTerms parse_trade_note(const World& w, const std::string& note) {
+    TradeTerms t;
+    std::vector<std::string> parts;
+    std::string cur;
+    for (char ch : note) {
+        if (ch == '|' || ch == ';') { parts.push_back(cur); cur.clear(); }
+        else cur.push_back(ch);
+    }
+    parts.push_back(cur);
+    for (const std::string& pt : parts) {
+        if (pt == "defer") { t.defer = true; continue; }
+        if (pt == "contract") { t.contract = true; continue; }
+        const std::size_t c1 = pt.find(':');
+        const std::size_t c2 = pt.find(':', c1 == std::string::npos
+                                          ? c1 : c1 + 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        const std::string side = pt.substr(0, c1);
+        const std::string mname = pt.substr(c1 + 1, c2 - c1 - 1);
+        std::int64_t qty = 0;
+        try { qty = std::stoll(pt.substr(c2 + 1)); } catch (...) { continue; }
+        const MaterialId mid = w.materials.id_of(mname);
+        if (mid == kNoMaterial || qty <= 0) continue;
+        if (side == "give" && t.give == kNoMaterial) {
+            t.give = mid; t.give_qty = qty;
+        } else if (side == "get" && t.get == kNoMaterial) {
+            t.get = mid; t.get_qty = qty;
+        }
+    }
+    t.ok = t.give != kNoMaterial && t.get != kNoMaterial &&
+           t.give != t.get && t.give_qty > 0 && t.get_qty > 0;
+    return t;
+}
+
+// quantity helper local to this file (Cognition's econ_qty is anonymous).
+std::int64_t econ_qty_local(const World& w, const Entity& e) {
+    const PropId q = pid(w, "quantity");
+    if (q == kNoProp) return 1;
+    const Value* v = w.prop_of(e, q);
+    if (!v || v->type != ValType::Integer || v->i <= 0) return 1;
+    return v->i;
+}
+
+PredictionResult predict_take(const World& w, const InteractionContext& ctx,
+                              bool steal) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_theft = pid(w, "theft_flag");
+    const PropId p_rep = pid(w, "trade_reputation");
+    const PropId p_reach = pid(w, "reach");
+    if (p_poss == kNoProp) { r.failure = "no possession property"; return r; }
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* t = single_target(w, ctx, r, contained);
+    if (!t) return r;
+    if (t->id == ctx.actor) { r.failure = "cannot take oneself"; return r; }
+    if (!econ_is_goods(w, *t)) { r.failure = "not a goods entity"; return r; }
+    const std::int64_t holder = w.prop_int(*t, p_poss, 0);
+    const bool mine = holder == static_cast<std::int64_t>(ctx.actor);
+    if (holder != 0 && !mine) {
+        if (!steal) { r.failure = "already claimed"; return r; }
+    }
+    if (!in_reach(w, *actor, *t, p_reach, 0, &r)) {
+        r.failure = "out of reach"; return r;
+    }
+    if (!charge_energy(*actor, energy, steal ? kStealCost : kTakeCost, r))
+        return r;
+    // witnessed? any OTHER minded agent in sight of the actor sees the grab
+    bool seen = false;
+    for (const auto& [wid, wm] : w.minds_) {
+        (void)wm;
+        if (wid == ctx.actor) continue;
+        const Entity* we = w.find(wid);
+        if (!we || !we->alive) continue;
+        const PropId sight = pid(w, "sight_range");
+        const std::int64_t range = sight != kNoProp
+            ? w.prop_int(*we, sight, 0) : 0;
+        if (range > 0 && dist2(we->pos, actor->pos) <= range * range) {
+            seen = true; break;
+        }
+    }
+    set_change(r, t->id, p_poss, holder,
+               static_cast<std::int64_t>(ctx.actor));
+    if (steal && holder != 0) {
+        if (p_theft != kNoProp)
+            set_change(r, t->id, p_theft, w.prop_int(*t, p_theft, 0),
+                       seen ? 0 : kTheftExposureTicks);
+        if (seen && p_rep != kNoProp) {
+            const std::int64_t rep = w.prop_int(*actor, p_rep, 1000);
+            set_change(r, ctx.actor, p_rep, rep,
+                       std::max<std::int64_t>(0, rep - 200));
+            r.notes.push_back("theft witnessed");
+        } else if (!seen) {
+            r.notes.push_back("theft unseen — exposure window armed");
+        }
+    }
+    r.possible = true; r.ticks = 1;
+    r.notes.push_back(steal ? "stole item" : "claimed item");
+    return r;
+}
+
+PredictionResult predict_trade(const World& w, const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_rep = pid(w, "trade_reputation");
+    const PropId p_reach = pid(w, "reach");
+    if (p_poss == kNoProp) { r.failure = "no possession property"; return r; }
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* partner = single_target(w, ctx, r, contained);
+    if (!partner) return r;
+    if (!in_reach(w, *actor, *partner, p_reach, 0, &r)) {
+        r.failure = "trading partner out of reach"; return r;
+    }
+    TradeTerms tt = parse_trade_note(w, ctx.parameters.note);
+    if (!tt.ok) { r.failure = "malformed trade terms"; return r; }
+    if (!charge_energy(*actor, energy, kTradeCost, r)) return r;
+
+    // subjective price check — the ACTOR must not overpay by its own lights
+    const std::int64_t vg = econ_total_value(w, ctx.actor, tt.give);
+    const std::int64_t vt = econ_total_value(w, ctx.actor, tt.get);
+    if (vt <= 0) { r.failure = "consideration worthless to actor"; return r; }
+    const std::int64_t req = tt.give_qty * vg / vt;
+    // 10% deal margin — haggling noise, deterministic
+    if (tt.get_qty * 10 < req * 9) {
+        r.failure = "insufficient consideration"; return r;
+    }
+    // partner's side: must not lose more than an eighth of the deal's worth
+    const std::int64_t pvg = econ_total_value(w, partner->id, tt.get);
+    const std::int64_t pvt = econ_total_value(w, partner->id, tt.give);
+    const __int128 p_surplus = static_cast<__int128>(tt.give_qty) * pvt -
+        static_cast<__int128>(tt.get_qty) * pvg;
+    if (p_surplus < -(static_cast<__int128>(tt.get_qty) * pvg) / 8) {
+        r.failure = "partner would refuse the terms"; return r;
+    }
+
+    const std::uint64_t now = w.clock_.tick();
+    if (tt.defer) {
+        // credit sale: actor receives `get` now, owes debt_value later
+        const std::int64_t rep = p_rep != kNoProp
+            ? w.prop_int(*actor, p_rep, 1000) : 1000;
+        if (rep < kCreditFloorRep) {
+            r.failure = "no credit — reputation too low"; return r;
+        }
+        // goods flow partner -> actor immediately
+        if (!econ_transfer(r, w, partner->id, ctx.actor, tt.get,
+                           tt.get_qty, actor->pos)) {
+            r.failure = "partner lacks the goods"; return r;
+        }
+        const std::int64_t received_val =
+            econ_total_value(w, ctx.actor, tt.get) * tt.get_qty;
+        const std::int64_t premium = std::clamp<std::int64_t>(
+            1400 - rep, 0, 1200);
+        const std::int64_t debt_val =
+            static_cast<std::int64_t>(
+                static_cast<__int128>(received_val) * (1000 + premium) / 1000);
+        const std::int64_t term = w.prop_int(*actor,
+            pid(w, "credit_term_ticks"), kDefaultCreditTerm);
+        SpawnSpec dbt;
+        dbt.kind = "debt_obligation";
+        dbt.pos = actor->pos;
+        dbt.props.set(pid(w, "debt_value"), Value::integer(debt_val));
+        dbt.props.set(pid(w, "due_tick"),
+                      Value::integer(static_cast<std::int64_t>(now) + term));
+        dbt.props.set(pid(w, "debtor_id"),
+                      Value::integer(static_cast<std::int64_t>(ctx.actor)));
+        dbt.props.set(pid(w, "creditor_id"),
+                      Value::integer(static_cast<std::int64_t>(partner->id)));
+        dbt.props.set(pid(w, "debt_status"), Value::integer(0));
+        r.spawns.push_back(dbt);
+        // optional written contract: a literate debtor carves the terms
+        if (tt.contract) {
+            const PropId p_lang = pid(w, "language_id");
+            const std::int64_t al = p_lang != kNoProp
+                ? w.prop_int(*actor, p_lang, 0) : 0;
+            const std::int64_t pl = p_lang != kNoProp
+                ? w.prop_int(*partner, p_lang, 0) : 0;
+            if (al > 0 && pl > 0) {
+                SpawnSpec ins;
+                ins.kind = "inscription";
+                ins.pos = actor->pos;
+                ins.props.set(p_lang, Value::integer(al));
+                const PropId p_ck = pid(w, "concept_keys");
+                if (p_ck != kNoProp)
+                    ins.props.set(p_ck, Value::text(
+                        "debt:" + std::to_string(tt.get) + ":" +
+                        std::to_string(tt.get_qty)));
+                const PropId p_it = pid(w, "inscription_tick");
+                if (p_it != kNoProp)
+                    ins.props.set(p_it, Value::integer(
+                        static_cast<std::int64_t>(now)));
+                const PropId p_ia = pid(w, "inscription_author");
+                if (p_ia != kNoProp)
+                    ins.props.set(p_ia, Value::integer(
+                        static_cast<std::int64_t>(ctx.actor)));
+                r.spawns.push_back(ins);
+            }
+        }
+        econ_consensus_commit(r, w, econ_community_of(w, ctx.actor),
+                              tt.get, tt.get_qty);
+        econ_consensus_commit(r, w, econ_community_of(w, partner->id),
+                              tt.give, 0);   // nothing received yet — no bump
+        r.possible = true; r.ticks = kTradeCost;
+        r.notes.push_back("credit sale, debt " + std::to_string(debt_val));
+        return r;
+    }
+
+    // spot trade: both legs settle now
+    if (!econ_transfer(r, w, ctx.actor, partner->id, tt.give,
+                       tt.give_qty, partner->pos)) {
+        r.failure = "actor lacks the goods"; return r;
+    }
+    if (!econ_transfer(r, w, partner->id, ctx.actor, tt.get,
+                       tt.get_qty, actor->pos)) {
+        r.failure = "partner lacks the goods"; return r;
+    }
+    // store-of-value receipts push the community's money consensus
+    econ_consensus_commit(r, w, econ_community_of(w, ctx.actor),
+                          tt.get, tt.get_qty);
+    econ_consensus_commit(r, w, econ_community_of(w, partner->id),
+                          tt.give, tt.give_qty);
+    r.possible = true; r.ticks = kTradeCost;
+    r.notes.push_back("trade " + std::to_string(tt.give_qty) + "x give");
+    return r;
+}
+
+PredictionResult predict_repay(const World& w, const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_rep = pid(w, "trade_reputation");
+    const PropId p_reach = pid(w, "reach");
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* creditor = single_target(w, ctx, r, contained);
+    if (!creditor) return r;
+    if (!in_reach(w, *actor, *creditor, p_reach, 0, &r)) {
+        r.failure = "creditor out of reach"; return r;
+    }
+    // find the open obligation debtor=actor -> creditor (lowest id wins)
+    const PropId p_dv = pid(w, "debt_value");
+    const PropId p_db = pid(w, "debtor_id");
+    const PropId p_cr = pid(w, "creditor_id");
+    const PropId p_ds = pid(w, "debt_status");
+    EntityId debt = kNoEntity;
+    std::int64_t debt_val = 0;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "debt_obligation") continue;
+        if (w.prop_int(e, p_ds, 0) != 0) continue;
+        if (w.prop_int(e, p_db, 0) != static_cast<std::int64_t>(ctx.actor))
+            continue;
+        if (w.prop_int(e, p_cr, 0) !=
+            static_cast<std::int64_t>(creditor->id)) continue;
+        if (debt == kNoEntity || e.id < debt) {
+            debt = e.id;
+            debt_val = w.prop_int(e, p_dv, 0);
+        }
+    }
+    if (debt == kNoEntity) { r.failure = "no open debt"; return r; }
+    if (!charge_energy(*actor, energy, kRepayCost, r)) return r;
+    // payment terms: "mat:qty" in note — must cover the debt's value
+    const TradeTerms tt = parse_trade_note(w, ctx.parameters.note);
+    MaterialId pmat = tt.give; std::int64_t pqty = tt.give_qty;
+    if (pmat == kNoMaterial) {
+        // default: pay with the single most valuable held stack, all of it
+        std::int64_t best_v = -1; EntityId best = kNoEntity;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (!e.alive || e.material == kNoMaterial ||
+                p_poss == kNoProp) continue;
+            if (w.prop_int(e, p_poss, 0) !=
+                static_cast<std::int64_t>(ctx.actor)) continue;
+            const std::int64_t v = econ_total_value(w, ctx.actor,
+                                                   e.material) *
+                                   econ_qty_local(w, e);
+            if (v > best_v) { best_v = v; best = e.id; }
+        }
+        if (best == kNoEntity) { r.failure = "nothing to repay with"; return r; }
+        const Entity* be = w.find(best);
+        pmat = be->material;
+        pqty = econ_qty_local(w, *be);
+    }
+    const std::int64_t paid_val =
+        econ_total_value(w, ctx.actor, pmat) * pqty;
+    if (paid_val < debt_val) {
+        r.failure = "payment does not cover the debt"; return r;
+    }
+    if (!econ_transfer(r, w, ctx.actor, creditor->id, pmat, pqty,
+                       creditor->pos)) {
+        r.failure = "cannot part with the goods"; return r;
+    }
+    if (p_ds != kNoProp) set_change(r, debt, p_ds, 0, 1);
+    if (p_dv != kNoProp) set_change(r, debt, p_dv, debt_val, 0);
+    // on-time settlement builds credit; late settlement still counts but
+    // the overdue default already hit reputation in econ_drift
+    const std::int64_t rep = p_rep != kNoProp
+        ? w.prop_int(*actor, p_rep, 1000) : 1000;
+    if (p_rep != kNoProp)
+        set_change(r, ctx.actor, p_rep, rep,
+                   std::min<std::int64_t>(2000, rep + 150));
+    r.possible = true; r.ticks = kRepayCost;
+    r.notes.push_back("debt settled");
+    return r;
+}
+
 }  // namespace
 
 LawId SocialModel::id() const { return 8; }
@@ -565,7 +990,8 @@ bool SocialModel::supports(const World& w, const InteractionContext& ctx) const 
     const std::string& a = ctx.parameters.action;
     if (a == "found") return ctx.targets.empty();
     if (a == "communicate" || a == "engrave" || a == "read" ||
-        a == "join" || a == "leave" || a == "share" || a == "withdraw")
+        a == "join" || a == "leave" || a == "share" || a == "withdraw" ||
+        a == "take" || a == "steal" || a == "trade" || a == "repay")
         return ctx.targets.size() == 1;
     return false;
 }
@@ -581,6 +1007,10 @@ PredictionResult SocialModel::predict(const World& w,
     if (a == "leave")      return predict_joinleave(w, ctx, false);
     if (a == "share")      return predict_share(w, ctx);
     if (a == "withdraw")   return predict_withdraw(w, ctx);
+    if (a == "take")       return predict_take(w, ctx, false);
+    if (a == "steal")      return predict_take(w, ctx, true);
+    if (a == "trade")      return predict_trade(w, ctx);
+    if (a == "repay")      return predict_repay(w, ctx);
     PredictionResult r; r.law = id(); r.law_name = name();
     r.failure = "unsupported social action";
     return r;

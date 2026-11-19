@@ -433,6 +433,8 @@ species sapient
   syllable_length_bias 3
   glyph_angularity 700
   hardness 650
+  trade_reputation 1000
+  credit_term_ticks 600
   gene speed
   gene metabolism
   gene sight_range

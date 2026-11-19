@@ -379,6 +379,13 @@ private:
     // into erosion_level; at 1000 the glyph/concept payload is illegible.
     void language_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                         CausalEvent& ev);
+    // Phase 12.2 economy drift inside metabolize: possessed items accrue
+    // possession_ticks; theft_flag counts down its exposure window and a
+    // still-armed grab is exposed when any OTHER minded agent sees the
+    // item (reputation hit, flag cleared); open debt_obligations past
+    // due_tick default (status=2, debtor reputation collapses).
+    void econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                    CausalEvent& ev);
     // Phase 12.1d lexicon codex: deterministic text export — per language,
     // every LexicalEntry rendered as raw phoneme/glyph strings (seeds ->
     // syllable stream via species acoustics) with the objective chronicle

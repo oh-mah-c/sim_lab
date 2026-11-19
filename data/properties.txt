@@ -366,3 +366,27 @@ portable_surface      integer  permille     range 0 1000    domain=physical   # 
 inscription_author   integer  units                     domain=social  # inscription: entity id of the carver (kNoEntity=0 when unknown)
 inscription_tick     integer  ticks        range 0 1000000000 domain=social  # inscription: world tick the carving was made
 dialect_drift_threshold integer milli-units range 1 100000000 domain=social # language: accum per phoneme-shift roll
+
+# ---- inductive economy: subjective value, ownership, credit (Phase 12.2) ----
+# Material-level physical axes — prop_of() falls back to material defaults,
+# so every goods entity inherits them without instance props.
+intrinsic_scarcity  integer permille     range 0 1000    domain=physical   # material: inherent rarity — raises exchange value
+portability_score   integer permille     range 0 1000    domain=physical   # material: carry/split/store suitability — money axis
+spoilage_rate       integer permille     range 0 1000    domain=physical   # material: value-decay — perishables cannot store value
+# Item-level possession truth (observable: "that thing is in her hands").
+possessed_by        integer units                     domain=observable # item: entity id of current holder (0 = loose in world)
+possessed_kind      text     none                     domain=observable # item: kind_name snapshot at claim time (survives stack merges)
+possession_ticks    integer units        range 0 1000000000 domain=physical # item: ticks held by current possessor (internal)
+theft_flag          integer units        range 0 1000000 domain=physical   # item: exposure window left after an unwitnessed grab (internal)
+# Agent-level social standing.
+trade_reputation    integer units        range 0 2000    domain=social     # agent: credit standing (absent = neutral 1000)
+credit_term_ticks   integer ticks        range 0 1000000 domain=social     # agent/species: standard deferred-payment horizon
+# debt_obligation entity: a World-Truth IOU between two agents.
+debt_value          integer units        range 0 1000000000 domain=social # debt_obligation: outstanding value, trade units
+due_tick            integer ticks        range 0 1000000000 domain=social # debt_obligation: repayment deadline
+debtor_id           integer units                     domain=social     # debt_obligation: who owes
+creditor_id         integer units                     domain=social     # debt_obligation: who is owed
+debt_status         integer units        range 0 10     domain=social     # debt_obligation: 0 open, 1 settled, 2 defaulted
+# language/community entity: "mid:fixedpoint;..." store-of-value consensus.
+# fixedpoint = permille * 64 — the fraction IS the Euclid accumulator.
+monetary_consensus  text     none                     domain=social     # community: per-material money candidacy (0..64000)

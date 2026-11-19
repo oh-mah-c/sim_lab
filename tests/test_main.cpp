@@ -6903,6 +6903,317 @@ static void test_causal_language_syntax_rosetta_and_inscriptions() {
     }
 }
 
+
+// ================= Phase 12.2: inductive economy ==============================
+static EntityId econ_person(World& w, Vec2 pos, std::int64_t hunger = 100,
+                            std::int64_t motor = 1000,
+                            std::int64_t horizon = 2) {
+    EntityId id = mk_person(w, pos);
+    Entity* e = w.find(id);
+    tseti(*e, w, "metabolism", 50);
+    tseti(*e, w, "hunger", hunger);
+    tseti(*e, w, "sight_range", 800);
+    tseti(*e, w, "reach", 300);
+    tseti(*e, w, "communicate_range", 500);
+    tseti(*e, w, "mind_motor_precision", motor);
+    tseti(*e, w, "mind_plan_horizon", horizon);
+    tseti(*e, w, "trade_reputation", 1000);
+    tseti(*e, w, "credit_term_ticks", 200);
+    AgentMind& m = w.mind(id);
+    for (const char* v : {"take","steal","trade","repay","share"})
+        m.known_actions.insert(v);
+    return id;
+}
+
+static EntityId mk_goods(World& w, const char* mat, std::int64_t qty,
+                         Vec2 pos, std::int64_t holder = 0) {
+    PropertyBag b;
+    const PropId pq = tpid(w, "quantity");
+    const PropId pp = tpid(w, "possessed_by");
+    if (pq != kNoProp) b.set(pq, Value::integer(qty));
+    if (pp != kNoProp && holder != 0)
+        b.set(pp, Value::integer(holder));
+    return w.create_entity("goods", w.materials.id_of(mat), pos, b);
+}
+
+static InteractionResult econ_act(World& w, EntityId actor,
+                                  std::vector<EntityId> targets,
+                                  const char* action,
+                                  const std::string& note = "") {
+    InteractionContext c;
+    c.actor = actor; c.targets = std::move(targets);
+    c.parameters.action = action; c.parameters.note = note;
+    c.parameters.ticks = 1;
+    return w.interact(c);
+}
+
+static std::int64_t econ_rep(World& w, EntityId a) {
+    const Entity* e = w.find(a);
+    return e ? w.prop_int(*e, tpid(w, "trade_reputation"), 1000) : -1;
+}
+
+static void test_inductive_economy_currency_inflation_and_credit() {
+    const MaterialId SALT = 0, BERRY = 0, GRANITE = 0; (void)SALT;(void)BERRY;(void)GRANITE;
+
+    // ---- A+B: ownership, witnessed vs silent theft, subjective valuation --
+    {
+        World w(301, "data");
+        const EntityId owner = econ_person(w, {0, 0});
+        const EntityId thief = econ_person(w, {10, 0});
+        const EntityId witness = econ_person(w, {15, 0});
+        const EntityId loner  = econ_person(w, {5000, 5000});
+        const EntityId far_holder = mk_person(w, {4995, 4995});  // no mind: invisible to witness scan
+        const EntityId item = mk_goods(w, "copper_metal", 5, {12, 0});
+        const EntityId far_item = mk_goods(w, "copper_metal", 5, {4990, 4990},
+                                           far_holder);
+        w.mind(owner); w.mind(thief); w.mind(witness); w.mind(loner);
+
+        // claim -> World-Truth possession + owner conviction
+        CHECK(econ_act(w, owner, {item}, "take").completed);
+        CHECK(tint(*w.find(item), w, "possessed_by") ==
+              static_cast<std::int64_t>(owner));
+        const Belief* ob = w.find_mind(owner)
+            ->find_belief("owns:" + std::to_string(item));
+        CHECK(ob && ob->confidence >= 900);
+        // witness forms a weaker "X owns it" belief after perceiving
+        perceive(w, witness);
+        CHECK(w.find_mind(witness)->find_belief(
+            "owns:" + std::to_string(item) + ":" +
+            std::to_string(owner)) != nullptr);
+
+        // witnessed steal: reputation hit, no exposure flag
+        CHECK(econ_act(w, thief, {item}, "steal").completed);
+        CHECK(tint(*w.find(item), w, "possessed_by") ==
+              static_cast<std::int64_t>(thief));
+        CHECK(tint(*w.find(item), w, "theft_flag") == 0);
+        CHECK(econ_rep(w, thief) <= 800);
+
+        // silent steal: flag armed, reputation untouched
+        CHECK(econ_act(w, loner, {far_item}, "steal").completed);
+        CHECK(tint(*w.find(far_item), w, "theft_flag") > 0);
+        CHECK(econ_rep(w, loner) == 1000);
+
+        // marginal valuation: hunger raises food's use value; thin
+        // perceived supply raises exchange value — no price table involved
+        const MaterialId BERRY = w.materials.id_of("wild_berries");
+        const EntityId hungry = econ_person(w, {30, 0}, 950);
+        const EntityId full   = econ_person(w, {35, 0}, 50);
+        w.mind(hungry); w.mind(full);
+        CHECK(econ_total_value(w, hungry, BERRY) >
+              econ_total_value(w, full, BERRY));
+        AgentMind& fm = w.mind(full);
+        fm.belief("pa:" + std::to_string(BERRY)).confidence = 150;
+        const std::int64_t v_thin = econ_exchange_value(w, full, BERRY);
+        fm.belief("pa:" + std::to_string(BERRY)).confidence = 950;
+        const std::int64_t v_glut = econ_exchange_value(w, full, BERRY);
+        CHECK(v_thin > v_glut);
+        // required-qty pricing is symmetric and positive
+        const std::int64_t req = econ_required_qty(w, full, BERRY, 10,
+                                                 w.materials.id_of("salt"));
+        CHECK(req > 0);
+    }
+
+    // ---- C+D+E: currency convergence, inflation, comparative advantage ----
+    {
+        World w(302, "data");
+        // speech community: vocal sapients + one verified discovery -> lang
+        const EntityId a = econ_person(w, {0, 0});
+        const EntityId b = econ_person(w, {20, 0});
+        lang_person(w, a, "person", 500, 2);
+        lang_person(w, b, "person", 500, 2);
+        w.mind(a).discoveries["m"] = mk_record("m", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);   // language_tick coins the registry
+        const MaterialId SALT = w.materials.id_of("salt");
+        const MaterialId BERRY = w.materials.id_of("wild_berries");
+        const MaterialId STONE = w.materials.id_of("granite");
+
+        // salt stack for A, berry stack for B
+        mk_goods(w, "salt", 300, {2, 0}, a);
+        mk_goods(w, "wild_berries", 400, {18, 0}, b);
+        mk_goods(w, "granite", 40, {25, 0}, b);
+
+        // comparative advantage: precision craftsman vs plain worker
+        const EntityId smith = econ_person(w, {40, 0}, 100, 2200, 2);
+        const EntityId hand  = econ_person(w, {45, 0}, 100, 400, 5);
+        InteractionContext cx; cx.actor = smith;
+        cx.parameters.action = "combine";
+        InteractionContext cy; cy.actor = hand;
+        cy.parameters.action = "combine";
+        InteractionContext cd; cd.actor = hand;
+        cd.parameters.action = "dig";
+        CHECK(econ_aptitude_bonus(w, smith, w.mind(smith), cx) >
+              econ_aptitude_bonus(w, hand, w.mind(hand), cx));
+        CHECK(econ_aptitude_bonus(w, hand, w.mind(hand), cd) > 0);  // horizon
+
+        // currency: ~20 spot trades, B always receives salt as payment
+        // price: salt is worth more per unit — berries per salt computed
+        // from each side's own subjective values
+        int completed_pairs = 0;
+        for (int i = 0; i < 30; ++i) {
+            // prices are recomputed from CURRENT subjective values every
+            // round — consensus growth itself inflates the money's price
+            const std::string note_ab = "give:salt:5|get:wild_berries:" +
+                std::to_string(std::max<std::int64_t>(1,
+                    econ_required_qty(w, a, SALT, 5, BERRY)));
+            const std::string note_ba = "give:wild_berries:10|get:salt:" +
+                std::to_string(std::max<std::int64_t>(1,
+                    econ_required_qty(w, b, BERRY, 10, SALT)));
+            InteractionResult r1 = econ_act(w, a, {b}, "trade", note_ab);
+            if (!r1.completed) break;
+            InteractionResult r2 = econ_act(w, b, {a}, "trade", note_ba);
+            if (!r2.completed) break;
+            ++completed_pairs;
+        }
+        CHECK(completed_pairs >= 12);
+        const std::int64_t mc_salt = econ_consensus(w, a, SALT);
+        const std::int64_t mc_berry = econ_consensus(w, a, BERRY);
+        CHECK(mc_salt >= 700);          // converged to common money
+        CHECK(mc_salt > mc_berry);      // perishables never monetize
+        CHECK(mc_salt > econ_consensus(w, a, STONE)); // granite too heavy
+
+        // inflation: flood the community's sight with salt -> perceived
+        // abundance spikes -> salt's exchange value collapses -> more salt
+        // units needed per berry
+        const std::int64_t v_salt_pre = econ_exchange_value(w, a, SALT);
+        const std::int64_t salt_for_berry_pre =
+            econ_required_qty(w, a, BERRY, 20, SALT);
+        for (int i = 0; i < 30; ++i)
+            mk_goods(w, "salt", 10, {static_cast<std::int32_t>(i * 3),
+                                     static_cast<std::int32_t>(i % 7)});
+        perceive(w, a); perceive(w, a); perceive(w, a);
+        const std::int64_t v_salt_post = econ_exchange_value(w, a, SALT);
+        const std::int64_t salt_for_berry_post =
+            econ_required_qty(w, a, BERRY, 20, SALT);
+        CHECK(v_salt_post < v_salt_pre);
+        CHECK(salt_for_berry_post > salt_for_berry_pre);
+
+        // ---- F: credit, contract, default ----------------------------------
+        const EntityId debtor = econ_person(w, {60, 0});
+        const EntityId cred   = econ_person(w, {65, 0});
+        mk_goods(w, "salt", 80, {62, 0}, cred);
+        lang_person(w, debtor, "person", 500, 2);
+        lang_person(w, cred, "person", 500, 2);
+        w.advance_ticks_for_test(1);
+        // credit purchase: debtor receives salt now, owes value later.
+        // give-side qty = berries whose value covers the salt leg.
+        const std::int64_t bqty = std::max<std::int64_t>(1,
+            econ_required_qty(w, debtor, SALT, 5, BERRY));
+        InteractionResult cr = econ_act(w, debtor, {cred}, "trade",
+            "give:wild_berries:" + std::to_string(bqty) +
+            "|get:salt:5|defer|contract");
+        CHECK(cr.completed);
+        EntityId debt = kNoEntity; std::int64_t dval = 0, ddue = 0;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive || ep->kind_name != "debt_obligation") continue;
+            if (tint(*ep, w, "debtor_id") == static_cast<std::int64_t>(debtor)) {
+                debt = ep->id;
+                dval = tint(*ep, w, "debt_value");
+                ddue = tint(*ep, w, "due_tick");
+            }
+        }
+        CHECK(debt != kNoEntity);
+        CHECK(dval > 0);
+        CHECK(ddue > static_cast<std::int64_t>(w.clock_.tick()));
+        // written contract spawned for literate parties
+        bool saw_contract = false;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "inscription" &&
+                tint(*ep, w, "inscription_author") ==
+                    static_cast<std::int64_t>(debtor)) saw_contract = true;
+        CHECK(saw_contract);
+        // repay on time: hand debtor a salt stack covering the debt
+        const std::int64_t need_qty = std::max<std::int64_t>(1,
+            dval / std::max<std::int64_t>(1,
+                econ_total_value(w, debtor, SALT)) + 2);
+        mk_goods(w, "salt", need_qty + 5, {64, 0}, debtor);
+        const std::int64_t rep_pre = econ_rep(w, debtor);
+        CHECK(econ_act(w, debtor, {cred}, "repay",
+                       "give:salt:" + std::to_string(need_qty)).completed);
+        CHECK(tint(*w.find(debt), w, "debt_status") == 1);
+        CHECK(econ_rep(w, debtor) > rep_pre);
+
+        // default: short-term debtor who never pays -> reputation collapse
+        const EntityId deadbeat = econ_person(w, {80, 0});
+        lang_person(w, deadbeat, "person", 500, 2);   // shares the money consensus
+        w.advance_ticks_for_test(1);
+        tseti(*w.find(deadbeat), w, "credit_term_ticks", 5);
+        mk_goods(w, "salt", 50, {82, 0}, cred);
+        const std::int64_t dqty = std::max<std::int64_t>(1,
+            econ_required_qty(w, deadbeat, SALT, 3, BERRY));
+        CHECK(econ_act(w, deadbeat, {cred}, "trade",
+            "give:wild_berries:" + std::to_string(dqty) +
+            "|get:salt:3|defer").completed);
+        w.advance_ticks_for_test(30);   // past due -> econ_drift defaults
+        bool saw_default = false;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "debt_obligation" &&
+                tint(*ep, w, "debtor_id") ==
+                    static_cast<std::int64_t>(deadbeat) &&
+                tint(*ep, w, "debt_status") == 2) saw_default = true;
+        CHECK(saw_default);
+        CHECK(econ_rep(w, deadbeat) < 400);
+        // credit freeze: the defaulter can no longer buy on credit
+        InteractionResult denied = econ_act(w, deadbeat, {cred}, "trade",
+            "give:wild_berries:" + std::to_string(dqty) +
+            "|get:salt:3|defer");
+        CHECK(!denied.completed);
+    }
+
+    // ---- G: LOD invariance + save/load --------------------------------------
+    {
+        auto build = [](World& w) {
+            const EntityId a = econ_person(w, {0, 0});
+            const EntityId b = econ_person(w, {30, 0});
+            lang_person(w, a, "person", 500, 2);
+            w.mind(a).discoveries["m"] =
+                mk_record("m", DiscoveryStatus::Verified);
+            w.advance_ticks_for_test(1);
+            const EntityId it = mk_goods(w, "salt", 10, {5, 0}, a);
+            mk_goods(w, "wild_berries", 50, {28, 0}, b);
+            // an armed theft flag mid-window + an open obligation
+            tseti(*w.find(it), w, "theft_flag", 120);
+            PropertyBag db;
+            db.set(tpid(w, "debt_value"), Value::integer(500));
+            db.set(tpid(w, "due_tick"), Value::integer(100000));
+            db.set(tpid(w, "debtor_id"), Value::integer(
+                static_cast<std::int64_t>(b)));
+            db.set(tpid(w, "creditor_id"), Value::integer(
+                static_cast<std::int64_t>(a)));
+            db.set(tpid(w, "debt_status"), Value::integer(0));
+            w.create_entity("debt_obligation", kNoMaterial, {10, 0}, db);
+            return it;
+        };
+        World wt(303, "data"), wb(303, "data");
+        const EntityId it_t = build(wt);
+        const EntityId it_b = build(wb);
+        (void)it_b;
+        for (int i = 0; i < 200; ++i) wt.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(200);
+        auto snap = [&](World& w, EntityId it) {
+            std::vector<std::int64_t> v;
+            v.push_back(tint(*w.find(it), w, "possession_ticks"));
+            v.push_back(tint(*w.find(it), w, "theft_flag"));
+            for (const auto& ep : w.entities)
+                if (ep->alive && ep->kind_name == "debt_obligation") {
+                    v.push_back(tint(*ep, w, "debt_status"));
+                    v.push_back(tint(*ep, w, "debt_value"));
+                }
+            for (const auto& ep : w.entities)
+                if (ep->alive && ep->kind_name == "language")
+                    v.push_back(tint(*ep, w, "dialect_drift_accum"));
+            return v;
+        };
+        CHECK(snap(wt, it_t) == snap(wb, it_b));
+
+        // save/load roundtrip keeps the whole economy state
+        const std::uint64_t h = wt.state_hash();
+        CHECK(wt.save("/tmp/simlab_econ_save.bin"));
+        World wl(303, "data");
+        CHECK(wl.load("/tmp/simlab_econ_save.bin"));
+        CHECK(wl.state_hash() == h);
+    }
+}
+
 int main() {
     test_registries();
     test_new_material_data_only();
@@ -6951,6 +7262,7 @@ int main() {
     test_vector_ecology_selection_and_herd_immunity();
     test_causal_language_dialect_drift_and_inscriptions();
     test_causal_language_syntax_rosetta_and_inscriptions();
+    test_inductive_economy_currency_inflation_and_credit();
     test_infection_and_primitive_medicine();
     test_neuro_psychopathology();
     test_phase9_autonomous_civilization();

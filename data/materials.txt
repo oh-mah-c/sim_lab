@@ -8,6 +8,7 @@
 #
 # integrity 0..1000: structural soundness; reaching 0 destroys the entity.
 
+
 material dry_wood
   hardness 350
   brittleness 650
@@ -36,6 +37,10 @@ material dry_wood
 
   absorbency 400
   contamination 200
+  intrinsic_scarcity 250
+  portability_score 450
+  spoilage_rate 150
+
 material hardwood
   hardness 500
   brittleness 400
@@ -64,6 +69,10 @@ material hardwood
 
   absorbency 300
   contamination 250
+  intrinsic_scarcity 250
+  portability_score 500
+  spoilage_rate 100
+
 material stone
   hardness 800
   brittleness 300
@@ -89,6 +98,10 @@ material stone
   carving_hardness_req 700
 
   contamination 300
+  intrinsic_scarcity 300
+  portability_score 150
+  spoilage_rate 0
+
 material flint
   hardness 950
   brittleness 850
@@ -114,6 +127,10 @@ material flint
   carving_hardness_req 750
 
   contamination 350
+  intrinsic_scarcity 450
+  portability_score 650
+  spoilage_rate 0
+
 material obsidian
   hardness 980
   brittleness 900
@@ -140,6 +157,10 @@ material obsidian
 
 # ---- raw substances (natural occurrences yield these before processing) ------
   contamination 400
+  intrinsic_scarcity 600
+  portability_score 550
+  spoilage_rate 0
+
 material copper_ore
   hardness 600
   brittleness 500
@@ -162,6 +183,10 @@ material copper_ore
   contamination 500
   inscription_durability 750
   carving_hardness_req 500
+  intrinsic_scarcity 500
+  portability_score 550
+  spoilage_rate 0
+
 material iron_ore
   hardness 700
   brittleness 450
@@ -184,6 +209,10 @@ material iron_ore
   carving_hardness_req 550
 
   contamination 600
+  intrinsic_scarcity 550
+  portability_score 500
+  spoilage_rate 0
+
 material host_rock
   hardness 750
   brittleness 350
@@ -203,6 +232,10 @@ material host_rock
   contamination 400
   inscription_durability 850
   carving_hardness_req 650
+  intrinsic_scarcity 150
+  portability_score 100
+  spoilage_rate 0
+
 material granite
   hardness 900
   brittleness 250
@@ -222,6 +255,10 @@ material granite
   carving_hardness_req 800
 
   contamination 300
+  intrinsic_scarcity 250
+  portability_score 120
+  spoilage_rate 0
+
 material basalt
   hardness 950
   brittleness 300
@@ -239,6 +276,10 @@ material basalt
   lithology 1
 
   contamination 350
+  intrinsic_scarcity 250
+  portability_score 150
+  spoilage_rate 0
+
 material sandstone
   hardness 650
   brittleness 500
@@ -256,6 +297,10 @@ material sandstone
   lithology 2
 
   contamination 450
+  intrinsic_scarcity 200
+  portability_score 140
+  spoilage_rate 0
+
 material limestone
   hardness 800
   brittleness 400
@@ -273,6 +318,10 @@ material limestone
   lithology 2
 
   contamination 400
+  intrinsic_scarcity 200
+  portability_score 160
+  spoilage_rate 0
+
 material shale
   hardness 500
   brittleness 600
@@ -290,6 +339,10 @@ material shale
   lithology 2
 
   contamination 500
+  intrinsic_scarcity 200
+  portability_score 130
+  spoilage_rate 0
+
 material marble
   hardness 850
   brittleness 350
@@ -310,6 +363,10 @@ material marble
 
 # ---- soils (top stratum; type follows parent rock + climate) -------------------
   contamination 350
+  intrinsic_scarcity 400
+  portability_score 150
+  spoilage_rate 0
+
 material soil_sand
   burial_medium 700
   hardness 150
@@ -331,6 +388,10 @@ material soil_sand
 
   contamination 800
   absorbency 500
+  intrinsic_scarcity 120
+  portability_score 250
+  spoilage_rate 0
+
 material soil_loam
   burial_medium 700
   hardness 200
@@ -352,6 +413,10 @@ material soil_loam
 
   contamination 800
   absorbency 500
+  intrinsic_scarcity 150
+  portability_score 300
+  spoilage_rate 0
+
 material soil_clay
   burial_medium 700
   hardness 250
@@ -377,6 +442,10 @@ material soil_clay
 # ---- organic / energy substances ----------------------------------------------
   contamination 800
   absorbency 500
+  intrinsic_scarcity 180
+  portability_score 350
+  spoilage_rate 0
+
 material coal
   hardness 250
   brittleness 700
@@ -398,6 +467,10 @@ material coal
   geom_thk 80
 
   contamination 600
+  intrinsic_scarcity 500
+  portability_score 650
+  spoilage_rate 120
+
 material gold_placer
   hardness 400
   brittleness 550
@@ -419,6 +492,10 @@ material gold_placer
 
 # Quartz-hosted gold: hydrothermal vein fill (forms along faults, see deposits.txt).
   contamination 700
+  intrinsic_scarcity 900
+  portability_score 900
+  spoilage_rate 0
+
 material gold_quartz
   hardness 700
   brittleness 450
@@ -442,6 +519,10 @@ material gold_quartz
 
 # Animal body (fauna species in species.txt are made of it).
   contamination 500
+  intrinsic_scarcity 900
+  portability_score 700
+  spoilage_rate 0
+
 material flesh
   sterilization_temp 700
   cremation_temp 6000
@@ -472,6 +553,10 @@ material flesh
 # ---- processed / fuel / waste materials (Phase 3 processing outputs) ----------
   contamination 300
   absorbency 200
+  intrinsic_scarcity 300
+  portability_score 600
+  spoilage_rate 850
+
 material copper_metal
   hardness 700
   brittleness 300
@@ -495,6 +580,10 @@ material copper_metal
   carving_hardness_req 500
 
   contamination 250
+  intrinsic_scarcity 800
+  portability_score 850
+  spoilage_rate 0
+
 material charcoal
   antimicrobial 550
   hardness 100
@@ -523,6 +612,10 @@ material charcoal
   antiseptic 600
   absorbency 700
   contamination 100
+  intrinsic_scarcity 600
+  portability_score 750
+  spoilage_rate 80
+
 material slag
   hardness 800
   brittleness 200
@@ -543,6 +636,10 @@ material slag
   geom_thk 80
 
   contamination 600
+  intrinsic_scarcity 150
+  portability_score 500
+  spoilage_rate 0
+
 material iron_blade
   hardness 900
   brittleness 200
@@ -564,6 +661,10 @@ material iron_blade
 # ---- forageable wild food (physiology: nutrition/hydration are World Truth --
 # agents must discover edibility by consuming or by witness, never by lookup)
   contamination 200
+  intrinsic_scarcity 750
+  portability_score 800
+  spoilage_rate 0
+
 material wild_berries
   hardness 50
   brittleness 900
@@ -593,6 +694,10 @@ material wild_berries
 # integrity. Learned the hard way: taste-test, death, witnessed taboo.
   antiseptic 300
   contamination 150
+  intrinsic_scarcity 450
+  portability_score 700
+  spoilage_rate 800
+
 material nightshade
   hardness 50
   brittleness 900
@@ -623,6 +728,10 @@ material nightshade
 # never because its fruit was eaten or spoiled.
   antiseptic 500
   contamination 400
+  intrinsic_scarcity 650
+  portability_score 700
+  spoilage_rate 850
+
 material living_wood
   hardness 200
   brittleness 300
@@ -656,6 +765,10 @@ material living_wood
   absorbency 500
   antiseptic 450
   contamination 200
+  intrinsic_scarcity 200
+  portability_score 300
+  spoilage_rate 300
+
 material dormant_seed
   hardness 50
   brittleness 900
@@ -679,6 +792,10 @@ material dormant_seed
 # Dead-wood litter — the non-living half of a plant's death_drops manifest.
 # Pure debris: no sprout_* props, so it only rots away.
   contamination 250
+  intrinsic_scarcity 500
+  portability_score 800
+  spoilage_rate 100
+
 material wood_debris
   hardness 80
   brittleness 950
@@ -702,6 +819,10 @@ material wood_debris
 # bone takes compression but snaps, organ is soft and vital, blood seeps.
   absorbency 600
   contamination 500
+  intrinsic_scarcity 100
+  portability_score 600
+  spoilage_rate 250
+
 material skin
   sterilization_temp 700
   cremation_temp 6000
@@ -732,6 +853,10 @@ material skin
 
   absorbency 400
   contamination 250
+  intrinsic_scarcity 350
+  portability_score 600
+  spoilage_rate 300
+
 material muscle
   sterilization_temp 700
   cremation_temp 6000
@@ -759,6 +884,10 @@ material muscle
   edge 150
 
   contamination 300
+  intrinsic_scarcity 300
+  portability_score 650
+  spoilage_rate 800
+
 material bone
   hardness 800
   brittleness 850
@@ -783,6 +912,10 @@ material bone
   portable_surface 1000
 
   contamination 150
+  intrinsic_scarcity 500
+  portability_score 750
+  spoilage_rate 120
+
 material organ
   sterilization_temp 700
   cremation_temp 6000
@@ -810,6 +943,10 @@ material organ
   edge 50
 
   contamination 400
+  intrinsic_scarcity 400
+  portability_score 550
+  spoilage_rate 700
+
 material blood
   hardness 0
   brittleness 100
@@ -834,6 +971,10 @@ material blood
   contamination 350
 
 # ---- metabolic waste (Phase 10.3): entity-level filth that fertilizes ----
+  intrinsic_scarcity 200
+  portability_score 550
+  spoilage_rate 600
+
 material feces
   hardness 100
   brittleness 0
@@ -859,6 +1000,9 @@ material feces
   nutrient 850
   moisture 400
   viscosity 650
+  intrinsic_scarcity 50
+  portability_score 400
+  spoilage_rate 950
 
 material urine
   hardness 0
@@ -889,6 +1033,10 @@ material urine
 # ---- Phase 11: environmental reservoirs, sterilization, burial -------------
 # Standing water: drinkable, never flows (flow_rate 0) so it fouls into a
 # stagnation reservoir; heat or salt preserves it.
+  intrinsic_scarcity 50
+  portability_score 450
+  spoilage_rate 900
+
 material water
   hardness 0
   brittleness 0
@@ -919,6 +1067,10 @@ material water
 
 # Solar/crude salt: chemical preservation — combine onto food or water
 # (antimicrobial >= 500) sets cooked_state 1000 and clears pathogens.
+  intrinsic_scarcity 100
+  portability_score 250
+  spoilage_rate 300
+
 material salt
   hardness 200
   brittleness 200
@@ -943,6 +1095,10 @@ material salt
   contamination 0
 
 # Antimicrobial herb: a poultice-grade botanical (>=500 threshold met).
+  intrinsic_scarcity 700
+  portability_score 900
+  spoilage_rate 50
+
 material antimicrobial_herb
   hardness 50
   brittleness 300
@@ -966,6 +1122,10 @@ material antimicrobial_herb
   contamination 100
 
 # Cremation residue: sterile, desiccated, excellent burial medium.
+  intrinsic_scarcity 550
+  portability_score 700
+  spoilage_rate 600
+
 material ash
   hardness 100
   brittleness 0
@@ -992,3 +1152,6 @@ material ash
   sterilization_temp 0
   inscription_durability 50
   carving_hardness_req 10
+  intrinsic_scarcity 100
+  portability_score 600
+  spoilage_rate 0

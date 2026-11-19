@@ -416,4 +416,34 @@ void social_from_event(World& w, EntityId actor,
                        const std::vector<EntityId>& targets,
                        const CausalEvent& ev);
 
+
+// Phase 12.2: inductive economy — all valuations are SUBJUCTIVE (viewer
+// needs, pa:<mat> abundance beliefs, community monetary consensus, material
+// physics). No price table exists anywhere.
+
+std::int64_t econ_abundance(const AgentMind* m, MaterialId mat);
+std::int64_t econ_consensus(const World& w, EntityId viewer, MaterialId mat);
+std::int64_t econ_use_value(const World& w, EntityId viewer, MaterialId mat);
+std::int64_t econ_exchange_value(const World& w, EntityId viewer,
+                                 MaterialId mat);
+std::int64_t econ_total_value(const World& w, EntityId viewer,
+                              MaterialId mat);
+// get-qty of `get` a fair trade demands for `give_qty` of `give`.
+std::int64_t econ_required_qty(const World& w, EntityId viewer,
+                               MaterialId give, std::int64_t give_qty,
+                               MaterialId get);
+EntityId econ_held_stack(const World& w, EntityId agent, MaterialId mat,
+                         std::int64_t need);
+bool econ_is_store_of_value(const World& w, MaterialId mat);
+// Returns the updated consensus text after a store-of-value trade
+// (pure function — predict commits it as a StateChange).
+std::string econ_consensus_bump_text(const std::string& cur,
+                                     MaterialId mat, std::int64_t qty);
+void econ_from_event(World& w, EntityId actor,
+                     const std::vector<EntityId>& targets,
+                     const CausalEvent& ev);
+std::int64_t econ_aptitude_bonus(const World& w, EntityId npc,
+                                 const AgentMind& mind,
+                                 const InteractionContext& c);
+
 }  // namespace simlab

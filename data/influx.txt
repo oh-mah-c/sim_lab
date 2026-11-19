@@ -38,6 +38,8 @@ influx_zone northern_pass
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
+    prop trade_reputation 1000
+    prop credit_term_ticks 400
     prop reach 300
     prop energy 300000
     prop max_energy 300000
@@ -88,6 +90,8 @@ influx_zone northern_pass
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
+    prop trade_reputation 1000
+    prop credit_term_ticks 400
     prop reach 300
     prop energy 300000
     prop max_energy 300000
@@ -125,6 +129,8 @@ influx_zone inland_band
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
+    prop trade_reputation 1000
+    prop credit_term_ticks 400
     prop reach 300
     prop energy 300000
     prop max_energy 300000
@@ -170,6 +176,8 @@ influx_zone inland_band
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
+    prop trade_reputation 1000
+    prop credit_term_ticks 400
     prop reach 300
     prop energy 300000
     prop max_energy 300000

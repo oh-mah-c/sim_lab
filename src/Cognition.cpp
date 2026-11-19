@@ -977,6 +977,11 @@ std::size_t perceive(World& w, EntityId npc) {
     neuro_touch(w, npc);
 
     std::size_t added = 0;
+    // Phase 12.2: perceived supply per material — what the agent actually
+    // SEES nearby becomes its pa:<mat> abundance belief (private economics).
+    std::map<MaterialId, std::int64_t> seen_supply;
+    const PropertyDef* qty_d_p = w.props.find_name("quantity");
+    const PropId qty_pid_p = qty_d_p ? qty_d_p->id : kNoProp;
     for (const EntityId eid : w.entities_near(me->pos, range)) {
         if (eid == npc) continue;
         const Entity* e = w.find(eid);
@@ -1135,8 +1140,34 @@ std::size_t perceive(World& w, EntityId npc) {
                 ns.panic = std::min<std::int64_t>(1000, ns.panic +
                     fb_mag * ns.threat_gain / 1000);
         }
+        if (e->material != kNoMaterial && e->alive) {
+            std::int64_t q = 1;
+            if (qty_pid_p != kNoProp) {
+                const Value* qv = w.prop_of(*e, qty_pid_p);
+                if (qv && qv->type == ValType::Integer && qv->i > 0)
+                    q = qv->i;
+            }
+            seen_supply[e->material] += q;
+        }
         mind.observe(std::move(o));
         ++added;
+    }
+    // fold the visual supply survey into abundance beliefs (EMA):
+    // abundance is RELATIVE — 1000 = "as much as I ever see", the exact
+    // scale matters less than the trend the agent experiences.
+    {
+        for (const auto& [mat, total] : seen_supply) {
+            const std::int64_t sample = std::min<std::int64_t>(total * 120, 1000);
+            Belief& b = mind.belief("pa:" + std::to_string(mat));
+            const bool fresh = b.evidence_for == 0 && b.confidence == 0;
+            b.confidence = fresh ? sample
+                                 : (b.confidence * 3 + sample) / 4;
+            b.evidence_for += sample / 10 + 1;
+            b.last_tick = w.clock_.tick();
+            if (b.status == BeliefStatus::Unknown ||
+                b.status == BeliefStatus::Hypothesized)
+                b.status = BeliefStatus::Observed;
+        }
     }
     // visited_cells: the agent's own frontier record (per-mind knowledge —
     // never a World flag). Drives ExploreGoal targets.
@@ -2080,9 +2111,11 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
                                      + sublimation_bonus(*lmind,
                                                         c.parameters.action)
                                      : 0);
-                if (lmind)
+                if (lmind) {
                     child.score += conformity_bonus(*spec, npc, *lmind,
                                                    c.parameters.action);
+                    child.score += econ_aptitude_bonus(*spec, npc, *lmind, c);
+                }
                 results.push_back({child.path, child.score, ev.satisfied});
                 if (!ev.satisfied) {
                     // Incremental beam pruning: never hold more than
@@ -2937,6 +2970,401 @@ void World::decay_minds(std::int64_t n) {
         mind.neuro.grief = std::clamp<std::int64_t>(
             mind.neuro.grief + ostr_g - dec, 0, 1000);
     }
+}
+
+
+// ================= Phase 12.2: inductive economy ==============================
+// Everything below is SUBJUCTIVE microeconomics: value emerges from the
+// viewer's own needs, its perceived-abundance beliefs, its speech
+// community's monetary consensus, and material physics. No price table,
+// no currency enum, no profession list — a "merchant" is just a mind whose
+// aptitudes make trade score well.
+
+namespace {
+
+PropId econ_pid(const World& w, const char* n) {
+    const PropertyDef* d = w.props.find_name(n);
+    return d ? d->id : kNoProp;
+}
+
+// Material-default lookup (instance props already fell back via prop_of;
+// here we read the MaterialDef directly for entities that may not exist).
+std::int64_t mat_prop(const World& w, MaterialId mat, const char* name,
+                      std::int64_t fallback) {
+    if (mat == kNoMaterial) return fallback;
+    const MaterialDef* md = w.materials.find(mat);
+    if (!md) return fallback;
+    const PropId p = econ_pid(w, name);
+    if (p == kNoProp) return fallback;
+    const auto it = md->props.find(p);
+    if (it == md->props.end()) return fallback;
+    const Value& v = it->second;
+    if (v.type == ValType::Integer || v.type == ValType::Fixed) return v.i;
+    if (v.type == ValType::Boolean) return v.b ? 1 : 0;
+    return fallback;
+}
+
+std::int64_t belief_conf(const AgentMind* m, const std::string& key,
+                         std::int64_t fallback) {
+    if (!m) return fallback;
+    const Belief* b = m->find_belief(key);
+    return b ? b->confidence : fallback;
+}
+
+}  // namespace
+
+std::int64_t econ_abundance(const AgentMind* m, MaterialId mat) {
+    return belief_conf(m, "pa:" + std::to_string(mat), 500);
+}
+
+std::int64_t econ_consensus(const World& w, EntityId viewer, MaterialId mat) {
+    const PropId p_lang = econ_pid(w, "language_id");
+    const PropId p_lname = econ_pid(w, "language_name");
+    const PropId p_mc = econ_pid(w, "monetary_consensus");
+    if (p_lang == kNoProp || p_lname == kNoProp || p_mc == kNoProp)
+        return 0;
+    const Entity* ve = w.find(viewer);
+    if (!ve) return 0;
+    const std::int64_t lang = w.prop_int(*ve, p_lang, 0);
+    if (lang <= 0) return 0;
+    // find this community's registry entity and read its consensus table
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "language") continue;
+        if (w.prop_int(e, p_lname, 0) != lang) continue;
+        const Value* tv = w.prop_of(e, p_mc);
+        if (!tv || tv->type != ValType::Text) return 0;
+        // "mid:fixed;mid:fixed..." — fixed = permille * 64
+        const std::string want = std::to_string(mat) + ":";
+        std::size_t pos = 0;
+        while (pos <= tv->s.size()) {
+            const std::size_t semi = tv->s.find(';', pos);
+            const std::string ent = tv->s.substr(
+                pos, semi == std::string::npos ? std::string::npos
+                                               : semi - pos);
+            if (ent.compare(0, want.size(), want) == 0) {
+                const std::int64_t fx = std::stoll(ent.substr(want.size()));
+                return std::min<std::int64_t>(1000, fx / 64);
+            }
+            if (semi == std::string::npos) break;
+            pos = semi + 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+std::int64_t econ_use_value(const World& w, EntityId viewer, MaterialId mat) {
+    const Entity* ve = w.find(viewer);
+    if (!ve) return 0;
+    const AgentMind* m = w.find_mind(viewer);
+    const std::int64_t pa = econ_abundance(m, mat);
+    std::int64_t use = 0;
+    // marginal use: own needs vs what the material relieves
+    const std::int64_t hunger = w.prop_int(*ve, econ_pid(w, "hunger"), 0);
+    const std::int64_t thirst = w.prop_int(*ve, econ_pid(w, "thirst"), 0);
+    const std::int64_t nut = mat_prop(w, mat, "nutrition", 0);
+    const std::int64_t hyd = mat_prop(w, mat, "hydration", 0);
+    if (nut > 0) use += hunger * nut / 500;
+    if (hyd > 0) use += thirst * hyd / 500;
+    // medicine: wounded/sick actor values dressings & antipyretics
+    const std::int64_t integ = w.prop_int(*ve, econ_pid(w, "integrity"), 1000);
+    if (integ < 800) {
+        const std::int64_t pot = std::max({
+            mat_prop(w, mat, "antiseptic", 0),
+            mat_prop(w, mat, "antipyretic", 0),
+            mat_prop(w, mat, "absorbency", 0)});
+        use += (800 - integ) * pot / 1000;
+    }
+    // storage value: durable goods are worth hoarding when supply looks
+    // thin — scaled by the agent's planning horizon (far-sighted minds
+    // stockpile; myopic ones live hand to mouth)
+    const std::int64_t spoil = mat_prop(w, mat, "spoilage_rate", 0);
+    const std::int64_t horizon = m ? mind_params(w, *ve).plan_horizon : 2;
+    if (spoil < 1000) {
+        const std::int64_t thin = std::max<std::int64_t>(0, 1000 - pa);
+        use += horizon * 167 * (1000 - spoil) / 1000 * thin / 1000 * 3;
+    }
+    return std::min<std::int64_t>(use, 4000);
+}
+
+std::int64_t econ_exchange_value(const World& w, EntityId viewer,
+                                 MaterialId mat) {
+    const AgentMind* m = w.find_mind(viewer);
+    const std::int64_t pa = econ_abundance(m, mat);
+    const std::int64_t mc = econ_consensus(w, viewer, mat);
+    const std::int64_t port = mat_prop(w, mat, "portability_score", 300);
+    const std::int64_t spoil = mat_prop(w, mat, "spoilage_rate", 0);
+    const std::int64_t scar = mat_prop(w, mat, "intrinsic_scarcity", 0);
+    // exch permille = port*(1000-spoil)*(1000+scarce)*(1000+mc)
+    //                 / ((1000+pa) * 1e6); 0..~4000
+    const __int128 n = static_cast<__int128>(port) * (1000 - spoil) *
+                       (1000 + scar) * (1000 + mc);
+    const __int128 d = static_cast<__int128>(1000 + pa) * 1000000;
+    const std::int64_t v = static_cast<std::int64_t>(n / d);
+    return std::min<std::int64_t>(v, 6000);
+}
+
+std::int64_t econ_total_value(const World& w, EntityId viewer,
+                              MaterialId mat) {
+    return econ_exchange_value(w, viewer, mat) +
+           econ_use_value(w, viewer, mat);
+}
+
+std::int64_t econ_required_qty(const World& w, EntityId viewer,
+                               MaterialId give, std::int64_t give_qty,
+                               MaterialId get) {
+    const std::int64_t vg = econ_total_value(w, viewer, give);
+    const std::int64_t vt = econ_total_value(w, viewer, get);
+    if (vt <= 0 || vg <= 0) return -1;
+    return give_qty * vg / vt;      // floor; caller applies margin
+}
+
+EntityId econ_held_stack(const World& w, EntityId agent, MaterialId mat,
+                         std::int64_t need) {
+    const PropId p_poss = econ_pid(w, "possessed_by");
+    const PropId p_qty = econ_pid(w, "quantity");
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.material != mat) continue;
+        if (p_poss == kNoProp) continue;
+        if (w.prop_int(e, p_poss, 0) != static_cast<std::int64_t>(agent))
+            continue;
+        std::int64_t q = 1;
+        if (p_qty != kNoProp) {
+            const Value* v = w.prop_of(e, p_qty);
+            if (v && v->type == ValType::Integer && v->i > 0) q = v->i;
+        }
+        if (q >= need) return e.id;
+    }
+    return kNoEntity;
+}
+
+bool econ_is_store_of_value(const World& w, MaterialId mat) {
+    if (mat == kNoMaterial) return false;
+    if (mat_prop(w, mat, "portability_score", 0) < 500) return false;
+    if (mat_prop(w, mat, "spoilage_rate", 0) > 400) return false;
+    if (mat_prop(w, mat, "nutrition", 0) > 0 ||
+        mat_prop(w, mat, "hydration", 0) > 0) return false;
+    return true;
+}
+
+// Consensus table codec: "mid:fixed;mid:fixed" sorted by mid, fixed =
+// permille*64. The stored fraction is the accumulator — bumps below never
+// round, so dust-sized trades still count (Euclid-style remainder).
+std::string econ_consensus_render(const std::map<std::uint32_t,
+                                               std::int64_t>& tab) {
+    std::string out;
+    for (const auto& [mid, fx] : tab) {
+        if (!out.empty()) out.push_back(';');
+        out += std::to_string(mid) + ":" + std::to_string(fx);
+    }
+    return out;
+}
+
+std::map<std::uint32_t, std::int64_t>
+econ_consensus_parse(const std::string& s) {
+    std::map<std::uint32_t, std::int64_t> tab;
+    std::size_t pos = 0;
+    while (pos <= s.size()) {
+        const std::size_t semi = s.find(';', pos);
+        const std::string ent = s.substr(pos, semi == std::string::npos
+            ? std::string::npos : semi - pos);
+        const std::size_t colon = ent.find(':');
+        if (colon != std::string::npos && colon > 0) {
+            try {
+                tab[static_cast<std::uint32_t>(
+                    std::stoul(ent.substr(0, colon)))] =
+                    std::stoll(ent.substr(colon + 1));
+            } catch (...) { /* malformed entries are skipped */ }
+        }
+        if (semi == std::string::npos) break;
+        pos = semi + 1;
+    }
+    return tab;
+}
+
+std::string econ_consensus_bump_text(const std::string& cur,
+                                     MaterialId mat, std::int64_t qty) {
+    auto tab = econ_consensus_parse(cur);
+    // +8 permille per unit received as a store-of-value candidate;
+    // fixed = permille*64, clamp at consensus 1000
+    std::int64_t& fx = tab[mat];
+    fx = std::min<std::int64_t>(64000, fx + qty * 512);
+    return econ_consensus_render(tab);
+}
+
+// ---- ownership beliefs -------------------------------------------------------
+
+// Who currently holds `item` per World Truth (0 = loose).
+std::int64_t econ_holder(const World& w, EntityId item) {
+    const Entity* e = w.find(item);
+    if (!e) return 0;
+    return w.prop_int(*e, econ_pid(w, "possessed_by"), 0);
+}
+
+void econ_ownership_beliefs(World& w, EntityId item, std::int64_t holder,
+                            const Vec2& where, std::uint64_t tick) {
+    // holder's own conviction is absolute; witnesses hold a weaker claim
+    const std::string self_key = "owns:" + std::to_string(item);
+    if (holder != 0 && w.find_mind(static_cast<EntityId>(holder))) {
+        AgentMind& hm = w.mind(static_cast<EntityId>(holder));
+        Belief& b = hm.belief(self_key);
+        b.status = BeliefStatus::Verified;
+        b.confidence = 1000; b.evidence_for += 500;
+        b.self_evidence += 500; b.last_tick = tick;
+        // previous owner's claim lapses
+        // (callers handle the demotion via the `before` holder)
+    }
+    // witnesses: every OTHER minded agent in sight of the event location
+    for (auto& [wid, wm] : w.minds_) {
+        if (wid == static_cast<EntityId>(holder)) continue;
+        const Entity* we = w.find(wid);
+        if (!we || !we->alive) continue;
+        const PropId sight = econ_pid(w, "sight_range");
+        const std::int64_t range = sight != kNoProp
+            ? w.prop_int(*we, sight, 0) : 0;
+        if (range <= 0) continue;
+        if (dist2(we->pos, where) > range * range) continue;
+        // "<holder> owns <item>" — confidence scales with theory_of_mind
+        const std::string key = self_key + ":" + std::to_string(holder);
+        Belief& b = wm.belief(key);
+        b.status = BeliefStatus::Observed;
+        std::int64_t tom = 1000;
+        if (const Entity* ae = w.find(wid))
+            tom = mind_params(w, *ae).theory_of_mind;
+        const std::int64_t conf = 300 + tom * 400 / 1000;   // 300..700
+        b.confidence = std::max(b.confidence, conf);
+        b.evidence_for += conf / 4; b.last_tick = tick;
+    }
+}
+
+// negative engram toward `wrongdoer` for every witness in range — theft is
+// a social shock, encoded through the same Ebbinghaus channel as violence.
+void econ_witness_shame(World& w, EntityId wrongdoer, const Vec2& where,
+                        std::uint64_t tick, std::int64_t charge) {
+    for (auto& [wid, wm] : w.minds_) {
+        if (wid == wrongdoer) continue;
+        const Entity* we = w.find(wid);
+        if (!we || !we->alive) continue;
+        const PropId sight = econ_pid(w, "sight_range");
+        const std::int64_t range = sight != kNoProp
+            ? w.prop_int(*we, sight, 0) : 0;
+        if (range <= 0 || dist2(we->pos, where) > range * range) continue;
+        AgentMind::MemorySnapshot snap = snapshot_now(w, wrongdoer, tick);
+        const MindParams mp = mind_params(w, *we);
+        upsert_memory_g(w, wm, wrongdoer, snap, charge, mp, range);
+    }
+}
+
+// post-commit economic consequences (called from World::interact after
+// social_from_event). Reads the committed event; writes MINDS and relation
+// ties only — every prop change was already proposed by predict().
+void econ_from_event(World& w, EntityId actor,
+                     const std::vector<EntityId>& targets,
+                     const CausalEvent& ev) {
+    if (actor == kNoEntity) return;
+    const PropId p_poss = econ_pid(w, "possessed_by");
+    const PropId p_theft = econ_pid(w, "theft_flag");
+    const std::string& act = ev.action;
+    if (act != "take" && act != "steal" && act != "trade" &&
+        act != "repay" && act != "share")
+        return;
+    // items whose possession changed hands in this event
+    std::set<EntityId> touched;
+    for (const StateChange& ch : ev.changes)
+        if (ch.prop == p_poss && ch.after.type == ValType::Integer &&
+            ch.after.i != 0)
+            touched.insert(ch.entity);
+    for (EntityId s : ev.spawned) {
+        const Entity* se = w.find(s);
+        if (se && p_poss != kNoProp &&
+            w.prop_int(*se, p_poss, 0) != 0)
+            touched.insert(s);
+    }
+    const Entity* ae = w.find(actor);
+    const Vec2 where = ae ? ae->pos : Vec2{0, 0};
+    for (EntityId item : touched) {
+        const std::int64_t holder = econ_holder(w, item);
+        if (holder == 0) continue;
+        econ_ownership_beliefs(w, item, holder, where, ev.tick);
+        // previous owner's conviction lapses
+        for (const StateChange& ch : ev.changes) {
+            if (ch.entity != item || ch.prop != p_poss) continue;
+            const std::int64_t prev = ch.before.type == ValType::Integer
+                ? ch.before.i : 0;
+            if (prev != 0 && prev != holder && w.find_mind(
+                    static_cast<EntityId>(prev))) {
+                AgentMind& om = w.mind(static_cast<EntityId>(prev));
+                om.belief("owns:" + std::to_string(item))
+                    .confidence = 0;
+            }
+        }
+    }
+    // witnessed theft: shame engrams for every onlooker (silent grabs —
+    // theft_flag still armed — only expose the holder later via econ_drift)
+    if (act == "steal") {
+        bool caught = false;
+        for (EntityId item : touched) {
+            const Entity* ie = w.find(item);
+            if (ie && p_theft != kNoProp &&
+                w.prop_int(*ie, p_theft, 0) == 0) { caught = true; break; }
+        }
+        if (caught)
+            econ_witness_shame(w, actor, where, ev.tick, -600);
+    }
+    // settling a debt earns gratitude toward the payer
+    if (act == "repay" && targets.size() == 1) {
+        const EntityId creditor = targets.front();
+        if (creditor != kNoEntity && ae) {
+            const MindParams mp = mind_params(w, *ae);
+            if (const Entity* ce = w.find(creditor))
+                gratitude_engram(w, creditor, actor, ev.tick,
+                                 mind_params(w, *ce));
+            (void)mp;
+        }
+    }
+}
+
+// comparative-advantage aptitude: craft verbs ride motor_precision,
+// harvesting rides plan_horizon, medicine/lore ride abstraction_gain,
+// and holding store-of-value goods feeds a merchant's nose.
+std::int64_t econ_aptitude_bonus(const World& w, EntityId npc,
+                                 const AgentMind& mind,
+                                 const InteractionContext& c) {
+    (void)mind;
+    const Entity* me = w.find(npc);
+    if (!me || !me->alive) return 0;
+    const MindParams mp = mind_params(w, *me);
+    const std::string& a = c.parameters.action;
+    std::int64_t bonus = 0;
+    auto craft = [&](const char* v) {
+        return a == v;
+    };
+    if (craft("assemble") || craft("process") || craft("combine") ||
+        craft("engrave") || craft("strike"))
+        bonus += (mp.motor_precision - 1000) * 500 / 1000;
+    if (craft("dig") || craft("chop"))
+        bonus += (mp.plan_horizon - 2) * 200;
+    if (craft("treat") || craft("read"))
+        bonus += (mp.abstraction_gain - 1000) * 500 / 1000;
+    if (a == "trade") {
+        // merchant nose: holding portable durable stores biases toward
+        // more dealing — the hoard itself is the aptitude signal
+        const PropId p_poss = econ_pid(w, "possessed_by");
+        if (p_poss != kNoProp) {
+            for (const auto& ep : w.entities) {
+                const Entity& e = *ep;
+                if (!e.alive || e.material == kNoMaterial) continue;
+                if (w.prop_int(e, p_poss, 0) !=
+                    static_cast<std::int64_t>(npc)) continue;
+                if (econ_is_store_of_value(w, e.material)) {
+                    bonus += 400; break;
+                }
+            }
+        }
+    }
+    return std::clamp<std::int64_t>(bonus, -800, 1200);
 }
 
 }  // namespace simlab
