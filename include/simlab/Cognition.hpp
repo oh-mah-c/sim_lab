@@ -483,4 +483,20 @@ void political_from_event(World& w, EntityId actor,
                           const std::vector<EntityId>& targets,
                           const CausalEvent& ev);
 
+
+// ---- Phase 12.4: architecture & settlement ---------------------------------
+PropId arch_pid(const World& w, const char* name);
+std::int64_t arch_prop(const World& w, const Entity& e, const char* name,
+                       std::int64_t fallback);
+EntityId arch_enclosure_at(const World& w, Vec2 pos);
+EntityId arch_owner_of(const World& w, EntityId enc);
+std::int64_t arch_complexity(const World& w, EntityId enc);
+std::string arch_function(const World& w, EntityId enc);
+std::int64_t arch_utility_bonus(const World& w, EntityId npc,
+                                const std::string& action);
+void arch_from_event(World& w, EntityId actor,
+                     const std::vector<EntityId>& targets,
+                     const CausalEvent& ev);
+
 }  // namespace simlab
+

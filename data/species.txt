@@ -428,6 +428,7 @@ species sapient
   immune_cost_accum 0
   communicate_range 500
   reach 250
+  architectural_style_bias 500
   vocal_capability 900
   phoneme_harshness 450
   syllable_length_bias 3

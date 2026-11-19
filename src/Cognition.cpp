@@ -3386,6 +3386,7 @@ std::int64_t econ_aptitude_bonus(const World& w, EntityId npc,
             }
         }
     }
+    bonus += arch_utility_bonus(w, npc, a);
     return std::clamp<std::int64_t>(bonus, -800, 1200);
 }
 
@@ -3834,6 +3835,209 @@ void political_from_event(World& w, EntityId actor,
                 }
             } catch (...) {}
             pos = e > pos ? e : pos + 1;
+        }
+    }
+}
+
+
+
+// ---- Phase 12.4: architecture & settlement ----------------------------------
+// Enclosures are entities; containment is SPATIAL (footprint_radius),
+// never a kind flag. Function is INFERRED from contents — nothing here
+// names a building type; the labels are readouts of material facts.
+
+PropId arch_pid(const World& w, const char* name) {
+    const PropertyDef* d = w.props.find_name(name);
+    return d ? d->id : kNoProp;
+}
+std::int64_t arch_prop(const World& w, const Entity& e, const char* name,
+                       std::int64_t fallback) {
+    const PropId p = arch_pid(w, name);
+    return p != kNoProp ? w.prop_int(e, p, fallback) : fallback;
+}
+
+// innermost (smallest footprint) alive enclosure covering pos
+EntityId arch_enclosure_at(const World& w, Vec2 pos) {
+    const PropId p_rad = arch_pid(w, "footprint_radius");
+    if (p_rad == kNoProp) return kNoEntity;
+    EntityId best = kNoEntity; std::int64_t best_r = INT64_MAX;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "enclosure") continue;
+        const std::int64_t r = w.prop_int(e, p_rad, 0);
+        if (r <= 0) continue;
+        const std::int64_t dx = e.pos.x - pos.x;
+        const std::int64_t dy = e.pos.y - pos.y;
+        if (dx * dx + dy * dy > r * r) continue;
+        if (r < best_r) { best_r = r; best = e.id; }
+    }
+    return best;
+}
+
+// owner = lowest-id mind holding a Verified-grade owns:<enc> belief
+EntityId arch_owner_of(const World& w, EntityId enc) {
+    const std::string key = "owns:" +
+        std::to_string(static_cast<std::uint64_t>(enc));
+    EntityId best = kNoEntity;
+    for (const auto& [mid, m] : w.minds_) {
+        (void)m;
+        const Belief* b = m.find_belief(key);
+        if (b && b->confidence >= 600 &&
+            (best == kNoEntity || mid < best)) best = mid;
+    }
+    return best;
+}
+
+// maze-ness: stored base + live nesting depth + portal count + inner rooms
+std::int64_t arch_complexity(const World& w, EntityId enc) {
+    const Entity* e = w.find(enc);
+    if (!e || !e->alive || e->kind_name != "enclosure") return 0;
+    const PropId p_rad = arch_pid(w, "footprint_radius");
+    const std::int64_t r = arch_prop(w, *e, "footprint_radius", 0);
+    if (r <= 0) return 0;
+    std::int64_t depth = 0, portals = 0, inner = 0;
+    for (const auto& ep : w.entities) {
+        const Entity& o = *ep;
+        if (!o.alive || o.id == enc) continue;
+        const std::int64_t ox = o.pos.x - e->pos.x;
+        const std::int64_t oy = o.pos.y - e->pos.y;
+        const std::int64_t d2 = ox * ox + oy * oy;
+        if (o.kind_name == "portal" && d2 <= r * r) ++portals;
+        else if (o.kind_name == "enclosure") {
+            const std::int64_t orad = arch_prop(w, o,
+                "footprint_radius", 0);
+            if (orad <= 0) continue;
+            if (d2 <= r * r) ++inner;                    // room inside this one
+            // does `o` enclose US? (we sit inside its footprint)
+            const std::int64_t wx = e->pos.x - o.pos.x;
+            const std::int64_t wy = e->pos.y - o.pos.y;
+            if (wx * wx + wy * wy <= orad * orad) ++depth;
+        }
+    }
+    const std::int64_t base = arch_prop(w, *e, "spatial_complexity", 0);
+    return std::clamp<std::int64_t>(
+        base + depth * 60 + portals * 50 + inner * 40, 0, 1000);
+}
+
+// emergent function: read off what the shell CONTAINS, never a label table
+std::string arch_function(const World& w, EntityId enc) {
+    const Entity* e = w.find(enc);
+    if (!e || !e->alive || e->kind_name != "enclosure") return "";
+    const PropId p_rad = arch_pid(w, "footprint_radius");
+    const std::int64_t r = arch_prop(w, *e, "footprint_radius", 0);
+    if (r <= 0) return "open_ground";
+    const PropId p_temp = arch_pid(w, "temperature");
+    const PropId p_law = arch_pid(w, "law_action");
+    const PropId p_bar = arch_pid(w, "access_barrier");
+    const PropId p_integ = arch_pid(w, "integrity");
+    const PropId p_nut = arch_pid(w, "nutrition");
+    bool heat = false, law = false, rich_food = false;
+    std::int64_t inner_enc = 0;
+    for (const auto& ep : w.entities) {
+        const Entity& o = *ep;
+        if (!o.alive || o.id == enc) continue;
+        const std::int64_t ox = o.pos.x - e->pos.x;
+        const std::int64_t oy = o.pos.y - e->pos.y;
+        if (ox * ox + oy * oy > r * r) continue;
+        if (o.kind_name == "enclosure") { ++inner_enc; continue; }
+        if (o.kind_name == "inscription" && p_law != kNoProp) {
+            const Value* lv = w.prop_of(o, p_law);
+            if (lv && lv->type == ValType::Text && !lv->s.empty())
+                law = true;
+        }
+        if (p_temp != kNoProp &&
+            w.prop_int(o, p_temp, 0) > 500) heat = true;
+        if (o.material != kNoMaterial && p_nut != kNoProp &&
+            w.prop_int(o, p_nut, 0) >= 400) rich_food = true;
+    }
+    const std::int64_t integ = arch_prop(w, *e, "integrity", 500);
+    const std::int64_t bar = arch_prop(w, *e, "access_barrier", 0);
+    const EntityId owner = arch_owner_of(w, enc);
+    // mandate-holder frequenting the shell marks it as the council fire
+    bool council = false;
+    if (owner != kNoEntity) {
+        const Entity* oe = w.find(owner);
+        if (oe) {
+            const std::int64_t ox = oe->pos.x - e->pos.x;
+            const std::int64_t oy = oe->pos.y - e->pos.y;
+            council = ox * ox + oy * oy <= r * r;
+        }
+    }
+    if (integ >= 800 && bar >= 800 && inner_enc >= 1) return "fortress";
+    if (heat) return "forge";
+    if (law || council) return "court";
+    if (bar >= 600 && (rich_food || bar >= 800)) return "vault";
+    return "dwelling";
+}
+
+// utility pull toward functional zones — same slot as econ_aptitude_bonus
+std::int64_t arch_utility_bonus(const World& w, EntityId npc,
+                                const std::string& action) {
+    const Entity* me = w.find(npc);
+    if (!me || !me->alive) return 0;
+    const EntityId enc = arch_enclosure_at(w, me->pos);
+    if (enc == kNoEntity) return 0;
+    const std::string fn = arch_function(w, enc);
+    const MindParams mp = mind_params(w, *me);
+    if (fn == "forge" &&
+        (action == "combine" || action == "process" ||
+         action == "carve" || action == "assemble" || action == "dig"))
+        return (mp.motor_precision - 800) * 2 / 5 + 200;
+    if (fn == "vault" &&
+        (action == "trade" || action == "tribute"))
+        return 300;
+    if (fn == "court" && action == "adjudicate")
+        return 400;
+    return 0;
+}
+
+void arch_from_event(World& w, EntityId actor,
+                     const std::vector<EntityId>& targets,
+                     const CausalEvent& ev) {
+    if (actor == kNoEntity || ev.action.empty()) return;
+    if (ev.action == "enclose") {
+        // builder claims the shell — same ownership-belief machinery as goods
+        for (EntityId nid : ev.spawned) {
+            const Entity* ne = w.find(nid);
+            if (ne && ne->alive && ne->kind_name == "enclosure")
+                econ_ownership_beliefs(w, nid, actor, ne->pos, ev.tick);
+        }
+    } else if (ev.action == "bypass_barrier" && !targets.empty()) {
+        const EntityId enc = targets.front();
+        const std::string enc_key = std::to_string(
+            static_cast<std::uint64_t>(enc));
+        const bool failed =
+            ev.evidence.find("bypass repelled") != std::string::npos;
+        if (!w.find_mind(actor)) return;
+        if (failed) {
+            // noise carries: every owner who can see the shell is alerted
+            const std::string owns_key = "owns:" + enc_key;
+            const Entity* ee = w.find(enc);
+            const PropId p_sight = arch_pid(w, "sight_range");
+            for (auto& [oid, om] : w.minds_) {
+                (void)om;
+                const Belief* ob = om.find_belief(owns_key);
+                if (!ob || ob->confidence < 600) continue;
+                const Entity* oe = w.find(oid);
+                if (!oe || !oe->alive || !ee) continue;
+                const std::int64_t sight = p_sight != kNoProp
+                    ? w.prop_int(*oe, p_sight, 0) : 0;
+                const std::int64_t dx = oe->pos.x - ee->pos.x;
+                const std::int64_t dy = oe->pos.y - ee->pos.y;
+                if (dx * dx + dy * dy <= sight * sight * 4) {
+                    AgentMind& om2 = w.mind(oid);
+                    Belief& al = om2.belief("alert:" + enc_key);
+                    al.confidence = 800;
+                    al.status = BeliefStatus::Observed;
+                    al.last_tick = ev.tick;
+                }
+            }
+        } else {
+            // stealth success: quiet entry granted — consent, not force
+            Belief& g = w.mind(actor).belief("entry_granted:" + enc_key);
+            g.confidence = 900;
+            g.status = BeliefStatus::Observed;
+            g.last_tick = ev.tick;
         }
     }
 }

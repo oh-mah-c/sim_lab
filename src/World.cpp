@@ -416,6 +416,9 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
         cp(src.temperature, dst.temperature); cp(src.slope, dst.slope);
         cp(src.wind_x, dst.wind_x); cp(src.wind_y, dst.wind_y);
         cp(src.water_table, dst.water_table);
+        if (src.traffic_wear.size() == src.elevation.size())
+            cp(src.traffic_wear, dst.traffic_wear);
+        else dst.traffic_wear.assign(n, 0);
         dst.water.assign(n, 0);
         for (int ly = 0; ly < dst.h; ++ly)
             for (int lx = 0; lx < dst.w; ++lx) {
@@ -473,7 +476,8 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
 void World::advance_ticks(std::int64_t n) {
     for (std::int64_t i = 0; i < n; ++i) clock_.advance();
     if (n > 0) { metabolize(n); dissipate_heat(n); ecology_tick(n);
-                 language_tick(clock_.tick()); decay_minds(n); political_drift(n); }
+                 language_tick(clock_.tick()); decay_minds(n); political_drift(n);
+                 terrain_wear_decay(n); }
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -1677,6 +1681,38 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                 env_t = terrain.temp_at(e.pos);
                 env_m = terrain.moist_at(e.pos);
             }
+            // Phase 12.4: a roofed shell damps the environment toward the
+            // occupant's set-point by its achieved insulation_factor —
+            // shelter is physics (enclosure_ratio x shell material), not a
+            // flag. Innermost footprint wins.
+            {
+                const PropId p_ins = props.find_name("insulation_factor")
+                    ? props.find_name("insulation_factor")->id : kNoProp;
+                const PropId p_rad2 = props.find_name("footprint_radius")
+                    ? props.find_name("footprint_radius")->id : kNoProp;
+                if (p_ins != kNoProp && p_rad2 != kNoProp) {
+                    std::int64_t best_ins = 0, best_r = INT64_MAX;
+                    for (const auto& sep : entities) {
+                        const Entity& s = *sep;
+                        if (!s.alive || s.kind_name != "enclosure")
+                            continue;
+                        const std::int64_t r = prop_int(s, p_rad2, 0);
+                        if (r <= 0) continue;
+                        const std::int64_t dx = s.pos.x - e.pos.x;
+                        const std::int64_t dy = s.pos.y - e.pos.y;
+                        if (dx * dx + dy * dy > r * r) continue;
+                        if (r < best_r) {
+                            best_r = r;
+                            best_ins = prop_int(s, p_ins, 0);
+                        }
+                    }
+                    if (best_ins > 0) {
+                        env_t = normal + (env_t - normal) *
+                                (1000 - best_ins) / 1000;
+                        env_m = env_m * (1000 - best_ins / 2) / 1000;
+                    }
+                }
+            }
             const std::int64_t energy_r = prop_int(e, energy_p, 60000);
             std::int64_t pull = (1000 - therm);
             if (env_t < normal - 10)
@@ -2674,6 +2710,9 @@ void World::metabolize(std::int64_t dt) {
                            e.props.get(econ_theft)) ||
                           e.kind_name == "debt_obligation")
                 maybe = true;
+            if (!maybe && (e.kind_name == "enclosure" ||
+                           e.kind_name == "portal"))
+                maybe = true;
             if (!maybe && e.material != kNoMaterial &&
                 e.material - 1 < mat_need_flags_.size() &&
                 mat_need_flags_[e.material - 1])
@@ -2700,6 +2739,7 @@ void World::metabolize(std::int64_t dt) {
                 if (is_vec) vector_drift(e, 1, sub_now, ev, drift_spawns);
                 language_drift(e, 1, sub_now, ev);
                 econ_drift(e, 1, sub_now, ev);
+                arch_drift(e, 1, sub_now, ev, drift_spawns);
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -2713,6 +2753,8 @@ void World::metabolize(std::int64_t dt) {
                          drift_spawns);
             language_drift(e, static_cast<std::int64_t>(pending), now, ev);
             econ_drift(e, static_cast<std::int64_t>(pending), now, ev);
+            arch_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                       drift_spawns);
         }
         // Phase 11: standing water fouls into a stagnation reservoir on the
         // same batched, accumulator-exact contract as every other drift.
@@ -4469,8 +4511,42 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     for (const MoveSpec& mv : pred.moves) {
         Entity* me = find(mv.entity);
         if (!me || !me->alive) continue;
+        const Vec2 from = me->pos;
         me->pos = mv.to;
         spatial.move(mv.entity, mv.to);
+        // Phase 12.4: footfall compacts the ground — every cell the step
+        // crosses gains traffic_wear (trails emerge from use, fade linearly).
+        if (!terrain.traffic_wear.empty() && terrain.cell > 0) {
+            const std::int64_t dx =
+                static_cast<std::int64_t>(mv.to.x) - from.x;
+            const std::int64_t dy =
+                static_cast<std::int64_t>(mv.to.y) - from.y;
+            const std::int64_t d2 = dx * dx + dy * dy;
+            if (d2 > 0) {
+                std::int64_t dist = 1;
+                while (dist * dist < d2) ++dist;   // ceil sqrt
+                const std::int64_t step = terrain.cell / 2;
+                std::int64_t samples = dist / step;
+                if (samples < 1) samples = 1;
+                for (std::int64_t i = 0; i <= samples; ++i) {
+                    const Vec2 p{
+                        from.x + static_cast<std::int32_t>(
+                            dx * i / samples),
+                        from.y + static_cast<std::int32_t>(
+                            dy * i / samples)};
+                    if (!terrain.contains(p)) continue;
+                    terrain.add_wear(p, terrain.cell);
+                    wear_cells_.insert(
+                        (static_cast<std::uint64_t>(
+                             static_cast<std::uint32_t>(
+                                 TerrainGrid::cell_of(p.x,
+                                                      terrain.cell)))
+                         << 32) |
+                        static_cast<std::uint32_t>(
+                            TerrainGrid::cell_of(p.y, terrain.cell)));
+                }
+            }
+        }
         ev.evidence += "move " + std::to_string(mv.entity) + " ->(" +
                        std::to_string(mv.to.x) + "," + std::to_string(mv.to.y) + "); ";
     }
@@ -4562,6 +4638,7 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         social_from_event(*this, ctx.actor, ctx.targets, *sev);
         simlab::econ_from_event(*this, ctx.actor, ctx.targets, *sev);
         simlab::political_from_event(*this, ctx.actor, ctx.targets, *sev);
+        simlab::arch_from_event(*this, ctx.actor, ctx.targets, *sev);
     }
     return res;
 }
@@ -4819,6 +4896,7 @@ std::uint64_t World::content_hash() const {
     };
     vec(terrain.elevation); vec(terrain.moisture); vec(terrain.temperature);
     vec(terrain.vegetation); vec(terrain.slope); vec(terrain.water_table);
+    vec(terrain.traffic_wear);
     for (std::uint8_t x : terrain.water) h = fnv(h, x);
     for (const auto& col : subsurface.cells)
         for (const Stratum& s : col) { h = fnv(h, s.material); h = fnv(h, static_cast<std::uint32_t>(s.top)); h = fnv(h, static_cast<std::uint32_t>(s.bottom)); }
@@ -4899,7 +4977,7 @@ std::uint64_t World::state_hash() const {
         };
         mixv(terrain.elevation); mixv(terrain.moisture); mixv(terrain.temperature);
         mixv(terrain.vegetation); mixv(terrain.slope); mixv(terrain.wind_x); mixv(terrain.wind_y);
-        mixv(terrain.water_table);
+        mixv(terrain.water_table); mixv(terrain.traffic_wear);
         for (std::uint8_t x : terrain.water) mix(x);
     }
     if (!subsurface.empty()) {
@@ -5080,7 +5158,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 16;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum
+constexpr std::uint32_t kSaveFormat = 17;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear
 
 struct Writer {
     std::ofstream f;
@@ -5196,6 +5274,7 @@ bool World::save(const std::string& path, std::string* err) const {
     write_i32vec(w, terrain.temperature); write_i32vec(w, terrain.vegetation);
     write_i32vec(w, terrain.slope); write_i32vec(w, terrain.wind_x);
     write_i32vec(w, terrain.wind_y); write_i32vec(w, terrain.water_table);
+    write_i32vec(w, terrain.traffic_wear);
     write_u8vec(w, terrain.water);
     // subsurface
     w.put(subsurface.w); w.put(subsurface.h); w.put(subsurface.ox); w.put(subsurface.oy);
@@ -5456,6 +5535,7 @@ bool World::load(const std::string& path, std::string* err) {
         !read_i32vec(r, terrain.temperature) || !read_i32vec(r, terrain.vegetation) ||
         !read_i32vec(r, terrain.slope) || !read_i32vec(r, terrain.wind_x) ||
         !read_i32vec(r, terrain.wind_y) || !read_i32vec(r, terrain.water_table) ||
+        !read_i32vec(r, terrain.traffic_wear) ||
         !read_u8vec(r, terrain.water)) return fail("truncated terrain");
 
     int sw = 0, sh = 0, sox = 0, soy = 0, sdepth = 0; std::uint32_t scc = 0;
@@ -5795,6 +5875,22 @@ bool World::load(const std::string& path, std::string* err) {
                 m.political_accum = pa2;
             }
             minds_[nid] = std::move(m);
+        }
+        // Phase 12.4: rebuild the wear dirty-set from terrain truth —
+        // deterministic scan, no extra serialized state needed.
+        wear_cells_.clear();
+        if (!terrain.traffic_wear.empty()) {
+            for (int gy = 0; gy < terrain.h; ++gy)
+                for (int gx = 0; gx < terrain.w; ++gx) {
+                    const std::size_t ci =
+                        static_cast<std::size_t>(gy) * terrain.w + gx;
+                    if (terrain.traffic_wear[ci] > 0)
+                        wear_cells_.insert(
+                            (static_cast<std::uint64_t>(
+                                 static_cast<std::uint32_t>(
+                                     gx + terrain.ox)) << 32) |
+                            static_cast<std::uint32_t>(gy + terrain.oy));
+                }
         }
     }
     if (fmt >= 4) {
@@ -6624,4 +6720,239 @@ std::string World::export_lexicon_codex() const {
     return o.str();
 }
 
+// ---- Phase 12.4: architecture drift ----------------------------------------
+// Enclosure weathering is accumulator-exact: decay_accum += pending *
+// (1000 - weather_resistance) in permille-ticks; every 64000 worth fires
+// one integrity hit. Linear in `pending`, so dt=1 xN and dt=N agree.
+// Collapse is causal: debris spawns + occupant impact inside the same
+// metabolize event, then the entity dies (integrity 0 reap rule).
+void World::terrain_wear_decay(std::int64_t n) {
+    if (n <= 0 || wear_cells_.empty() || terrain.traffic_wear.empty())
+        return;
+    constexpr std::int64_t kFade = 1;    // wear units lost per tick
+    for (auto it = wear_cells_.begin(); it != wear_cells_.end();) {
+        const std::uint64_t key = *it;
+        const int gx = static_cast<std::int32_t>(key >> 32);
+        const int gy = static_cast<std::int32_t>(key & 0xFFFFFFFFull);
+        int lx = 0, ly = 0;
+        if (!terrain.local_cell(gx, gy, lx, ly)) {
+            it = wear_cells_.erase(it); continue;
+        }
+        const std::size_t ci =
+            static_cast<std::size_t>(ly) * terrain.w + lx;
+        const std::int64_t w =
+            static_cast<std::int64_t>(terrain.traffic_wear[ci]) - n * kFade;
+        if (w <= 0) {
+            terrain.traffic_wear[ci] = 0;
+            it = wear_cells_.erase(it);
+        } else {
+            terrain.traffic_wear[ci] = static_cast<std::int32_t>(w);
+            ++it;
+        }
+    }
+}
+
+void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                       CausalEvent& ev, std::vector<SpawnSpec>& out) {
+    if (pending <= 0 || !e.alive) return;
+    const PropId p_da = props.find_name("decay_accum")
+        ? props.find_name("decay_accum")->id : kNoProp;
+    const PropId p_wres = props.find_name("weather_resistance")
+        ? props.find_name("weather_resistance")->id : kNoProp;
+    const PropId p_integ = props.find_name("integrity")
+        ? props.find_name("integrity")->id : kNoProp;
+    const PropId p_rad = props.find_name("footprint_radius")
+        ? props.find_name("footprint_radius")->id : kNoProp;
+    const PropId p_ratio = props.find_name("enclosure_ratio")
+        ? props.find_name("enclosure_ratio")->id : kNoProp;
+
+    if (e.kind_name == "portal") {
+        // A portal lives only while an enclosure footprint still covers it;
+        // collapse or relocation orphans the passage and it fails.
+        bool hosted = false;
+        for (const auto& ep : entities) {
+            const Entity& h = *ep;
+            if (!h.alive || h.id == e.id || h.kind_name != "enclosure" ||
+                p_rad == kNoProp) continue;
+            const std::int64_t r = prop_int(h, p_rad, 0);
+            if (r <= 0) continue;
+            const std::int64_t dx = h.pos.x - e.pos.x;
+            const std::int64_t dy = h.pos.y - e.pos.y;
+            if (dx * dx + dy * dy <= r * r) { hosted = true; break; }
+        }
+        if (!hosted) {
+            e.alive = false;
+            spatial.erase(e.id);
+            ev.evidence += "portal orphaned; ";
+        }
+        return;
+    }
+    if (e.kind_name != "enclosure" || p_da == kNoProp) return;
+
+    // ---- trespass / consent scan -----------------------------------------
+    // Every minded agent inside the footprint is either consented (owner,
+    // entry_granted, own claim) or trespassing. `inside:<enc>` marks current
+    // presence so alerts fire once per entry, not per tick — idempotent and
+    // therefore LOD-exact (positions/beliefs are interact-stable).
+    {
+        const std::int64_t r = p_rad != kNoProp ? prop_int(e, p_rad, 0) : 0;
+        const std::string owns_key = "owns:" +
+            std::to_string(static_cast<std::uint64_t>(e.id));
+        const std::string inside_key = "inside:" +
+            std::to_string(static_cast<std::uint64_t>(e.id));
+        const std::string grant_key = "entry_granted:" +
+            std::to_string(static_cast<std::uint64_t>(e.id));
+        const std::string tres_key = "trespass:" +
+            std::to_string(static_cast<std::uint64_t>(e.id));
+        // owners = minds holding a Verified-grade owns belief on this shell
+        std::vector<EntityId> owners;
+        for (const auto& [oid, om] : minds_) {
+            (void)om;
+            const Belief* b = om.find_belief(owns_key);
+            if (b && b->confidence >= 600) owners.push_back(oid);
+        }
+        if (r > 0 && !owners.empty()) {
+            const PropId p_sight = props.find_name("sight_range")
+                ? props.find_name("sight_range")->id : kNoProp;
+            for (auto& [mid, mm] : minds_) {
+                const Entity* me = find(mid);
+                if (!me || !me->alive) continue;
+                const std::int64_t dx = me->pos.x - e.pos.x;
+                const std::int64_t dy = me->pos.y - e.pos.y;
+                const bool inside = dx * dx + dy * dy <= r * r;
+                auto ib_it = mm.beliefs.find(inside_key);
+                Belief* ib = ib_it != mm.beliefs.end() ? &ib_it->second
+                                                       : nullptr;
+                if (!inside) {
+                    if (ib) { mm.beliefs.erase(inside_key); }
+                    continue;
+                }
+                bool consent = false;
+                for (EntityId o : owners)
+                    if (o == mid) { consent = true; break; }
+                if (!consent) {
+                    const Belief* gb = mm.find_belief(grant_key);
+                    if (gb && gb->confidence >= 500) consent = true;
+                    const Belief* ob = mm.find_belief(owns_key);
+                    if (ob && ob->confidence >= 600) consent = true;
+                }
+                if (consent) {
+                    if (ib) mm.beliefs.erase(inside_key);
+                    continue;
+                }
+                if (!ib) {
+                    // fresh entry: mark presence + trespass state
+                    Belief& in = mm.belief(inside_key);
+                    in.confidence = 1000; in.status = BeliefStatus::Observed;
+                    in.last_tick = now;
+                    Belief& tb = mm.belief(tres_key);
+                    tb.confidence = 1000; tb.status = BeliefStatus::Observed;
+                    tb.last_tick = now;
+                    // alert only if an owner could plausibly see the shell
+                    for (EntityId o : owners) {
+                        const Entity* oe = find(o);
+                        if (!oe || !oe->alive) continue;
+                        const std::int64_t ox = oe->pos.x - e.pos.x;
+                        const std::int64_t oy = oe->pos.y - e.pos.y;
+                        const std::int64_t sight = p_sight != kNoProp
+                            ? prop_int(*oe, p_sight, 0) : 0;
+                        if (ox * ox + oy * oy <= sight * sight * 4) {
+                            AgentMind& om = mind(o);
+                            Belief& al = om.belief("alert:" +
+                                std::to_string(static_cast<std::uint64_t>(mid)));
+                            al.confidence = 800;
+                            al.status = BeliefStatus::Observed;
+                            al.last_tick = now;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- weathering --------------------------------------------------------
+    const std::int64_t wres = p_wres != kNoProp ? prop_int(e, p_wres, 500) : 500;
+    const std::int64_t accum0 = p_da != kNoProp ? prop_int(e, p_da, 0) : 0;
+    const std::int64_t accum = accum0 + pending * (1000 - wres);
+    std::int64_t integ = p_integ != kNoProp ? prop_int(e, p_integ, 500) : 500;
+    std::int64_t fires = accum / 64000;
+    std::int64_t rem = accum % 64000;
+    // per-fire evaluation keeps collapse ordering identical to ticked play
+    while (fires-- > 0 && e.alive && integ > 0) {
+        integ -= 25;
+        if (integ <= 0) break;
+    }
+    if (integ <= 0 && e.alive) {
+        // collapse: shell fails, debris falls, occupants take impact
+        const std::int64_t r = p_rad != kNoProp ? prop_int(e, p_rad, 0) : 0;
+        static const std::int64_t kOff[3][2] = {
+            {1, 0}, {-1, 0}, {0, -1}};
+        for (int i = 0; i < 3; ++i) {
+            SpawnSpec ds;
+            ds.kind = "rubble"; ds.material = e.material;
+            ds.pos = {e.pos.x + static_cast<std::int32_t>(
+                          r * kOff[i][0] / 2),
+                      e.pos.y + static_cast<std::int32_t>(
+                          r * kOff[i][1] / 2)};
+            PropertyBag pb;
+            const PropId pq = props.find_name("quantity")
+                ? props.find_name("quantity")->id : kNoProp;
+            const PropId pi = props.find_name("integrity")
+                ? props.find_name("integrity")->id : kNoProp;
+            if (pq != kNoProp) pb.set(pq, Value::integer(std::max<
+                std::int64_t>(1, r / 20)));
+            if (pi != kNoProp) pb.set(pi, Value::integer(80));
+            ds.props = pb;
+            out.push_back(std::move(ds));
+        }
+        if (p_integ != kNoProp && r > 0) {
+            for (EntityId oid : spatial.within(e.pos, r)) {
+                if (oid == e.id) continue;
+                Entity* oe = find(oid);
+                if (!oe || !oe->alive || p_integ == kNoProp) continue;
+                const std::int64_t oi = prop_int(*oe, p_integ, 500);
+                if (oi <= 0) continue;
+                const std::int64_t na = std::max<std::int64_t>(0, oi - 300);
+                StateChange ch;
+                ch.entity = oid; ch.prop = p_integ; ch.had_before = true;
+                ch.before = Value::integer(oi);
+                ch.after = Value::integer(na);
+                oe->props.set(p_integ, ch.after);
+                ev.changes.push_back(ch);
+                ev.participants.push_back(oid);
+            }
+        }
+        e.alive = false;
+        spatial.erase(e.id);
+        ev.participants.push_back(e.id);
+        ev.evidence += "enclosure collapsed; ";
+        return;
+    }
+    // write back accumulator remainder + integrity
+    if (p_da != kNoProp) {
+        const std::int64_t cur = prop_int(e, p_da, 0);
+        if (rem != cur) {
+            StateChange ch;
+            ch.entity = e.id; ch.prop = p_da; ch.had_before = true;
+            ch.before = Value::integer(cur);
+            ch.after = Value::integer(rem);
+            e.props.set(p_da, Value::integer(rem));
+            ev.changes.push_back(ch);
+        }
+    }
+    if (p_integ != kNoProp) {
+        const std::int64_t cur = prop_int(e, p_integ, 500);
+        if (integ != cur) {
+            StateChange ch;
+            ch.entity = e.id; ch.prop = p_integ; ch.had_before = true;
+            ch.before = Value::integer(cur);
+            ch.after = Value::integer(integ);
+            e.props.set(p_integ, Value::integer(integ));
+            ev.changes.push_back(ch);
+            ev.participants.push_back(e.id);
+        }
+    }
+}
+
 }  // namespace simlab
+

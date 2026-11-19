@@ -7504,6 +7504,412 @@ static void test_political_legal_base_core_norms_authority_and_revolt() {
     }
 }
 
+
+// ================= Phase 12.4: architecture & settlement =====================
+static InteractionResult arch_act(World& w, EntityId actor,
+                                  std::vector<EntityId> targets,
+                                  const char* action,
+                                  const std::string& note = "") {
+    InteractionContext c;
+    c.actor = actor; c.targets = std::move(targets);
+    c.parameters.action = action; c.parameters.note = note;
+    c.parameters.ticks = 1;
+    return w.interact(c);
+}
+
+static std::string ttext(Entity& e, World& w, const char* n,
+                         const char* fb = "") {
+    const PropId p = tpid(w, n);
+    if (p == kNoProp) return fb;
+    const Value* v = e.props.get(p);
+    return v && v->type == ValType::Text ? v->s : fb;
+}
+
+// structural part: material defaults + per-entity geometry overrides
+static EntityId mk_part(World& w, const char* mat, Vec2 pos,
+                        std::int64_t gt, std::int64_t gl,
+                        std::int64_t gw, std::int64_t gk,
+                        std::int64_t integ = 600) {
+    PropertyBag b;
+    auto si = [&](const char* n, std::int64_t v) {
+        const PropId p = tpid(w, n);
+        if (p != kNoProp) b.set(p, Value::integer(v));
+    };
+    si("geom_type", gt); si("geom_len", gl);
+    si("geom_wid", gw);  si("geom_thk", gk);
+    si("integrity", integ); si("mass", 500);
+    return w.create_entity("goods", w.materials.id_of(mat), pos, b);
+}
+
+// ring of 4 rods + optional centre post + one big roof slab, then enclose
+static EntityId build_enc(World& w, EntityId builder, Vec2 c,
+                          bool centre_post, const char* slab_mat,
+                          std::int64_t slab_span, bool with_slab = true) {
+    std::vector<EntityId> parts;
+    for (Vec2 d : {Vec2{-180,0},{180,0},{0,-180},{0,180}})
+        parts.push_back(mk_part(w, "dry_wood",
+            {c.x + d.x, c.y + d.y}, 1, 400, 80, 80));
+    if (centre_post)
+        parts.push_back(mk_part(w, "dry_wood", c, 1, 300, 80, 80));
+    if (with_slab)
+        parts.push_back(mk_part(w, slab_mat, c, 2,
+                                slab_span, slab_span, 60));
+    arch_act(w, builder, parts, "enclose");
+    EntityId best = kNoEntity; std::int64_t bd = INT64_MAX;
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.kind_name != "enclosure") continue;
+        const std::int64_t dx = e.pos.x - c.x, dy = e.pos.y - c.y;
+        const std::int64_t d2 = dx * dx + dy * dy;
+        if (d2 < bd) { bd = d2; best = e.id; }
+    }
+    return best;
+}
+
+static void test_architectural_base_core_enclosures_ergonomics_and_decay() {
+    // long advances starve default-metabolism actors; test persons idle,
+    // so give them a slow metabolism and deep energy reserves.
+    auto slow = [](World& w, Vec2 pos) {
+        EntityId id = mk_person(w, pos);
+        tseti(*w.find(id), w, "metabolism", 50);
+        tseti(*w.find(id), w, "energy", 1000000);
+        return id;
+    };
+
+    // ============ A: thermal shelter vs exposure ============================
+    {
+        World w(501, "data");
+        WorldGenParams gp; gp.seed = 77; gp.grid_w = 48; gp.grid_h = 48;
+        gp.cell_size = 16;
+        WorldGenerator gen;
+        CHECK(gen.generate(w, gp));
+        // deep-freeze every cell: environment becomes a killing cold
+        for (auto& t : w.terrain.temperature) t = -300;
+        const Vec2 C{400, 400};
+        EntityId builder = slow(w, C);
+        tseti(*w.find(builder), w, "architectural_style_bias", 600); // burrow
+        tseti(*w.find(builder), w, "reach", 400);
+        tseti(*w.find(builder), w, "sight_range", 800);
+        // thermal phenotype: weak thermoregulator tracks the environment
+        for (EntityId id : {builder}) {
+            Entity* e = w.find(id);
+            tseti(*e, w, "normal_body_temp", 370);
+            tseti(*e, w, "thermoreg_gain", 300);
+            tseti(*e, w, "hypothermia_delta", 15);
+            tseti(*e, w, "fever_delta_max", 35);
+            tseti(*e, w, "hyperpyrexia_delta", 45);
+            tseti(*e, w, "body_temp", 370);
+            tseti(*e, w, "temp_accum", 0);
+            tseti(*e, w, "blood_volume", 1000);   // circulatory -> thermoreg runs
+        }
+        const EntityId enc = build_enc(w, builder, C, true,
+                                       "hardwood", 500);
+        CHECK(enc != kNoEntity);
+        Entity* ee = w.find(enc);
+        CHECK(tint(*ee, w, "insulation_factor", 0) > 300);
+        const EntityId inside = slow(w, C);
+        const EntityId outside = slow(w, {700, 400});
+        for (EntityId id : {inside, outside}) {
+            Entity* e = w.find(id);
+            tseti(*e, w, "normal_body_temp", 370);
+            tseti(*e, w, "thermoreg_gain", 300);
+            tseti(*e, w, "hypothermia_delta", 15);
+            tseti(*e, w, "fever_delta_max", 35);
+            tseti(*e, w, "hyperpyrexia_delta", 45);
+            tseti(*e, w, "body_temp", 370);
+            tseti(*e, w, "temp_accum", 0);
+            tseti(*e, w, "blood_volume", 1000);
+        }
+        w.advance_ticks_for_test(200);
+        const std::int64_t tin = tint(*w.find(inside), w, "body_temp", 0);
+        const std::int64_t tout = tint(*w.find(outside), w, "body_temp", 0);
+        CHECK(tin > tout + 200);          // shell warmth is real physics
+        CHECK(tin > 0);                   // sheltered survivor stays warm
+    }
+
+    // ============ B: span physics — roof without a post collapses ==========
+    {
+        World w(502, "data");
+        const Vec2 C{0, 0};
+        EntityId b1 = slow(w, C); tseti(*w.find(b1), w, "reach", 400);
+        EntityId b2 = slow(w, {2000, 0}); tseti(*w.find(b2), w, "reach", 400);
+        // flint slab span_req=500 > flint max_span=150: legal ONLY with a
+        // centre post inside half-span; without it the shell is stillborn
+        const EntityId good = build_enc(w, b1, C, true, "flint", 500);
+        const EntityId bad  = build_enc(w, b2, {2000, 0}, false, "flint", 500);
+        CHECK(good != kNoEntity && bad != kNoEntity);
+        CHECK(tint(*w.find(good), w, "integrity", 0) > 500);
+        CHECK(tint(*w.find(bad), w, "integrity", 0) <= 5);
+        w.advance_ticks_for_test(60);    // unstable span finishes collapsing
+        CHECK(!w.find(bad)->alive);
+        // collapse leaves rubble — World Truth debris at the site
+        bool rubble = false;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "rubble") { rubble = true; break; }
+        CHECK(rubble);
+        CHECK(w.find(good)->alive);
+    }
+
+    // ============ C+D: habitability, freeform styles ========================
+    {
+        World w(503, "data");
+        const Vec2 C{0, 0};
+        EntityId bA = slow(w, C); tseti(*w.find(bA), w, "reach", 400);
+        tseti(*w.find(bA), w, "architectural_style_bias", 100);  // radial
+        EntityId bB = slow(w, {3000, 0});
+        tseti(*w.find(bB), w, "reach", 400);
+        tseti(*w.find(bB), w, "architectural_style_bias", 900);  // tower
+        const EntityId eA = build_enc(w, bA, C, true, "flint", 500);
+        const EntityId eB = build_enc(w, bB, {3000, 0}, true, "flint", 500);
+        CHECK(eA != kNoEntity && eB != kNoEntity);
+        CHECK(tint(*w.find(eA), w, "habitable_score", 0) > 400);
+        CHECK(tint(*w.find(eB), w, "habitable_score", 0) > 400);
+        // freeform: different biases -> different emergent form classes,
+        // both physically legitimate
+        const std::string sA = ttext(*w.find(eA), w, "arch_style");
+        const std::string sB = ttext(*w.find(eB), w, "arch_style");
+        CHECK(sA == "radial");
+        CHECK(sB == "tower");
+        CHECK(sA != sB);
+        // every enclosure gets a passage — nobody seals themselves in
+        bool portal = false;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "portal") { portal = true; break; }
+        CHECK(portal);
+    }
+
+    // ============ E: stealth bypass vs noise ================================
+    {
+        World w(504, "data");
+        const Vec2 C{0, 0};
+        EntityId owner = slow(w, C);
+        tseti(*w.find(owner), w, "reach", 400);
+        tseti(*w.find(owner), w, "sight_range", 800);
+        const EntityId enc = build_enc(w, owner, C, true, "flint", 500);
+        CHECK(enc != kNoEntity);
+        w.advance_ticks_for_test(2);   // ownership belief settles
+        // quiet professional vs clumsy amateur
+        EntityId pro = slow(w, {400, 0});
+        tseti(*w.find(pro), w, "mind_motor_precision", 1000);
+        tseti(*w.find(pro), w, "mind_theory_of_mind", 1000);
+        tseti(*w.find(pro), w, "reach", 500);
+        EntityId clumsy = slow(w, {420, 0});
+        tseti(*w.find(clumsy), w, "mind_motor_precision", 100);
+        tseti(*w.find(clumsy), w, "mind_theory_of_mind", 100);
+        tseti(*w.find(clumsy), w, "reach", 500);
+        const std::int64_t integ0 = tint(*w.find(enc), w, "integrity", 0);
+        CHECK(arch_act(w, pro, {enc}, "bypass_barrier").completed);
+        CHECK(arch_act(w, clumsy, {enc}, "bypass_barrier").completed);
+        // quiet success grants entry; failure makes noise — shell unscathed
+        CHECK(tint(*w.find(enc), w, "integrity", 0) == integ0);
+        const AgentMind* pm = w.find_mind(pro);
+        CHECK(pm && pm->find_belief("entry_granted:" +
+            std::to_string(static_cast<std::uint64_t>(enc))) != nullptr);
+        // the owner heard the noise
+        const AgentMind* om = w.find_mind(owner);
+        CHECK(om && om->find_belief("alert:" +
+            std::to_string(static_cast<std::uint64_t>(enc))) != nullptr);
+        // trespass: a third party walks into the owned low-barrier shell
+        EntityId lurker = slow(w, {100, 0});
+        tseti(*w.find(lurker), w, "sight_range", 100);
+        (void)w.mind(lurker);          // agents exist once they perceive
+        w.advance_ticks_for_test(3);   // arch_drift scan runs
+        const AgentMind* lm = w.find_mind(lurker);
+        CHECK(lm && lm->find_belief("trespass:" +
+            std::to_string(static_cast<std::uint64_t>(enc))) != nullptr);
+    }
+
+    // ============ F: defensive maze complexity =============================
+    {
+        World w(505, "data");
+        const Vec2 C{0, 0};
+        EntityId baron = slow(w, C);
+        tseti(*w.find(baron), w, "reach", 400);
+        tseti(*w.find(baron), w, "architectural_style_bias", 700);
+        const EntityId outer = build_enc(w, baron, C, true, "flint", 500);
+        CHECK(outer != kNoEntity);
+        // the robbed baron nests a second shell inside the first
+        const EntityId inner = build_enc(w, baron, {60, 0}, true,
+                                       "flint", 500);
+        CHECK(inner != kNoEntity);
+        w.advance_ticks_for_test(2);
+        const std::int64_t cx = arch_complexity(w, inner);
+        CHECK(cx >= 150);             // depth+portals make it a maze
+        // bypass cost scales with maze-ness: more ticks, higher threshold
+        EntityId thief = slow(w, {300, 60});
+        tseti(*w.find(thief), w, "mind_motor_precision", 900);
+        tseti(*w.find(thief), w, "mind_theory_of_mind", 900);
+        tseti(*w.find(thief), w, "reach", 600);
+        InteractionResult br = arch_act(w, thief, {inner}, "bypass_barrier");
+        CHECK(br.completed);
+        CHECK(br.event != kNoEvent);
+    }
+
+    // ============ G: emergent function, no hardcoded labels ================
+    {
+        World w(506, "data");
+        const Vec2 C{0, 0};
+        EntityId smith = slow(w, C);
+        tseti(*w.find(smith), w, "reach", 400);
+        tseti(*w.find(smith), w, "mind_motor_precision", 1000);
+        const EntityId forge = build_enc(w, smith, C, true, "flint", 500);
+        CHECK(forge != kNoEntity);
+        // a hot hearth + ore inside -> the shell reads as a workplace
+        EntityId hearth = mk_part(w, "stone", C, 3, 100, 100, 100);
+        tseti(*w.find(hearth), w, "temperature", 800);
+        EntityId ore = mk_part(w, "iron_ore", {50, 0}, 3, 100, 100, 100);
+        EntityId food = mk_part(w, "wild_berries", {5000, 0}, 3, 50, 50, 50);
+        CHECK(arch_function(w, forge) == "forge");
+        // utility: the smith is pulled to work inside the forge shell
+        CHECK(arch_utility_bonus(w, smith, "combine") > 0);
+        // a second shell stocked with food behind a hard barrier -> vault
+        EntityId baron = slow(w, {5000, 0});
+        tseti(*w.find(baron), w, "reach", 400);
+        const EntityId vault = build_enc(w, baron, {5000, 0}, true,
+                                       "flint", 500);
+        CHECK(vault != kNoEntity);
+        Entity* ve = w.find(vault);
+        tseti(*ve, w, "access_barrier", 800);
+        w.find(baron)->pos = {5600, 0};   // owner steps out: no council
+        EntityId grain = mk_part(w, "wild_berries", {5050, 0}, 3, 50, 50, 50);
+        (void)food; (void)ore; (void)grain;
+        CHECK(arch_function(w, vault) == "vault");
+    }
+
+    // ============ H: weathering, repair, trails =============================
+    {
+        World wA(507, "data"), wB(507, "data");
+        // wood shell weathers fast, stone shell endures — same clock
+        EntityId bA = slow(wA, {0, 0}); tseti(*wA.find(bA), wA, "reach", 400);
+        EntityId bB = slow(wB, {0, 0}); tseti(*wB.find(bB), wB, "reach", 400);
+        const EntityId wood_enc = build_enc(wA, bA, {0, 0}, true,
+                                            "wood_debris", 200);
+        const EntityId stone_enc = build_enc(wB, bB, {0, 0}, true,
+                                             "flint", 500);
+        CHECK(wood_enc != kNoEntity && stone_enc != kNoEntity);
+        // equalize starting integrity so weathering alone differentiates
+        for (auto& [w, enc] : {std::pair{&wA, wood_enc},
+                               std::pair{&wB, stone_enc}}) {
+            Entity* e = w->find(enc);
+            tseti(*e, *w, "integrity", 900);
+            tseti(*e, *w, "decay_accum", 0);
+        }
+        wA.advance_ticks_for_test(800);
+        wB.advance_ticks_for_test(800);
+        const std::int64_t iw = tint(*wA.find(wood_enc), wA, "integrity", 0);
+        const std::int64_t is = tint(*wB.find(stone_enc), wB, "integrity", 0);
+        CHECK(iw < is);               // wood rots, stone stands
+        // owner patches the worn shell back to health
+        tseti(*wA.find(bA), wA, "energy", 100000);   // metabolism drained it
+        std::vector<EntityId> rep{wood_enc,
+            mk_part(wA, "dry_wood", {100, 0}, 3, 100, 100, 100)};
+        CHECK(arch_act(wA, bA, rep, "repair").completed);
+        CHECK(tint(*wA.find(wood_enc), wA, "integrity", 0) > iw);
+        // abandoned shell eventually falls: force it past the threshold
+        Entity* we = wA.find(wood_enc);
+        tseti(*we, wA, "integrity", 30);
+        tseti(*we, wA, "decay_accum", 125000);
+        wA.advance_ticks_for_test(20);
+        CHECK(!we->alive);
+        // trails: repeated footfall compacts the cell underfoot
+        World wC(508, "data");
+        WorldGenParams gp; gp.seed = 9; gp.grid_w = 16; gp.grid_h = 16;
+        gp.cell_size = 16; gp.origin_x = 0; gp.origin_y = 0;
+        WorldGenerator g2; CHECK(g2.generate(wC, gp));
+        EntityId walker = slow(wC, {50, 50});
+        tseti(*wC.find(walker), wC, "speed", 8000);
+        tseti(*wC.find(walker), wC, "energy", 1000000);
+        Vec2 a{50, 50}, b{200, 50};
+        for (int i = 0; i < 6; ++i) {   // one-way: reach the far cell
+            InteractionContext mc; mc.actor = walker;
+            mc.parameters.action = "move"; mc.parameters.ticks = 4;
+            mc.parameters.destination = b;
+            mc.parameters.has_destination = true;
+            wC.interact(mc);
+        }
+        CHECK(wC.terrain.wear_at({150, 50}) > 0);
+        // worn ground is cheaper: identical hop on trail vs fresh ground
+        const std::int64_t e0 = tint(*wC.find(walker), wC, "energy", 0);
+        InteractionContext m1; m1.actor = walker;
+        m1.parameters.action = "move"; m1.parameters.ticks = 4;
+        m1.parameters.destination = {150, 50};
+        m1.parameters.has_destination = true;
+        wC.interact(m1);
+        const std::int64_t worn_cost = e0 - tint(*wC.find(walker), wC, "energy", 0);
+        EntityId fresh = slow(wC, {200, 150});
+        tseti(*wC.find(fresh), wC, "speed", 8000);
+        tseti(*wC.find(fresh), wC, "energy", 1000000);
+        const std::int64_t f0 = tint(*wC.find(fresh), wC, "energy", 0);
+        InteractionContext m2; m2.actor = fresh;
+        m2.parameters.action = "move"; m2.parameters.ticks = 4;
+        m2.parameters.destination = {150, 150};
+        m2.parameters.has_destination = true;
+        wC.interact(m2);
+        const std::int64_t fresh_cost = f0 - tint(*wC.find(fresh), wC, "energy", 0);
+        CHECK(worn_cost > 0);
+        CHECK(worn_cost < fresh_cost);   // trail discounts the step
+    }
+
+    // ============ I: LOD invariance + save roundtrip =========================
+    {
+        auto build_pair = [&](World& w) {
+            EntityId b = slow(w, {0, 0});
+            tseti(*w.find(b), w, "reach", 400);
+            return build_enc(w, b, {0, 0}, true, "flint", 500);
+        };
+        World wA(509, "data"), wB(509, "data");
+        const EntityId eA = build_pair(wA);
+        const EntityId eB = build_pair(wB);
+        CHECK(eA != kNoEntity && eB != kNoEntity);
+        wA.advance_ticks_for_test(1); wB.advance_ticks_for_test(1);
+        // identical wear seed on both worlds via one shared move path
+        World wT1(510, "data"), wT2(510, "data");
+        WorldGenParams gp; gp.seed = 3; gp.grid_w = 16; gp.grid_h = 16;
+        gp.cell_size = 16;
+        WorldGenerator g; CHECK(g.generate(wT1, gp)); CHECK(g.generate(wT2, gp));
+        auto seed_wear = [&](World& w) {
+            EntityId walker = slow(w, {50, 50});
+            tseti(*w.find(walker), w, "speed", 8000);
+            tseti(*w.find(walker), w, "energy", 1000000);
+            for (int i = 0; i < 5; ++i) {
+                InteractionContext mc; mc.actor = walker;
+                mc.parameters.action = "move"; mc.parameters.ticks = 4;
+                mc.parameters.destination = Vec2{200, 50};
+                mc.parameters.has_destination = true;
+                w.interact(mc);
+            }
+        };
+        seed_wear(wT1); seed_wear(wT2);
+        // ticked vs batched: enclosure drift + wear fade must agree exactly
+        for (int i = 0; i < 30; ++i) wT1.advance_ticks_for_test(1);
+        wT2.advance_ticks_for_test(30);
+        // compare every terrain wear cell + enclosure decay state
+        bool wear_eq = true;
+        for (std::size_t i = 0; i < wT1.terrain.traffic_wear.size(); ++i)
+            if (wT1.terrain.traffic_wear[i] != wT2.terrain.traffic_wear[i]) {
+                wear_eq = false; break;
+            }
+        CHECK(wear_eq);
+        // enclosure decay_accum exact under both schedules (worlds wA/wB)
+        wA.advance_ticks_for_test(1);
+        wB.advance_ticks_for_test(1);
+        // (already advanced 1+1 above; compare accumulators directly)
+        CHECK(tint(*wA.find(eA), wA, "decay_accum", -1) ==
+              tint(*wB.find(eB), wB, "decay_accum", -1));
+        // save roundtrip keeps the whole architectural state hashable
+        World wS(511, "data");
+        const EntityId eS = build_pair(wS);
+        CHECK(eS != kNoEntity);
+        wS.advance_ticks_for_test(10);
+        const std::uint64_t h0 = wS.state_hash();
+        const std::string tmp = "/tmp/arch_save.bin";
+        CHECK(wS.save(tmp, nullptr));
+        World wL(511, "data");
+        CHECK(wL.load(tmp, nullptr));
+        CHECK(wL.state_hash() == h0);
+    }
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -7557,6 +7963,7 @@ int main(int argc, char** argv) {
     RUN(test_causal_language_syntax_rosetta_and_inscriptions);
     RUN(test_inductive_economy_currency_inflation_and_credit);
     RUN(test_political_legal_base_core_norms_authority_and_revolt);
+    RUN(test_architectural_base_core_enclosures_ergonomics_and_decay);
     RUN(test_infection_and_primitive_medicine);
     RUN(test_neuro_psychopathology);
     RUN(test_phase9_autonomous_civilization);

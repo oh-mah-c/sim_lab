@@ -27,6 +27,7 @@
 #include "simlab/World.hpp"
 #include "LawUtil.hpp"
 #include "simlab/Geometry.hpp"
+#include "simlab/Cognition.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
@@ -103,6 +104,9 @@ bool CompositionModel::supports(const World& w, const InteractionContext& ctx) c
     if (a == "assemble") return ctx.targets.size() >= 2;
     if (a == "disassemble" || a == "wield" || a == "unwield") return true;
     if (a == "carve") return ctx.targets.size() == 1;
+    if (a == "enclose") return ctx.targets.size() >= 4;
+    if (a == "bypass_barrier") return ctx.targets.size() == 1;
+    if (a == "repair") return ctx.targets.size() >= 2;
     return false;
 }
 
@@ -502,10 +506,20 @@ static PredictionResult predict_carve(const World& w, const InteractionContext& 
     return r;
 }
 
+PredictionResult predict_enclose(const World& w,
+                                 const InteractionContext& ctx);
+PredictionResult predict_bypass_barrier(const World& w,
+                                        const InteractionContext& ctx);
+PredictionResult predict_repair(const World& w,
+                                const InteractionContext& ctx);
+
 PredictionResult CompositionModel::predict(const World& w,
                                            const InteractionContext& ctx) const {
     const std::string& a = ctx.parameters.action;
     if (a == "disassemble") return predict_disassemble(w, ctx);
+    if (a == "enclose")      return predict_enclose(w, ctx);
+    if (a == "bypass_barrier") return predict_bypass_barrier(w, ctx);
+    if (a == "repair")       return predict_repair(w, ctx);
     if (a == "wield") return predict_wield(w, ctx, false);
     if (a == "unwield") return predict_wield(w, ctx, true);
     if (a == "carve") return predict_carve(w, ctx);
@@ -514,6 +528,400 @@ PredictionResult CompositionModel::predict(const World& w,
 
 std::unique_ptr<INaturalLawModel> CompositionModel::clone() const {
     return std::make_unique<CompositionModel>();
+}
+
+
+
+// ---- Phase 12.4: architecture -----------------------------------------------
+// "enclose" raises a roofed space from loose structural parts; "bypass_
+// barrier" is the quiet-entry contest against access_barrier+maze
+// complexity; "repair" patches a shell from spare material. No building
+// types exist — walls are rods, roofs are slabs, doors are portals, and
+// every verdict comes from material physics.
+
+namespace {
+
+struct ArchPart {
+    EntityId id;
+    MaterialId material;
+    Vec2 pos;
+    std::int64_t mass, integ, geom_len, geom_wid, geom_thk, geom_type;
+    std::int64_t lbs, span, insul, wres, hard, flamm;
+};
+
+std::int64_t arch_mat_prop(const World& w, MaterialId m, const char* name,
+                           std::int64_t fb) {
+    if (m == kNoMaterial) return fb;
+    const MaterialDef* d = w.materials.find(m);
+    if (!d) return fb;
+    const PropertyDef* pd = w.props.find_name(name);
+    if (!pd) return fb;
+    const auto it = d->props.find(pd->id);
+    return it != d->props.end() && it->second.type == ValType::Integer
+        ? it->second.i : fb;
+}
+
+bool arch_load_part(const World& w, const Entity& t, ArchPart& p,
+                    const char* failbuf, std::string& fail) {
+    (void)w; (void)failbuf;
+    if (!t.alive) { fail = "dead part"; return false; }
+    const PropId contained = prop_id(w, "contained");
+    if (contained != kNoProp && prop_bool(w, t, contained)) {
+        fail = "part already contained"; return false;
+    }
+    if (t.kind_name == "enclosure" || t.kind_name == "portal") {
+        fail = "cannot build from a finished space"; return false;
+    }
+    p.id = t.id; p.material = t.material; p.pos = t.pos;
+    p.mass   = w.prop_int(t, prop_id(w, "mass"), 1000);
+    p.integ  = w.prop_int(t, prop_id(w, "integrity"), 500);
+    p.geom_type = w.prop_int(t, prop_id(w, "geom_type"), 0);
+    p.geom_len = w.prop_int(t, prop_id(w, "geom_len"), 0);
+    p.geom_wid = w.prop_int(t, prop_id(w, "geom_wid"), 0);
+    p.geom_thk = w.prop_int(t, prop_id(w, "geom_thk"), 0);
+    p.lbs   = arch_mat_prop(w, t.material, "load_bearing_strength", 300);
+    p.span  = arch_mat_prop(w, t.material, "max_span", 0);
+    p.insul = arch_mat_prop(w, t.material, "thermal_insulation", 300);
+    p.wres  = arch_mat_prop(w, t.material, "weather_resistance", 400);
+    p.hard  = w.prop_int(t, prop_id(w, "hardness"), 300);
+    p.flamm = w.prop_int(t, prop_id(w, "flammability"), 200);
+    return true;
+}
+
+}  // namespace
+
+PredictionResult predict_enclose(const World& w,
+                                 const InteractionContext& ctx) {
+    PredictionResult r; r.law = 5; r.law_name = "physical.compose";
+    const PropId contained = prop_id(w, "contained");
+    const PropId energy = prop_id(w, "energy");
+    const PropId reach = prop_id(w, "reach");
+    const PropId p_rad = prop_id(w, "footprint_radius");
+    const PropId p_ratio = prop_id(w, "enclosure_ratio");
+    const PropId p_ins = prop_id(w, "insulation_factor");
+    const PropId p_hab = prop_id(w, "habitable_score");
+    const PropId p_cx = prop_id(w, "spatial_complexity");
+    const PropId p_bar = prop_id(w, "access_barrier");
+    const PropId p_style = prop_id(w, "arch_style");
+    const PropId p_da = prop_id(w, "decay_accum");
+    const PropId p_wres = prop_id(w, "weather_resistance");
+    const PropId p_integ = prop_id(w, "integrity");
+    const PropId p_temp = prop_id(w, "temperature");
+    if (ctx.targets.size() < 4) {
+        r.failure = "enclosure needs at least 4 parts"; return r;
+    }
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+
+    std::vector<ArchPart> parts;
+    std::int64_t total_mass = 0;
+    Vec2 centroid{0, 0};
+    for (EntityId tid : ctx.targets) {
+        const Entity* t = w.find(tid);
+        if (!t) { r.failure = "missing part"; return r; }
+        ArchPart p;
+        std::string why;
+        if (!arch_load_part(w, *t, p, "", why)) {
+            r.failure = "part " + std::to_string(tid) + ": " + why;
+            return r;
+        }
+        if (!in_reach(w, *actor, *t, reach)) {
+            r.failure = "part " + std::to_string(tid) + " out of reach";
+            return r;
+        }
+        total_mass += p.mass;
+        centroid.x += p.pos.x; centroid.y += p.pos.y;
+        parts.push_back(p);
+    }
+    centroid.x /= static_cast<std::int64_t>(parts.size());
+    centroid.y /= static_cast<std::int64_t>(parts.size());
+
+    // footprint: half the widest part spread, clamped to buildable sizes
+    std::int64_t radsq = 0;
+    for (const ArchPart& p : parts) {
+        const std::int64_t dx = p.pos.x - centroid.x;
+        const std::int64_t dy = p.pos.y - centroid.y;
+        radsq = std::max<std::int64_t>(radsq, dx * dx + dy * dy);
+    }
+    // integer sqrt via Newton (same trick as locomotion)
+    std::int64_t spread = 0;
+    if (radsq > 0) {
+        std::int64_t x = radsq, y = (x + 1) / 2;
+        while (y < x) { x = y; y = (x + radsq / x) / 2; }
+        spread = x;
+    }
+    std::int64_t radius = spread / 2 + 120;
+    radius = std::clamp<std::int64_t>(radius, 120, 3000);
+
+    // ---- span physics ------------------------------------------------------
+    // Slabs (geom_type 2 plates) bridge between posts (geom_type 1 rods).
+    // A slab whose bridging dimension exceeds its material's max_span AND
+    // which has no post within half that span collapses the whole shell.
+    bool unstable = false;
+    std::int64_t min_integ = INT64_MAX;
+    std::int64_t w_hard = 0, w_ins = 0, w_wres = 0, w_fl = 0, w_lbs = 0;
+    MaterialId shell_mat = kNoMaterial; std::int64_t shell_mass = -1;
+    for (const ArchPart& p : parts) {
+        min_integ = std::min(min_integ, p.integ);
+        w_hard += p.hard * p.mass; w_ins += p.insul * p.mass;
+        w_wres += p.wres * p.mass; w_fl += p.flamm * p.mass;
+        w_lbs += p.lbs * p.mass;
+        if (p.mass > shell_mass) { shell_mass = p.mass; shell_mat = p.material; }
+    }
+    auto wavg = [](std::int64_t acc, std::int64_t mass) {
+        return mass > 0 ? acc / mass : 0; };
+    const std::int64_t hard_a = wavg(w_hard, total_mass);
+    const std::int64_t ins_a = wavg(w_ins, total_mass);
+    const std::int64_t wres_a = wavg(w_wres, total_mass);
+    const std::int64_t fl_a = wavg(w_fl, total_mass);
+    const std::int64_t lbs_a = wavg(w_lbs, total_mass);
+    (void)lbs_a;
+
+    for (const ArchPart& s : parts) {
+        if (s.geom_type != 2) continue;                    // slabs only
+        const std::int64_t span_req = std::max(s.geom_len, s.geom_wid);
+        const std::int64_t mspan = s.span;
+        if (span_req <= 0 || mspan <= 0) continue;
+        if (span_req <= mspan) continue;                   // material copes
+        // nearest post distance
+        std::int64_t d2min = INT64_MAX;
+        for (const ArchPart& q : parts) {
+            if (q.geom_type != 1 || q.id == s.id) continue;
+            const std::int64_t dx = q.pos.x - s.pos.x;
+            const std::int64_t dy = q.pos.y - s.pos.y;
+            d2min = std::min<std::int64_t>(d2min, dx * dx + dy * dy);
+        }
+        // support within half the allowed span -> still stands
+        if (d2min == INT64_MAX || d2min * 4 > mspan * mspan)
+            unstable = true;
+    }
+
+    // ---- freeform style ----------------------------------------------------
+    // bias quartiles pick a form CLASS; every class must still pass the
+    // same physics — aesthetics bend the rules, never break them.
+    const std::int64_t bias = std::clamp<std::int64_t>(
+        w.prop_int(*actor, prop_id(w, "architectural_style_bias"), 500),
+        0, 1000);
+    const int style = static_cast<int>(bias * 4 / 1000);  // 0..3
+    static const char* kStyleName[4] =
+        {"radial", "court", "burrow", "tower"};
+    // radial wants a round ring (6R perimeter), court a square (8R);
+    // burrow reads as earth-sheltered (insulation bonus), tower packs tight
+    // with more inner complexity for its footprint.
+    const std::int64_t perim = (style == 0 ? 6 : 8) * radius;
+    const std::int64_t ins_bonus = style == 2 ? 150 : 0;
+    const std::int64_t cx_bonus = style == 3 ? 60 : style == 0 ? 30 : 0;
+
+    // coverage: rods/walls contribute length, fill contributes a stub
+    std::int64_t wall_cov = 0;
+    for (const ArchPart& p : parts) {
+        if (p.geom_type == 2) continue;                    // slabs roof, not wall
+        wall_cov += p.geom_len > 0 ? p.geom_len : 120;
+    }
+    std::int64_t roof_area = 0;
+    for (const ArchPart& p : parts)
+        if (p.geom_type == 2)
+            roof_area += std::max<std::int64_t>(0, p.geom_len) *
+                         std::max<std::int64_t>(0, p.geom_wid);
+    const std::int64_t floor_area = 4 * radius * radius;  // square proxy
+    const std::int64_t wall_ratio = wall_cov * 1000 / std::max<
+        std::int64_t>(1, perim);
+    const std::int64_t roof_ratio = roof_area * 1000 /
+        std::max<std::int64_t>(1, floor_area);
+    const std::int64_t ratio = std::clamp<std::int64_t>(
+        std::min(wall_ratio, roof_ratio), 0, 1000);
+
+    // inner rooms already standing inside the footprint add complexity
+    std::int64_t inner_enc = 0;
+    for (const auto& ep : w.entities) {
+        const Entity& o = *ep;
+        if (!o.alive || o.kind_name != "enclosure" || o.id == ctx.actor)
+            continue;
+        const std::int64_t ox = o.pos.x - centroid.x;
+        const std::int64_t oy = o.pos.y - centroid.y;
+        if (ox * ox + oy * oy <= radius * radius) ++inner_enc;
+    }
+    const std::int64_t complexity = std::min<std::int64_t>(1000,
+        40 + inner_enc * 40 + cx_bonus);
+
+    // ---- habitability -------------------------------------------------------
+    // sealed + heated interior + flammable shell = fire risk penalty
+    bool interior_heat = false;
+    if (p_temp != kNoProp) {
+        for (const auto& ep : w.entities) {
+            const Entity& o = *ep;
+            if (!o.alive) continue;
+            const std::int64_t ox = o.pos.x - centroid.x;
+            const std::int64_t oy = o.pos.y - centroid.y;
+            if (ox * ox + oy * oy <= radius * radius &&
+                w.prop_int(o, p_temp, 0) > 500) { interior_heat = true; break; }
+        }
+    }
+    std::int64_t hab = 350;                                 // portal spawned open
+    hab += radius >= 150 ? 350 : radius * 350 / 150;        // floor clearance
+    if (ratio < 300) hab -= 150;                            // too open
+    if (ratio > 800 && interior_heat && fl_a > 400) hab -= 300;
+    hab = std::clamp<std::int64_t>(hab, 0, 1000);
+
+    const std::int64_t ins_fac = std::clamp<std::int64_t>(
+        ratio * ins_a / 1000 + ins_bonus, 0, 1000);
+    const std::int64_t barrier = std::clamp<std::int64_t>(
+        hard_a * ratio / 1000 + (ratio > 800 ? 100 : 0), 0, 1000);
+
+    const std::int64_t cost = 300 + total_mass / 100;
+    if (!charge_or_fail(w, *actor, energy, cost, r)) return r;
+
+    // ---- spawn --------------------------------------------------------------
+    PropertyBag pb;
+    auto seti = [&](PropId p, std::int64_t v) {
+        if (p != kNoProp) pb.set(p, Value::integer(v)); };
+    seti(p_rad, radius);
+    seti(p_ratio, ratio);
+    seti(p_ins, ins_fac);
+    seti(p_hab, hab);
+    seti(p_cx, complexity);
+    seti(p_bar, barrier);
+    seti(p_da, unstable ? 63500 : 0);
+    seti(p_wres, wres_a);
+    if (p_style != kNoProp)
+        pb.set(p_style, Value::text(kStyleName[style]));
+    // integrity: weakest link governs; an unstable span is born failing
+    const std::int64_t integ0 = std::clamp<std::int64_t>(
+        std::min(min_integ, wavg(w_lbs, total_mass)), 1, 1000);
+    seti(p_integ, unstable ? 1 : integ0);
+    seti(prop_id(w, "mass"), total_mass);
+
+    SpawnSpec s;
+    s.kind = "enclosure"; s.material = shell_mat; s.pos = centroid;
+    s.props = pb;
+    for (const ArchPart& p : parts)
+        s.rel_from.push_back({"part_of", p.id});
+    r.spawns.push_back(s);
+
+    // one open passage on the rim — the door is a portal entity, not a flag
+    {
+        SpawnSpec ps;
+        ps.kind = "portal";
+        ps.material = kNoMaterial;
+        ps.pos = {centroid.x + static_cast<std::int32_t>(radius),
+                  centroid.y};
+        PropertyBag pp;
+        const PropId p_open = prop_id(w, "portal_open");
+        const PropId p_abar = prop_id(w, "access_barrier");
+        if (p_open != kNoProp) pp.set(p_open, Value::integer(1));
+        if (p_abar != kNoProp) pp.set(p_abar, Value::integer(barrier));
+        ps.props = pp;
+        r.spawns.push_back(ps);
+    }
+
+    for (const ArchPart& p : parts) {
+        if (contained != kNoProp)
+            set_change_v(r, p.id, contained,
+                         Value::boolean(false), Value::boolean(true));
+    }
+    r.possible = true;
+    r.ticks = static_cast<std::int64_t>(parts.size()) / 2 + 1;
+    std::ostringstream n;
+    n << "enclose r=" << radius << " ratio=" << ratio
+      << " insul=" << ins_fac << " hab=" << hab << " cx=" << complexity
+      << " barrier=" << barrier << " style=" << kStyleName[style]
+      << (unstable ? " UNSTABLE-SPAN" : "") << " cost=" << cost;
+    r.notes.push_back(n.str());
+    return r;
+}
+
+PredictionResult predict_bypass_barrier(const World& w,
+                                        const InteractionContext& ctx) {
+    PredictionResult r; r.law = 5; r.law_name = "physical.compose";
+    const PropId energy = prop_id(w, "energy");
+    const PropId contained = prop_id(w, "contained");
+    const PropId reach = prop_id(w, "reach");
+    const PropId p_bar = prop_id(w, "access_barrier");
+    const PropId p_open = prop_id(w, "portal_open");
+    (void)p_open;
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    const Entity* enc = ctx.targets.empty() ? nullptr
+        : w.find(ctx.targets.front());
+    if (!enc || !enc->alive) { r.failure = "no living target"; return r; }
+    if (enc->kind_name != "enclosure") {
+        r.failure = "target is not an enclosure"; return r;
+    }
+    if (!in_reach(w, *actor, *enc, reach)) {
+        r.failure = "enclosure out of reach"; return r;
+    }
+    // owner never needs to bypass their own shell
+    if (arch_owner_of(w, enc->id) == ctx.actor) {
+        r.failure = "already inside consent"; return r;
+    }
+    if (!charge_or_fail(w, *actor, energy, 60, r)) return r;
+    const std::int64_t barrier = p_bar != kNoProp
+        ? w.prop_int(*enc, p_bar, 0) : 0;
+    const std::int64_t cx = arch_complexity(w, enc->id);
+    const std::int64_t motor = w.prop_int(*actor,
+        prop_id(w, "mind_motor_precision"), 1000);
+    const std::int64_t tom = w.prop_int(*actor,
+        prop_id(w, "mind_theory_of_mind"), 1000);
+    const std::int64_t skill = (motor + tom) / 2;
+    const std::int64_t need = barrier + cx / 10;
+    r.ticks = 2 + cx / 20;
+    if (skill >= need) {
+        r.possible = true;
+        r.notes.push_back("bypass succeeded quietly");
+    } else {
+        // the attempt still happens — noise is the cost of failure
+        r.possible = true;
+        r.notes.push_back("bypass repelled — noise alerted the household");
+    }
+    return r;
+}
+
+PredictionResult predict_repair(const World& w,
+                                const InteractionContext& ctx) {
+    PredictionResult r; r.law = 5; r.law_name = "physical.compose";
+    const PropId contained = prop_id(w, "contained");
+    const PropId energy = prop_id(w, "energy");
+    const PropId reach = prop_id(w, "reach");
+    const PropId p_integ = prop_id(w, "integrity");
+    if (ctx.targets.size() < 2) {
+        r.failure = "repair needs an enclosure plus material"; return r;
+    }
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    const Entity* enc = w.find(ctx.targets.front());
+    if (!enc || enc->kind_name != "enclosure") {
+        r.failure = "repair target is not an enclosure"; return r;
+    }
+    if (!in_reach(w, *actor, *enc, reach)) {
+        r.failure = "enclosure out of reach"; return r;
+    }
+    if (!charge_or_fail(w, *actor, energy, 100, r)) return r;
+    std::int64_t integ = p_integ != kNoProp
+        ? w.prop_int(*enc, p_integ, 500) : 500;
+    std::int64_t patched = 0;
+    for (std::size_t i = 1; i < ctx.targets.size(); ++i) {
+        const Entity* t = w.find(ctx.targets[i]);
+        if (!t || !t->alive) continue;
+        if (!in_reach(w, *actor, *t, reach)) {
+            r.failure = "patch material out of reach"; return r;
+        }
+        const std::int64_t ti = p_integ != kNoProp
+            ? w.prop_int(*t, p_integ, 200) : 200;
+        const std::int64_t add = std::min<std::int64_t>(ti / 2, 120);
+        integ = std::min<std::int64_t>(1000, integ + add);
+        patched += add;
+        if (contained != kNoProp)
+            set_change_v(r, t->id, contained,
+                         Value::boolean(false), Value::boolean(true));
+    }
+    if (patched <= 0) { r.failure = "nothing to patch with"; return r; }
+    if (p_integ != kNoProp) {
+        const std::int64_t cur = w.prop_int(*enc, p_integ, 500);
+        set_change(r, enc->id, p_integ, cur, integ);
+    }
+    r.possible = true; r.ticks = 2;
+    r.notes.push_back("patched shell +" + std::to_string(patched));
+    return r;
 }
 
 }  // namespace simlab

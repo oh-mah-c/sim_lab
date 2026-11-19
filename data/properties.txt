@@ -402,3 +402,24 @@ law_aversion         integer permille     range 0 1000   domain=social     # ins
 # language entity: communal political memory (like monetary_consensus)
 norm_table           text     none                     domain=social     # community: "action:fixed;" taboo aversion ledger
 ostracism_table      text     none                     domain=social     # community: "agent_id:fixed;" collective outlaw ledger
+
+# ---- architectural domain: enclosures, span physics, weathering, trails ----
+# Material-level structural & climatic capability (0..1000 permille unless noted).
+load_bearing_strength integer permille     range 0 1000   domain=physical # material: compression/load capacity for walls & roofs
+max_span               integer units                   domain=physical # material: longest unsupported horizontal span (0 = cannot bridge)
+thermal_insulation     integer permille     range 0 1000   domain=physical # material: heat/wind barrier of a built shell
+weather_resistance     integer permille     range 0 1000   domain=physical # material: resistance to rain/wind erosion
+# Agent/species-level form preference — biases layout, never forbids it.
+architectural_style_bias integer permille   range 0 1000   domain=cognitive # agent: emergent structural form preference
+# enclosure entity: one roofed space; nesting is spatial, not typed.
+footprint_radius       integer units                   domain=physical # enclosure: floor radius in map units
+enclosure_ratio        integer permille     range 0 1000   domain=physical # enclosure: wall/roof coverage of the perimeter
+insulation_factor      integer permille     range 0 1000   domain=physical # enclosure: effective thermal barrier actually achieved
+habitable_score        integer permille     range 0 1000   domain=physical # enclosure: ergonomics verdict (portal+area+ventilation)
+spatial_complexity     integer permille     range 0 1000   domain=physical # enclosure: maze-ness (nesting depth + portals + inner rooms)
+access_barrier         integer permille     range 0 1000   domain=physical # enclosure: forced-entry difficulty for bypass/barrier checks
+arch_style             text     none                     domain=physical # enclosure: emergent form class label (radial/court/burrow/tower)
+decay_accum            integer units                   domain=physical # enclosure: weathering Euclid accumulator (permille-ticks)
+# portal entity: a passage node on an enclosure's edge; destination is
+# resolved spatially (nearest other enclosure, else the outside).
+portal_open            integer units        range 0 1    domain=physical # portal: passage currently passable

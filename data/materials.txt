@@ -34,6 +34,10 @@ material dry_wood
   residue_share 250
   inscription_durability 150
   carving_hardness_req 150
+  load_bearing_strength 500
+  max_span 900
+  thermal_insulation 550
+  weather_resistance 400
 
   absorbency 400
   contamination 200
@@ -66,6 +70,10 @@ material hardwood
   residue_share 250
   inscription_durability 250
   carving_hardness_req 250
+  load_bearing_strength 650
+  max_span 1200
+  thermal_insulation 600
+  weather_resistance 550
 
   absorbency 300
   contamination 250
@@ -96,6 +104,10 @@ material stone
   length 0
   inscription_durability 900
   carving_hardness_req 700
+  load_bearing_strength 900
+  max_span 300
+  thermal_insulation 250
+  weather_resistance 950
 
   contamination 300
   intrinsic_scarcity 300
@@ -125,6 +137,10 @@ material flint
   length 0
   inscription_durability 800
   carving_hardness_req 750
+  load_bearing_strength 600
+  max_span 150
+  thermal_insulation 200
+  weather_resistance 800
 
   contamination 350
   intrinsic_scarcity 450
@@ -154,6 +170,10 @@ material obsidian
   length 0
   inscription_durability 750
   carving_hardness_req 800
+  load_bearing_strength 500
+  max_span 120
+  thermal_insulation 150
+  weather_resistance 750
 
 # ---- raw substances (natural occurrences yield these before processing) ------
   contamination 400
@@ -227,6 +247,10 @@ material host_rock
   sight_range 0
   speed 0
   opacity 1000
+  load_bearing_strength 850
+  max_span 200
+  thermal_insulation 220
+  weather_resistance 900
 
 # ---- geological materials (lithology: 1=igneous 2=sedimentary 3=metamorphic) --
   contamination 400
@@ -253,6 +277,10 @@ material granite
   lithology 1
   inscription_durability 950
   carving_hardness_req 800
+  load_bearing_strength 950
+  max_span 250
+  thermal_insulation 300
+  weather_resistance 980
 
   contamination 300
   intrinsic_scarcity 250
@@ -274,6 +302,10 @@ material basalt
   speed 0
   opacity 1000
   lithology 1
+  load_bearing_strength 900
+  max_span 300
+  thermal_insulation 280
+  weather_resistance 970
 
   contamination 350
   intrinsic_scarcity 250
@@ -295,6 +327,10 @@ material sandstone
   speed 0
   opacity 1000
   lithology 2
+  load_bearing_strength 700
+  max_span 350
+  thermal_insulation 350
+  weather_resistance 700
 
   contamination 450
   intrinsic_scarcity 200
@@ -316,6 +352,10 @@ material limestone
   speed 0
   opacity 1000
   lithology 2
+  load_bearing_strength 800
+  max_span 400
+  thermal_insulation 320
+  weather_resistance 800
 
   contamination 400
   intrinsic_scarcity 200
@@ -337,6 +377,10 @@ material shale
   speed 0
   opacity 1000
   lithology 2
+  load_bearing_strength 550
+  max_span 250
+  thermal_insulation 300
+  weather_resistance 600
 
   contamination 500
   intrinsic_scarcity 200
@@ -360,6 +404,10 @@ material marble
   lithology 3
   inscription_durability 850
   carving_hardness_req 650
+  load_bearing_strength 850
+  max_span 500
+  thermal_insulation 350
+  weather_resistance 850
 
 # ---- soils (top stratum; type follows parent rock + climate) -------------------
   contamination 350
@@ -385,6 +433,10 @@ material soil_sand
   speed 0
   opacity 1000
   soil_texture 1
+  load_bearing_strength 250
+  max_span 0
+  thermal_insulation 350
+  weather_resistance 250
 
   contamination 800
   absorbency 500
@@ -410,6 +462,10 @@ material soil_loam
   speed 0
   opacity 1000
   soil_texture 2
+  load_bearing_strength 350
+  max_span 0
+  thermal_insulation 650
+  weather_resistance 300
 
   contamination 800
   absorbency 500
@@ -438,6 +494,10 @@ material soil_clay
   inscription_durability 600
   carving_hardness_req 400
   portable_surface 1000
+  load_bearing_strength 500
+  max_span 0
+  thermal_insulation 550
+  weather_resistance 650
 
 # ---- organic / energy substances ----------------------------------------------
   contamination 800
@@ -465,6 +525,10 @@ material coal
   geom_len 80
   geom_wid 80
   geom_thk 80
+  load_bearing_strength 650
+  max_span 250
+  thermal_insulation 150
+  weather_resistance 700
 
   contamination 600
   intrinsic_scarcity 500
@@ -578,6 +642,10 @@ material copper_metal
   geom_thk 60
   inscription_durability 700
   carving_hardness_req 500
+  load_bearing_strength 600
+  max_span 600
+  thermal_insulation 350
+  weather_resistance 800
 
   contamination 250
   intrinsic_scarcity 800
@@ -606,6 +674,10 @@ material charcoal
   geom_thk 60
   inscription_durability 300
   carving_hardness_req 200
+  load_bearing_strength 200
+  max_span 0
+  thermal_insulation 150
+  weather_resistance 500
 
   mutagenic 250
 
@@ -634,6 +706,10 @@ material slag
   geom_len 80
   geom_wid 80
   geom_thk 80
+  load_bearing_strength 700
+  max_span 200
+  thermal_insulation 200
+  weather_resistance 700
 
   contamination 600
   intrinsic_scarcity 150
@@ -657,6 +733,10 @@ material iron_blade
   tensile 850
   inscription_durability 800
   carving_hardness_req 600
+  load_bearing_strength 800
+  max_span 700
+  thermal_insulation 300
+  weather_resistance 850
 
 # ---- forageable wild food (physiology: nutrition/hydration are World Truth --
 # agents must discover edibility by consuming or by witness, never by lookup)
@@ -754,6 +834,10 @@ material living_wood
   geom_thk 80
   inscription_durability 200
   carving_hardness_req 200
+  load_bearing_strength 400
+  max_span 700
+  thermal_insulation 500
+  weather_resistance 300
 
 # Dormant propagule — the seed-bank layer. Left behind where a fruiting plant
 # dies (see `death_drops` on species). It is World Truth biomass: light,
@@ -813,6 +897,10 @@ material wood_debris
   opacity 1000
   inscription_durability 100
   carving_hardness_req 100
+  load_bearing_strength 150
+  max_span 300
+  thermal_insulation 400
+  weather_resistance 200
 
 # ---- biological tissue & body fluids (Phase 10 anatomy) -------------------
 # Layered body materials: skin resists cuts, muscle transmits force,
@@ -1155,3 +1243,7 @@ material ash
   intrinsic_scarcity 100
   portability_score 600
   spoilage_rate 0
+  load_bearing_strength 100
+  max_span 0
+  thermal_insulation 500
+  weather_resistance 400

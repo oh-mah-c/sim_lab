@@ -406,6 +406,15 @@ private:
     // grievance drift, revolt. Accumulator-exact like decay_minds; prop
     // consequences ride one ledgered CausalEvent per call.
     void political_drift(std::int64_t n);
+    // Phase 12.4 architecture: per-entity structural drift inside
+    // metabolize — enclosure weathering (decay_accum Euclid), collapse
+    // into debris + occupant impact, orphan portal reaping. Also scans
+    // enclosure footprints for trespass/consent state each pass.
+    void arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                    CausalEvent& ev, std::vector<SpawnSpec>& out);
+    // Footfall compaction: linear per-tick fade over dirty cells only —
+    // exact under dt=1 xN vs dt=N because the decay has no memory.
+    void terrain_wear_decay(std::int64_t n);
     // Causal parents of an interaction: caller-supplied + the last event that
     // touched each target / wielded tool (automatic provenance chain).
     std::vector<EventId> auto_parents(const InteractionContext& ctx) const;
@@ -416,6 +425,10 @@ private:
     std::map<EntityId, EventId> touched_;
     std::vector<std::uint8_t> mat_need_flags_;        // LOD prefilter (lazy)               // entity -> last causal event that changed/created it   // id -> entities[] slot (lookup only)
     std::set<std::tuple<std::uint32_t, int, int>> gen_spawned_;
+    // Global cell coords (gx,gy packed) whose terrain.traffic_wear > 0 —
+    // rebuilt deterministically from terrain on load; only dirty cells pay
+    // the per-advance decay cost.
+    std::set<std::uint64_t> wear_cells_;
 };
 
 }  // namespace simlab
