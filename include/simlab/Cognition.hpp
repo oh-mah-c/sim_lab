@@ -224,7 +224,7 @@ void maybe_spurious_association(World& w, AgentMind& mind, EntityId npc,
 // Compulsion bonus for plan scoring: actions that relieved panic before.
 std::int64_t compulsion_bonus(const AgentMind& mind, const std::string& action);
 // Bond/imprint-driven utility bonus for plan scoring (Nhịp 4.5).
-std::int64_t bond_bonus(const AgentMind& mind,
+std::int64_t bond_bonus(const World& w, const AgentMind& mind,
                         const InteractionContext& c);
 // Inferred welfare of a bonded engram target (0..1000): ToM mood
 // confidence + imprint depth + OBSERVABLE snapshot signs only — private

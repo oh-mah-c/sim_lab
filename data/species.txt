@@ -36,10 +36,31 @@ species berry_bush
   max_fruit 40
   fruit_regrow_rate 120
   fruit_spoil_rate 15
+  blight_susceptibility 700
+  sterilization_temp 700
   death_drops dormant_seed=4,wood_debris=1
   density 120
   condition temperature -100 400
   condition moisture 300 1000
+  condition vegetation 400 1000
+
+# Wild grain — a second susceptible flora. Its distinct species name makes
+# it a DIFFERENT spore host: interleaving it with berry_bush dilutes
+# same-species spore density (polyculture resistance emerges from data).
+species wild_grain
+  kind flora
+  material living_wood
+  fruit_material wild_berries
+  fruit_count 30
+  max_fruit 30
+  fruit_regrow_rate 100
+  fruit_spoil_rate 12
+  blight_susceptibility 600
+  sterilization_temp 700
+  death_drops dormant_seed=3,wood_debris=1
+  density 90
+  condition temperature -50 350
+  condition moisture 350 1000
   condition vegetation 400 1000
 
 species boreal_tree
@@ -111,6 +132,10 @@ species grazer
   dna_repair_gain 1000
   immune_count 0
   passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
   # body plan (Phase 10): head/torso/limbs/organs as contained part_of
   # children. Materials are the dominant load layer; vital_organ 1000
   # parts kill the body when destroyed or severed.
@@ -135,6 +160,12 @@ species grazer
   gene sight_range
   gene fertility
   gene mutation_rate
+  # disease-resistance axes are heritable loci (Phase 11.3): under
+  # sustained epidemic pressure, high-immune/high-tolerance lineages
+  # out-reproduce susceptible ones — selection, not a script.
+  gene immune_power_base
+  gene dna_repair_gain
+  gene reservoir_tolerance
   # neural tuning (Nhịp 1): mind_* props are this grazer's SpeciesMindParams;
   # the two gene loci let memory traits drift under selection heritably.
   mind_base_clarity 400
@@ -192,6 +223,69 @@ species grazer
   gene mind_xenophobia_bias
   gene mind_ego_defense_gain
 
+
+# Reservoir beast — a wild species that coexists with a commensal
+# PathogenStrain (Phase 11). reservoir_tolerance >= 700 means the symbiont
+# sheds without virulence tissue damage or fever; a sensitive predator or
+# scavenger eating it raw can catch the jumped, amplified variant.
+species reservoir_beast
+  kind fauna
+  material flesh
+  density 8
+  condition temperature -100 400
+  condition moisture 300 1000
+  condition slope 0 25
+  condition vegetation 400 1000
+  sight_range 400
+  speed 6000
+  metabolism 1800
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 500
+  adult_age 200
+  mutation_rate 30
+  energy 60000
+  max_energy 100000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1000
+  immune_power_base 1000
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  # symbiosis template: first metabolize seeds a symbiont=1 strain entity
+  # plus a low-grade ActiveInfection; tolerance keeps it harmless locally.
+  reservoir_tolerance 900
+  zoonotic_jump_bias 400
+  symbiont_signature 2654435761
+  symbiont_virulence 120
+  symbiont_airborne_rate 120
+  symbiont_waterborne_rate 350
+  symbiont_contact_rate 450
+  symbiont_incubation_ticks 300
+  gene speed
+  gene metabolism
+  gene fertility
+  gene immune_power_base
+  gene dna_repair_gain
+  gene reservoir_tolerance
+
 species nightshade_patch
   kind flora
   material living_wood
@@ -205,3 +299,71 @@ species nightshade_patch
   condition temperature -50 350
   condition moisture 350 1000
   condition vegetation 450 1000
+
+# Disease vector — a small flying parasite that carries strains between
+# hosts. reservoir_tolerance >= 800 plus the is_disease_vector flag means
+# picked-up pathogens do not damage it; it breeds only inside its declared
+# temperature band and only near stagnant water, so epizootics breathe
+# with the seasons and die back in the cold/dry — no calendar anywhere.
+species vector_midge
+  kind fauna
+  material flesh
+  density 30
+  condition temperature 150 450
+  condition moisture 200 1000
+  condition vegetation 0 1000
+  sight_range 200
+  speed 9000
+  metabolism 900
+  hunger 300
+  thirst 300
+  fatigue 100
+  fertility 800
+  adult_age 60
+  mutation_rate 40
+  energy 30000
+  max_energy 60000
+  blood_volume 300
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 300
+  thermoreg_gain 1000
+  hypothermia_delta 20
+  fever_delta_max 30
+  hyperpyrexia_delta 40
+  body_temp 300
+  temp_accum 0
+  immune_power 800
+  immune_power_base 800
+  dna_repair_gain 800
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  # vector ecology (Phase 11.3): active only in the warm band AND near
+  # fouled standing water; dormant midges neither bite nor breed.
+  is_disease_vector 1
+  reservoir_tolerance 900
+  vector_optimal_temp_min 220
+  vector_optimal_temp_max 360
+  vector_requires_stagnant_water 1
+  vector_stagnation_min 500
+  vector_dormant 1
+  vector_bite_radius 48
+  vector_bite_rate 400
+  vector_bite_accum 0
+  vector_breed_accum 0
+  vector_fecundity 250
+  vector_carrier_load 120
+  vector_brood_cap 24
+  gene speed
+  gene metabolism
+  gene fertility
+  gene immune_power_base
+  gene dna_repair_gain
+  gene reservoir_tolerance

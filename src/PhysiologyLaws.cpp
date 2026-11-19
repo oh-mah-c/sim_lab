@@ -110,6 +110,8 @@ static PredictionResult predict_consume(const World& w,
     std::int64_t harm = 0;          // integrity-scale damage from toxins
     std::int64_t mass_gain = 0;     // solid matter awaiting the gut (10.3)
     std::int64_t fluid_gain = 0;    // liquid awaiting the kidneys (10.3)
+    std::int64_t toxin_gain = 0;    // Phase 11.2: blighted meals poison
+    std::int64_t energy_penalty = 0;// the gut and the calories both suffer
 
     for (EntityId tid : ctx.targets) {
         if (tid == ctx.actor) continue;                    // cannot eat oneself
@@ -215,6 +217,47 @@ static PredictionResult predict_consume(const World& w,
         // so a bad meal still fills the belly while it kills. This is the
         // data hook that lets a witnessed death teach a material taboo.
         if (tox > 0) harm += tox * units;
+        // Phase 11.2 blight: raw fruit from a spore-infected plant is a
+        // gut poison — toxin_load rises and calorie gain is blunted. A
+        // cooked_state >= 500 plant is preserved: the same heat/chemical
+        // rule that sterilizes meat sterilizes standing fruit. The toxin
+        // change lands in ev.changes, so outcome beliefs and the actor's
+        // event_charge engram mark the plant as the culprit by themselves.
+        if (fruiting) {
+            const PropId cooked_p = prop_id(w, "cooked_state");
+            const bool sterile = cooked_p != kNoProp &&
+                w.prop_int(*t, cooked_p, 0) >= 500;
+            if (!sterile) {
+                const PropId ps_p = prop_id(w, "pathogen_strain"),
+                             pl_p = prop_id(w, "pathogen_load"),
+                             spr_p = prop_id(w, "spore_rate"),
+                             vir_p = prop_id(w, "virulence");
+                if (ps_p != kNoProp && spr_p != kNoProp) {
+                    std::int64_t pen = 0;
+                    for (const Relation& rel : w.relations_of(tid, "carries")) {
+                        if (rel.a != tid) continue;
+                        const Entity* ie = w.find(rel.b);
+                        if (!ie || !ie->alive) continue;
+                        const std::int64_t seid = w.prop_int(*ie, ps_p, 0);
+                        const Entity* st = seid > 0
+                            ? w.find(static_cast<EntityId>(seid)) : nullptr;
+                        if (!st || !st->alive) continue;
+                        if (w.prop_int(*st, spr_p, 0) <= 0) continue;
+                        const std::int64_t ld = pl_p != kNoProp
+                            ? w.prop_int(*ie, pl_p, 0) : 0;
+                        const std::int64_t vr = vir_p != kNoProp
+                            ? w.prop_int(*st, vir_p, 0) : 0;
+                        pen += std::min<std::int64_t>(200, ld * vr / 400);
+                    }
+                    pen = std::min<std::int64_t>(500, pen) * units;
+                    if (pen > 0) {
+                        toxin_gain += pen;
+                        energy_penalty += pen * 8;
+                        r.notes.push_back("blighted fruit: gut poison");
+                    }
+                }
+            }
+        }
         r.possible = true;
         std::ostringstream n;
         n << "consume " << tid << " nut=" << nut << " hyd=" << hyd
@@ -244,6 +287,16 @@ static PredictionResult predict_consume(const World& w,
         const std::int64_t ib = w.prop_int(*actor, integrity, 0);
         set_change(r, ctx.actor, integrity, ib, std::max<std::int64_t>(0, ib - harm));
     }
+    if (toxin_gain > 0) {
+        const PropId tl_p = prop_id(w, "toxin_load");
+        if (tl_p != kNoProp && w.prop_of(*actor, tl_p)) {
+            const std::int64_t tb = w.prop_int(*actor, tl_p, 0);
+            set_change(r, ctx.actor, tl_p, tb,
+                       std::min<std::int64_t>(1000, tb + toxin_gain));
+        }
+    }
+    if (energy_penalty > 0)
+        energy_gain = std::max<std::int64_t>(0, energy_gain - energy_penalty);
 
     if (r.possible) {
         r.ticks = kConsumeTicks;

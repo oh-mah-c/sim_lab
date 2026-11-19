@@ -3,6 +3,7 @@
 #include "simlab/Processes.hpp"
 #include "LawUtil.hpp"
 #include <algorithm>
+#include <set>
 #include <map>
 #include <sstream>
 
@@ -401,7 +402,7 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
 
     for (EntityId tid : ctx.targets) {
         const Entity* t = w.find(tid);
-        if (!t || !t->alive) continue;
+        if (!t) continue;
         if (is_contained(w, *t, contained_pid)) continue;
         if (!in_reach(w, *actor, *t, reach_pid, treach, &r)) {
             r.notes.push_back("target " + std::to_string(tid) + " out of reach");
@@ -413,6 +414,117 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
         const std::int64_t delta = E / (100 * tmass);
         const std::int64_t nw = std::min<std::int64_t>(t_max, cur + delta);
         set_change(r, tid, P.temperature, cur, nw);
+        if (!t->alive) {
+            // Phase 11 cremation: dead remains still conduct heat; past the
+            // material's data-defined cremation_temp they burn down to the
+            // declared residue (ash) and every carried pathogen dies with
+            // them — strain_ref/contamination/odor zeroed, infection edges
+            // cut, infection pathogen mass destroyed.
+            const PropId cre_p = pid(w, "cremation_temp");
+            const std::int64_t cre = cre_p != kNoProp
+                ? w.prop_int(*t, cre_p, 0) : 0;
+            r.possible = true;
+            if (cre > 0 && nw >= cre) {
+            auto zero_if = [&](const char* name) {
+                const PropId zp = pid(w, name);
+                if (zp == kNoProp) return;
+                const std::int64_t zv = w.prop_int(*t, zp, 0);
+                if (zv != 0) set_change(r, tid, zp, zv, 0);
+            };
+            zero_if("strain_ref"); zero_if("contamination");
+            zero_if("odor"); zero_if("corpse_decay_level");
+            const PropId cooked_p = pid(w, "cooked_state");
+            if (cooked_p != kNoProp &&
+                w.prop_int(*t, cooked_p, 0) != 1000)
+                set_change(r, tid, cooked_p,
+                           w.prop_int(*t, cooked_p, 0), 1000);
+            const PropId crem_p = pid(w, "cremated");
+            if (crem_p != kNoProp)
+                set_change(r, tid, crem_p, w.prop_int(*t, crem_p, 0), 1);
+            const PropId integ_p = pid(w, "integrity");
+            const PropId pl_p = pid(w, "pathogen_load");
+            for (const Relation& rel : w.relations_of(tid, "carries")) {
+                if (rel.a != tid) continue;
+                r.rel_changes.push_back({tid, "carries", rel.b, false});
+                const Entity* ie = w.find(rel.b);
+                if (!ie || !ie->alive) continue;
+                if (pl_p != kNoProp) {
+                    const std::int64_t lv = w.prop_int(*ie, pl_p, 0);
+                    if (lv != 0) set_change(r, rel.b, pl_p, lv, 0);
+                }
+                if (integ_p != kNoProp)
+                    set_change(r, rel.b, integ_p,
+                               w.prop_int(*ie, integ_p, 0), 0);
+            }
+            // residue: the material's own declared burn product (ash)
+            if (residue_pid != kNoProp && share_pid != kNoProp) {
+                const Value* rv = w.prop_of(*t, residue_pid);
+                const MaterialId rm = rv && rv->type == ValType::Text
+                    ? w.materials.id_of(rv->s) : kNoMaterial;
+                const std::int64_t share = w.prop_int(*t, share_pid, 0);
+                const std::int64_t q = w.prop_int(*t, mass_pid, 0) * share / 1000;
+                if (rm != kNoMaterial && q > 0) {
+                    SpawnSpec rs;
+                    rs.kind = "remains"; rs.material = rm; rs.pos = t->pos;
+                    if (P.quantity != kNoProp)
+                        rs.props.set(P.quantity, Value::integer(q));
+                    r.spawns.push_back(rs);
+                }
+            }
+            r.notes.push_back("cremated: residue spawned, pathogens cleared");
+            continue;
+            }
+            // dead but not yet cremation-hot: sterilization still applies —
+            // cooked meat is dead tissue that must reach cooked_state.
+            {
+                const PropId st_p = pid(w, "sterilization_temp");
+                const std::int64_t st = st_p != kNoProp
+                    ? w.prop_int(*t, st_p, 0) : 0;
+                if (st > 0 && nw >= st) {
+                    const PropId cooked_p = pid(w, "cooked_state");
+                    if (cooked_p != kNoProp &&
+                        w.prop_int(*t, cooked_p, 0) != 1000)
+                        set_change(r, tid, cooked_p,
+                                   w.prop_int(*t, cooked_p, 0), 1000);
+                    const PropId sr_p = pid(w, "strain_ref");
+                    if (sr_p != kNoProp && w.prop_int(*t, sr_p, 0) != 0)
+                        set_change(r, tid, sr_p, w.prop_int(*t, sr_p, 0), 0);
+                    const PropId cont_p = pid(w, "contamination");
+                    if (cont_p != kNoProp && w.prop_int(*t, cont_p, 0) != 0)
+                        set_change(r, tid, cont_p, w.prop_int(*t, cont_p, 0), 0);
+                    // Phase 11.2: sterilized remains cannot keep seeding —
+                    // carried infections are killed and any strain stamps
+                    // on the husk are wiped.
+                    const PropId pl_p = pid(w, "pathogen_load");
+                    const PropId ip_p = pid(w, "integrity");
+                    for (const Relation& rel : w.relations_of(tid, "carries")) {
+                        if (rel.a != tid) continue;
+                        r.rel_changes.push_back({tid, "carries", rel.b, false});
+                        const Entity* ie = w.find(rel.b);
+                        if (!ie || !ie->alive) continue;
+                        if (pl_p != kNoProp) {
+                            const std::int64_t lv = w.prop_int(*ie, pl_p, 0);
+                            if (lv != 0) set_change(r, rel.b, pl_p, lv, 0);
+                        }
+                        if (ip_p != kNoProp)
+                            set_change(r, rel.b, ip_p,
+                                       w.prop_int(*ie, ip_p, 0), 0);
+                    }
+                    const PropId ssl_p = pid(w, "soil_spore_load");
+                    const PropId ssr_p = pid(w, "soil_strain_ref");
+                    const PropId sda_p = pid(w, "spore_decay_accum");
+                    if (ssl_p != kNoProp && w.prop_int(*t, ssl_p, 0) != 0)
+                        set_change(r, tid, ssl_p, w.prop_int(*t, ssl_p, 0), 0);
+                    if (ssr_p != kNoProp && w.prop_int(*t, ssr_p, 0) != 0)
+                        set_change(r, tid, ssr_p, w.prop_int(*t, ssr_p, 0), 0);
+                    if (sda_p != kNoProp && w.prop_int(*t, sda_p, 0) != 0)
+                        set_change(r, tid, sda_p, w.prop_int(*t, sda_p, 0), 0);
+                    r.notes.push_back("sterilized dead tissue");
+                }
+            }
+            r.notes.push_back("heat dead " + std::to_string(tid));
+            continue;
+        }
 
         // combustion: hot flammable material burns while it is heated
         const std::int64_t flamm = flamm_pid != kNoProp ? w.prop_int(*t, flamm_pid, 0) : 0;
@@ -438,6 +550,141 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
                 }
             }
         }
+        // Phase 11 sterilization: a target at/above its material's
+        // sterilization_temp is cooked/preserved — cooked_state 1000 makes
+        // it safe to eat/drink and blocks every pathogen route.
+        {
+            const PropId st_p = pid(w, "sterilization_temp");
+            const std::int64_t st = st_p != kNoProp
+                ? w.prop_int(*t, st_p, 0) : 0;
+            if (st > 0 && std::max(cur, nw) >= st) {
+                const PropId cooked_p = pid(w, "cooked_state");
+                if (cooked_p != kNoProp &&
+                    w.prop_int(*t, cooked_p, 0) != 1000)
+                    set_change(r, tid, cooked_p,
+                               w.prop_int(*t, cooked_p, 0), 1000);
+                const PropId sr_p = pid(w, "strain_ref");
+                if (sr_p != kNoProp && w.prop_int(*t, sr_p, 0) != 0)
+                    set_change(r, tid, sr_p, w.prop_int(*t, sr_p, 0), 0);
+                const PropId cont_p = pid(w, "contamination");
+                if (cont_p != kNoProp && w.prop_int(*t, cont_p, 0) != 0)
+                    set_change(r, tid, cont_p, w.prop_int(*t, cont_p, 0), 0);
+                r.notes.push_back("sterilized at temperature");
+            }
+        }
+        // Phase 11.2 thermal cleansing: heat past sterilization_temp on a
+        // spore host (blight_susceptibility > 0) or a soil patch
+        // (soil_spore_load > 0) kills every carried infection and the
+        // banked spore load; burnt plant biomass returns the material's
+        // ash_nutrient_bonus fertility to the soil beneath — burn-barrows
+        // emerge from the physics, never from a script.
+        {
+            const PropId susc_p = pid(w, "blight_susceptibility"),
+                         pl_p = pid(w, "pathogen_load"),
+                         ip_p = pid(w, "integrity"),
+                         ssl_p = pid(w, "soil_spore_load"),
+                         ssr_p = pid(w, "soil_strain_ref"),
+                         sda_p = pid(w, "spore_decay_accum"),
+                         st_p = pid(w, "sterilization_temp"),
+                         anb_p = pid(w, "ash_nutrient_bonus"),
+                         snu_p = pid(w, "soil_nutrient");
+            const bool plant_host = susc_p != kNoProp &&
+                w.prop_int(*t, susc_p, 0) > 0;
+            const bool soil_host = ssl_p != kNoProp &&
+                w.prop_of(*t, ssl_p) != nullptr;
+            const std::int64_t st = st_p != kNoProp
+                ? w.prop_int(*t, st_p, 0) : 0;
+            if ((plant_host || soil_host) && st > 0 && nw >= st) {
+                for (const Relation& rel : w.relations_of(tid, "carries")) {
+                    if (rel.a != tid) continue;
+                    r.rel_changes.push_back({tid, "carries", rel.b, false});
+                    const Entity* ie = w.find(rel.b);
+                    if (!ie || !ie->alive) continue;
+                    if (pl_p != kNoProp) {
+                        const std::int64_t lv = w.prop_int(*ie, pl_p, 0);
+                        if (lv != 0) set_change(r, rel.b, pl_p, lv, 0);
+                    }
+                    if (ip_p != kNoProp)
+                        set_change(r, rel.b, ip_p,
+                                   w.prop_int(*ie, ip_p, 0), 0);
+                }
+                if (ssl_p != kNoProp && w.prop_int(*t, ssl_p, 0) != 0)
+                    set_change(r, tid, ssl_p, w.prop_int(*t, ssl_p, 0), 0);
+                if (ssr_p != kNoProp && w.prop_int(*t, ssr_p, 0) != 0)
+                    set_change(r, tid, ssr_p, w.prop_int(*t, ssr_p, 0), 0);
+                if (sda_p != kNoProp && w.prop_int(*t, sda_p, 0) != 0)
+                    set_change(r, tid, sda_p, w.prop_int(*t, sda_p, 0), 0);
+                r.notes.push_back("thermal cleansing: spores destroyed");
+                // burnt plant biomass -> ash + soil fertility credit
+                if (plant_host) {
+                    const MaterialId ash_mat = w.materials.id_of("ash");
+                    if (ash_mat != kNoMaterial) {
+                        SpawnSpec as;
+                        as.kind = "residue"; as.material = ash_mat;
+                        as.pos = t->pos;
+                        const std::int64_t mq = w.prop_int(*t, mass_pid, 0);
+                        if (P.quantity != kNoProp && mq > 0)
+                            as.props.set(P.quantity, Value::integer(
+                                std::max<std::int64_t>(1, mq / 20)));
+                        r.spawns.push_back(as);
+                    }
+                    // fertility credit is a property of the ASH material —
+                    // the burn product decides how much the soil gains.
+                    std::int64_t bonus = 0;
+                    if (anb_p != kNoProp) {
+                        if (const MaterialDef* amd = w.materials.find(ash_mat)) {
+                            const auto it = amd->props.find(anb_p);
+                            if (it != amd->props.end()) bonus = it->second.i;
+                        }
+                    }
+                    if (bonus > 0 && snu_p != kNoProp) {
+                        EntityId patch = kNoEntity;
+                        {
+                            std::vector<EntityId> near =
+                                w.entities_near(t->pos, 48);
+                            std::sort(near.begin(), near.end());
+                            for (EntityId nid : near) {
+                                const Entity* o = w.find(nid);
+                                if (!o || !o->alive || nid == tid) continue;
+                                if (ssl_p != kNoProp &&
+                                    w.prop_of(*o, ssl_p) != nullptr) {
+                                    patch = nid; break;
+                                }
+                            }
+                        }
+                        if (patch != kNoEntity) {
+                            const Entity* po = w.find(patch);
+                            const std::int64_t cur =
+                                w.prop_int(*po, snu_p, 0);
+                            set_change(r, patch, snu_p, cur,
+                                std::min<std::int64_t>(2000, cur + bonus));
+                        } else {
+                            const MaterialId soil_mat =
+                                w.materials.id_of("soil_loam");
+                            if (soil_mat != kNoMaterial) {
+                                SpawnSpec ps;
+                                ps.kind = "soil_patch"; ps.material = soil_mat;
+                                ps.pos = t->pos;
+                                PropertyBag pb;
+                                pb.set(snu_p, Value::integer(bonus));
+                                if (ssl_p != kNoProp)
+                                    pb.set(ssl_p, Value::integer(0));
+                                if (ssr_p != kNoProp)
+                                    pb.set(ssr_p, Value::integer(0));
+                                if (sda_p != kNoProp)
+                                    pb.set(sda_p, Value::integer(0));
+                                const PropId cont_p = pid(w, "contamination");
+                                if (cont_p != kNoProp)
+                                    pb.set(cont_p, Value::integer(0));
+                                ps.props = pb;
+                                r.spawns.push_back(ps);
+                            }
+                        }
+                        r.notes.push_back("ash fertilized soil");
+                    }
+                }
+            }
+        }
         r.possible = true;
         std::ostringstream n;
         n << "heat E=" << E << " tmass=" << tmass << " temp " << cur << "->" << nw;
@@ -454,6 +701,122 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
 
 std::unique_ptr<INaturalLawModel> ThermalModel::clone() const {
     return std::make_unique<ThermalModel>();
+}
+
+// ============================ Combine =========================================
+// Phase 11 material combination: antimicrobial >= 500 sterilizes siblings,
+// burial_medium >= 500 buries dead siblings. Data decides everything.
+
+LawId CombineModel::id() const { return 22; }
+
+bool CombineModel::supports(const World& w, const InteractionContext& ctx) const {
+    (void)w;
+    return ctx.parameters.action == "combine" && ctx.targets.size() >= 2;
+}
+
+PredictionResult CombineModel::predict(const World& w,
+                                       const InteractionContext& ctx) const {
+    PredictionResult r;
+    r.law = id(); r.law_name = name();
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+
+    const auto [treach, tedge] = w.tool_bonus(ctx.actor);
+    (void)tedge;
+    const PropId reach_pid = pid(w, "reach"),
+                 contained_pid = pid(w, "contained"),
+                 am_p = pid(w, "antimicrobial"),
+                 bm_p = pid(w, "burial_medium"),
+                 cooked_p = pid(w, "cooked_state"),
+                 sr_p = pid(w, "strain_ref"),
+                 cont_p = pid(w, "contamination"),
+                 buried_p = pid(w, "buried"),
+                 odor_p = pid(w, "odor"),
+                 nut_p = pid(w, "nutrition"),
+                 hyd_p = pid(w, "hydration");
+    if (am_p == kNoProp && bm_p == kNoProp) {
+        r.failure = "no antimicrobial/burial_medium properties defined";
+        return r;
+    }
+    struct Cand {
+        EntityId id; const Entity* e; bool am, bm;
+    };
+    std::vector<Cand> cs;
+    for (EntityId tid : ctx.targets) {
+        if (tid == ctx.actor) continue;
+        const Entity* t = w.find(tid);
+        if (!t) continue;
+        if (is_contained(w, *t, contained_pid)) continue;
+        if (!in_reach(w, *actor, *t, reach_pid, treach, &r)) {
+            r.notes.push_back("target " + std::to_string(tid) + " out of reach");
+            continue;
+        }
+        cs.push_back({tid, t,
+                      am_p != kNoProp && w.prop_int(*t, am_p, 0) >= 500,
+                      bm_p != kNoProp && w.prop_int(*t, bm_p, 0) >= 500});
+    }
+    std::set<EntityId> sterilized, buried_done;
+    auto sterilize = [&](EntityId tid) {
+        if (!sterilized.insert(tid).second) return;
+        const Entity* t = w.find(tid);
+        if (!t) return;
+        if (cooked_p != kNoProp) {
+            const std::int64_t c = w.prop_int(*t, cooked_p, 0);
+            if (c != 1000) set_change(r, tid, cooked_p, c, 1000);
+        }
+        if (sr_p != kNoProp) {
+            const std::int64_t v = w.prop_int(*t, sr_p, 0);
+            if (v != 0) set_change(r, tid, sr_p, v, 0);
+        }
+        if (cont_p != kNoProp) {
+            const std::int64_t v = w.prop_int(*t, cont_p, 0);
+            if (v != 0) set_change(r, tid, cont_p, v, 0);
+        }
+        r.notes.push_back("sterilized " + std::to_string(tid));
+    };
+    auto bury = [&](EntityId tid) {
+        if (!buried_done.insert(tid).second) return;
+        const Entity* t = w.find(tid);
+        if (!t || t->alive) return;
+        if (buried_p != kNoProp) {
+            const std::int64_t b = w.prop_int(*t, buried_p, 0);
+            if (b != 1) set_change(r, tid, buried_p, b, 1);
+        }
+        if (odor_p != kNoProp) {
+            const std::int64_t o = w.prop_int(*t, odor_p, 0);
+            if (o != 0) set_change(r, tid, odor_p, o, 0);
+        }
+        r.notes.push_back("buried " + std::to_string(tid));
+    };
+    for (const Cand& c : cs) {
+        if (!c.am && !c.bm) continue;             // not a reagent
+        for (const Cand& s : cs) {
+            if (s.id == c.id) continue;
+            if (c.am) {
+                const Entity* t = w.find(s.id);
+                if (!t) continue;
+                // substrate must be preservable matter: remains, food,
+                // drink, strain-bearing or already-treated entities.
+                const bool eligible = !t->alive ||
+                    w.prop_int(*t, nut_p, 0) > 0 ||
+                    w.prop_int(*t, hyd_p, 0) > 0 ||
+                    (sr_p != kNoProp && w.prop_int(*t, sr_p, 0) > 0) ||
+                    (cont_p != kNoProp && w.prop_int(*t, cont_p, 0) > 0) ||
+                    (cooked_p != kNoProp && w.prop_of(*t, cooked_p));
+                if (eligible) sterilize(s.id);
+            }
+            if (c.bm) bury(s.id);                  // bury() gates on dead
+        }
+    }
+    r.possible = !sterilized.empty() || !buried_done.empty();
+    if (!r.possible && r.failure.empty())
+        r.failure = "no antimicrobial/burial_medium effect applies";
+    r.ticks = ctx.parameters.ticks;
+    return r;
+}
+
+std::unique_ptr<INaturalLawModel> CombineModel::clone() const {
+    return std::make_unique<CombineModel>();
 }
 
 }  // namespace simlab

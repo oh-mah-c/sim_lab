@@ -9,6 +9,22 @@
 #include <cstdio>
 
 namespace simlab {
+namespace {
+// Phase 11 props that make an entity worth a metabolize pass even when it
+// has no need/metabolism props: corpse rot bookkeeping, standing-water
+// fouling, strain stamps on reservoirs, symbiont templates, terminal flags.
+const char* const kEnvPropNames[] = {
+    "corpse_decay_level", "corpse_decay_accum", "buried",
+    "stagnation_level", "stagnation_accum", "reservoir_spread_accum",
+    "strain_ref", "symbiont_signature", "cremated",
+    "soil_spore_load", "soil_nutrient", "spore_decay_accum",
+    "yield_penalty", "blight_marks",
+    "is_disease_vector", "vector_dormant", "vector_bite_accum",
+    "vector_breed_accum", "vector_bite_rolls",
+    "stagnation_hist_level", "stagnation_hist_acc",
+    "stagnation_hist_rate", "stagnation_hist_start"};
+}  // namespace
+
 
 namespace {
 bool file_exists(const std::string& path) {
@@ -54,6 +70,7 @@ World::World(std::uint64_t s, const std::string& data_dir) : seed(s) {
     laws.push_back(std::make_unique<CompositionModel>());
     laws.push_back(std::make_unique<PhysiologyModel>());
     laws.push_back(std::make_unique<TreatModel>());
+    laws.push_back(std::make_unique<CombineModel>());
     laws.push_back(std::make_unique<BiologyModel>());
     laws.push_back(std::make_unique<SocialModel>());
     laws.push_back(std::make_unique<LocomotionModel>());
@@ -480,6 +497,8 @@ World::NeedProps World::need_props() const {
     np.mind_abstraction = pid("mind_abstraction_gain");
     np.mind_brain_cost = pid("mind_brain_metabolic_cost");
     np.brain_accum = pid("mind_brain_accum");
+    np.yield_penalty = pid("yield_penalty");
+    np.soil_nutrient = pid("soil_nutrient");
     return np;
 }
 
@@ -621,6 +640,64 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             }
         }
     }
+    // Immune metabolic cost (Phase 11.3): an immune_power_base above the
+    // species' declared threshold burns extra energy — permille-granular
+    // like the brain cost, drained through immune_cost_accum by Euclid
+    // division so batched and ticked evaluation agree. This is the
+    // trade-off that keeps resistance selection from running away: a
+    // hyper-immune lineage pays for every allele it keeps.
+    if (np.energy != kNoProp) {
+        auto ipid = [&](const char* n) {
+            const PropertyDef* d = props.find_name(n);
+            return d ? d->id : kNoProp;
+        };
+        const PropId ipb = ipid("immune_power_base"),
+                     ict = ipid("immune_cost_threshold"),
+                     icp = ipid("immune_cost_permille"),
+                     ica = ipid("immune_cost_accum");
+        if (ipb != kNoProp && prop_of(e, ipb) && ica != kNoProp) {
+            const std::int64_t base = prop_int(e, ipb, 0);
+            const std::int64_t thresh = ict != kNoProp
+                ? prop_int(e, ict, 1200) : 1200;
+            const std::int64_t cperm = icp != kNoProp
+                ? prop_int(e, icp, 0) : 0;
+            const std::int64_t excess = std::max<std::int64_t>(0, base - thresh);
+            if (excess > 0 && cperm > 0 && met > 0) {
+                // eff permille of metabolism: excess*cperm/1000, floored —
+                // sub-permille rates still accumulate exactly.
+                const std::int64_t eff = excess * cperm / 1000;
+                std::int64_t acc = prop_int(e, ica, 0);
+                acc += met * eff * dt;
+                const std::int64_t drop = acc / 1000;
+                acc %= 1000;
+                const Value* en = prop_of(e, np.energy);
+                if (en && en->type == ValType::Integer && drop > 0) {
+                    const std::int64_t nxt =
+                        std::max<std::int64_t>(0, en->i - drop);
+                    if (nxt != en->i) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = np.energy;
+                        ch.had_before = true;
+                        ch.before = Value::integer(en->i);
+                        ch.after = Value::integer(nxt);
+                        e.props.set(np.energy, Value::integer(nxt));
+                        ev.changes.push_back(ch);
+                        touched = true;
+                    }
+                }
+                const std::int64_t a0 = prop_int(e, ica, 0);
+                if (acc != a0) {
+                    StateChange ch;
+                    ch.entity = e.id; ch.prop = ica; ch.had_before = true;
+                    ch.before = Value::integer(a0);
+                    ch.after = Value::integer(acc);
+                    e.props.set(ica, Value::integer(acc));
+                    ev.changes.push_back(ch);
+                    touched = true;
+                }
+            }
+        }
+    }
     // Flora fruit drift — an ecological process independent of `metabolism`
     // (plants do not eat) and, crucially, independent of the plant's own
     // `integrity`: fruit on the branch has a lifespan, the bush does not.
@@ -717,7 +794,31 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                         std::clamp<std::int64_t>(1000 - dev * 4, 0, 1000);
                     env = moist * tf / 1000;
                 }
-                net += prop_int(e, np.fruit_regrow_rate, 0) * env / 1000;
+                std::int64_t regen =
+                    prop_int(e, np.fruit_regrow_rate, 0) * env / 1000;
+                // Phase 11.2: blight yield penalty and ash-fertilized soil
+                // modulate the same rate — both World-Truth props, both
+                // constant across a drift window (LOD-safe).
+                if (np.yield_penalty != kNoProp) {
+                    const std::int64_t yp =
+                        std::min<std::int64_t>(900,
+                            prop_int(e, np.yield_penalty, 0));
+                    regen = regen * (1000 - yp) / 1000;
+                }
+                if (np.soil_nutrient != kNoProp) {
+                    std::int64_t fert = 0;
+                    const std::int64_t r2 = 64 * 64;
+                    for (EntityId nid : spatial.within(e.pos, 64)) {
+                        const Entity* o = find(nid);
+                        if (!o || !o->alive || nid == e.id) continue;
+                        if (dist2(o->pos, e.pos) > r2) continue;
+                        fert = std::max(fert,
+                            prop_int(*o, np.soil_nutrient, 0));
+                    }
+                    if (fert > 0)
+                        regen = regen * (1000 + std::min<std::int64_t>(fert, 1000)) / 1000;
+                }
+                net += regen;
             }
             if (has_fspoil && cur > 0)     // bare branch holds no rot debt
                 net -= prop_int(e, np.fruit_spoil_rate, 0);
@@ -1499,6 +1600,7 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             std::int64_t vir = 0, load = 0, ab = 0, elapsed = 0;
             std::uint32_t antigen = 0;
             std::string slot;
+            bool tolerated = false;   // reservoir host + symbiont strain
         };
         std::vector<Infect> infections;
         std::int64_t burden = total_infection;
@@ -1523,6 +1625,20 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                 if (sl_p != kNoProp) {
                     const Value* sv = prop_of(*st, sl_p);
                     if (sv && sv->type == ValType::Text) I.slot = sv->s;
+                }
+                // Phase 11: a reservoir-tolerant host carrying a symbiont
+                // strain coexists peacefully — no virulence damage, no
+                // fever, no toxin — but still sheds it environmentally.
+                {
+                    const PropertyDef* rtd = props.find_name("reservoir_tolerance");
+                    const PropertyDef* syd = props.find_name("symbiont");
+                    const PropertyDef* idv = props.find_name("is_disease_vector");
+                    if (rtd && syd)
+                        I.tolerated =
+                            prop_int(e, rtd->id, 0) >= 700 &&
+                            (prop_int(*st, syd->id, 0) != 0 ||
+                             (idv && prop_of(e, idv->id) &&
+                              prop_int(e, idv->id, 0) != 0));
                 }
                 pathogen_sum += I.load;
                 infections.push_back(I);
@@ -1574,7 +1690,7 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             // defensive fever: infection burden elevates set-point by
             // 15..fever_delta_max scaled by load — species-relative.
             for (const Infect& I : infections)
-                if (ie_p != kNoProp && I.elapsed >=
+                if (!I.tolerated && ie_p != kNoProp && I.elapsed >=
                     prop_int(*I.strain, pid("incubation_ticks"), 0))
                     fever_active = true;
             if (fever_active) {
@@ -1684,13 +1800,49 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                 if (sig_slot[i] == static_cast<std::int64_t>(ag)) return true;
             return false;
         };
-        // passive maternal immunity decays tick by tick
+        // passive maternal immunity decays tick by tick; when it expires
+        // the borrowed signatures leave immune memory — the shield was
+        // lent, not earned, so the host becomes naive again (herd-immunity
+        // waves need susceptibles to return with each generation).
         if (pi_p != kNoProp && prop_of(e, pi_p)) {
             const std::int64_t pv = prop_int(e, pi_p, 0);
             if (pv > 0) change(pi_p, pv, std::max<std::int64_t>(0, pv - dt));
         }
         const std::int64_t pi_left = pi_p != kNoProp
             ? prop_int(e, pi_p, 0) : 0;
+        {
+            const PropId psc_p = pid("passive_sig_count");
+            if (pi_left <= 0 && psc_p != kNoProp &&
+                prop_of(e, psc_p) && prop_int(e, psc_p, 0) > 0 &&
+                ics_p != kNoProp) {
+                const int psc = static_cast<int>(
+                    std::min<std::int64_t>(8, prop_int(e, psc_p, 0)));
+                int n = static_cast<int>(std::min<std::int64_t>(8,
+                    prop_int(e, ics_p, 0)));
+                // borrowed sigs occupy the leading slots; earned memories
+                // sit behind them — compact the earned ones forward.
+                for (int i = psc; i < n; ++i) {
+                    const PropId dst = pid(("immune_sig" +
+                        std::to_string(i - psc)).c_str());
+                    const PropId src = pid(("immune_sig" +
+                        std::to_string(i)).c_str());
+                    if (dst == kNoProp || src == kNoProp) continue;
+                    const std::int64_t sv = prop_int(e, src, 0);
+                    if (prop_int(e, dst, 0) != sv)
+                        change(dst, prop_int(e, dst, 0), sv);
+                }
+                for (int i = n - psc; i < n; ++i) {
+                    const PropId tp = pid(("immune_sig" +
+                        std::to_string(i)).c_str());
+                    if (tp != kNoProp && prop_int(e, tp, 0) != 0)
+                        change(tp, prop_int(e, tp, 0), 0);
+                }
+                if (n - psc != n && ics_p != kNoProp)
+                    change(ics_p, n, std::max(0, n - psc));
+                change(psc_p, psc, 0);
+                ev.evidence += "passive immunity lapsed; ";
+            }
+        }
         const bool fever_kill = dT >= 15;
         for (Infect& I : infections) {
             Entity& ie = *I.ie;
@@ -1737,7 +1889,7 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                 // remainder persists every call — gating the write on
                 // dd>0 starves the accumulator under per-tick evaluation.
                 change_on(ie, da_p, dacc0, dacc - dd * 100000);
-                if (dd > 0) {
+                if (dd > 0 && !I.tolerated) {
                     for (const Relation& rel : relations_of(e.id, "part_of")) {
                         if (rel.b != e.id) continue;
                         Entity* pt = find(rel.a);
@@ -1760,7 +1912,8 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                 }
             }
             // virulence sheds toxin into the host's blood
-            if (nl > 0 && tox_p != kNoProp && prop_of(e, tox_p)) {
+            if (nl > 0 && !I.tolerated && tox_p != kNoProp &&
+                prop_of(e, tox_p)) {
                 const std::int64_t ta0 = ita_p != kNoProp
                     ? prop_int(ie, ita_p, 0) : 0;
                 const std::int64_t tacc = ta0 + dt * nl * I.vir / 500;
@@ -1826,7 +1979,8 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             }
             // clearance: antibody dominance sterilizes the infection and
             // writes the antigen into immune memory (max 8 signatures).
-            if (nl <= 0 || I.ab > nl) {
+            // A tolerated symbiont is chronic — the reservoir keeps it.
+            if (!I.tolerated && (nl <= 0 || I.ab > nl)) {
                 ie.alive = false; spatial.erase(ie.id);
                 ev.evidence += "cleared ";
                 if (!has_memory(I.antigen) && sig_n < 8) {
@@ -2115,6 +2269,82 @@ bool World::physiology_coupled(const Entity& e) const {
 }
 
 // host's pending ticks, so dormant catch-up transmits identically.
+// Shared infection-spawn path: every transmission route (airborne,
+// contact, waterborne, vector bite, soil sprout) queues the same
+// ActiveInfection shape — deduped per pass so a host never gets two
+// copies of the same strain queued in one metabolize event.
+void World::queue_infection(std::vector<SpawnSpec>& out, EntityId host,
+                            std::int64_t strain_eid, std::int64_t load) {
+    Entity* h = find(host);
+    if (!h) return;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId ps_p = pid("pathogen_strain"),
+                 pl_p = pid("pathogen_load"),
+                 ab_p = pid("antibody_level"),
+                 ie_p = pid("infection_elapsed"),
+                 ila_p = pid("infection_load_accum"),
+                 iba_p = pid("infection_ab_accum"),
+                 sa_p = pid("shed_accum");
+    for (const SpawnSpec& sp : out) {
+        bool is_carries = false;
+        for (const auto& [t, o] : sp.rel_from)
+            if (t == "carries" && o == host) is_carries = true;
+        if (!is_carries) continue;
+        const Value* v = sp.props.get(ps_p);
+        if (v && v->type == ValType::Integer && v->i == strain_eid)
+            return;   // identical infection already queued this pass
+    }
+    SpawnSpec s;
+    s.kind = "infection";
+    s.material = kNoMaterial;
+    s.pos = h->pos;
+    PropertyBag pb;
+    pb.set(ps_p, Value::integer(strain_eid));
+    pb.set(pl_p, Value::integer(load));
+    pb.set(ab_p, Value::integer(0));
+    if (ie_p != kNoProp) pb.set(ie_p, Value::integer(0));
+    if (ila_p != kNoProp) pb.set(ila_p, Value::integer(0));
+    if (iba_p != kNoProp) pb.set(iba_p, Value::integer(0));
+    if (sa_p != kNoProp) pb.set(sa_p, Value::integer(0));
+    s.props = pb;
+    s.rel_from.push_back({"carries", host});
+    out.push_back(std::move(s));
+}
+
+// Herd immunity (Phase 11.3): a host whose immune_sig slots hold the
+// strain's antigen_signature is protected — transmission routes skip it.
+// Slots beyond immune_count are stale (cleared or never written) and do
+// not count; maternally borrowed sigs protect only while passive_immune
+// remains (the expiry compaction in anatomy_drift removes them anyway).
+bool World::host_immune_to(EntityId host, std::int64_t strain_id) const {
+    const Entity* st = find(static_cast<EntityId>(strain_id));
+    if (!st || !st->alive) return false;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId ag_p = pid("antigen_signature"),
+                 ics_p = pid("immune_count");
+    if (ag_p == kNoProp) return false;
+    const std::int64_t ag = prop_int(*st, ag_p, 0);
+    if (ag <= 0) return false;
+    const Entity* h = find(host);
+    if (!h || !h->alive) return false;
+    const int n = ics_p != kNoProp
+        ? static_cast<int>(std::min<std::int64_t>(8, prop_int(*h, ics_p, 0)))
+        : 0;
+    for (int i = 0; i < n; ++i) {
+        const PropId sp = pid(("immune_sig" + std::to_string(i)).c_str());
+        if (sp != kNoProp && prop_of(*h, sp) &&
+            prop_int(*h, sp, 0) == ag)
+            return true;
+    }
+    return false;
+}
+
 void World::epidemiology_drift(Entity& e, std::int64_t pending,
                                std::uint64_t now, CausalEvent& ev,
                                std::vector<SpawnSpec>& out) {
@@ -2125,12 +2355,7 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
         return d ? d->id : kNoProp;
     };
     const PropId ps_p = pid("pathogen_strain"),
-                 pl_p = pid("pathogen_load"),
-                 ab_p = pid("antibody_level"),
-                 ie_p = pid("infection_elapsed"),
                  sa_p = pid("shed_accum"),
-                 ila_p = pid("infection_load_accum"),
-                 iba_p = pid("infection_ab_accum"),
                  sr_p = pid("strain_ref"),
                  air_p = pid("airborne_rate"),
                  wat_p = pid("waterborne_rate"),
@@ -2167,32 +2392,7 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
     };
     auto spawn_infection = [&](EntityId host, std::int64_t strain_eid,
                                std::int64_t load) {
-        Entity* h = find(host);
-        if (!h) return;
-        for (const SpawnSpec& s : out) {
-            bool is_carries = false;
-            for (const auto& [t, o] : s.rel_from)
-                if (t == "carries" && o == host) is_carries = true;
-            if (!is_carries) continue;
-            const Value* v = s.props.get(ps_p);
-            if (v && v->type == ValType::Integer && v->i == strain_eid)
-                return;   // identical infection already queued this pass
-        }
-        SpawnSpec s;
-        s.kind = "infection";
-        s.material = kNoMaterial;
-        s.pos = h->pos;
-        PropertyBag pb;
-        pb.set(ps_p, Value::integer(strain_eid));
-        pb.set(pl_p, Value::integer(load));
-        pb.set(ab_p, Value::integer(0));
-        if (ie_p != kNoProp) pb.set(ie_p, Value::integer(0));
-        if (ila_p != kNoProp) pb.set(ila_p, Value::integer(0));
-        if (iba_p != kNoProp) pb.set(iba_p, Value::integer(0));
-        if (sa_p != kNoProp) pb.set(sa_p, Value::integer(0));
-        s.props = pb;
-        s.rel_from.push_back({"carries", host});
-        out.push_back(std::move(s));
+        queue_infection(out, host, strain_eid, load);
     };
     // deterministic target pick: sorted candidates + stream hash
     auto pick_target = [&](const std::vector<EntityId>& cands,
@@ -2203,6 +2403,11 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
             const Entity* o = find(cid);
             if (!o || !is_host(*o) || o->id == e.id) continue;
             if (exclude_strain > 0 && carries_strain(cid, exclude_strain))
+                continue;
+            // herd immunity: a host carrying this strain's antigen in
+            // immune memory cannot be reinfected — chains starve as the
+            // recovered fraction of a cluster grows.
+            if (exclude_strain > 0 && host_immune_to(cid, exclude_strain))
                 continue;
             if (radius_kind == 1) {   // contact route: needs an open wound
                 bool wounded = br_p != kNoProp && prop_int(*o, br_p, 0) > 0;
@@ -2254,6 +2459,16 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
         return;   // waste hosts no infections of its own
     }
 
+    // Phase 11.3: a torpid vector neither sheds nor transmits — dormancy
+    // is an ecological state (cold/dry season), not damage.
+    {
+        const PropId idv_p = pid("is_disease_vector"),
+                     dm_p = pid("vector_dormant");
+        if (idv_p != kNoProp && dm_p != kNoProp &&
+            prop_of(e, idv_p) && prop_int(e, dm_p, 0) != 0)
+            return;
+    }
+
     // ---- airborne + contact: shed by each active infection on this host --
     if (!is_host(e)) return;
     for (const Relation& rel : relations_of(e.id, "carries")) {
@@ -2303,6 +2518,8 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
 void World::metabolize(std::int64_t dt) {
     (void)dt;   // per-entity pending time replaces the bulk dt (Phase 9 LOD)
     const NeedProps np = need_props();
+    const PropertyDef* idv_d = props.find_name("is_disease_vector");
+    const PropId idv_p = idv_d ? idv_d->id : kNoProp;
     if ((np.metabolism == kNoProp && np.age == kNoProp) ||
         (np.hunger == kNoProp && np.thirst == kNoProp && np.fatigue == kNoProp &&
          np.integrity == kNoProp)) return;
@@ -2363,6 +2580,14 @@ void World::metabolize(std::int64_t dt) {
                 if (p != kNoProp && md.props.count(p)) {
                     mat_need_flags_[md.id - 1] = 1; break;
                 }
+        for (const char* en : kEnvPropNames) {
+            const PropertyDef* ed = props.find_name(en);
+            if (!ed) continue;
+            for (const MaterialDef& md : materials.defs())
+                if (md.props.count(ed->id)) {
+                    mat_need_flags_[md.id - 1] = 1; break;
+                }
+        }
     }
 
     CausalEvent ev;
@@ -2372,10 +2597,29 @@ void World::metabolize(std::int64_t dt) {
     bool any = false;
     std::vector<ShedPool> shed_pools;
     std::vector<SpawnSpec> drift_spawns;
+    std::vector<EntityId> symbiont_hosts;
     for (const auto& ep : entities) {
         Entity& e = *ep;
-        if (!e.alive) continue;
         const std::uint64_t pending = now - e.last_metabolized;
+        if (!e.alive) {
+            // Phase 11: corpses are environmental reservoirs — they keep
+            // decaying, emitting odor and shedding strain_ref long after
+            // the organism's needs stopped mattering. Same LOD contract:
+            // dormant catch-up is one batched, accumulator-exact update.
+            if (pending > 0) {
+                if (lod && pending < static_cast<std::uint64_t>(kDormantStride) &&
+                    !is_active(e))
+                    continue;
+                const std::size_t chg0 = ev.changes.size();
+                environmental_drift(e, pending, ev);
+                if (ev.changes.size() != chg0) {
+                    ev.participants.push_back(e.id);
+                    any = true;
+                }
+                e.last_metabolized = now;
+            }
+            continue;
+        }
         // LOD: dormant entities wait until enough ticks accrued — cheapest
         // possible reject before ANY property lookup.
         if (lod && pending < static_cast<std::uint64_t>(kDormantStride) &&
@@ -2408,6 +2652,11 @@ void World::metabolize(std::int64_t dt) {
                                     np.decay_rate, np.decay_credit};
             for (PropId p : watch)
                 if (p != kNoProp && e.props.get(p)) { maybe = true; break; }
+            if (!maybe)
+                for (const char* en : kEnvPropNames) {
+                    const PropertyDef* ed = props.find_name(en);
+                    if (ed && e.props.get(ed->id)) { maybe = true; break; }
+                }
             if (!maybe && e.material != kNoMaterial &&
                 e.material - 1 < mat_need_flags_.size() &&
                 mat_need_flags_[e.material - 1])
@@ -2417,7 +2666,12 @@ void World::metabolize(std::int64_t dt) {
         if (pending == 0) { e.last_metabolized = now; continue; }
         bool drifted = false;
         const std::size_t chg0 = ev.changes.size();
-        if (pending > 1 && physiology_coupled(e)) {
+        // Vectors always replay tick-wise on catch-up: their dormancy,
+        // biting and brood quanta interleave with need-driven death and
+        // with the shared spawn queue exactly like advance(1) x N would.
+        const bool is_vec = idv_p != kNoProp &&
+            prop_of(e, idv_p) && prop_int(e, idv_p, 0) != 0;
+        if (pending > 1 && (physiology_coupled(e) || is_vec)) {
             // coupled physiology replays tick-by-tick — the only way a
             // batched catch-up stays bit-identical to advance(1) x N.
             for (std::uint64_t k = 0; k < pending && e.alive; ++k) {
@@ -2425,6 +2679,8 @@ void World::metabolize(std::int64_t dt) {
                 if (drift_needs(e, 1, np, ev)) drifted = true;
                 anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
+                flora_drift(e, 1, sub_now, ev, drift_spawns);
+                if (is_vec) vector_drift(e, 1, sub_now, ev, drift_spawns);
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -2432,12 +2688,30 @@ void World::metabolize(std::int64_t dt) {
             anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
             epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
                                drift_spawns);
+            flora_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                        drift_spawns);
+            vector_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                         drift_spawns);
+        }
+        // Phase 11: standing water fouls into a stagnation reservoir on the
+        // same batched, accumulator-exact contract as every other drift.
+        environmental_drift(e, pending, ev);
+        // Lazy symbiont: hosts carrying a symbiont_signature template get
+        // their commensal strain seeded post-loop with real entity ids.
+        {
+            const PropertyDef* sd = props.find_name("symbiont_signature");
+            if (sd && prop_int(e, sd->id, 0) > 0)
+                symbiont_hosts.push_back(e.id);
         }
         if (drifted || ev.changes.size() != chg0) {
             ev.participants.push_back(e.id);
             any = true;
         }
         e.last_metabolized = now;
+    }
+    if (!symbiont_hosts.empty()) {
+        seed_symbionts(ev, symbiont_hosts);
+        any = true;
     }
     // shed waste lands as material entities — World Truth grows causally
     // inside the same metabolize event (blood pools, feces, urine).
@@ -2463,6 +2737,1153 @@ void World::metabolize(std::int64_t dt) {
     if (any) {
         ev.evidence = "needs drift with metabolism; " + ev.evidence;
         ledger.append(std::move(ev));
+    }
+}
+
+// Phase 11 — environmental reservoirs. One batched, accumulator-exact pass
+// per metabolize call, identical contract to drift_needs: every remainder is
+// written unconditionally, every quantum loop is bounded, buried/cremated
+// corpses go silent immediately.
+void World::environmental_drift(Entity& e, std::uint64_t pending_u,
+                                CausalEvent& ev, bool record_hist) {
+    if (pending_u == 0) return;
+    const std::int64_t pending = static_cast<std::int64_t>(pending_u);
+    // Phase 11.3: snapshot the pre-window stagnation mark so vectors can
+    // evaluate "was the water fouled at tick T" for ANY T inside this
+    // window — stagnation is affine in elapsed ticks, so one mark plus
+    // the material rate reconstructs the whole trajectory exactly.
+    if (record_hist && e.alive) {
+        auto hpid = [&](const char* n) {
+            const PropertyDef* d = props.find_name(n);
+            return d ? d->id : kNoProp;
+        };
+        const PropId stl = hpid("stagnation_level"),
+                     sta = hpid("stagnation_accum"),
+                     sra = hpid("stagnation_rate"),
+                     flo = hpid("flow_rate"),
+                     hl = hpid("stagnation_hist_level"),
+                     ha = hpid("stagnation_hist_acc"),
+                     hr = hpid("stagnation_hist_rate"),
+                     hs = hpid("stagnation_hist_start");
+        if (stl != kNoProp && prop_of(e, stl) && hl != kNoProp &&
+            ha != kNoProp && hr != kNoProp && hs != kNoProp &&
+            !(flo != kNoProp && prop_int(e, flo, 0) > 0)) {
+            const std::int64_t rate = sra != kNoProp
+                ? prop_int(e, sra, 0) : 0;
+            if (rate > 0) {
+                auto hset = [&](PropId p, std::int64_t v) {
+                    if (p == kNoProp) return;
+                    const Value* cur = prop_of(e, p);
+                    const std::int64_t before = cur ? cur->i : 0;
+                    if (before == v && cur) return;
+                    StateChange ch;
+                    ch.entity = e.id; ch.prop = p;
+                    ch.had_before = cur != nullptr;
+                    ch.before = cur ? *cur : Value::integer(0);
+                    ch.after = Value::integer(v);
+                    e.props.set(p, Value::integer(v));
+                    ev.changes.push_back(ch);
+                };
+                hset(hl, prop_int(e, stl, 0));
+                hset(ha, sta != kNoProp ? prop_int(e, sta, 0) : 0);
+                hset(hr, rate);
+                hset(hs, static_cast<std::int64_t>(clock_.tick()) - pending);
+            }
+        }
+    }
+    // LOD guard: reservoir levels are monotonic, so emission switches on
+    // exactly once. A batch that straddles the threshold would emit for
+    // the whole window while dt=1 ticks emit only after crossing — the
+    // spread/odor accumulators would diverge. Replay tick-wise instead.
+    if (pending > 1) {
+        auto xpid = [&](const char* n) {
+            const PropertyDef* d = props.find_name(n);
+            return d ? d->id : kNoProp;
+        };
+        bool cross = false;
+        if (!e.alive) {
+            const PropId cdl = xpid("corpse_decay_level"),
+                         cda = xpid("corpse_decay_accum"),
+                         buried = xpid("buried"),
+                         crem = xpid("cremated"),
+                         dec = xpid("decay_rate");
+            if (cdl != kNoProp && cda != kNoProp &&
+                !(buried != kNoProp && prop_int(e, buried, 0) != 0) &&
+                !(crem != kNoProp && prop_int(e, crem, 0) != 0) &&
+                prop_of(e, cdl)) {
+                const std::int64_t lvl0 = prop_int(e, cdl, 0);
+                const std::int64_t rate = dec != kNoProp
+                    ? prop_int(e, dec, 0) : 0;
+                const std::int64_t acc = prop_int(e, cda, 0) +
+                    pending * rate;
+                const std::int64_t nl = std::min<std::int64_t>(1000,
+                    lvl0 + acc / 1000);
+                cross = lvl0 <= 200 && nl > 200;
+            }
+        } else {
+            const PropId stl = xpid("stagnation_level"),
+                         sta = xpid("stagnation_accum"),
+                         sra = xpid("stagnation_rate"),
+                         flow = xpid("flow_rate");
+            if (stl != kNoProp && sta != kNoProp && prop_of(e, stl) &&
+                !(flow != kNoProp && prop_int(e, flow, 0) > 0)) {
+                const std::int64_t rate = sra != kNoProp
+                    ? prop_int(e, sra, 0) : 0;
+                if (rate > 0) {
+                    const std::int64_t lvl0 = prop_int(e, stl, 0);
+                    const std::int64_t acc = prop_int(e, sta, 0) +
+                        pending * rate;
+                    const std::int64_t nl = std::min<std::int64_t>(1000,
+                        lvl0 + acc / 1000);
+                    cross = lvl0 <= 500 && nl > 500;
+                }
+            }
+        }
+        if (cross) {
+            for (std::int64_t i = 0; i < pending; ++i)
+                environmental_drift(e, 1, ev, false);
+            return;
+        }
+    }
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId cdl_p = pid("corpse_decay_level"),
+                 cda_p = pid("corpse_decay_accum"),
+                 buried_p = pid("buried"),
+                 cremated_p = pid("cremated"),
+                 stl_p = pid("stagnation_level"),
+                 sta_p = pid("stagnation_accum"),
+                 sra_p = pid("stagnation_rate"),
+                 flow_p = pid("flow_rate"),
+                 rsp_p = pid("reservoir_spread_accum"),
+                 odor_p = pid("odor"),
+                 cont_p = pid("contamination"),
+                 sr_p = pid("strain_ref"),
+                 dec_p = pid("decay_rate"),
+                 ps_p = pid("pathogen_strain"),
+                 spr_p = pid("spore_rate"),
+                 pl_p = pid("pathogen_load"),
+                 ssl_p = pid("soil_spore_load"),
+                 ssr_p = pid("soil_strain_ref"),
+                 sda_p = pid("spore_decay_accum"),
+                 sdr_p = pid("spore_decay_rate"),
+                 dep_p = pid("spores_deposited");
+    auto change_on = [&](Entity& tgt, PropId p, std::int64_t before,
+                         std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch;
+        ch.entity = tgt.id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(before);
+        ch.after = Value::integer(after);
+        tgt.props.set(p, Value::integer(after));
+        ev.changes.push_back(ch);
+    };
+    // prop_of already falls back to material props — presence anywhere in
+    // the entity+material chain is what makes a reservoir candidate.
+    auto has_prop = [&](PropId p) { return p != kNoProp && prop_of(e, p); };
+    // instance-marker write: observable corpse_decay_level must exist as an
+    // ENTITY prop (not just the material default) so perception/snapshots
+    // can tell a corpse from the living — e.props.get is instance-only.
+    auto ensure_instance = [&](PropId p, std::int64_t v) {
+        if (p == kNoProp || e.props.get(p)) return;
+        StateChange ch;
+        ch.entity = e.id; ch.prop = p; ch.had_before = false;
+        ch.before = Value::integer(0);
+        ch.after = Value::integer(v);
+        e.props.set(p, Value::integer(v));
+        ev.changes.push_back(ch);
+    };
+
+    std::int64_t emit_level = 0;      // >threshold -> reservoir is emitting
+    bool is_corpse = false;
+    if (!e.alive) {
+        is_corpse = true;
+        if ((cremated_p != kNoProp && prop_int(e, cremated_p, 0) != 0) ||
+            (buried_p != kNoProp && prop_int(e, buried_p, 0) != 0)) {
+            // interred/burned remains leave the world again: out of the
+            // spatial index, invisible to perception and interaction.
+            if (spatial.contains(e.id)) spatial.erase(e.id);
+            return;                                    // inert / interred
+        }
+        // Phase 11.2: a corpse carrying a plant pathogen leaches its
+        // spore load into the soil beneath it — once. The patch becomes a
+        // persistent reservoir that infects future susceptible sprouts.
+        if (dep_p != kNoProp && prop_int(e, dep_p, 0) == 0 &&
+            spr_p != kNoProp && ps_p != kNoProp) {
+            std::int64_t best_strain = 0, best_load = 0, total = 0;
+            for (const Relation& rel : relations_of(e.id, "carries")) {
+                if (rel.a != e.id) continue;
+                const Entity* ie = find(rel.b);
+                if (!ie || !ie->alive) continue;
+                const std::int64_t seid = prop_int(*ie, ps_p, 0);
+                const Entity* st = seid > 0
+                    ? find(static_cast<EntityId>(seid)) : nullptr;
+                if (!st || !st->alive) continue;
+                if (prop_int(*st, spr_p, 0) <= 0) continue;
+                const std::int64_t ld = prop_int(*ie, pl_p, 0);
+                total += ld;
+                if (ld > best_load) { best_load = ld; best_strain = seid; }
+            }
+            if (total > 0 && ssl_p != kNoProp && ssr_p != kNoProp) {
+                const std::int64_t deposit =
+                    std::min<std::int64_t>(400, std::max<std::int64_t>(100, total / 3));
+                // find-or-create the soil patch at this spot (sorted near)
+                EntityId patch_id = kNoEntity;
+                {
+                    std::vector<EntityId> near = spatial.within(e.pos, 24);
+                    std::sort(near.begin(), near.end());
+                    for (EntityId nid : near) {
+                        Entity* o = find(nid);
+                        if (o && o->alive && prop_of(*o, ssl_p)) {
+                            patch_id = nid; break;
+                        }
+                    }
+                }
+                if (patch_id == kNoEntity) {
+                    const MaterialId soil_mat = materials.id_of("soil_loam");
+                    PropertyBag pb;
+                    pb.set(ssl_p, Value::integer(0));
+                    pb.set(ssr_p, Value::integer(0));
+                    const PropertyDef* snu = props.find_name("soil_nutrient");
+                    if (snu) pb.set(snu->id, Value::integer(0));
+                    const PropertyDef* sda = props.find_name("spore_decay_accum");
+                    if (sda) pb.set(sda->id, Value::integer(0));
+                    const PropId cont_i = pid("contamination");
+                    if (cont_i != kNoProp) pb.set(cont_i, Value::integer(0));
+                    const PropId shk = pid("soil_host_kind");
+                    if (shk != kNoProp)
+                        pb.set(shk, Value::text(e.kind_name));
+                    patch_id = create_entity("soil_patch", soil_mat, e.pos, pb);
+                    if (patch_id != kNoEntity) {
+                        ev.spawned.push_back(patch_id);
+                        ev.evidence += "soil_patch " +
+                            std::to_string(patch_id) + " formed; ";
+                    }
+                }
+                if (patch_id != kNoEntity) {
+                    if (Entity* patch = find(patch_id)) {
+                        const std::int64_t cur = prop_int(*patch, ssl_p, 0);
+                        change_on(*patch, ssl_p, cur,
+                                  std::min<std::int64_t>(1000, cur + deposit));
+                        if (cur == 0 && best_strain > 0)
+                            change_on(*patch, ssr_p,
+                                      prop_int(*patch, ssr_p, 0), best_strain);
+                    }
+                    change_on(e, dep_p, 0, 1);
+                    ev.evidence += "spores leached to soil; ";
+                }
+            }
+        }
+        if (!has_prop(cdl_p)) return;                  // not a decaying remain
+        // corpses re-enter the spatial index so they can be seen, smelled
+        // and interacted with (consume/bury/heat) — death erases them once,
+        // the reservoir pass restores the physical presence.
+        if (!spatial.contains(e.id)) spatial.insert(e.id, e.pos);
+        ensure_instance(cdl_p, 0);
+        ensure_instance(cda_p, 0);   // remainder prop must exist even when
+                                     // a batch lands exactly on its start
+        const std::int64_t rate = dec_p != kNoProp
+            ? prop_int(e, dec_p, 0) : 0;               // permille/tick, mat fallback
+        if (rate > 0 && cda_p != kNoProp) {
+            const std::int64_t a0 = prop_int(e, cda_p, 0);
+            const std::int64_t acc = a0 + pending * rate;
+            const std::int64_t quanta = acc / 1000;
+            const std::int64_t lvl0 = prop_int(e, cdl_p, 0);
+            const std::int64_t nl = std::min<std::int64_t>(1000, lvl0 + quanta);
+            change_on(e, cdl_p, lvl0, nl);
+            change_on(e, cda_p, a0, acc - quanta * 1000);
+            if (nl > 200) emit_level = nl;
+        } else if (prop_int(e, cdl_p, 0) > 200) {
+            emit_level = prop_int(e, cdl_p, 0);
+        }
+    } else {
+        // Phase 11.2: a soil patch is a living-world entity whose spore
+        // bank decays when no host replenishes it — fallowing self-cleans.
+        if (ssl_p != kNoProp && prop_of(e, ssl_p)) {
+            const std::int64_t srate = sdr_p != kNoProp
+                ? prop_int(e, sdr_p, 0) : 0;
+            if (srate > 0 && sda_p != kNoProp) {
+                const std::int64_t a0 = prop_int(e, sda_p, 0);
+                const std::int64_t acc = a0 + pending * srate;
+                const std::int64_t quanta = acc / 1000;
+                const std::int64_t l0 = prop_int(e, ssl_p, 0);
+                const std::int64_t nl = std::max<std::int64_t>(0, l0 - quanta);
+                change_on(e, ssl_p, l0, nl);
+                change_on(e, sda_p, a0, acc - quanta * 1000);
+                if (nl <= 0 && ssr_p != kNoProp &&
+                    prop_int(e, ssr_p, 0) != 0)
+                    change_on(e, ssr_p, prop_int(e, ssr_p, 0), 0);
+            }
+            return;                     // soil is not water: no emit pass
+        }
+        // living entity: only standing (flow_rate <= 0) water fouls
+        if (!has_prop(stl_p)) return;
+        if (flow_p != kNoProp && prop_int(e, flow_p, 0) > 0) return;
+        const std::int64_t rate = sra_p != kNoProp
+            ? prop_int(e, sra_p, 0) : 0;               // milli-units/tick
+        if (rate <= 0 || sta_p == kNoProp) return;
+        ensure_instance(sta_p, 0);
+        const std::int64_t a0 = prop_int(e, sta_p, 0);
+        const std::int64_t acc = a0 + pending * rate;
+        const std::int64_t quanta = acc / 1000;
+        const std::int64_t lvl0 = prop_int(e, stl_p, 0);
+        const std::int64_t nl = std::min<std::int64_t>(1000, lvl0 + quanta);
+        change_on(e, stl_p, lvl0, nl);
+        change_on(e, sta_p, a0, acc - quanta * 1000);
+        if (nl > 500) emit_level = nl;
+    }
+    if (emit_level <= 0) return;
+
+    // observable stench on corpses; both reservoir kinds raise contamination
+    if (is_corpse && odor_p != kNoProp) {
+        const std::int64_t ov = std::min<std::int64_t>(1000,
+            (emit_level - 200) * 4);
+        change_on(e, odor_p, prop_int(e, odor_p, 0), ov);
+    }
+    if (cont_p != kNoProp) {
+        const std::int64_t ct = is_corpse
+            ? std::min<std::int64_t>(1000, emit_level)
+            : std::min<std::int64_t>(1000, 200 + (emit_level - 500));
+        change_on(e, cont_p, prop_int(e, cont_p, 0),
+                  std::max(prop_int(e, cont_p, 0), ct));
+    }
+
+    // emission quanta: every 250 ticks of reservoir time, the rot/fouling
+    // reaches neighbouring cells — contamination rises and any strain the
+    // reservoir carries (corpse keeps carries->infection edges; stamped
+    // water/waste carries strain_ref) propagates to nearby entities.
+    if (rsp_p == kNoProp) return;
+    ensure_instance(rsp_p, 0);
+    const std::int64_t r0 = prop_int(e, rsp_p, 0);
+    const std::int64_t racc = r0 + pending * 1000;    // milli-ticks
+    std::int64_t squanta = racc / 250000;       // one per 250 ticks
+    if (squanta <= 0) {
+        change_on(e, rsp_p, r0, racc);
+        return;
+    }
+    const std::int64_t q = std::min<std::int64_t>(squanta, 32);
+    // unprocessed quanta stay in the accumulator — catch-up is lossless.
+    change_on(e, rsp_p, r0, racc - q * 250000);
+    squanta = q;
+
+    // strains this reservoir can pass on (sorted, deduped, capped)
+    std::vector<std::int64_t> strains;
+    for (const Relation& rel : relations_of(e.id, "carries")) {
+        if (rel.a != e.id) continue;
+        const Entity* ie = find(rel.b);
+        if (!ie || !ie->alive || ps_p == kNoProp) continue;
+        const std::int64_t seid = prop_int(*ie, ps_p, 0);
+        if (seid > 0) strains.push_back(seid);
+    }
+    if (sr_p != kNoProp) {
+        const std::int64_t sr = prop_int(e, sr_p, 0);
+        if (sr > 0) strains.push_back(sr);
+    }
+    std::sort(strains.begin(), strains.end());
+    strains.erase(std::unique(strains.begin(), strains.end()), strains.end());
+    if (strains.size() > 4) strains.resize(4);
+    const std::int64_t first_strain = strains.empty() ? 0 : strains.front();
+
+    for (std::int64_t qi = 0; qi < q; ++qi) {
+        std::vector<EntityId> near = spatial.within(e.pos, 64);
+        std::sort(near.begin(), near.end());
+        std::int64_t done = 0;
+        for (EntityId cid : near) {
+            if (done >= 6) break;
+            if (cid == e.id) continue;
+            Entity* o = find(cid);
+            if (!o) continue;
+            // reservoirs spread filth onto anything that can hold it:
+            // contamination-capable matter or water (hydration carriers).
+            const bool holds = (cont_p != kNoProp && prop_of(*o, cont_p)) ||
+                               prop_int(*o, pid("hydration"), 0) > 0;
+            if (!holds) continue;
+            if (cont_p != kNoProp) {
+                const std::int64_t c0 = prop_int(*o, cont_p, 0);
+                change_on(*o, cont_p, c0, std::min<std::int64_t>(1000, c0 + 80));
+            }
+            const PropertyDef* bv_d = props.find_name("blood_volume");
+            const bool is_hostile = bv_d && prop_of(*o, bv_d->id);
+            if (first_strain > 0 && sr_p != kNoProp && !is_hostile &&
+                prop_int(*o, sr_p, 0) == 0)
+                change_on(*o, sr_p, 0, first_strain);
+            ++done;
+        }
+    }
+}
+
+// Phase 11.3 — vector ecology. A disease vector is an ordinary organism
+// whose activity is gated by the LOCAL environment: terrain temperature
+// inside its declared band plus (optionally) a nearby stagnant-water
+// reservoir. Dormant vectors neither bite nor breed — epizootics breathe
+// with the seasons for free. Water state is read through the pond's
+// stagnation_hist_* mark (written by environmental_drift) so "was the
+// water fouled at tick T" is answered exactly for any T in the window —
+// the same affine trajectory per-tick evaluation sees.
+void World::vector_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                         CausalEvent& ev, std::vector<SpawnSpec>& out) {
+    if (pending <= 0 || !e.alive) return;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId idv_p = pid("is_disease_vector"),
+                 dm_p = pid("vector_dormant"),
+                 tmin_p = pid("vector_optimal_temp_min"),
+                 tmax_p = pid("vector_optimal_temp_max"),
+                 reqw_p = pid("vector_requires_stagnant_water"),
+                 smin_p = pid("vector_stagnation_min"),
+                 brad_p = pid("vector_bite_radius"),
+                 brate_p = pid("vector_bite_rate"),
+                 bacc_p = pid("vector_bite_accum"),
+                 broll_p = pid("vector_bite_rolls"),
+                 brood_p = pid("vector_brood_rolls"),
+                 fec_p = pid("vector_fecundity"),
+                 vacc_p = pid("vector_breed_accum"),
+                 cload_p = pid("vector_carrier_load"),
+                 cap_p = pid("vector_brood_cap"),
+                 stl_p = pid("stagnation_level"),
+                 flo_p = pid("flow_rate"),
+                 hl_p = pid("stagnation_hist_level"),
+                 ha_p = pid("stagnation_hist_acc"),
+                 hr_p = pid("stagnation_hist_rate"),
+                 hs_p = pid("stagnation_hist_start"),
+                 bv_p = pid("blood_volume"),
+                 ps_p = pid("pathogen_strain"),
+                 vbr_p = pid("vector_borne_rate");
+    if (idv_p == kNoProp || !prop_of(e, idv_p) ||
+        prop_int(e, idv_p, 0) == 0)
+        return;                                   // not a vector
+
+    auto change_on = [&](Entity& tgt, PropId p, std::int64_t before,
+                         std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch;
+        ch.entity = tgt.id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(before);
+        ch.after = Value::integer(after);
+        tgt.props.set(p, Value::integer(after));
+        ev.changes.push_back(ch);
+    };
+
+    // ---- environment -------------------------------------------------------
+    // Ambient fallback matches the engine's neutral 20 °C convention used
+    // for entity temperature defaults; real worlds always carry terrain.
+    std::int64_t env_temp = 200;
+    if (!terrain.empty() && terrain.contains(e.pos))
+        env_temp = terrain.temp_at(e.pos);
+    const std::int64_t tmin = tmin_p != kNoProp
+        ? prop_int(e, tmin_p, -1000) : -1000;
+    const std::int64_t tmax = tmax_p != kNoProp
+        ? prop_int(e, tmax_p, 2000) : 2000;
+    const bool temp_ok = env_temp >= tmin && env_temp <= tmax;
+    const bool req_water = reqw_p != kNoProp && prop_of(e, reqw_p) &&
+                           prop_int(e, reqw_p, 0) != 0;
+    const std::int64_t stag_min = smin_p != kNoProp
+        ? prop_int(e, smin_p, 500) : 500;
+    const std::int64_t bite_r = brad_p != kNoProp
+        ? std::max<std::int64_t>(1, prop_int(e, brad_p, 48)) : 48;
+    const std::int64_t bite_rate = brate_p != kNoProp
+        ? prop_int(e, brate_p, 0) : 0;
+    const std::int64_t fec = fec_p != kNoProp ? prop_int(e, fec_p, 0) : 0;
+
+    // stagnant-water candidates in biting range (positions are frozen for
+    // the whole metabolize pass — the set is identical every sub-tick)
+    struct Pond {
+        const Entity* e = nullptr;
+        std::int64_t hl = 0, ha = 0, hr = 0, hs = 0;   // hist mark
+        bool has_hist = false;
+    };
+    std::vector<Pond> ponds;
+    if (req_water && stl_p != kNoProp) {
+        std::vector<EntityId> near = spatial.within(e.pos, bite_r);
+        std::sort(near.begin(), near.end());
+        for (EntityId nid : near) {
+            const Entity* o = find(nid);
+            if (!o || !o->alive || o->id == e.id) continue;
+            if (!prop_of(*o, stl_p)) continue;
+            if (flo_p != kNoProp && prop_int(*o, flo_p, 0) > 0) continue;
+            Pond pd; pd.e = o;
+            if (hl_p != kNoProp && ha_p != kNoProp &&
+                hr_p != kNoProp && hs_p != kNoProp &&
+                prop_of(*o, hl_p) && prop_of(*o, ha_p) &&
+                prop_of(*o, hr_p) && prop_of(*o, hs_p)) {
+                pd.hl = prop_int(*o, hl_p, 0);
+                pd.ha = prop_int(*o, ha_p, 0);
+                pd.hr = prop_int(*o, hr_p, 0);
+                pd.hs = prop_int(*o, hs_p, 0);
+                pd.has_hist = true;
+            }
+            ponds.push_back(pd);
+        }
+    }
+    // pond stagnation level at absolute tick T — reconstructed from the
+    // hist mark when it covers T, else the live value (best available).
+    auto pond_level_at = [&](const Pond& pd, std::int64_t T) -> std::int64_t {
+        if (!pd.has_hist) return prop_int(*pd.e, stl_p, 0);
+        if (T > static_cast<std::int64_t>(now))
+            return prop_int(*pd.e, stl_p, 0);
+        if (T < pd.hs) return pd.hl;          // before the mark: upper bound
+        const std::int64_t el = T - pd.hs;
+        const std::int64_t quanta =
+            (pd.ha + el * pd.hr) / 1000;
+        return std::min<std::int64_t>(1000, pd.hl + quanta);
+    };
+    auto wet_at = [&](std::int64_t T) -> bool {
+        for (const Pond& pd : ponds)
+            if (pond_level_at(pd, T) > stag_min) return true;
+        return false;
+    };
+
+    // ---- per-tick work -----------------------------------------------------
+    auto is_host = [&](const Entity& o) {
+        return o.alive && bv_p != kNoProp && prop_of(o, bv_p) != nullptr;
+    };
+    auto carries_strain = [&](EntityId host, std::int64_t strain_eid) {
+        for (const Relation& r : relations_of(host, "carries")) {
+            if (r.a != host) continue;
+            const Entity* ie = find(r.b);
+            if (!ie || !ie->alive) continue;
+            if (ps_p != kNoProp && prop_int(*ie, ps_p, 0) == strain_eid)
+                return true;
+        }
+        // infections queued this pass are not entities yet — a batched
+        // window must see the same "already infected" state ticked mode
+        // would see on the next tick.
+        for (const SpawnSpec& sp : out) {
+            bool is_carries = false;
+            for (const auto& [t, o] : sp.rel_from)
+                if (t == "carries" && o == host) is_carries = true;
+            if (!is_carries) continue;
+            const Value* v = sp.props.get(ps_p);
+            if (v && v->type == ValType::Integer && v->i == strain_eid)
+                return true;
+        }
+        return false;
+    };
+    // strains this vector can inject: its real carries plus infections
+    // already queued onto it this pass.
+    auto carried_vbr_strains = [&]() -> std::vector<std::pair<std::int64_t, std::int64_t>> {
+        std::vector<std::pair<std::int64_t, std::int64_t>> res; // (strain,vbr)
+        auto consider = [&](std::int64_t seid) {
+            if (seid <= 0 || vbr_p == kNoProp) return;
+            const Entity* st = find(static_cast<EntityId>(seid));
+            if (!st || !st->alive) return;
+            const std::int64_t vbr = prop_int(*st, vbr_p, 0);
+            if (vbr <= 0) return;
+            for (auto& pr : res)
+                if (pr.first == seid) return;
+            res.push_back({seid, vbr});
+        };
+        if (ps_p != kNoProp)
+            for (const Relation& r : relations_of(e.id, "carries")) {
+                if (r.a != e.id) continue;
+                const Entity* ie = find(r.b);
+                if (ie && ie->alive)
+                    consider(prop_int(*ie, ps_p, 0));
+            }
+        for (const SpawnSpec& sp : out) {
+            bool is_carries = false;
+            for (const auto& [t, o] : sp.rel_from)
+                if (t == "carries" && o == e.id) is_carries = true;
+            if (!is_carries) continue;
+            const Value* v = sp.props.get(ps_p);
+            if (v && v->type == ValType::Integer)
+                consider(v->i);
+        }
+        std::sort(res.begin(), res.end());
+        return res;
+    };
+    // hosts within bite range that could donate a strain to this vector
+    auto pickup_candidates = [&]() {
+        std::vector<std::pair<EntityId, std::int64_t>> res; // (host,strain)
+        std::vector<EntityId> near = spatial.within(e.pos, bite_r);
+        std::sort(near.begin(), near.end());
+        for (EntityId nid : near) {
+            const Entity* o = find(nid);
+            if (!o || !is_host(*o) || o->id == e.id) continue;
+            for (const Relation& r : relations_of(nid, "carries")) {
+                if (r.a != nid) continue;
+                const Entity* ie = find(r.b);
+                if (!ie || !ie->alive || ps_p == kNoProp) continue;
+                const std::int64_t seid = prop_int(*ie, ps_p, 0);
+                const Entity* st = seid > 0
+                    ? find(static_cast<EntityId>(seid)) : nullptr;
+                if (!st || !st->alive || vbr_p == kNoProp) continue;
+                if (prop_int(*st, vbr_p, 0) <= 0) continue;
+                if (carries_strain(e.id, seid)) continue;
+                res.push_back({nid, seid});
+            }
+        }
+        std::sort(res.begin(), res.end());
+        res.erase(std::unique(res.begin(), res.end()), res.end());
+        return res;
+    };
+    // hosts within bite range that could receive an injected strain
+    auto inject_candidates = [&](std::int64_t strain) {
+        std::vector<EntityId> res;
+        std::vector<EntityId> near = spatial.within(e.pos, bite_r);
+        std::sort(near.begin(), near.end());
+        for (EntityId nid : near) {
+            const Entity* o = find(nid);
+            if (!o || !is_host(*o) || o->id == e.id) continue;
+            if (carries_strain(nid, strain)) continue;
+            if (host_immune_to(nid, strain)) continue;
+            res.push_back(nid);
+        }
+        return res;
+    };
+
+    std::uint64_t brood_n = brood_p != kNoProp
+        ? static_cast<std::uint64_t>(prop_int(e, brood_p, 0)) : 0;
+    auto do_bite = [&](std::uint64_t roll_epoch) {
+        // inject first: a loaded vector passes its strain on; only a
+        // vector with nothing to give goes looking for a new strain.
+        const auto carried = carried_vbr_strains();
+        if (!carried.empty()) {
+            const auto& [seid, vbr] = carried.front();
+            const std::vector<EntityId> cands = inject_candidates(seid);
+            if (!cands.empty()) {
+                const std::uint64_t h = Rng::stream_seed(seed,
+                    "vector_bite", static_cast<std::uint64_t>(e.id) ^
+                    roll_epoch);
+                const EntityId tgt = cands[h % cands.size()];
+                queue_infection(out, tgt, seid, vbr);
+                ev.evidence += "vector bite transmission; ";
+                return;
+            }
+        }
+        const auto pickup = pickup_candidates();
+        if (!pickup.empty()) {
+            const std::uint64_t h = Rng::stream_seed(seed,
+                "vector_pickup", static_cast<std::uint64_t>(e.id) ^
+                roll_epoch);
+            const auto& [host, seid] = pickup[h % pickup.size()];
+            const std::int64_t load = cload_p != kNoProp
+                ? prop_int(e, cload_p, 120) : 120;
+            queue_infection(out, e.id, seid, load);
+            ev.evidence += "vector picked up strain; ";
+        }
+    };
+    auto do_brood = [&](std::uint64_t qi) {
+        // species defaults give the newborn its full declared prop set;
+        // genome loci then overwrite with the inherited alleles — the
+        // same phenotype=allele rule BiologyModel uses.
+        SpawnSpec s;
+        s.kind = e.kind_name; s.material = e.material;
+        const std::uint64_t h = Rng::stream_seed(seed, "vector_brood",
+            static_cast<std::uint64_t>(e.id) ^ (brood_n + qi) * 2654435761ull);
+        s.pos = {e.pos.x + static_cast<std::int32_t>(h % 49) - 24,
+                 e.pos.y + static_cast<std::int32_t>((h >> 16) % 49) - 24};
+        if (const SpeciesDef* sp = species.find_name(e.kind_name)) {
+            for (const auto& [pid2, v2] : sp->props.entries)
+                s.props.set(pid2, v2);
+        }
+        for (const auto& [p2, allele] : e.genome.loci) {
+            const PropertyDef* pd = props.find(p2);
+            if (!pd || (pd->type != ValType::Integer &&
+                        pd->type != ValType::Fixed)) continue;
+            std::int64_t v = allele;
+            if (pd->has_range) v = std::clamp<std::int64_t>(v, pd->lo, pd->hi);
+            s.props.set(p2, Value::integer(v));
+        }
+        s.genome = e.genome;
+        s.rel_from.push_back({"parent_of", e.id});
+        out.push_back(std::move(s));
+    };
+    // one tick of vector activity: dormancy flag + gated bite/breed work.
+    // Bite roll epochs come from the PERSISTENT vector_bite_rolls counter —
+    // a per-call counter would restart every tick and correlate picks.
+    auto do_tick = [&](std::int64_t T) {
+        const bool active = temp_ok && (!req_water || wet_at(T));
+        const std::int64_t want = active ? 0 : 1;
+        const std::int64_t d0 = dm_p != kNoProp ? prop_int(e, dm_p, 0) : 0;
+        if (d0 != want) { change_on(e, dm_p, d0, want); }
+        if (!active) return;
+        if (fec > 0 && vacc_p != kNoProp && prop_of(e, vacc_p)) {
+            // Density-dependent breeding: conspecifics in biting range —
+            // live ones plus brood already queued this pass (pending
+            // SpawnSpecs stay visible through `out` until commit, which is
+            // exactly what a ticked run sees as committed entities on the
+            // next tick) — pause reproduction past vector_brood_cap. The
+            // count is a frozen spatial snapshot plus deterministic spawn
+            // positions, so batched and ticked evaluation agree.
+            const std::int64_t cap = cap_p != kNoProp
+                ? std::max<std::int64_t>(1, prop_int(e, cap_p, 24)) : 24;
+            std::int64_t crowd = 0;
+            {
+                std::vector<EntityId> cn = spatial.within(e.pos, bite_r);
+                for (EntityId nid : cn) {
+                    if (nid == e.id) continue;
+                    const Entity* o = find(nid);
+                    if (o && o->alive && o->kind_name == e.kind_name)
+                        ++crowd;
+                }
+                const std::int64_t rr2 = bite_r * bite_r;
+                for (const SpawnSpec& sp : out) {
+                    if (sp.kind != e.kind_name) continue;
+                    bool is_brood = false;
+                    for (const auto& [t, o] : sp.rel_from)
+                        if (t == "parent_of") { is_brood = true; break; }
+                    if (!is_brood) continue;
+                    if (dist2(e.pos, sp.pos) <= rr2) ++crowd;
+                }
+            }
+            if (crowd < cap) {
+                const std::int64_t a0 = prop_int(e, vacc_p, 0);
+                const std::int64_t acc = a0 + fec;
+                std::int64_t quanta = acc / 1000;
+                const std::int64_t nsp = std::min<std::int64_t>(quanta, 4);
+                change_on(e, vacc_p, a0, acc - nsp * 1000);
+                for (std::int64_t i = 0; i < nsp; ++i) do_brood(brood_n + i);
+                brood_n += static_cast<std::uint64_t>(nsp);
+                if (brood_p != kNoProp)
+                    change_on(e, brood_p, prop_int(e, brood_p, 0),
+                              static_cast<std::int64_t>(brood_n));
+            }
+        }
+        if (bite_rate > 0 && bacc_p != kNoProp && prop_of(e, bacc_p)) {
+            const std::int64_t a0 = prop_int(e, bacc_p, 0);
+            const std::int64_t acc = a0 + bite_rate;
+            std::int64_t quanta = acc / 1000;
+            const std::int64_t nb = std::min<std::int64_t>(quanta, 8);
+            change_on(e, bacc_p, a0, acc - nb * 1000);
+            for (std::int64_t i = 0; i < nb; ++i) {
+                const std::int64_t br = broll_p != kNoProp
+                    ? prop_int(e, broll_p, 0) : 0;
+                const std::uint64_t h = Rng::stream_seed(seed,
+                    "vector_bite_epoch", static_cast<std::uint64_t>(e.id) ^
+                    static_cast<std::uint64_t>(br));
+                do_bite(h);
+                if (broll_p != kNoProp)
+                    change_on(e, broll_p, br, br + 1);
+            }
+        }
+    };
+
+    // ---- schedule: batch when dormancy is steady, replay on a flip -------
+    const std::int64_t wstart = static_cast<std::int64_t>(now) - pending;
+    const bool wet_first = req_water ? wet_at(wstart + 1) : true;
+    const bool wet_last = req_water ? wet_at(now) : true;
+    if (pending > 1 && wet_first != wet_last) {
+        // dormancy flips inside the window — replay tick-wise so bite and
+        // breed accumulators only charge while the vector is active.
+        for (std::int64_t k = 1; k <= pending && e.alive; ++k)
+            do_tick(wstart + k);
+        return;
+    }
+    // steady window: dormancy constant across every sub-tick — replay the
+    // tick body pending times; accumulator telescoping makes this
+    // bit-identical to advance(1) x N.
+    for (std::int64_t k = 0; k < pending && e.alive; ++k)
+        do_tick(wstart + k + 1);
+}
+
+// Phase 11.2 — flora epidemiology. A plant is a spore host when it carries
+// blight_susceptibility > 0; a strain is a plant pathogen when it declares
+// spore_rate > 0 (the same data flag that excludes it from zoonotic
+// spillover). Shed rate scales with SAME-SPECIES neighbor density — the
+// monoculture amplifier: interleaved species dilute the count and slow the
+// epidemic with no scripted rule anywhere. Quanta found infections through
+// the shared drift_spawns commit path; every roll uses a monotonic
+// per-infection counter so batched and ticked evaluation agree.
+void World::flora_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                        CausalEvent& ev, std::vector<SpawnSpec>& out) {
+    (void)now;
+    if (pending <= 0 || !e.alive) return;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId susc_p = pid("blight_susceptibility"),
+                 ps_p = pid("pathogen_strain"),
+                 pl_p = pid("pathogen_load"),
+                 ab_p = pid("antibody_level"),
+                 spr_p = pid("spore_rate"),
+                 vir_p = pid("virulence"),
+                 sacc_p = pid("spore_accum"),
+                 sroll_p = pid("spore_rolls"),
+                 integ_p = pid("integrity"),
+                 dacc_p = pid("damage_accum"),
+                 yp_p = pid("yield_penalty"),
+                 bm_p = pid("blight_marks");
+    if (susc_p == kNoProp || ps_p == kNoProp || pl_p == kNoProp) return;
+    if (prop_int(e, susc_p, 0) <= 0) return;    // not a susceptible host
+
+    auto change_on = [&](Entity& tgt, PropId p, std::int64_t before,
+                         std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch;
+        ch.entity = tgt.id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(before);
+        ch.after = Value::integer(after);
+        tgt.props.set(p, Value::integer(after));
+        ev.changes.push_back(ch);
+    };
+
+    // ---- collect this plant's active spore infections ---------------------
+    struct Infect {
+        Entity* ie = nullptr;
+        Entity* strain = nullptr;
+        std::int64_t load = 0, vir = 0, rate = 0, strain_id = 0;
+    };
+    std::vector<Infect> infections;
+    std::int64_t total_load = 0;
+    for (const Relation& rel : relations_of(e.id, "carries")) {
+        if (rel.a != e.id) continue;
+        Entity* ie = find(rel.b);
+        if (!ie || !ie->alive) continue;
+        const std::int64_t seid = prop_int(*ie, ps_p, 0);
+        Entity* st = seid > 0 ? find(static_cast<EntityId>(seid)) : nullptr;
+        if (!st || !st->alive) continue;
+        const std::int64_t rate = spr_p != kNoProp
+            ? prop_int(*st, spr_p, 0) : 0;
+        if (rate <= 0) continue;               // not a plant pathogen
+        Infect I;
+        I.ie = ie; I.strain = st; I.strain_id = seid;
+        I.load = prop_int(*ie, pl_p, 0);
+        I.vir = vir_p != kNoProp ? prop_int(*st, vir_p, 0) : 0;
+        I.rate = rate;
+        total_load += I.load;
+        infections.push_back(I);
+    }
+
+    // ---- spore shed: density-scaled, Euclid-exact --------------------------
+    // same-species neighbors within the spore range count once per call;
+    // the count is a World-Truth snapshot, identical under batched and
+    // per-tick evaluation as long as the entity set is static — coupled
+    // plants already replay tick-wise via physiology_coupled().
+    if (!infections.empty()) {
+        std::int64_t density = 0;
+        {
+            std::vector<EntityId> near = spatial.within(e.pos, 96);
+            std::sort(near.begin(), near.end());
+            for (EntityId nid : near) {
+                if (nid == e.id || density >= 12) continue;
+                const Entity* o = find(nid);
+                if (!o || !o->alive || o->kind_name != e.kind_name) continue;
+                if (prop_int(*o, susc_p, 0) <= 0) continue;
+                ++density;
+            }
+        }
+        for (Infect& I : infections) {
+            // virulence erodes the plant's own integrity every call —
+            // blight is a wasting disease, independent of shed success.
+            if (dacc_p != kNoProp && integ_p != kNoProp &&
+                prop_of(e, integ_p)) {
+                const std::int64_t da0 = prop_int(*I.ie, dacc_p, 0);
+                const std::int64_t dacc = da0 + pending * I.load * I.vir / 200;
+                const std::int64_t dq = dacc / 1000;
+                change_on(*I.ie, dacc_p, da0, dacc - dq * 1000);
+                if (dq > 0) {
+                    const std::int64_t iv = prop_int(e, integ_p, 0);
+                    change_on(e, integ_p, iv,
+                              std::max<std::int64_t>(0, iv - dq * 3));
+                }
+            }
+            // shed quanta: spore_rate permille/tick scaled by same-species
+            // density/4 — zero neighbors means zero shed (isolation is the
+            // polyculture benefit, emergent from the count alone).
+            const std::int64_t shed =
+                I.rate * std::min<std::int64_t>(density, 12) / 4;
+            if (shed <= 0 || sacc_p == kNoProp) continue;
+            const std::int64_t a0 = prop_int(*I.ie, sacc_p, 0);
+            const std::int64_t acc = a0 + pending * shed;
+            std::int64_t quanta = acc / 1000;
+            change_on(*I.ie, sacc_p, a0, acc - quanta * 1000);
+            if (quanta <= 0) continue;
+            if (quanta > 32) quanta = 32;
+            // each quantum picks one deterministic same-species target.
+            // Epoch = monotonic per-infection roll counter (never the
+            // accumulator remainder — Phase 10.4 contract).
+            std::vector<EntityId> cands;
+            {
+                const std::int64_t r2 = 96 * 96;
+                std::vector<EntityId> near = spatial.within(e.pos, 96);
+                std::sort(near.begin(), near.end());
+                for (EntityId nid : near) {
+                    if (nid == e.id) continue;
+                    const Entity* o = find(nid);
+                    if (!o || !o->alive || o->kind_name != e.kind_name) continue;
+                    if (prop_int(*o, susc_p, 0) <= 0) continue;
+                    if (dist2(o->pos, e.pos) > r2) continue;
+                    bool has = false;
+                    for (const Relation& rr : relations_of(nid, "carries")) {
+                        if (rr.a != nid) continue;
+                        const Entity* x = find(rr.b);
+                        if (x && x->alive &&
+                            prop_int(*x, ps_p, 0) == I.strain_id) {
+                            has = true; break;
+                        }
+                    }
+                    if (!has) cands.push_back(nid);
+                    if (cands.size() >= 16) break;
+                }
+            }
+            if (cands.empty()) continue;
+            const std::int64_t rc0 = sroll_p != kNoProp
+                ? prop_int(*I.ie, sroll_p, 0) : 0;
+            for (std::int64_t qi = 0; qi < quanta; ++qi) {
+                const std::uint64_t h = Rng::stream_seed(world_seed,
+                    "spore_spread",
+                    static_cast<std::uint64_t>(I.ie->id) ^
+                    static_cast<std::uint64_t>(I.strain_id) ^
+                    static_cast<std::uint64_t>(rc0 + qi));
+                const EntityId tgt = cands[
+                    h % static_cast<std::uint64_t>(cands.size())];
+                // dedupe against infections already queued this pass
+                bool queued = false;
+                for (const SpawnSpec& sp : out) {
+                    bool is_carries = false;
+                    for (const auto& [t, o] : sp.rel_from)
+                        if (t == "carries" && o == tgt) is_carries = true;
+                    if (!is_carries) continue;
+                    const Value* v = sp.props.get(ps_p);
+                    if (v && v->type == ValType::Integer &&
+                        v->i == I.strain_id) { queued = true; break; }
+                }
+                if (queued) continue;
+                SpawnSpec sp;
+                sp.kind = "infection"; sp.material = kNoMaterial;
+                sp.pos = e.pos;
+                PropertyBag pb;
+                pb.set(ps_p, Value::integer(I.strain_id));
+                pb.set(pl_p, Value::integer(120));
+                if (ab_p != kNoProp) pb.set(ab_p, Value::integer(0));
+                const PropId ie_p = pid("infection_elapsed");
+                if (ie_p != kNoProp) pb.set(ie_p, Value::integer(0));
+                const PropId ila_p = pid("infection_load_accum");
+                if (ila_p != kNoProp) pb.set(ila_p, Value::integer(0));
+                const PropId iba_p = pid("infection_ab_accum");
+                if (iba_p != kNoProp) pb.set(iba_p, Value::integer(0));
+                const PropId sa_p = pid("shed_accum");
+                if (sa_p != kNoProp) pb.set(sa_p, Value::integer(0));
+                sp.props = pb;
+                sp.rel_from.push_back({"carries", tgt});
+                out.push_back(std::move(sp));
+                ev.evidence += "spore jump; ";
+            }
+            if (sroll_p != kNoProp)
+                change_on(*I.ie, sroll_p, rc0, rc0 + quanta);
+        }
+    }
+
+    // ---- yield penalty + visible marks -------------------------------------
+    // Blight load slows fruiting and shows as observable wilt — the
+    // perception/engram channel learns the signs without any hidden state.
+    {
+        const std::int64_t yp = std::min<std::int64_t>(900, total_load / 2);
+        change_on(e, yp_p,
+                  yp_p != kNoProp ? prop_int(e, yp_p, 0) : 0, yp);
+        const std::int64_t bm = std::min<std::int64_t>(1000, total_load);
+        change_on(e, bm_p,
+                  bm_p != kNoProp ? prop_int(e, bm_p, 0) : 0, bm);
+    }
+}
+
+// Phase 11 — lazy symbiont seeding. A host carrying `symbiont_signature`
+// (and `symbiont_*` strain templates) that does not already carry a
+// symbiont=1 strain gets its commensal PathogenStrain + ActiveInfection
+// created here — real ids, inside the metabolize causal event.
+void World::seed_symbionts(CausalEvent& ev,
+                           const std::vector<EntityId>& hosts) {
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId sig_p = pid("symbiont_signature"),
+                 ps_p = pid("pathogen_strain"),
+                 pl_p = pid("pathogen_load"),
+                 ab_p = pid("antibody_level"),
+                 sym_p = pid("symbiont");
+    if (sig_p == kNoProp || ps_p == kNoProp) return;
+    for (EntityId hid : hosts) {
+        Entity* h = find(hid);
+        if (!h || !h->alive) continue;
+        if (prop_int(*h, sig_p, 0) <= 0) continue;
+        bool has_symbiont = false;
+        for (const Relation& rel : relations_of(hid, "carries")) {
+            if (rel.a != hid) continue;
+            const Entity* ie = find(rel.b);
+            if (!ie || !ie->alive) continue;
+            const std::int64_t seid = prop_int(*ie, ps_p, 0);
+            const Entity* st = seid > 0
+                ? find(static_cast<EntityId>(seid)) : nullptr;
+            if (st && st->alive && sym_p != kNoProp &&
+                prop_int(*st, sym_p, 0) != 0) { has_symbiont = true; break; }
+        }
+        if (has_symbiont) continue;
+        // strain entity: template props copied host -> strain 1:1
+        PropertyBag sp;
+        struct Map { const char* from; const char* to; };
+        static const Map kMap[] = {
+            {"symbiont_signature", "antigen_signature"},
+            {"symbiont_virulence", "virulence"},
+            {"symbiont_airborne_rate", "airborne_rate"},
+            {"symbiont_waterborne_rate", "waterborne_rate"},
+            {"symbiont_contact_rate", "contact_rate"},
+            {"symbiont_incubation_ticks", "incubation_ticks"},
+        };
+        for (const Map& m : kMap) {
+            const PropertyDef* fp = props.find_name(m.from);
+            const PropertyDef* tp = props.find_name(m.to);
+            if (!fp || !tp) continue;
+            const Value* v = prop_of(*h, fp->id);
+            if (v) sp.set(tp->id, *v);
+        }
+        const PropertyDef* sslot_p = props.find_name("symbiont_slot");
+        const PropertyDef* tslot_p = props.find_name("target_slot");
+        if (sslot_p && tslot_p) {
+            if (const Value* v = prop_of(*h, sslot_p->id))
+                sp.set(tslot_p->id, *v);
+        }
+        if (sym_p != kNoProp) sp.set(sym_p, Value::integer(1));
+        const EntityId strain_id = create_entity(
+            "pathogen_strain", kNoMaterial, h->pos, sp);
+        if (strain_id == kNoEntity) continue;
+        PropertyBag ip;
+        ip.set(ps_p, Value::integer(static_cast<std::int64_t>(strain_id)));
+        if (pl_p != kNoProp) ip.set(pl_p, Value::integer(200));
+        if (ab_p != kNoProp) ip.set(ab_p, Value::integer(0));
+        const EntityId inf = create_entity(
+            "infection", kNoMaterial, h->pos, ip);
+        if (inf == kNoEntity) continue;
+        relations.relate(hid, "carries", inf);
+        ev.spawned.push_back(strain_id);
+        ev.spawned.push_back(inf);
+        ev.evidence += "symbiont seeded; ";
+    }
+}
+
+// Phase 11 — zoonotic spillover. Runs post-commit inside interact(): a
+// successful consume of raw (cooked_state < 500) strain-carrying tissue or
+// water infects a susceptible actor (reservoir_tolerance < 700). Below 500
+// the deterministic zoonotic_jump_bias roll may found an adapted strain —
+// new antigen_signature, amplified virulence — via a monotonic per-host
+// spillover_rolls counter (LOD-invariant epoch, same contract as drift).
+void World::zoonotic_spillover(const InteractionContext& ctx,
+                               CausalEvent& ev,
+                               std::vector<EntityId>& spawned) {
+    if (ctx.parameters.action != "consume") return;
+    Entity* actor = find(ctx.actor);
+    if (!actor || !actor->alive) return;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId rt_p = pid("reservoir_tolerance"),
+                 cooked_p = pid("cooked_state"),
+                 bias_p = pid("zoonotic_jump_bias"),
+                 sr_p = pid("strain_ref"),
+                 ps_p = pid("pathogen_strain"),
+                 rolls_p = pid("spillover_rolls"),
+                 pl_p = pid("pathogen_load"),
+                 ab_p = pid("antibody_level"),
+                 ag_p = pid("antigen_signature"),
+                 vir_p = pid("virulence"),
+                 sym_p = pid("symbiont"),
+                 spr_p = pid("spore_rate");
+    if (rt_p == kNoProp || ps_p == kNoProp) return;
+    const std::int64_t rt = prop_int(*actor, rt_p, 0);
+    if (rt >= 700) return;                     // tolerant reservoir: no jump
+    // gather unique strain ids reachable from the consumed targets
+    std::vector<std::int64_t> strain_ids;
+    for (EntityId tid : ctx.targets) {
+        if (tid == ctx.actor) continue;
+        const Entity* t = find(tid);
+        if (!t) continue;
+        if (cooked_p != kNoProp && prop_int(*t, cooked_p, 0) >= 500) continue;
+        if (sr_p != kNoProp) {
+            const std::int64_t sr = prop_int(*t, sr_p, 0);
+            if (sr > 0) strain_ids.push_back(sr);
+        }
+        for (const Relation& rel : relations_of(tid, "carries")) {
+            if (rel.a != tid) continue;
+            const Entity* ie = find(rel.b);
+            if (!ie || !ie->alive) continue;
+            const std::int64_t seid = prop_int(*ie, ps_p, 0);
+            if (seid > 0) strain_ids.push_back(seid);
+        }
+    }
+    std::sort(strain_ids.begin(), strain_ids.end());
+    strain_ids.erase(std::unique(strain_ids.begin(), strain_ids.end()),
+                     strain_ids.end());
+    if (strain_ids.size() > 4) strain_ids.resize(4);
+    for (std::int64_t seid : strain_ids) {
+        const Entity* strain = find(static_cast<EntityId>(seid));
+        if (!strain || !strain->alive) continue;
+        // plant pathogens (spore_rate > 0) poison via the gut, not via
+        // species jump — they belong to the flora epidemiology channel.
+        if (spr_p != kNoProp && prop_int(*strain, spr_p, 0) > 0) continue;
+        // already carrying this strain? no duplicate infections
+        bool already = false;
+        for (const Relation& rel : relations_of(ctx.actor, "carries")) {
+            if (rel.a != ctx.actor) continue;
+            const Entity* ie = find(rel.b);
+            if (ie && ie->alive &&
+                prop_int(*ie, ps_p, 0) == seid) { already = true; break; }
+        }
+        if (already) continue;
+        std::int64_t use_strain = seid;
+        bool adapted = false;
+        EntityId variant_id = kNoEntity;
+        if (rt < 500 && rolls_p != kNoProp) {
+            const std::int64_t bias = bias_p != kNoProp
+                ? prop_int(*actor, bias_p, 300) : 300;
+            const std::int64_t rc = prop_int(*actor, rolls_p, 0);
+            const std::uint64_t h = Rng::stream_seed(world_seed,
+                "zoonotic_jump",
+                static_cast<std::uint64_t>(ctx.actor) ^
+                static_cast<std::uint64_t>(seid) ^
+                static_cast<std::uint64_t>(rc));
+            {
+                StateChange ch;
+                ch.entity = ctx.actor; ch.prop = rolls_p; ch.had_before = true;
+                ch.before = Value::integer(rc);
+                ch.after = Value::integer(rc + 1);
+                actor->props.set(rolls_p, Value::integer(rc + 1));
+                ev.changes.push_back(ch);
+            }
+            if (h % 1000 < static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(1, bias))) {
+                // host-adapted variant: copy the strain, re-sign the
+                // antigen and amplify virulence for a naive host.
+                PropertyBag sp;
+                for (const auto& [pp, vv] : strain->props.entries)
+                    sp.set(pp, vv);
+                if (ag_p != kNoProp)
+                    sp.set(ag_p, Value::integer(static_cast<std::int64_t>(
+                        (static_cast<std::uint32_t>(h >> 16) |
+                         static_cast<std::uint32_t>(
+                             prop_int(*strain, ag_p, 0))) ^ 0x9E3779B9u)));
+                if (vir_p != kNoProp) {
+                    const std::int64_t v0 = prop_int(*strain, vir_p, 0);
+                    sp.set(vir_p, Value::integer(std::min<std::int64_t>(1000,
+                        v0 + v0 / 3 + bias / 20)));
+                }
+                if (sym_p != kNoProp) sp.set(sym_p, Value::integer(0));
+                variant_id = create_entity("pathogen_strain", kNoMaterial,
+                                           actor->pos, sp);
+                if (variant_id != kNoEntity) {
+                    use_strain = static_cast<std::int64_t>(variant_id);
+                    adapted = true;
+                    spawned.push_back(variant_id);
+                }
+            }
+        }
+        PropertyBag ip;
+        ip.set(ps_p, Value::integer(use_strain));
+        if (pl_p != kNoProp) ip.set(pl_p, Value::integer(120));
+        if (ab_p != kNoProp) ip.set(ab_p, Value::integer(0));
+        const EntityId inf = create_entity("infection", kNoMaterial,
+                                           actor->pos, ip);
+        if (inf == kNoEntity) continue;
+        relations.relate(ctx.actor, "carries", inf);
+        spawned.push_back(inf);
+        ev.evidence += adapted ? "zoonotic spillover adapted; "
+                               : "zoonotic spillover; ";
     }
 }
 
@@ -2716,6 +4137,73 @@ void World::ecology_tick(std::int64_t n) {
             if (Entity* ne = find(nid)) ne->genome = s.genome;
         ev.spawned.push_back(nid);
         spawn_ids[i] = nid;
+    }
+    // Phase 11.2: a sprout landing on a contaminated soil patch inherits
+    // the banked strain — the patch's host range (soil_host_kind, "" =
+    // generalist) decides which species the memory can hurt.
+    {
+        const PropId susc_p = pid("blight_susceptibility"),
+                     ps_p = pid("pathogen_strain"),
+                     pl_p = pid("pathogen_load"),
+                     ab_p = pid("antibody_level"),
+                     ssl_p = pid("soil_spore_load"),
+                     ssr_p = pid("soil_strain_ref"),
+                     shk_p = pid("soil_host_kind"),
+                     ie_p = pid("infection_elapsed"),
+                     ila_p = pid("infection_load_accum"),
+                     iba_p = pid("infection_ab_accum"),
+                     sa_p = pid("shed_accum");
+        if (susc_p != kNoProp && ssl_p != kNoProp && ssr_p != kNoProp &&
+            ps_p != kNoProp && pl_p != kNoProp) {
+            for (EntityId nid : spawn_ids) {
+                if (nid == kNoEntity) continue;
+                Entity* ne = find(nid);
+                if (!ne || !ne->alive) continue;
+                if (prop_int(*ne, susc_p, 0) <= 0) continue;
+                std::vector<EntityId> near = spatial.within(ne->pos, 32);
+                std::sort(near.begin(), near.end());
+                for (EntityId pid2 : near) {
+                    Entity* patch = find(pid2);
+                    if (!patch || !patch->alive) continue;
+                    if (prop_int(*patch, ssl_p, 0) <= 200) continue;
+                    const std::int64_t seid = prop_int(*patch, ssr_p, 0);
+                    if (seid <= 0) continue;
+                    const Entity* strain = find(static_cast<EntityId>(seid));
+                    if (!strain || !strain->alive) continue;
+                    if (shk_p != kNoProp) {
+                        const Value* hk = prop_of(*patch, shk_p);
+                        if (hk && hk->type == ValType::Text &&
+                            !hk->s.empty() && hk->s != ne->kind_name)
+                            continue;    // strain not adapted to this species
+                    }
+                    bool has = false;
+                    for (const Relation& rr : relations_of(nid, "carries")) {
+                        if (rr.a != nid) continue;
+                        const Entity* x = find(rr.b);
+                        if (x && x->alive &&
+                            prop_int(*x, ps_p, 0) == seid) {
+                            has = true; break;
+                        }
+                    }
+                    if (has) break;
+                    PropertyBag pb;
+                    pb.set(ps_p, Value::integer(seid));
+                    pb.set(pl_p, Value::integer(200));
+                    if (ab_p != kNoProp) pb.set(ab_p, Value::integer(0));
+                    if (ie_p != kNoProp) pb.set(ie_p, Value::integer(0));
+                    if (ila_p != kNoProp) pb.set(ila_p, Value::integer(0));
+                    if (iba_p != kNoProp) pb.set(iba_p, Value::integer(0));
+                    if (sa_p != kNoProp) pb.set(sa_p, Value::integer(0));
+                    const EntityId inf = create_entity(
+                        "infection", kNoMaterial, ne->pos, pb);
+                    if (inf == kNoEntity) break;
+                    relations.relate(nid, "carries", inf);
+                    ev.spawned.push_back(inf);
+                    ev.evidence += "sprout infected from soil; ";
+                    break;                      // one soil memory per sprout
+                }
+            }
+        }
     }
     // innate-verbs migrants arrive sapient: an empty AgentMind with their
     // instinct set — everything else they must learn by contact/experiment.
@@ -3006,6 +4494,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // permille cut of what this event yielded into the common store — same
     // causal event, same atomicity as the harvest itself.
     social_tithe(ev, ctx.actor, res.spawned);
+    // Phase 11: a raw meal can jump species — resolved here, post-commit,
+    // inside the same causal event (real strain/infection entity ids).
+    zoonotic_spillover(ctx, ev, res.spawned);
     // Actions consume simulated time: the law's declared duration wins,
     // else the caller's tick count (default 1). Time passing also
     // metabolizes needs (ledgered as "metabolize" events).

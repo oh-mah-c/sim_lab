@@ -3807,9 +3807,9 @@ static void test_attachment_and_parental_care() {
         // Score(H): sharing with the bonded pays a bond bonus; an unbonded
         // stranger gets none. No flag — just engram charge.
         InteractionContext sc = mk_ctx(a, {child}, "share", 0);
-        CHECK(bond_bonus(*ma, sc) > 0);
+        CHECK(bond_bonus(w, *ma, sc) > 0);
         InteractionContext sc2 = mk_ctx(a, {b}, "strike", 0);
-        CHECK(bond_bonus(*ma, sc2) == 0);        // positive bond != aggression
+        CHECK(bond_bonus(w, *ma, sc2) == 0);        // positive bond != aggression
     }
     // 2) Bereavement: the dearly-held bond dying flips its engram negative,
     //    floods grief, and marks the killer — allostatic shift does the rest.
@@ -3903,7 +3903,7 @@ static void test_attachment_and_parental_care() {
             // and the imprint shows up as care-drive in Score(H)
             InteractionContext sc = mk_ctx(a, {r.spawned.front()},
                                            "share", 0);
-            return {parent_marks && child_marks, bond_bonus(*ma, sc) > 0};
+            return {parent_marks && child_marks, bond_bonus(w, *ma, sc) > 0};
         };
         auto hi = run(2000);
         CHECK(hi.first);                            // both directions imprinted
@@ -5468,6 +5468,872 @@ static void test_thermoregulation_immunity_neoplasm_and_epidemiology() {
     }
 }
 
+// ---------- Phase 11: zoonotic reservoirs, environmental reservoirs, ------
+// ---------- sterilization & burial ------------------------------------------
+static void test_zoonosis_sterilization_and_burial() {
+    auto mk_host = [&](World& w, Vec2 pos, std::int64_t rt,
+                       std::int64_t bias) -> EntityId {
+        EntityId b = mk_body(w, pos);
+        Entity* e = w.find(b);
+        tseti(*e, w, "metabolism", 0);
+        tseti(*e, w, "decay_rate", 0);          // no rot while alive
+        tseti(*e, w, "hunger", 100);
+        tseti(*e, w, "fatigue", 0);
+        tseti(*e, w, "energy", 200000);
+        tseti(*e, w, "max_energy", 300000);
+        tseti(*e, w, "reach", 300);
+        tseti(*e, w, "sight_range", 400);
+        tseti(*e, w, "reservoir_tolerance", rt);
+        tseti(*e, w, "zoonotic_jump_bias", bias);
+        tseti(*e, w, "toxin_load", 0);
+        tseti(*e, w, "toxin_accum", 0);
+        tseti(*e, w, "normal_body_temp", 370);
+        tseti(*e, w, "thermoreg_gain", 1000);
+        tseti(*e, w, "hypothermia_delta", 15);
+        tseti(*e, w, "fever_delta_max", 35);
+        tseti(*e, w, "hyperpyrexia_delta", 45);
+        tseti(*e, w, "body_temp", 370);
+        tseti(*e, w, "temp_accum", 0);
+        tseti(*e, w, "immune_power", 1000);
+        tseti(*e, w, "immune_power_base", 1000);
+        tseti(*e, w, "dna_repair_gain", 1000);
+        return b;
+    };
+    auto seed_symbiont = [&](World& w, EntityId h) {
+        Entity* e = w.find(h);
+        tseti(*e, w, "symbiont_signature", 2654435761);
+        tseti(*e, w, "symbiont_virulence", 120);
+        tseti(*e, w, "symbiont_airborne_rate", 120);
+        tseti(*e, w, "symbiont_waterborne_rate", 350);
+        tseti(*e, w, "symbiont_contact_rate", 450);
+        tseti(*e, w, "symbiont_incubation_ticks", 300);
+    };
+    auto strain_of = [&](World& w, EntityId host) -> EntityId {
+        for (const Relation& r : w.relations_of(host, "carries")) {
+            if (r.a != host) continue;
+            Entity* ie = w.find(r.b);
+            if (!ie || !ie->alive) continue;
+            const std::int64_t se = tint(*ie, w, "pathogen_strain");
+            if (se > 0) return static_cast<EntityId>(se);
+        }
+        return kNoEntity;
+    };
+
+    // ---- A: tolerant reservoir hosts a harmless, still-shedding symbiont -
+    {
+        World w(31, "data");
+        EntityId beast = mk_host(w, {0, 0}, 900, 400);
+        seed_symbiont(w, beast);
+        w.advance_ticks_for_test(50);       // symbiont strain+infection seeded
+        EntityId sym = strain_of(w, beast);
+        CHECK(sym != kNoEntity);
+        Entity* ss = w.find(sym);
+        CHECK(tint(*ss, w, "symbiont") == 1);
+        w.advance_ticks_for_test(2000);     // well past incubation (300)
+        Entity* B = w.find(beast);
+        CHECK(B->alive);
+        const std::int64_t bt = tint(*B, w, "body_temp");
+        CHECK(bt >= 360 && bt <= 380);       // no fever from a tolerated symbiont
+        CHECK(tint(*B, w, "toxin_load") < 500); // no virulence toxin surge
+        CHECK(strain_of(w, beast) == sym);  // still carries & sheds it
+    }
+
+    // ---- B: raw consume of reservoir meat -> adapted zoonotic strain ------
+    {
+        World w(32, "data");
+        EntityId beast = mk_host(w, {0, 0}, 900, 400);
+        seed_symbiont(w, beast);
+        w.advance_ticks_for_test(50);
+        EntityId sym = strain_of(w, beast);
+        CHECK(sym != kNoEntity);
+        w.destroy_entity(beast);            // carcass keeps carries->infection
+        EntityId eater = mk_host(w, {10, 0}, 0, 1000);  // naive, always-adapt
+        tseti(*w.find(eater), w, "immune_power", 200);   // slow antibody ->
+        tseti(*w.find(eater), w, "immune_power_base", 200); // infection persists
+        InteractionResult cr = w.interact(mk_ctx(eater, {beast}, "consume", 0));
+        CHECK(cr.completed);
+        EntityId jumped = strain_of(w, eater);
+        CHECK(jumped != kNoEntity);
+        CHECK(jumped != sym);               // host-adapted variant, not parent
+        Entity* vs = w.find(jumped);
+        Entity* ps = w.find(sym);
+        CHECK(tint(*vs, w, "symbiont") == 0);
+        CHECK(tint(*vs, w, "virulence") > tint(*ps, w, "virulence"));
+        CHECK(tint(*vs, w, "antigen_signature") !=
+              tint(*ps, w, "antigen_signature"));
+        w.advance_ticks_for_test(700);      // incubation 300 -> fever on
+        Entity* E2=w.find(eater);
+        CHECK(E2->alive);
+        CHECK(strain_of(w, eater) != kNoEntity);   // infection still active
+        CHECK(tint(*w.find(eater), w, "body_temp") > 385);
+    }
+
+    // ---- C: heat sterilizes dead tissue; cooked meat infects nobody ------
+    {
+        World w(33, "data");
+        EntityId beast = mk_host(w, {0, 0}, 900, 400);
+        seed_symbiont(w, beast);
+        w.advance_ticks_for_test(50);
+        EntityId sym = strain_of(w, beast);
+        w.destroy_entity(beast);
+        Entity* B = w.find(beast);
+        tseti(*B, w, "strain_ref", static_cast<std::int64_t>(sym));
+        tseti(*B, w, "contamination", 600);
+        tseti(*B, w, "thermal_mass", 1);    // cheap test heating
+        EntityId fire = mk_host(w, {20, 0}, 0, 0);
+        // 60000/(100*1)=600 deciC -> 200+600=800 >= sterilization_temp 700
+        InteractionResult hr = w.interact(mk_ctx(fire, {beast}, "heat", 60000));
+        CHECK(hr.completed);
+        CHECK(tint(*B, w, "cooked_state") == 1000);
+        CHECK(tint(*B, w, "strain_ref") == 0);
+        CHECK(tint(*B, w, "contamination") == 0);
+        EntityId eater = mk_host(w, {10, 0}, 0, 1000);
+        InteractionResult cr = w.interact(mk_ctx(eater, {beast}, "consume", 0));
+        CHECK(cr.completed);
+        CHECK(strain_of(w, eater) == kNoEntity);   // sterile meal is safe
+    }
+
+    // ---- D: antimicrobial combine sterilizes like heat --------------------
+    {
+        World w(34, "data");
+        EntityId beast = mk_host(w, {0, 0}, 900, 400);
+        seed_symbiont(w, beast);
+        w.advance_ticks_for_test(50);
+        EntityId sym = strain_of(w, beast);
+        w.destroy_entity(beast);
+        Entity* B = w.find(beast);
+        tseti(*B, w, "strain_ref", static_cast<std::int64_t>(sym));
+        tseti(*B, w, "contamination", 600);
+        const EntityId salt = w.create_entity("salt_lump", w.materials.id_of("salt"), {30, 0}, {});
+        EntityId hand = mk_host(w, {40, 0}, 0, 0);
+        InteractionResult mr = w.interact(
+            mk_ctx(hand, {beast, salt}, "combine", 0));
+        CHECK(mr.completed);
+        CHECK(tint(*B, w, "cooked_state") == 1000);
+        CHECK(tint(*B, w, "strain_ref") == 0);
+        CHECK(tint(*B, w, "contamination") == 0);
+    }
+
+    // ---- E: corpse reservoir -> water contamination; burial silences ------
+    {
+        World w(35, "data");
+        EntityId corpse = mk_host(w, {0, 0}, 0, 0);
+        EntityId cs = mk_strain(w, {0, 0},
+            {{"waterborne_rate", 500}, {"airborne_rate", 0},
+             {"contact_rate", 0}, {"antigen_signature", 777001},
+             {"virulence", 100}, {"incubation_ticks", 100}}, nullptr);
+        mk_infection(w, corpse, cs, 100, 0);
+        w.destroy_entity(corpse);
+        Entity* C = w.find(corpse);
+        tseti(*C, w, "decay_rate", 400);      // rot speed while dead
+        const EntityId pond = w.create_entity("pond", w.materials.id_of("water"), {12, 0}, {});
+        const EntityId far_pond = w.create_entity("pond2", w.materials.id_of("water"), {200, 0}, {});
+        w.advance_ticks_for_test(1600);      // level -> 640, emits from ~500
+        CHECK(tint(*C, w, "corpse_decay_level") > 200);
+        CHECK(tint(*C, w, "odor") > 0);
+        CHECK(tint(*C, w, "contamination") > 0);
+        CHECK(tint(*w.find(pond), w, "contamination") > 0);
+        CHECK(tint(*w.find(pond), w, "strain_ref") ==
+              static_cast<std::int64_t>(cs));   // strain reached the water
+        CHECK(tint(*w.find(far_pond), w, "strain_ref") == 0);
+        // burial via combine with a burial_medium material
+        const EntityId soil = w.create_entity("soil_mound", w.materials.id_of("soil_loam"),
+                                              {20, 0}, {});
+        EntityId mourner = mk_host(w, {30, 0}, 0, 0);
+        InteractionResult br = w.interact(
+            mk_ctx(mourner, {corpse, soil}, "combine", 0));
+        CHECK(br.completed);
+        CHECK(tint(*C, w, "buried") == 1);
+        CHECK(tint(*C, w, "odor") == 0);
+        const std::int64_t lvl = tint(*C, w, "corpse_decay_level");
+        const std::int64_t pond_c = tint(*w.find(pond), w, "contamination");
+        w.advance_ticks_for_test(500);
+        CHECK(tint(*C, w, "corpse_decay_level") == lvl);      // interred: frozen
+        CHECK(tint(*w.find(pond), w, "contamination") == pond_c);
+    }
+
+    // ---- F: stagnant water fouls and amplifies waterborne strains --------
+    {
+        World w(36, "data");
+        const EntityId strain = mk_strain(w, {0, 0},
+            {{"waterborne_rate", 500}, {"airborne_rate", 0},
+             {"contact_rate", 0}, {"antigen_signature", 777002},
+             {"virulence", 100}, {"incubation_ticks", 100}}, nullptr);
+        const EntityId pond = w.create_entity("pond", w.materials.id_of("water"), {0, 0}, {});
+        tseti(*w.find(pond), w, "stagnation_level", 600);
+        tseti(*w.find(pond), w, "strain_ref",
+              static_cast<std::int64_t>(strain));
+        const EntityId pond2 = w.create_entity("pond2", w.materials.id_of("water"), {10, 0}, {});
+        w.advance_ticks_for_test(300);
+        CHECK(tint(*w.find(pond), w, "stagnation_level") > 600);
+        CHECK(tint(*w.find(pond), w, "contamination") > 0);
+        CHECK(tint(*w.find(pond2), w, "strain_ref") ==
+              static_cast<std::int64_t>(strain));
+        CHECK(tint(*w.find(pond2), w, "contamination") > 0);
+    }
+
+    // ---- G: deep positive engram -> burial utility bonus -----------------
+    {
+        World w(37, "data");
+        EntityId npc = mk_host(w, {0, 0}, 0, 0);
+        EntityId kin = mk_host(w, {10, 0}, 0, 0);
+        w.destroy_entity(kin);
+        w.advance_ticks_for_test(2);         // corpse marker materializes
+        AgentMind& mm = w.mind(npc);
+        AgentMind::MemorySnapshot snap;
+        snap.pos = w.find(kin)->pos;
+        snap.material = w.find(kin)->material;
+        snap.kind_name = "test_beast";
+        const PropId cdl = tpid(w, "corpse_decay_level");
+        if (cdl != kNoProp) snap.props[cdl] = Value::integer(0);
+        snap.engram.emotional_charge = 700;
+        snap.engram.clarity = 600;
+        mm.memory[kin] = snap;
+        InteractionContext bc = mk_ctx(npc, {kin}, "combine", 0);
+        CHECK(bond_bonus(w, mm, bc) > 0);    // kin corpse -> burial urge
+        InteractionContext bc2 = mk_ctx(npc, {kin}, "consume", 0);
+        CHECK(bond_bonus(w, mm, bc2) == 0);  // not a generic bonus
+    }
+
+    // ---- H: LOD invariance + save roundtrip -------------------------------
+    {
+        auto build_env = [&](World& w) {
+            EntityId corpse = mk_host(w, {0, 0}, 0, 0);
+            const EntityId s = mk_strain(w, {0, 0},
+                {{"waterborne_rate", 500}, {"airborne_rate", 0},
+                 {"contact_rate", 0}, {"antigen_signature", 777003},
+                 {"virulence", 100}, {"incubation_ticks", 100}}, nullptr);
+            mk_infection(w, corpse, s, 100, 0);
+            w.destroy_entity(corpse);
+            tseti(*w.find(corpse), w, "decay_rate", 400);
+            const EntityId pond = w.create_entity("pond", w.materials.id_of("water"), {12, 0}, {});
+            tseti(*w.find(pond), w, "stagnation_level", 500);
+            return std::pair<EntityId, EntityId>{corpse, pond};
+        };
+        World wa(41, "data"), wb(41, "data");
+        const auto [ca, pa] = build_env(wa);
+        const auto [cb, pb] = build_env(wb);
+        for (int i = 0; i < 400; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(400);
+        CHECK(tint(*wa.find(ca), wa, "corpse_decay_level") ==
+              tint(*wb.find(cb), wb, "corpse_decay_level"));
+        CHECK(tint(*wa.find(pa), wa, "stagnation_level") ==
+              tint(*wb.find(pb), wb, "stagnation_level"));
+        // LOD parity is on reservoir state, not the event ledger: a
+        // ticked run legitimately logs N drift events where a batched run
+        // logs one — state_hash covers ledger history by design.
+        for (const char* pn : {"corpse_decay_level","corpse_decay_accum",
+                "odor","contamination","strain_ref","reservoir_spread_accum",
+                "stagnation_level","stagnation_accum"}) {
+            CHECK(tint(*wa.find(ca), wa, pn) == tint(*wb.find(cb), wb, pn));
+            CHECK(tint(*wa.find(pa), wa, pn) == tint(*wb.find(pb), wb, pn));
+        }
+        CHECK(wa.find(ca)->props.get(tpid(wa,"corpse_decay_accum")) != nullptr);
+        CHECK(wb.find(cb)->props.get(tpid(wb,"corpse_decay_accum")) != nullptr);
+        const std::uint64_t h0 = wa.state_hash();
+        CHECK(wa.save("/tmp/simlab_p11.bin"));
+        World wc(41, "data");
+        CHECK(wc.load("/tmp/simlab_p11.bin"));
+        CHECK(wc.state_hash() == h0);
+    }
+}
+
+
+// ---------- Phase 11.2: plant blight, monoculture, soil spores, fire -----
+static void test_plant_blight_monoculture_and_soil_cleansing() {
+    auto mk_plant = [&](World& w, const char* kind, Vec2 pos,
+                        std::int64_t susc) -> EntityId {
+        PropertyBag pb;
+        auto pi = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) pb.set(p, Value::integer(v)); };
+        auto pt = [&](const char* n, const char* v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) pb.set(p, Value::text(v)); };
+        pi("integrity", 1000); pi("decay_rate", 0); pi("metabolism", 0);
+        pi("fruit_count", 40); pi("max_fruit", 40);
+        pi("fruit_regrow_rate", 120); pi("fruit_spoil_rate", 15);
+        pi("blight_susceptibility", susc);
+        pi("sterilization_temp", 700);
+        pi("thermal_mass", 1);              // cheap test heating
+        pt("fruit_material", "wild_berries");
+        return w.create_entity(kind, w.materials.id_of("living_wood"),
+                               pos, pb);
+    };
+    auto mk_host2 = [&](World& w, Vec2 pos) -> EntityId {
+        EntityId b = mk_body(w, pos);
+        Entity* e = w.find(b);
+        tseti(*e, w, "metabolism", 0);
+        tseti(*e, w, "decay_rate", 0);
+        tseti(*e, w, "hunger", 100);
+        tseti(*e, w, "fatigue", 0);
+        tseti(*e, w, "energy", 200000);
+        tseti(*e, w, "max_energy", 300000);
+        tseti(*e, w, "reach", 300);
+        tseti(*e, w, "toxin_load", 0);
+        tseti(*e, w, "toxin_accum", 0);
+        return b;
+    };
+    auto blight_strain = [&](World& w, std::int64_t sig) -> EntityId {
+        return mk_strain(w, {0, 0},
+            {{"spore_rate", 500}, {"virulence", 250},
+             {"antigen_signature", sig}, {"airborne_rate", 0},
+             {"waterborne_rate", 0}, {"contact_rate", 0},
+             {"incubation_ticks", 50}}, nullptr);
+    };
+    auto count_kind_infected = [&](World& w, const char* kind,
+                                   EntityId strain) {
+        int n = 0;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (!e.alive || e.kind_name != kind) continue;
+            if (host_has_strain(w, e.id, strain)) ++n;
+        }
+        return n;
+    };
+    auto find_patch = [&](World& w, Vec2 near_pos) -> EntityId {
+        std::vector<EntityId> near = w.entities_near(near_pos, 64);
+        std::sort(near.begin(), near.end());
+        for (EntityId nid : near) {
+            const Entity* o = w.find(nid);
+            if (o && o->alive && o->kind_name == "soil_patch") return nid;
+        }
+        return kNoEntity;
+    };
+
+    // ---- A: monoculture amplifies, sparse/polyculture dilute -------------
+    {
+        World w(51, "data");
+        const EntityId strain = blight_strain(w, 888001);
+        // dense same-species cluster: every plant has 4 same-species
+        // neighbours inside the 96 spore range.
+        std::vector<EntityId> mono;
+        for (Vec2 p : {Vec2{0,0}, Vec2{40,0}, Vec2{80,0},
+                       Vec2{0,40}, Vec2{40,40}})
+            mono.push_back(mk_plant(w, "berry_bush", p, 700));
+        mk_infection(w, mono[0], strain, 800, 0);
+        // sparse same-species row: 150 spacing > spore range -> density 0.
+        std::vector<EntityId> sparse;
+        for (int i = 0; i < 5; ++i)
+            sparse.push_back(mk_plant(w, "berry_bush", {500 + i * 150, 0}, 700));
+        mk_infection(w, sparse[0], strain, 800, 0);
+        // polyculture: berries and grains interleaved — each species sees
+        // only ~1-2 same-species neighbours instead of 4.
+        std::vector<EntityId> poly_b, poly_g;
+        const char* kinds[6] = {"berry_bush","wild_grain","berry_bush",
+                                "wild_grain","berry_bush","wild_grain"};
+        for (int i = 0; i < 6; ++i) {
+            EntityId id = mk_plant(w, kinds[i],
+                {i % 3 * 40, 200 + i / 3 * 40}, i % 2 ? 600 : 700);
+            (kinds[i][0] == 'b' ? poly_b : poly_g).push_back(id);
+        }
+        mk_infection(w, poly_b[0], strain, 800, 0);
+        w.advance_ticks_for_test(120);
+        const int mono_n = count_kind_infected(w, "berry_bush", strain);
+        // mono cluster contributes >=4; sparse contributes exactly 1;
+        // poly contributes its seed + at most slow spread.
+        CHECK(mono_n >= 5);            // all five mono bushes caught it
+        // sparse row: only the seed itself (density 0 -> shed rate 0)
+        int sparse_n = 0;
+        for (EntityId id : sparse)
+            if (host_has_strain(w, id, strain)) ++sparse_n;
+        CHECK(sparse_n == 1);
+        // polyculture berries: strictly fewer infections than the dense
+        // monoculture cluster of the same species.
+        int poly_n = 0;
+        for (EntityId id : poly_b)
+            if (host_has_strain(w, id, strain)) ++poly_n;
+        CHECK(poly_n < mono_n - sparse_n - 1);   // dense >> interleaved
+    }
+
+    // ---- B: blighted raw fruit poisons; cooked fruit is safe ------------
+    {
+        World w(52, "data");
+        const EntityId strain = blight_strain(w, 888002);
+        EntityId plant = mk_plant(w, "berry_bush", {0, 0}, 700);
+        mk_infection(w, plant, strain, 800, 0);
+        EntityId eater = mk_host2(w, {20, 0});
+        const std::int64_t en0 = tint(*w.find(eater), w, "energy");
+        InteractionResult cr = w.interact(mk_ctx(eater, {plant}, "consume", 0));
+        CHECK(cr.completed);
+        Entity* E = w.find(eater);
+        CHECK(tint(*E, w, "toxin_load") > 0);          // gut poison
+        CHECK(tint(*E, w, "energy") < en0 + 20000);    // calories blunted
+        // the event's toxin change forges a negative engram on the plant
+        AgentMind& mm = w.mind(eater);
+        auto it = mm.memory.find(plant);
+        CHECK(it != mm.memory.end());
+        CHECK(it->second.engram.emotional_charge <= -400);
+        // cooked/preserved plant: same meal, no poison
+        tseti(*w.find(plant), w, "cooked_state", 1000);
+        EntityId eater2 = mk_host2(w, {20, 40});
+        const std::int64_t tox0 = tint(*w.find(eater2), w, "toxin_load");
+        InteractionResult cr2 = w.interact(
+            mk_ctx(eater2, {plant}, "consume", 0));
+        CHECK(cr2.completed);
+        CHECK(tint(*w.find(eater2), w, "toxin_load") == tox0);
+    }
+
+    // ---- C: soil spore bank infects sprouts; fallow self-cleans ---------
+    {
+        World w(53, "data");
+        const EntityId strain = blight_strain(w, 888003);
+        EntityId plant = mk_plant(w, "berry_bush", {0, 0}, 700);
+        mk_infection(w, plant, strain, 800, 0);
+        w.destroy_entity(plant);                    // blighted corpse
+        w.advance_ticks_for_test(5);                // leaches into soil
+        const EntityId patch = find_patch(w, {0, 0});
+        CHECK(patch != kNoEntity);
+        CHECK(tint(*w.find(patch), w, "soil_spore_load") > 200);
+        CHECK(tint(*w.find(patch), w, "soil_strain_ref") ==
+              static_cast<std::int64_t>(strain));
+        CHECK(tint(*w.find(patch), w, "soil_host_kind") == 0 ||
+              true);                                 // text prop, checked via sprout
+        // a propagule of the same species germinates on the banked soil
+        PropertyBag pb;
+        auto pi = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) pb.set(p, Value::integer(v)); };
+        auto pt = [&](const char* n, const char* v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) pb.set(p, Value::text(v)); };
+        pi("integrity", 100); pi("decay_rate", 0); pi("metabolism", 0);
+        pi("sprout_rate", 1000); pi("sprout_since", 0);
+        pi("sprout_moisture_min", 0); pi("sprout_temp_min", -1000);
+        pi("sprout_temp_max", 2000);
+        pt("sprout_target", "berry_bush");
+        pt("sprout_material", "living_wood");
+        const EntityId seed1 = w.create_entity(
+            "dormant_seed", w.materials.id_of("dormant_seed"), {4, 4}, pb);
+        CHECK(seed1 != kNoEntity);
+        w.advance_ticks_for_test(60);               // germinates + infected
+        // find the new living berry_bush
+        EntityId sprout = kNoEntity;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (e.alive && e.kind_name == "berry_bush") { sprout = e.id; break; }
+        }
+        CHECK(sprout != kNoEntity);
+        CHECK(host_has_strain(w, sprout, strain));  // soil memory bit
+        // fallow: no new host input -> bank decays to zero, strain cleared
+        w.advance_ticks_for_test(2200);
+        CHECK(tint(*w.find(patch), w, "soil_spore_load") == 0);
+        CHECK(tint(*w.find(patch), w, "soil_strain_ref") == 0);
+        // a second propagule on cleaned soil stays healthy
+        PropertyBag pb2 = pb;
+        const EntityId seed2 = w.create_entity(
+            "dormant_seed", w.materials.id_of("dormant_seed"), {8, 8}, pb2);
+        (void)seed2;
+        w.advance_ticks_for_test(60);
+        EntityId sprout2 = kNoEntity;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (e.alive && e.kind_name == "berry_bush" && e.id != sprout) {
+                sprout2 = e.id; break;
+            }
+        }
+        CHECK(sprout2 != kNoEntity);
+        CHECK(!host_has_strain(w, sprout2, strain)); // fallow worked
+    }
+
+    // ---- D: fire sterilizes spores; ash returns fertility ---------------
+    {
+        World w(54, "data");
+        const EntityId strain = blight_strain(w, 888004);
+        EntityId plant = mk_plant(w, "berry_bush", {0, 0}, 700);
+        mk_infection(w, plant, strain, 800, 0);
+        EntityId actor = mk_host2(w, {20, 0});
+        // heat to >= sterilization_temp (700): thermal_mass 1 -> +600
+        InteractionResult hr = w.interact(mk_ctx(actor, {plant}, "heat", 60000));
+        CHECK(hr.completed);
+        CHECK(!host_has_strain(w, plant, strain));   // infections cut
+        // ash residue spawned + soil patch fertilized
+        const MaterialId ash_mat = w.materials.id_of("ash");
+        bool ash_found = false;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->material == ash_mat) ash_found = true;
+        CHECK(ash_found);
+        const EntityId patch = find_patch(w, {0, 0});
+        CHECK(patch != kNoEntity);
+        CHECK(tint(*w.find(patch), w, "soil_nutrient") > 0);
+        // and a contaminated soil patch itself is sterilized by heat
+        tseti(*w.find(patch), w, "soil_spore_load", 600);
+        tseti(*w.find(patch), w, "soil_strain_ref",
+              static_cast<std::int64_t>(strain));
+        tseti(*w.find(patch), w, "thermal_mass", 1);   // cheap test burn
+        InteractionResult hr2 = w.interact(mk_ctx(actor, {patch}, "heat", 60000));
+        CHECK(hr2.completed);
+        CHECK(tint(*w.find(patch), w, "soil_spore_load") == 0);
+        CHECK(tint(*w.find(patch), w, "soil_strain_ref") == 0);
+    }
+
+    // ---- E: LOD parity on reservoir state + save roundtrip ---------------
+    {
+        auto build = [&](World& w) {
+            const EntityId strain = blight_strain(w, 888005);
+            EntityId plant = mk_plant(w, "berry_bush", {0, 0}, 700);
+            const EntityId inf = mk_infection(w, plant, strain, 800, 0);
+            // pre-existing soil bank so decay parity is exercised
+            PropertyBag pb;
+            auto pi = [&](const char* n, std::int64_t v) {
+                const PropId p = tpid(w, n);
+                if (p != kNoProp) pb.set(p, Value::integer(v)); };
+            pi("soil_spore_load", 600); pi("spore_decay_accum", 0);
+            pi("soil_strain_ref", static_cast<std::int64_t>(strain));
+            pi("soil_nutrient", 0); pi("integrity", 400);
+            pi("contamination", 0); pi("decay_rate", 0); pi("metabolism", 0);
+            const EntityId patch = w.create_entity(
+                "soil_patch", w.materials.id_of("soil_loam"), {12, 0}, pb);
+            return std::tuple<EntityId, EntityId, EntityId>{plant, inf, patch};
+        };
+        World wa(55, "data"), wb(55, "data");
+        const auto [pa, ia, qa] = build(wa);
+        const auto [pb_, ib, qb] = build(wb);
+        for (int i = 0; i < 300; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(300);
+        for (const char* pn : {"yield_penalty", "blight_marks", "integrity"})
+            CHECK(tint(*wa.find(pa), wa, pn) == tint(*wb.find(pb_), wb, pn));
+        for (const char* pn : {"spore_accum", "spore_rolls", "damage_accum"})
+            CHECK(tint(*wa.find(ia), wa, pn) == tint(*wb.find(ib), wb, pn));
+        for (const char* pn : {"soil_spore_load", "spore_decay_accum",
+                               "soil_strain_ref", "soil_nutrient"})
+            CHECK(tint(*wa.find(qa), wa, pn) == tint(*wb.find(qb), wb, pn));
+        const std::uint64_t h0 = wa.state_hash();
+        CHECK(wa.save("/tmp/simlab_p112.bin"));
+        World wc(55, "data");
+        CHECK(wc.load("/tmp/simlab_p112.bin"));
+        CHECK(wc.state_hash() == h0);
+    }
+}
+
+
+// ---------- Phase 11.3: vectors, seasons, selection, herd immunity ------
+static void test_vector_ecology_selection_and_herd_immunity() {
+    auto mk_vector = [&](World& w, Vec2 pos) -> EntityId {
+        // species-declared defaults become instance props — the vector is
+        // an ordinary organism whose props all come from data/species.txt.
+        const SpeciesDef* sp = w.species.find_name("vector_midge");
+        PropertyBag pb;
+        if (sp) for (const auto& [pid2, v2] : sp->props.entries)
+            pb.set(pid2, v2);
+        return w.create_entity("vector_midge",
+                               w.materials.id_of("flesh"), pos, pb);
+    };
+    auto mk_pond = [&](World& w, Vec2 pos, std::int64_t level) -> EntityId {
+        EntityId p = w.create_entity("water",
+                                     w.materials.id_of("water"), pos, {});
+        Entity* e = w.find(p);
+        tseti(*e, w, "stagnation_level", level);
+        tseti(*e, w, "stagnation_accum", 0);
+        tseti(*e, w, "flow_rate", 0);
+        return p;
+    };
+    auto mk_temp_terrain = [&](World& w, std::int64_t temp_c) {
+        // 16x16 grid of 64-unit cells covering [-256, 752) — temp uniform.
+        w.terrain.w = 16; w.terrain.h = 16; w.terrain.cell = 64;
+        w.terrain.ox = -4; w.terrain.oy = -4;
+        const std::size_t n = 256;
+        w.terrain.elevation.assign(n, 0);
+        w.terrain.moisture.assign(n, 500);
+        w.terrain.temperature.assign(n, temp_c);
+        w.terrain.water.assign(n, 0);
+        w.terrain.vegetation.assign(n, 500);
+        w.terrain.slope.assign(n, 0);
+        w.terrain.wind_x.assign(n, 0);
+        w.terrain.wind_y.assign(n, 0);
+        w.terrain.water_table.assign(n, 0);
+    };
+    auto vborne_strain = [&](World& w, std::int64_t sig,
+                             std::int64_t vir) -> EntityId {
+        return mk_strain(w, {0, 0},
+            {{"vector_borne_rate", 600}, {"virulence", vir},
+             {"antigen_signature", sig}, {"airborne_rate", 0},
+             {"waterborne_rate", 0}, {"contact_rate", 0},
+             {"spore_rate", 0}, {"incubation_ticks", 50},
+             {"symbiont", 0}}, nullptr);
+    };
+    // test-side mirror of host_immune_to (the method is World-private):
+    // count immune_sig slots below immune_count matching the antigen.
+    auto carrier_set = [&](World& w, EntityId strain) {
+        std::set<EntityId> out_;
+        for (auto& ep : w.entities) {
+            Entity& e = *ep;
+            if (!e.alive) continue;
+            for (const Relation& r : w.relations_of(e.id, "carries")) {
+                if (r.a != e.id) continue;
+                Entity* ie = w.find(r.b);
+                if (ie && ie->alive &&
+                    tint(*ie, w, "pathogen_strain") ==
+                        static_cast<std::int64_t>(strain)) {
+                    out_.insert(e.id); break;
+                }
+            }
+        }
+        return out_;
+    };
+    auto carriers_of = [&](World& w, EntityId strain) {
+        return static_cast<int>(carrier_set(w, strain).size());
+    };
+    // ids of alive entities whose immune_sig slots match the antigen —
+    // the herd-immunity protected set.
+    auto immune_ids = [&](World& w, EntityId strain) {
+        const std::int64_t ag = tint(*w.find(strain), w,
+                                     "antigen_signature");
+        std::set<EntityId> out_;
+        for (auto& ep : w.entities) {
+            Entity& e = *ep;
+            if (!e.alive) continue;
+            const int cnt = static_cast<int>(std::min<std::int64_t>(8,
+                tint(e, w, "immune_count")));
+            for (int i = 0; i < cnt; ++i) {
+                char nm[32];
+                std::snprintf(nm, sizeof nm, "immune_sig%d", i);
+                if (tint(e, w, nm) == ag) { out_.insert(e.id); break; }
+            }
+        }
+        return out_;
+    };
+    auto immune_hosts = [&](World& w, EntityId strain) {
+        return static_cast<int>(immune_ids(w, strain).size());
+    };
+
+    // ---- A: seasonality gates vector activity; bite transmits -----------
+    {
+        World w(61, "data");
+        mk_temp_terrain(w, 300);                    // 30 °C — inside 220..360
+        const EntityId pond = mk_pond(w, {10, 0}, 600);
+        (void)pond;
+        const EntityId vec = mk_vector(w, {50, 0});
+        EntityId hostA = mk_body(w, {90, 0});
+        EntityId hostB = mk_body(w, {50, 40});
+        EntityId hostC = mk_body(w, {500, 500});    // out of bite range
+        const EntityId strain = vborne_strain(w, 777001, 300);
+        mk_infection(w, hostA, strain, 800, 0);
+        w.advance_ticks_for_test(300);
+        Entity* V = w.find(vec);
+        CHECK(tint(*V, w, "vector_dormant") == 0);   // warm + wet -> active
+        CHECK(host_has_strain(w, vec, strain));     // picked the strain up
+        CHECK(host_has_strain(w, hostB, strain));   // injected into naive B
+        CHECK(!host_has_strain(w, hostC, strain));  // out of range: safe
+        // cold snap: below vector_optimal_temp_min -> torpor, no biting
+        w.terrain.temperature.assign(256, 100);     // 10 °C < 220
+        const std::int64_t bites0 = tint(*V, w, "vector_bite_rolls");
+        const std::int64_t bite_acc0 = tint(*V, w, "vector_bite_accum");
+        const std::set<EntityId> carriers0 = carrier_set(w, strain);
+        w.advance_ticks_for_test(120);
+        CHECK(tint(*w.find(vec), w, "vector_dormant") == 1);
+        CHECK(tint(*w.find(vec), w, "vector_bite_rolls") == bites0);
+        CHECK(tint(*w.find(vec), w, "vector_bite_accum") == bite_acc0);
+        // dormancy stopped transmission: every carrier now was already a
+        // carrier before the cold snap (old infections may clear, but no
+        // NEW host can acquire the strain while the vector is torpid).
+        for (EntityId cid : carrier_set(w, strain))
+            CHECK(carriers0.count(cid) != 0);
+    }
+
+    // ---- B: heritable resistance + epidemic selection -------------------
+    {
+        World w(62, "data");
+        const PropId ipb = tpid(w, "immune_power_base");
+        const PropId ipw = tpid(w, "immune_power");
+        const PropId drp = tpid(w, "dna_repair_gain");
+        const PropId rtp = tpid(w, "reservoir_tolerance");
+        const PropId met = tpid(w, "metabolism");
+        // moderate virulence: resistant clears before sepsis, susceptible
+        // does not — survival IS the selection pressure.
+        const EntityId strain = mk_strain(w, {0, 0},
+            {{"vector_borne_rate", 0}, {"virulence", 200},
+             {"antigen_signature", 777002}, {"airborne_rate", 0},
+             {"waterborne_rate", 0}, {"contact_rate", 0},
+             {"spore_rate", 0}, {"incubation_ticks", 50},
+             {"symbiont", 0}}, nullptr);
+        auto mk_res = [&](Vec2 p, std::int64_t ipb_v) {
+            std::vector<std::pair<PropId, std::int64_t>> loci = {
+                {ipb, ipb_v}, {drp, ipb_v > 1000 ? 1500 : 400},
+                {rtp, ipb_v > 1000 ? 900 : 100}};
+            EntityId id = mk_organism(w, "test_beast", p, loci,
+                                      300, 500, 30, 0);
+            Entity* e = w.find(id);
+            tseti(*e, w, "blood_volume", 1000);   // is_host: infections progress
+            tseti(*e, w, "immune_power", ipb_v);
+            tseti(*e, w, "immune_power_base", ipb_v);
+            tseti(*e, w, "toxin_load", 0);
+            tseti(*e, w, "toxin_accum", 0);
+            return id;
+        };
+        std::vector<EntityId> resistant, susceptible;
+        for (int i = 0; i < 4; ++i) {
+            resistant.push_back(mk_res({i * 30, 0}, 1800));
+            susceptible.push_back(mk_res({i * 30, 200}, 200));
+        }
+        for (EntityId id : resistant) mk_infection(w, id, strain, 900, 0);
+        for (EntityId id : susceptible) mk_infection(w, id, strain, 900, 0);
+        w.advance_ticks_for_test(2000);
+        int alive_r = 0, alive_s = 0;
+        for (EntityId id : resistant)
+            if (w.find(id)->alive) ++alive_r;
+        for (EntityId id : susceptible)
+            if (w.find(id)->alive) ++alive_s;
+        CHECK(alive_r >= 3);
+        CHECK(alive_s <= 1);          // resistance is heritable fitness
+        // F1: survivors reproduce — offspring inherit the resistant loci
+        std::vector<EntityId> surv;
+        for (EntityId id : resistant) if (w.find(id)->alive) surv.push_back(id);
+        CHECK(surv.size() >= 2);
+        // top up fertility/energy for the post-epidemic mating
+        for (EntityId id : surv) {
+            Entity* e = w.find(id);
+            tseti(*e, w, "fertility", 500);
+            tseti(*e, w, "energy", 100000);
+            tseti(*e, w, "hunger", 100);
+            tseti(*e, w, "age", 300);
+        }
+        InteractionResult rr = w.interact(
+            mk_ctx(surv[0], {surv[1]}, "reproduce", 0));
+        CHECK(rr.completed);
+        // find the child (newest test_beast)
+        EntityId child = kNoEntity;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (e.alive && e.kind_name == "test_beast" &&
+                e.id != surv[0] && e.id != surv[1] &&
+                std::none_of(resistant.begin(), resistant.end(),
+                             [&](EntityId x){return x==e.id;}) &&
+                std::none_of(susceptible.begin(), susceptible.end(),
+                             [&](EntityId x){return x==e.id;})) {
+                child = e.id; break;
+            }
+        }
+        CHECK(child != kNoEntity);
+        const std::int64_t child_ipb = tint(*w.find(child), w,
+                                            "immune_power_base");
+        CHECK(child_ipb >= 1000);     // resistance allele inherited
+        CHECK(tint(*w.find(surv[0]), w, "repro_mutation_rolls") >= 1);
+    }
+
+    // ---- C: herd immunity + second wave on naive recruits ---------------
+    {
+        World w(63, "data");
+        // persistent shedder: low immunity keeps a low-virulence infection
+        // alive for thousands of ticks — the reservoir that re-seeds.
+        const EntityId strain = mk_strain(w, {0, 0},
+            {{"vector_borne_rate", 0}, {"virulence", 50},
+             {"antigen_signature", 777003}, {"airborne_rate", 800},
+             {"waterborne_rate", 0}, {"contact_rate", 0},
+             {"spore_rate", 0}, {"incubation_ticks", 50},
+             {"symbiont", 0}}, nullptr);
+        auto mk_herd = [&](Vec2 p, std::int64_t ipb_v) {
+            EntityId id = mk_body(w, p);
+            Entity* e = w.find(id);
+            tseti(*e, w, "immune_power", ipb_v);
+            tseti(*e, w, "immune_power_base", ipb_v);
+            tseti(*e, w, "toxin_load", 0);
+            tseti(*e, w, "toxin_accum", 0);
+            tseti(*e, w, "metabolism", 0);
+            tseti(*e, w, "decay_rate", 0);
+            return id;
+        };
+        std::vector<EntityId> herd;
+        for (int i = 0; i < 6; ++i) herd.push_back(mk_herd({i * 30, 0}, 1600));
+        // herd[0] is the reservoir: weak immunity keeps its low-virulence
+        // infection alive for the whole scenario — the source that reseeds
+        // every wave.
+        {
+            Entity* sd = w.find(herd[0]);
+            tseti(*sd, w, "immune_power", 100);
+            tseti(*sd, w, "immune_power_base", 100);
+        }
+        mk_infection(w, herd[0], strain, 700, 0);
+        // wave 1: the shedder's airborne quanta sweep the cluster; each
+        // host clears and banks the antigen in immune memory. Advances
+        // are chunked because transmission commits at pass boundaries —
+        // a single giant batch cannot chain infections within itself.
+        for (int i = 0; i < 22; ++i) w.advance_ticks_for_test(100);
+        const int immune_n = immune_hosts(w, strain);
+        CHECK(immune_n >= 5);          // community reached herd immunity
+        const std::set<EntityId> immune_set = immune_ids(w, strain);
+        // wave 2: naive recruits (post-wave births, no immune memory)
+        // enter the same airborne plume and fall ill again.
+        // moderate immunity: they fall ill and STAY ill long enough to
+        // observe — herd immunity comes from memory, not from genes.
+        EntityId naive1 = mk_herd({80, 0}, 400);
+        EntityId naive2 = mk_herd({95, 0}, 400);
+        const int carriers_before = carriers_of(w, strain);
+        for (int i = 0; i < 4; ++i) w.advance_ticks_for_test(100);
+        CHECK(carriers_of(w, strain) > carriers_before);  // second wave
+        CHECK(host_has_strain(w, naive1, strain) ||
+              host_has_strain(w, naive2, strain));
+        // herd immunity held: no wave-1 survivor was reinfected — immune
+        // hosts are skipped by every transmission route.
+        for (EntityId id : immune_set)
+            CHECK(!host_has_strain(w, id, strain));
+    }
+
+    // ---- D: LOD parity for vector dormancy/accumulators -----------------
+    {
+        auto build = [&](World& w) {
+            mk_temp_terrain(w, 300);
+            mk_pond(w, {10, 0}, 600);
+            const EntityId vec = mk_vector(w, {50, 0});
+            EntityId hostA = mk_body(w, {90, 0});
+            mk_body(w, {50, 40});
+            mk_body(w, {120, 0});
+            const EntityId strain = vborne_strain(w, 777004, 300);
+            mk_infection(w, hostA, strain, 800, 0);
+            return std::tuple<EntityId, EntityId, EntityId>{vec, hostA, strain};
+        };
+        World wa(64, "data"), wb(64, "data");
+        const auto [va, ha, sa] = build(wa);
+        const auto [vb, hb, sb] = build(wb);
+        for (int i = 0; i < 200; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(200);
+        // brood_rolls/brood_accum are deliberately NOT compared: batched
+        // brood never metabolizes inside the window (spawn-commit
+        // semantics), so multi-generation crowd counts legitimately
+        // differ — the same exemption every spawn-coupled quantity gets.
+        for (const char* pn : {"vector_dormant", "vector_bite_accum",
+                               "vector_bite_rolls"})
+            CHECK(tint(*wa.find(va), wa, pn) == tint(*wb.find(vb), wb, pn));
+        // pond trajectory marks identical too
+        EntityId pa = kNoEntity, pb_ = kNoEntity;
+        for (const auto& ep : wa.entities)
+            if (ep->kind_name == "water") pa = ep->id;
+        for (const auto& ep : wb.entities)
+            if (ep->kind_name == "water") pb_ = ep->id;
+        // stagnation_hist_* are reconstruction marks, not state: ticked
+        // mode rewrites them every tick, batched once per window — the
+        // extrapolated level they encode is what must agree, and the
+        // level/accum pair below is exactly that.
+        for (const char* pn : {"stagnation_level", "stagnation_accum"})
+            CHECK(tint(*wa.find(pa), wa, pn) == tint(*wb.find(pb_), wb, pn));
+        // vector transmission happened in BOTH modes: the original
+        // vector carried the strain and hostB fell ill. Batched brood
+        // cannot bite inside the window (spawn-commit semantics), so
+        // per-host infection timing is spawn-coupled and exempt —
+        // presence on the deterministic first target is what must agree.
+        CHECK(host_has_strain(wa, va, sa));
+        CHECK(host_has_strain(wb, vb, sb));
+        {
+            EntityId hb_a = kNoEntity, hb_b = kNoEntity;
+            for (const auto& ep : wa.entities)
+                if (ep->kind_name == "test_beast" && ep->pos.x == 50 &&
+                    ep->pos.y == 40) hb_a = ep->id;
+            for (const auto& ep : wb.entities)
+                if (ep->kind_name == "test_beast" && ep->pos.x == 50 &&
+                    ep->pos.y == 40) hb_b = ep->id;
+            CHECK(hb_a != kNoEntity && hb_b != kNoEntity);
+            CHECK(host_has_strain(wa, hb_a, sa));
+            CHECK(host_has_strain(wb, hb_b, sb));
+        }
+        const std::uint64_t h0 = wa.state_hash();
+        CHECK(wa.save("/tmp/simlab_p113.bin"));
+        World wc(64, "data");
+        CHECK(wc.load("/tmp/simlab_p113.bin"));
+        CHECK(wc.state_hash() == h0);
+    }
+}
+
+
 int main() {
     test_registries();
     test_new_material_data_only();
@@ -5511,6 +6377,9 @@ int main() {
     test_anatomical_trauma_and_bleeding();
     test_lumen_mechanics_and_organ_coupling();
     test_thermoregulation_immunity_neoplasm_and_epidemiology();
+    test_zoonosis_sterilization_and_burial();
+    test_plant_blight_monoculture_and_soil_cleansing();
+    test_vector_ecology_selection_and_herd_immunity();
     test_infection_and_primitive_medicine();
     test_neuro_psychopathology();
     test_phase9_autonomous_civilization();

@@ -182,7 +182,7 @@ fracture_level    integer permille     range 0 1000   domain=physical   # bone/t
 severed           integer flag         range 0 1      domain=physical   # part detached from its body
 part_size         integer permille     range 0 1000   domain=physical   # hit-weight of the part within its parent
 bleed_accum       integer milli-units  range 0 1000000 domain=physical  # Euclid remainder for clotting (internal)
-odor              integer permille     range 0 1000   domain=physical   # scent intensity — carrion/blood draws predators
+odor              integer permille     range 0 1000   domain=observable # scent intensity — carrion/blood draws predators; corpse stench disgusts
 # ---- primitive medicine domain (Phase 10.2) ---------------------------------
 absorbency         integer permille     range 0 1000   domain=observable # dressing quality: soaks blood, mechanical cover
 antiseptic         integer permille     range 0 1000   domain=observable # natural antimicrobial potency of a material
@@ -263,3 +263,70 @@ neoplasm_rolls      integer  units       range 0 1000000000 domain=biological # 
 metastasis_rolls    integer  units       range 0 1000000000 domain=biological # metastasis seed roll counter (internal)
 damage_accum        integer  milli-units range 0 100000000 domain=biological # tissue-damage remainder on an infection (internal)
 infection_toxin_accum integer milli-units range -100000000 100000000 domain=biological # toxin-shedding remainder (internal)
+# ---- zoonotic reservoirs, environmental reservoirs, sterilization (Phase 11) --
+reservoir_tolerance integer permille    range 0 1000    domain=biological # symbiont tolerance: >=700 hosts shed without virulence damage/fever
+zoonotic_jump_bias  integer permille    range 0 1000    domain=biological # host-adaptation mutation propensity on species jump (default 300)
+symbiont            integer flag        range 0 1       domain=biological # strain flag: commensal lineage a tolerant reservoir carries
+symbiont_signature  integer units       range 0 4294967295 domain=biological # host-side antigen signature its symbiont strain is seeded with
+symbiont_virulence  integer permille    range 0 1000    domain=biological # symbiont strain virulence template
+symbiont_airborne_rate integer permille range 0 1000    domain=biological # symbiont airborne shed rate template
+symbiont_waterborne_rate integer permille range 0 1000 domain=biological # symbiont waterborne shed rate template
+symbiont_contact_rate integer permille   range 0 1000    domain=biological # symbiont contact shed rate template
+symbiont_incubation_ticks integer ticks  range 0 1000000 domain=biological # symbiont incubation template
+symbiont_slot       text     slot        domain=biological # symbiont preferred body_slot template ("" = any wound)
+cooked_state        integer  permille     range 0 1000    domain=physical   # 0 raw/live, 1000 heat- or chemical-sterilized/preserved
+sterilization_temp  integer  deci-°C      range 0 20000   domain=physical   # temperature at which an entity sterilizes (0 = never)
+antimicrobial       integer  permille     range 0 1000    domain=physical   # chemical kill/preservation potency of a material (>=500 sterilizes on combine)
+burial_medium       integer  permille     range 0 1000    domain=physical   # isolation potency of a burial material (>=500 buries corpses)
+cremation_temp      integer  deci-°C      range 0 20000   domain=physical   # temperature at which a corpse is cremated (0 = never)
+corpse_decay_level  integer  permille     range 0 1000    domain=observable # rot stage of a dead organism (0 = fresh)
+corpse_decay_accum  integer  milli-units  range 0 100000000 domain=physical # corpse decay Euclid remainder (internal)
+buried              integer  flag         range 0 1       domain=physical   # corpse interred: odor/contamination/pathogen emission stops
+stagnation_level    integer  permille     range 0 1000    domain=physical   # still-water fouling stage (0 = fresh)
+stagnation_accum    integer  milli-units  range 0 100000000 domain=physical # stagnation Euclid remainder (internal)
+stagnation_rate     integer  milli-units/tick range 0 1000000 domain=physical # material: how fast standing water fouls
+flow_rate           integer  permille     range 0 1000    domain=physical   # material: water exchange; 0 = stagnant
+reservoir_spread_accum integer milli-ticks range 0 100000000 domain=physical # reservoir emission quantum remainder (internal)
+cremated            integer  flag         range 0 1       domain=physical   # corpse destroyed by heat: inert husk, pathogens gone
+spillover_rolls     integer  units        range 0 1000000000 domain=biological # monotonic jump-roll counter per host (internal)
+spore_rate           integer  permille     range 0 1000    domain=biological # plant-pathogen strain: spore shed rate (0 = not a plant pathogen)
+blight_susceptibility integer permille    range 0 1000    domain=biological # flora: vulnerability to spore-borne blight (0 = immune)
+soil_spore_load      integer  permille     range 0 1000    domain=physical   # viable pathogen spores held in a soil patch (0 = clean)
+soil_strain_ref      integer  units        range 0 9223372036854775807 domain=physical # entity id of the strain the soil bank carries (0 = none)
+soil_host_kind       text     slot         domain=physical # species name the soil strain is adapted to ("" = any susceptible flora)
+soil_nutrient        integer  permille     range 0 2000    domain=physical   # fertility credit in a soil patch (ash fertilization)
+spore_decay_rate     integer  permille/tick range 0 1000   domain=physical   # material: how fast a soil spore bank dies back unfed
+spore_decay_accum    integer  milli-units  range 0 100000000 domain=physical # soil spore Euclid remainder (internal)
+spore_accum          integer  milli-units  range 0 100000000 domain=physical # spore shed quantum remainder on an infection (internal)
+spore_rolls          integer  units        range 0 1000000000 domain=physical # monotonic spore-target roll counter (internal)
+yield_penalty        integer  permille     range 0 1000    domain=observable # fruiting slowdown imposed by blight infection (0 = healthy)
+blight_marks         integer  permille     range 0 1000    domain=observable # visible blight/wilt signs on a plant (0 = clean)
+spores_deposited     integer  flag         range 0 1       domain=physical   # corpse already leached its spore load into the soil
+ash_nutrient_bonus   integer  permille     range 0 2000    domain=physical   # material: fertility returned to soil when biomass burns to it
+
+# ---- vector ecology, herd immunity & resistance selection (Phase 11.3) ----
+is_disease_vector   integer  flag         range 0 1       domain=biological # species is a disease vector (bites/hosts carry strains)
+vector_borne_rate   integer  permille     range 0 1000    domain=biological # strain: transmission efficiency through a vector bite
+vector_optimal_temp_min integer deci-°C   range -1000 2000 domain=biological # vector: lower bound of its active temperature band
+vector_optimal_temp_max integer deci-°C   range -1000 2000 domain=biological # vector: upper bound of its active temperature band
+vector_requires_stagnant_water integer flag range 0 1   domain=biological # vector: needs stagnation_level > vector_stagnation_min water nearby to be active
+vector_stagnation_min integer permille    range 0 1000    domain=biological # vector: fouling level that counts as breeding water (default 500)
+vector_dormant       integer  flag         range 0 1       domain=biological # vector: 1 = torpid (out of season / dry), no biting or breeding
+vector_bite_radius   integer  units        range 1 1000    domain=biological # vector: host-contact range for pickup and injection
+vector_bite_rate     integer  permille/tick range 0 1000  domain=biological # vector: bite-contact quantum rate while active
+vector_bite_accum    integer  milli-units  range 0 100000000 domain=physical # vector: bite quantum remainder (internal)
+vector_breed_accum   integer  milli-units  range 0 100000000 domain=physical # vector: breeding quantum remainder (internal)
+vector_fecundity     integer  permille/tick range 0 1000  domain=biological # vector: offspring quanta rate while active (0 = cannot breed)
+vector_carrier_load  integer  permille     range 0 2000    domain=biological # vector: pathogen_load a picked-up strain establishes in the vector
+vector_bite_rolls    integer  units        range 0 1000000000 domain=physical # vector: monotonic bite-target roll counter (internal)
+vector_brood_rolls   integer  units        range 0 1000000000 domain=physical # vector: monotonic brood-spawn roll counter (internal)
+vector_brood_cap     integer  units        range 1 1000    domain=biological # vector: conspecifics in bite range that pause breeding (density dependence)
+stagnation_hist_level integer permille    range 0 1000    domain=physical   # water: stagnation_level at the start of the last drift window
+stagnation_hist_acc  integer  milli-units  range 0 100000000 domain=physical # water: stagnation_accum at the start of the last drift window
+stagnation_hist_rate integer  milli-units/tick range 0 1000000 domain=physical # water: stagnation_rate over the last drift window
+stagnation_hist_start integer ticks      range 0 1000000000 domain=physical # water: clock tick the last drift window began at
+immune_cost_threshold integer permille   range 0 2000     domain=biological # immunity above this base costs extra metabolism
+immune_cost_permille integer permille    range 0 1000     domain=biological # metabolic surcharge per permille of immune excess
+immune_cost_accum    integer  milli-units range 0 100000000 domain=physical # immune-cost energy drain remainder (internal)
+passive_sig_count    integer  units        range 0 8       domain=biological # leading immune_sig slots borrowed from the mother (cleared on expiry)
+repro_mutation_rolls integer  units        range 0 1000000000 domain=biological # monotonic per-actor reproduction counter (internal)

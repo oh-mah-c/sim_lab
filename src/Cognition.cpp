@@ -179,6 +179,26 @@ std::int64_t perceive_charge(const World& w, const Entity& npc,
                 charge += desperate ? 600 : 250;
         }
     }
+    // Phase 11: stench and filth repel — observable odor/contamination on
+    // a perceived entity writes a negative engram charge (disgust/grief),
+    // the same channel every other valence uses.
+    {
+        const PropertyDef* od = w.props.find_name("odor");
+        const PropertyDef* ct = w.props.find_name("contamination");
+        std::int64_t bad = 0;
+        if (od) bad += w.prop_int(target, od->id, 0) * 3 / 5;
+        if (ct) bad += w.prop_int(target, ct->id, 0) / 4;
+        charge -= std::min<std::int64_t>(800, bad);
+    }
+    // Phase 11.2: visible blight/wilt marks on flora repel through the
+    // same observable-prop channel — a marked plant reads as sickly even
+    // when it still looks edible.
+    {
+        const PropertyDef* bm = w.props.find_name("blight_marks");
+        if (bm)
+            charge -= std::min<std::int64_t>(500,
+                w.prop_int(target, bm->id, 0) / 2);
+    }
     return mem_clamp(charge, -1000, 1000);
 }
 
@@ -211,6 +231,19 @@ std::int64_t event_charge(const World& w, EntityId learner,
         if (me && (need_of(w, *me, "hunger") > 850 ||
                    need_of(w, *me, "thirst") > 850))
             charge += 500;
+    }
+    // Phase 11.2: a meal that raised the learner's toxin_load marks the
+    // food as the culprit — blighted fruit forges a strong negative
+    // engram through the same causal channel as every other valence.
+    if (ev.action == "consume" && tid != learner) {
+        const PropertyDef* tl = w.props.find_name("toxin_load");
+        if (tl) {
+            for (const StateChange& c : ev.changes)
+                if (c.entity == learner && c.prop == tl->id &&
+                    c.before.type == ValType::Integer &&
+                    c.after.type == ValType::Integer &&
+                    c.after.i > c.before.i) { charge -= 800; break; }
+        }
     }
     // poison aftermath handled separately as a negative charge (-900)
     return mem_clamp(charge, -1000, 1000);
@@ -442,6 +475,7 @@ Vec2 recalled_pos(const AgentMind::MemorySnapshot& s, EntityId eid,
 Value recalled_prop(const AgentMind::MemorySnapshot& s, PropId p,
                     EntityId eid, std::uint64_t world_seed,
                     std::int64_t blur_threshold, const Value& fallback) {
+    (void)eid; (void)world_seed;
     const auto it = s.props.find(p);
     if (it == s.props.end()) return fallback;
     const Value& v = it->second;
@@ -572,9 +606,11 @@ std::int64_t compulsion_bonus(const AgentMind& mind, const std::string& action) 
 // defending its imprint: the threat wears a negative engram). Proximity
 // itself isn't a plannable action, so "move closer" shows up through
 // share/defence candidates. Capped so bonds bias, never dominate.
-std::int64_t bond_bonus(const AgentMind& mind,
+std::int64_t bond_bonus(const World& w, const AgentMind& mind,
                         const InteractionContext& c) {
     std::int64_t bonus = 0;
+    const PropertyDef* cdl_d = w.props.find_name("corpse_decay_level");
+    const PropId cdl_id = cdl_d ? cdl_d->id : kNoProp;
     for (EntityId t : c.targets) {
         const auto it = mind.memory.find(t);
         if (it == mind.memory.end()) continue;
@@ -587,6 +623,13 @@ std::int64_t bond_bonus(const AgentMind& mind,
                   c.parameters.action == "chop" ||
                   c.parameters.action == "dig"))
             bonus += -q;                         // aversion -> aggression
+        // Phase 11 kin burial: a deep positive engram toward a corpse the
+        // mind remembers (snapshot carries the corpse-only rot prop) makes
+        // "combine" — the burial/sterilization verb — genuinely desirable.
+        else if (q >= 600 && c.parameters.action == "combine" &&
+                 cdl_id != kNoProp &&
+                 it->second.props.count(cdl_id) != 0)
+            bonus += q;
     }
     return std::min<std::int64_t>(bonus, 1500);
 }
@@ -937,7 +980,22 @@ std::size_t perceive(World& w, EntityId npc) {
     for (const EntityId eid : w.entities_near(me->pos, range)) {
         if (eid == npc) continue;
         const Entity* e = w.find(eid);
-        if (!e || !e->alive) continue;
+        if (!e) continue;
+        // Phase 11: the dead are visible only as unburied, uncremated
+        // remains — a corpse is a thing in the world (and a source of
+        // stench), an interred or burned husk is not.
+        if (!e->alive) {
+            auto dead_visible = [&]() {
+                const PropertyDef* cdl = w.props.find_name("corpse_decay_level");
+                if (!cdl || !w.prop_of(*e, cdl->id)) return false;
+                const PropertyDef* b = w.props.find_name("buried");
+                if (b && w.prop_int(*e, b->id, 0) != 0) return false;
+                const PropertyDef* cr = w.props.find_name("cremated");
+                if (cr && w.prop_int(*e, cr->id, 0) != 0) return false;
+                return true;
+            };
+            if (!dead_visible()) continue;
+        }
         // World Truth: a buried occurrence is invisible (TODO §9.3) except for
         // its declared surface Observable Evidence (§9.10.2). Exposed deposits
         // are fully visible; a buried one with no evidence is undetectable.
@@ -953,12 +1011,17 @@ std::size_t perceive(World& w, EntityId npc) {
         if (dx * dx + dy * dy > r2) continue;
         Observation o;
         o.entity = eid; o.tick = w.clock_.tick(); o.pos = e->pos;
+        const PropertyDef* cdl_d = w.props.find_name("corpse_decay_level");
+        const PropId cdl_id = cdl_d ? cdl_d->id : kNoProp;
         for (PropId p : obs_props) {
             if (buried && p == exposed_p) continue;          // exposure state is not a sign
             if (buried) {                                    // only declared evidence props
                 const DepositDef* dd = w.deposits.find(e->deposit);
                 if (!dd->evidence.get(p)) continue;
             }
+            // rot stage is a corpse sign only — a living body's material
+            // default must not masquerade as one in memory snapshots.
+            if (e->alive && p == cdl_id) continue;
             if (const Value* v = w.prop_of(*e, p)) o.props[p] = *v;
         }
         // fog-of-war memory: Ebbinghaus-encoded snapshot of what was just
@@ -1498,6 +1561,7 @@ std::vector<InteractionContext> plan(const World& w, EntityId npc, const Goal& g
     static const std::vector<std::string> kVerbs = {
         "dig", "chop", "strike", "impact", "carve", "assemble",
         "disassemble", "process", "heat", "wield", "unwield",
+        "combine",
         "consume", "rest", "evacuate", "treat"};
 
     struct Scored { InteractionContext ctx; std::int64_t score; };
@@ -1851,10 +1915,20 @@ std::vector<InteractionContext> gen_candidates(const World& w, EntityId npc,
                                                const AgentMind& mind,
                                                const std::set<EntityId>& known) {
     std::vector<InteractionContext> out;
+    auto corpse_target = [&](const Entity* e) {
+        if (e->alive) return true;
+        const PropertyDef* cdl = w.props.find_name("corpse_decay_level");
+        if (!cdl || !w.prop_of(*e, cdl->id)) return false;
+        const PropertyDef* b = w.props.find_name("buried");
+        if (b && w.prop_int(*e, b->id, 0) != 0) return false;
+        const PropertyDef* cr = w.props.find_name("cremated");
+        if (cr && w.prop_int(*e, cr->id, 0) != 0) return false;
+        return true;
+    };
     std::vector<EntityId> targets;
     for (EntityId id : known) {
         const Entity* e = w.find(id);
-        if (e && e->alive) targets.push_back(id);
+        if (e && corpse_target(e)) targets.push_back(id);
     }
     // bonded charges (Nhịp 4.5): deeply-held positive engrams are valid
     // targets even when the entity has left known_entities — memory IS
@@ -1863,7 +1937,7 @@ std::vector<InteractionContext> gen_candidates(const World& w, EntityId npc,
     for (const auto& [id, ms] : mind.memory) {
         if (ms.engram.emotional_charge < 600) continue;
         const Entity* e = w.find(id);
-        if (!e || !e->alive) continue;
+        if (!e || !corpse_target(e)) continue;
         if (std::find(targets.begin(), targets.end(), id) == targets.end())
             targets.push_back(id);
         bonded.emplace_back(id, ms.pos);
@@ -1999,7 +2073,7 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
                 child.score = ev.score + belief_bonus(*spec, npc, c, res)
                             + (lmind ? compulsion_bonus(*lmind,
                                      c.parameters.action)
-                                     + bond_bonus(*lmind, c)
+                                     + bond_bonus(*spec, *lmind, c)
                                      + care_bonus(*spec, npc, *lmind, c)
                                      + wound_bonus(*spec, npc, *lmind, c)
                                      - excrete_penalty(*spec, npc, *lmind, c)

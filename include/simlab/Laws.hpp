@@ -291,5 +291,21 @@ public:
     std::unique_ptr<INaturalLawModel> clone() const override;
 };
 
+// ---- Material combination (Phase 11) -----------------------------------------
+// Generic "combine": >=2 reachable targets; entities carrying
+// `antimicrobial` >= 500 sterilize their siblings (cooked_state 1000, strain_ref
+// and contamination cleared); entities carrying `burial_medium` >= 500 bury
+// dead siblings (buried 1, odor silenced). No material or species is named —
+// salt preserves because its data says so, soil buries because its data says so.
+class CombineModel final : public INaturalLawModel {
+public:
+    LawId id() const override;
+    const char* name() const override { return "physical.combine"; }
+    std::vector<std::string> domains() const override { return {"physical", "biological"}; }
+    bool supports(const World& w, const InteractionContext& ctx) const override;
+    PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
+    std::unique_ptr<INaturalLawModel> clone() const override;
+};
+
 }  // namespace simlab
 

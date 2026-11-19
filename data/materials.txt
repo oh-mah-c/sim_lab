@@ -291,6 +291,7 @@ material marble
 # ---- soils (top stratum; type follows parent rock + climate) -------------------
   contamination 350
 material soil_sand
+  burial_medium 700
   hardness 150
   brittleness 800
   mass 1400
@@ -300,6 +301,8 @@ material soil_sand
   thermal_mass 1300
   conductivity 100
   fertility 200
+  sterilization_temp 700
+  spore_decay_rate 400
   metabolism 0
   sight_range 0
   speed 0
@@ -309,6 +312,7 @@ material soil_sand
   contamination 800
   absorbency 500
 material soil_loam
+  burial_medium 700
   hardness 200
   brittleness 700
   mass 1500
@@ -318,6 +322,8 @@ material soil_loam
   thermal_mass 1400
   conductivity 110
   fertility 500
+  sterilization_temp 700
+  spore_decay_rate 400
   metabolism 0
   sight_range 0
   speed 0
@@ -327,6 +333,7 @@ material soil_loam
   contamination 800
   absorbency 500
 material soil_clay
+  burial_medium 700
   hardness 250
   brittleness 650
   mass 1600
@@ -336,6 +343,8 @@ material soil_clay
   thermal_mass 1500
   conductivity 90
   fertility 600
+  sterilization_temp 700
+  spore_decay_rate 400
   metabolism 0
   sight_range 0
   speed 0
@@ -409,6 +418,12 @@ material gold_quartz
 # Animal body (fauna species in species.txt are made of it).
   contamination 500
 material flesh
+  sterilization_temp 700
+  cremation_temp 6000
+  corpse_decay_level 0
+  corpse_decay_accum 0
+  buried 0
+  reservoir_spread_accum 0
   hardness 30
   brittleness 100
   mass 40000
@@ -452,6 +467,7 @@ material copper_metal
 
   contamination 250
 material charcoal
+  antimicrobial 550
   hardness 100
   brittleness 800
   mass 250
@@ -650,6 +666,12 @@ material wood_debris
   absorbency 600
   contamination 500
 material skin
+  sterilization_temp 700
+  cremation_temp 6000
+  corpse_decay_level 0
+  corpse_decay_accum 0
+  buried 0
+  reservoir_spread_accum 0
   hardness 200
   brittleness 600
   mass 8000
@@ -672,6 +694,12 @@ material skin
   absorbency 400
   contamination 250
 material muscle
+  sterilization_temp 700
+  cremation_temp 6000
+  corpse_decay_level 0
+  corpse_decay_accum 0
+  buried 0
+  reservoir_spread_accum 0
   hardness 80
   brittleness 300
   mass 105000
@@ -714,6 +742,12 @@ material bone
 
   contamination 150
 material organ
+  sterilization_temp 700
+  cremation_temp 6000
+  corpse_decay_level 0
+  corpse_decay_accum 0
+  buried 0
+  reservoir_spread_accum 0
   hardness 40
   brittleness 200
   mass 1030000
@@ -809,3 +843,108 @@ material urine
   nutrient 500
   moisture 950
   viscosity 100
+
+# ---- Phase 11: environmental reservoirs, sterilization, burial -------------
+# Standing water: drinkable, never flows (flow_rate 0) so it fouls into a
+# stagnation reservoir; heat or salt preserves it.
+material water
+  hardness 0
+  brittleness 0
+  mass 1000
+  density 1000000
+  integrity 400
+  decay_rate 0
+  flammability 0
+  thermal_mass 3900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 300
+  nutrition 0
+  hydration 1000
+  tensile 0
+  edge 0
+  sterilization_temp 700
+  cremation_temp 0
+  contamination 0
+  stagnation_level 0
+  stagnation_accum 0
+  reservoir_spread_accum 0
+  flow_rate 0
+  stagnation_rate 20
+
+# Solar/crude salt: chemical preservation — combine onto food or water
+# (antimicrobial >= 500) sets cooked_state 1000 and clears pathogens.
+material salt
+  hardness 200
+  brittleness 200
+  mass 500
+  density 2200000
+  integrity 800
+  decay_rate 0
+  flammability 0
+  thermal_mass 900
+  conductivity 20
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 0
+  hydration 0
+  tensile 0
+  edge 0
+  antimicrobial 800
+  burial_medium 200
+  contamination 0
+
+# Antimicrobial herb: a poultice-grade botanical (>=500 threshold met).
+material antimicrobial_herb
+  hardness 50
+  brittleness 300
+  mass 50
+  density 400000
+  integrity 200
+  decay_rate 100
+  flammability 600
+  thermal_mass 500
+  conductivity 40
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 600
+  nutrition 100
+  hydration 600
+  tensile 100
+  edge 0
+  antimicrobial 700
+  contamination 100
+
+# Cremation residue: sterile, desiccated, excellent burial medium.
+material ash
+  hardness 100
+  brittleness 0
+  mass 50
+  density 700000
+  integrity 200
+  decay_rate 0
+  flammability 0
+  thermal_mass 800
+  conductivity 30
+  fertility 300
+  ash_nutrient_bonus 500
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 900
+  nutrition 0
+  hydration 0
+  tensile 0
+  edge 0
+  antimicrobial 600
+  burial_medium 900
+  contamination 0
+  sterilization_temp 0

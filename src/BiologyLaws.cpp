@@ -435,6 +435,8 @@ PredictionResult BiologyModel::predict(const World& w,
             }
             const PropId cc = prop_id(w, "immune_count");
             if (cc != kNoProp) s.props.set(cc, Value::integer(give));
+            const PropId psc = prop_id(w, "passive_sig_count");
+            if (psc != kNoProp) s.props.set(psc, Value::integer(give));
             const PropId pp = prop_id(w, "passive_immune");
             if (pp != kNoProp)
                 s.props.set(pp, Value::integer(2000));
@@ -443,6 +445,15 @@ PredictionResult BiologyModel::predict(const World& w,
     s.rel_from.push_back({"parent_of", actor->id});
     s.rel_from.push_back({"parent_of", partner->id});
     r.spawns.push_back(s);
+    // Phase 11.3: monotonic per-actor reproduction counter — the epoch salt
+    // for heritable-trait mutation rolls, mirroring drift_rolls.
+    {
+        const PropId rmr = prop_id(w, "repro_mutation_rolls");
+        if (rmr != kNoProp) {
+            const std::int64_t rv = w.prop_int(*actor, rmr, 0);
+            set_change(r, actor->id, rmr, rv, rv + 1);
+        }
+    }
 
     r.possible = true;
     r.ticks = ctx.parameters.ticks > 0 ? ctx.parameters.ticks : 4;

@@ -29,6 +29,7 @@ const std::vector<std::string>& action_verbs() {
     static const std::vector<std::string> kVerbs = {
         "dig", "chop", "strike", "impact", "carve", "assemble",
         "disassemble", "process", "heat", "wield", "unwield",
+        "combine",
         "consume", "rest", "evacuate", "treat"};
     return kVerbs;
 }

@@ -264,6 +264,10 @@ private:
         PropId energy = kNoProp, mind_horizon = kNoProp,
                mind_abstraction = kNoProp, mind_brain_cost = kNoProp,
                brain_accum = kNoProp;
+        // Phase 11.2 flora epidemiology reads: yield_penalty slows fruiting
+        // on blighted plants; soil_nutrient on nearby patches is the ash
+        // fertilization credit that speeds regrowth.
+        PropId yield_penalty = kNoProp, soil_nutrient = kNoProp;
     };
     NeedProps need_props() const;
     // Apply dt ticks of need/age drift to one entity; appends StateChanges
@@ -317,6 +321,50 @@ private:
     // Everything commits as ONE "ecology" causal event — spawns, kills and
     // bookkeeping prop changes are all ledgered like any other world change.
     void ecology_tick(std::int64_t n);
+    // Phase 11 environmental reservoirs: corpse rot (corpse_decay_level via
+    // decay_rate) and standing-water fouling (stagnation_level via
+    // stagnation_rate), both Euclid-batched; past their data thresholds a
+    // reservoir emits odor/contamination and spreads strain_ref to nearby
+    // entities on a reservoir_spread_accum quantum. `buried`/`cremated`
+    // silence a corpse instantly. Runs for dead AND living entities inside
+    // metabolize — batch-exact like every other drift.
+    void environmental_drift(Entity& e, std::uint64_t pending,
+                             CausalEvent& ev, bool record_hist = true);
+    // Lazy symbiont seeding: a host carrying `symbiont_signature` and no
+    // symbiont strain infection gets its commensal PathogenStrain +
+    // ActiveInfection created here (real entity ids, causal event).
+    void seed_symbionts(CausalEvent& ev, const std::vector<EntityId>& hosts);
+    // Zoonotic spillover: after a successful consume commit, a susceptible
+    // actor (reservoir_tolerance < 700) that ate raw strain-carrying tissue
+    // or water is infected — with reservoir_tolerance < 500 a deterministic
+    // zoonotic_jump_bias roll may found an adapted strain variant.
+    void zoonotic_spillover(const InteractionContext& ctx, CausalEvent& ev,
+                            std::vector<EntityId>& spawned);
+    // Phase 11.2 flora epidemiology: a susceptible plant (blight_susceptibility
+    // > 0) carrying a spore_rate>0 strain sheds spore quanta whose rate scales
+    // with same-species neighbor density (monoculture amplification); quanta
+    // found new infections on nearby same-species plants. Also drives
+    // virulence integrity loss, yield_penalty and observable blight_marks.
+    // Appends infection SpawnSpecs to `out` — same commit path as epidemiology.
+    void flora_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                     CausalEvent& ev, std::vector<SpawnSpec>& out);
+    // Phase 11.3 vector ecology: an is_disease_vector organism reads the
+    // local environment (terrain temperature band + nearby stagnant water)
+    // and flips vector_dormant. Active vectors bite on a vector_bite_accum
+    // quantum: they pick strains up from infected hosts and inject them
+    // into naive ones at the strain's vector_borne_rate; dormant vectors
+    // neither bite nor breed. Active vectors also breed on
+    // vector_breed_accum — offspring inherit the parental genome. Dormancy
+    // flips mid-window replay tick-wise (LOD-exact); steady windows batch.
+    void vector_drift(Entity& e, std::int64_t pending, std::uint64_t now,
+                      CausalEvent& ev, std::vector<SpawnSpec>& out);
+    // Herd immunity: does `host` carry immune memory matching the antigen
+    // of the strain entity `strain_id`? Used by every transmission route.
+    bool host_immune_to(EntityId host, std::int64_t strain_id) const;
+    // Queue an ActiveInfection SpawnSpec on `host` for `strain_id` —
+    // deduped against infections already pending in `out` this pass.
+    void queue_infection(std::vector<SpawnSpec>& out, EntityId host,
+                         std::int64_t strain_id, std::int64_t load);
     // Ebbinghaus decay (Nhịp 1): every mind's memory engrams and discovery
     // engrams lose clarity by the integer-exact accum/drop recurrence —
     // batch-exact for any dt, so per-tick and dormant-tick paths agree.
