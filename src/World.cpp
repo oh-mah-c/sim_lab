@@ -6,6 +6,7 @@
 #include <limits>
 #include <fstream>
 #include <sstream>
+#include <cstdio>
 
 namespace simlab {
 
@@ -52,6 +53,7 @@ World::World(std::uint64_t s, const std::string& data_dir) : seed(s) {
     laws.push_back(std::make_unique<ThermalModel>());
     laws.push_back(std::make_unique<CompositionModel>());
     laws.push_back(std::make_unique<PhysiologyModel>());
+    laws.push_back(std::make_unique<TreatModel>());
     laws.push_back(std::make_unique<BiologyModel>());
     laws.push_back(std::make_unique<SocialModel>());
     laws.push_back(std::make_unique<LocomotionModel>());
@@ -84,6 +86,67 @@ bool World::load_content(const std::string& data_dir, std::string* err) {
     deposits = std::move(td); processes = std::move(tpr); species = std::move(tsp);
     influx = std::move(tin);
     content_error.clear();
+    return true;
+}
+
+// Phase 10 anatomy: spawn a species body plan as contained part_of
+// children. Parts share the body's position (contained entities do not
+// locomote independently) and carry integrity 1000 + their role props.
+bool World::build_anatomy(EntityId body) {
+    Entity* e = find(body);
+    if (!e || !e->alive) return false;
+    const SpeciesDef* sp = species.find_name(e->kind_name);
+    if (!sp || sp->anatomy.empty()) return false;
+    // already has parts? (idempotent for re-loads / double calls)
+    for (const Relation& r : relations_of(body, "part_of"))
+        if (r.b == body) return false;
+    const PropId contained = props.find_name("contained")
+        ? props.find_name("contained")->id : kNoProp;
+    const PropId integ = props.find_name("integrity")
+        ? props.find_name("integrity")->id : kNoProp;
+    const PropId slot = props.find_name("body_slot")
+        ? props.find_name("body_slot")->id : kNoProp;
+    const PropId role = props.find_name("part_role")
+        ? props.find_name("part_role")->id : kNoProp;
+    const PropId vital = props.find_name("vital_organ")
+        ? props.find_name("vital_organ")->id : kNoProp;
+    const PropId bleed = props.find_name("bleed_rate")
+        ? props.find_name("bleed_rate")->id : kNoProp;
+    const PropId frac = props.find_name("fracture_level")
+        ? props.find_name("fracture_level")->id : kNoProp;
+    const PropId sev = props.find_name("severed")
+        ? props.find_name("severed")->id : kNoProp;
+    const PropId psz = props.find_name("part_size")
+        ? props.find_name("part_size")->id : kNoProp;
+    const PropId inf = props.find_name("infection_level")
+        ? props.find_name("infection_level")->id : kNoProp;
+    const PropId infa = props.find_name("infection_accum")
+        ? props.find_name("infection_accum")->id : kNoProp;
+    const PropId nec = props.find_name("necrotic")
+        ? props.find_name("necrotic")->id : kNoProp;
+    const PropId band = props.find_name("bandaged_integrity")
+        ? props.find_name("bandaged_integrity")->id : kNoProp;
+    for (const PartSpec& ps : sp->anatomy) {
+        PropertyBag pb;
+        if (contained != kNoProp) pb.set(contained, Value::boolean(true));
+        if (integ != kNoProp) pb.set(integ, Value::integer(1000));
+        if (slot != kNoProp) pb.set(slot, Value::text(ps.slot));
+        if (role != kNoProp) pb.set(role, Value::text(ps.role));
+        if (vital != kNoProp) pb.set(vital, Value::integer(ps.vital));
+        if (bleed != kNoProp) pb.set(bleed, Value::integer(0));
+        if (frac != kNoProp) pb.set(frac, Value::integer(0));
+        if (sev != kNoProp) pb.set(sev, Value::integer(0));
+        if (psz != kNoProp) pb.set(psz, Value::integer(ps.size));
+        if (inf != kNoProp) pb.set(inf, Value::integer(0));
+        if (infa != kNoProp) pb.set(infa, Value::integer(0));
+        if (nec != kNoProp) pb.set(nec, Value::integer(0));
+        if (band != kNoProp) pb.set(band, Value::integer(0));
+        for (const auto& [xpid, xv] : ps.extra.entries) pb.set(xpid, xv);
+        const EntityId pid = create_entity(
+            e->kind_name + "/" + ps.name, ps.material, e->pos, pb);
+        if (pid == kNoEntity) continue;
+        relations.relate(pid, "part_of", body);
+    }
     return true;
 }
 
@@ -729,6 +792,33 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                     ev.changes.push_back(ch);
                     touched = true;
                 }
+                // decomposition fertilizes (Phase 10.3): decaying matter
+                // carrying `nutrient`/`moisture` amends the soil cell it
+                // lies on — data-driven, any material may compost.
+                if (dmg > 0 && terrain.contains(e.pos)) {
+                    const PropertyDef* nd = props.find_name("nutrient");
+                    const PropertyDef* md = props.find_name("moisture");
+                    const std::int64_t nut =
+                        nd ? prop_int(e, nd->id, 0) : 0;
+                    const std::int64_t mst =
+                        md ? prop_int(e, md->id, 0) : 0;
+                    if (nut > 0 || mst > 0) {
+                        const std::size_t ci = terrain.index(e.pos);
+                        if (nut > 0)
+                            terrain.vegetation[ci] = static_cast<std::int32_t>(
+                                std::min<std::int64_t>(1000,
+                                    std::max<std::int64_t>(0,
+                                        terrain.vegetation[ci] +
+                                        dmg * nut / 400)));
+                        if (mst > 0)
+                            terrain.moisture[ci] = static_cast<std::int32_t>(
+                                std::min<std::int64_t>(1000,
+                                    std::max<std::int64_t>(0,
+                                        terrain.moisture[ci] +
+                                        dmg * mst / 400)));
+                        ev.evidence += "fertilized; ";
+                    }
+                }
                 if (nxt <= 0) {
                     e.alive = false;
                     spatial.erase(e.id);
@@ -752,6 +842,8 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
     ev.action = "metabolize";
     ev.applied_laws.push_back(6);
     bool any = false;
+    std::vector<ShedPool> shed_pools;
+    std::vector<SpawnSpec> drift_spawns;
     for (EntityId id : ids) {
         Entity* ep = find(id);
         if (!ep || !ep->alive) continue;
@@ -769,11 +861,49 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
                 continue;
             }
         }
-        if (drift_needs(e, pending, np, ev)) {
+        bool drifted = false;
+        const std::size_t chg0 = ev.changes.size();
+        if (pending > 1 && physiology_coupled(e)) {
+            for (std::uint64_t k = 0; k < pending && e.alive; ++k) {
+                const std::uint64_t sub_now = now - pending + k + 1;
+                if (drift_needs(e, 1, np, ev)) drifted = true;
+                anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
+                epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
+            }
+        } else {
+            drifted = drift_needs(e, pending, np, ev);
+            // Phase 10: circulation runs for every living entity that carries
+            // blood_volume — independent of the need-prop prefilter above.
+            anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
+            epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                               drift_spawns);
+        }
+        if (drifted || ev.changes.size() != chg0) {
             ev.participants.push_back(e.id);
             any = true;
         }
         e.last_metabolized = now;
+    }
+    // shed waste lands as material entities — World Truth grows causally
+    // inside the same metabolize event (blood pools, feces, urine).
+    if (!shed_pools.empty()) {
+        const PropId qty = props.find_name("quantity")
+            ? props.find_name("quantity")->id : kNoProp;
+        for (const ShedPool& sp : shed_pools) {
+            PropertyBag pb;
+            if (qty != kNoProp) pb.set(qty, Value::integer(sp.amount));
+            const EntityId bid = create_entity(
+                sp.kind, sp.material, sp.pos, pb);
+            if (bid != kNoEntity) {
+                ev.spawned.push_back(bid);
+                ev.evidence += sp.kind + " " + std::to_string(bid) + "; ";
+                any = true;
+            }
+        }
+    }
+    if (!drift_spawns.empty()) {
+        commit_drift_spawns(ev, drift_spawns);
+        any = true;
     }
     if (any) {
         ev.evidence = "needs caught up before interaction; " + ev.evidence;
@@ -796,6 +926,1378 @@ const std::vector<PropId>& World::observable_props() const {
         obs_props_defs_ = props.defs().size();
     }
     return obs_props_cache_;
+}
+
+// Phase 10: functional fraction of a body's parts matching `role`.
+// Denominator = every part entity ever wired part_of->body (severed parts
+// keep the edge as anatomical record; `severed` is the detach truth).
+// Numerator = attached (severed==0), alive, integrity>0. No anatomy -> 1000.
+std::int64_t World::anatomy_function(EntityId body, const char* role) const {
+    const PropId role_p = props.find_name("part_role")
+        ? props.find_name("part_role")->id : kNoProp;
+    const PropId sev_p = props.find_name("severed")
+        ? props.find_name("severed")->id : kNoProp;
+    const PropId integ_p = props.find_name("integrity")
+        ? props.find_name("integrity")->id : kNoProp;
+    if (role_p == kNoProp) return 1000;
+    std::int64_t total = 0, func = 0;
+    for (const Relation& rel : relations_of(body, "part_of")) {
+        if (rel.b != body) continue;
+        const Entity* p = find(rel.a);
+        if (!p || !p->alive) continue;
+        const Value* rv = prop_of(*p, role_p);
+        if (!rv || rv->type != ValType::Text || rv->s != role) continue;
+        ++total;
+        const Value* sv = sev_p != kNoProp ? prop_of(*p, sev_p) : nullptr;
+        const bool severed = sv && sv->type == ValType::Integer && sv->i != 0;
+        const Value* iv = integ_p != kNoProp ? prop_of(*p, integ_p) : nullptr;
+        const bool broken = iv && iv->type == ValType::Integer && iv->i <= 0;
+        if (!severed && !broken) ++func;
+    }
+    return total > 0 ? func * 1000 / total : 1000;
+}
+
+// Phase 10 circulation: hemorrhage, clotting, regeneration, hypovolemic
+// shock — all integer, Euclid-exact via blood_accum/bleed_accum remainders
+// so dt=1 x N is bit-identical to dt=N (same contract as drift_needs).
+void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
+                          CausalEvent& ev, std::vector<ShedPool>& pools,
+                          std::vector<SpawnSpec>* xspawns) {
+    if (dt_u == 0 || !e.alive) return;
+    const std::int64_t dt = static_cast<std::int64_t>(dt_u);
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId bv_p = pid("blood_volume"), ba_p = pid("blood_accum"),
+                 br_p = pid("bleed_rate"), bac_p = pid("bleed_accum"),
+                 cs_p = pid("consciousness"), integ_p = pid("integrity"),
+                 energy_p = pid("energy"), thirst_p = pid("thirst"),
+                 sev_p = pid("severed");
+    if (bv_p == kNoProp || !prop_of(e, bv_p)) return;    // non-circulatory
+
+    auto change = [&](PropId p, std::int64_t before, std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch;
+        ch.entity = e.id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(before); ch.after = Value::integer(after);
+        e.props.set(p, Value::integer(after));
+        ev.changes.push_back(ch);
+    };
+
+    // clotting + total bleed over attached parts AND the body's own
+    // bleed_rate (stump bleeding after amputation lives on the body).
+    std::int64_t total_bleed = 0;
+    // clotting writes the PART's own props (its own StateChange entries).
+    auto clot = [&](Entity& part) {
+        if (br_p == kNoProp || bac_p == kNoProp) return;
+        if (!prop_of(part, br_p)) return;
+        const std::int64_t br = prop_int(part, br_p, 0);
+        if (br <= 0) return;
+        const std::int64_t bacc0 = prop_int(part, bac_p, 0);
+        const std::int64_t acc = bacc0 + dt;
+        const std::int64_t drop = acc / 50;      // bleed_rate -1 per 50 ticks
+        const std::int64_t nacc = acc - drop * 50;
+        const std::int64_t nbr = std::max<std::int64_t>(0, br - drop);
+        if (nacc == bacc0 && nbr == br) return;
+        auto pchange = [&](PropId p, std::int64_t before, std::int64_t after) {
+            if (p == kNoProp || before == after) return;
+            StateChange ch;
+            ch.entity = part.id; ch.prop = p; ch.had_before = true;
+            ch.before = Value::integer(before);
+            ch.after = Value::integer(after);
+            part.props.set(p, Value::integer(after));
+            ev.changes.push_back(ch);
+        };
+        pchange(bac_p, bacc0, nacc);
+        pchange(br_p, br, nbr);
+    };
+    if (br_p != kNoProp && prop_of(e, br_p)) {
+        clot(e);
+        total_bleed += prop_int(e, br_p, 0);
+    }
+    for (const Relation& rel : relations_of(e.id, "part_of")) {
+        if (rel.b != e.id) continue;
+        Entity* p = find(rel.a);
+        if (!p || !p->alive) continue;
+        if (sev_p != kNoProp) {
+            const Value* sv = prop_of(*p, sev_p);
+            if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+        }
+        if (prop_of(*p, br_p)) {
+            clot(*p);
+            total_bleed += prop_int(*p, br_p, 0);
+        }
+    }
+
+    // toxin load from last tick gates infection progression & healing —
+    // failing filtration lets toxins accumulate (Phase 10.3b). Read once
+    // up-front; the toxin section below updates it for next tick.
+    const PropId tox_e_p = pid("toxin_load");
+    const std::int64_t toxin_prev = tox_e_p != kNoProp
+        ? prop_int(e, tox_e_p, 0) : 0;
+    const bool filter_ok = toxin_prev <= 400;
+
+    // ---- infection & necrosis (Phase 10.2) --------------------------------
+    // Open wounds (bleed_rate>0 or integrity<500) in unbandaged tissue
+    // (bandaged_integrity<300) accumulate infection_level via infection_accum
+    // (Euclid-exact). Rate scales with environmental contamination (max
+    // `contamination` material prop within 96 units) and inversely with the
+    // body's energy reserves. Bandaged wounds heal 2/tick (integer-exact).
+    const PropId inf_p = pid("infection_level"), infa_p = pid("infection_accum"),
+                 nec_p = pid("necrotic"), band_p = pid("bandaged_integrity"),
+                 contam_p = pid("contamination"), integ2_p = pid("integrity"),
+                 vital_p = pid("vital_organ"), pain_p = pid("pain_level");
+    std::int64_t total_infection = 0;
+    if (inf_p != kNoProp) {
+        // environmental contamination: worst filth material near the body
+        std::int64_t env_contam = 0;
+        {
+            const std::int64_t r2 = 96 * 96;
+            for (const auto& ep : entities) {
+                const Entity& o = *ep;
+                if (!o.alive || o.id == e.id) continue;
+                if (dist2(o.pos, e.pos) > r2) continue;
+                env_contam = std::max(env_contam, prop_int(o, contam_p, 0));
+            }
+        }
+        const std::int64_t energy_r = std::max<std::int64_t>(
+            300, prop_int(e, pid("energy"), 60000) / 40);
+        // toxemia doubles progression: failing filtration lets toxins
+        // accumulate (Phase 10.3b organ coupling).
+        const std::int64_t rate_milli =
+            (150 + env_contam * 3 / 2) * 1000 / energy_r * (filter_ok ? 1 : 2);
+        for (const Relation& rel : relations_of(e.id, "part_of")) {
+            if (rel.b != e.id) continue;
+            Entity* p = find(rel.a);
+            if (!p || !p->alive || !prop_of(*p, inf_p)) continue;
+            const std::int64_t br = br_p != kNoProp ? prop_int(*p, br_p, 0) : 0;
+            const std::int64_t pi = prop_int(*p, integ2_p, 1000);
+            const std::int64_t band = band_p != kNoProp ? prop_int(*p, band_p, 0) : 0;
+            const std::int64_t inf = prop_int(*p, inf_p, 0);
+            const std::int64_t nec = nec_p != kNoProp ? prop_int(*p, nec_p, 0) : 0;
+            if (nec) { total_infection += inf; continue; }
+            const bool wound_open = br > 0 || pi < 500;
+            if (!wound_open) { total_infection += inf; continue; }
+            if (band >= 300) {
+                // dressed: contamination blocked, infection heals 2/tick
+                const std::int64_t heal = std::min(inf,
+                    filter_ok ? dt * 2 : dt / 4);
+                if (heal > 0) {
+                    auto pc = [&](PropId pp, std::int64_t b4, std::int64_t af) {
+                        if (pp == kNoProp || b4 == af) return;
+                        StateChange ch; ch.entity = p->id; ch.prop = pp;
+                        ch.had_before = true; ch.before = Value::integer(b4);
+                        ch.after = Value::integer(af);
+                        p->props.set(pp, Value::integer(af));
+                        ev.changes.push_back(ch);
+                    };
+                    pc(inf_p, inf, inf - heal);
+                }
+                total_infection += inf - heal;
+                continue;
+            }
+            // progress via Euclid remainder
+            const std::int64_t iacc0 = infa_p != kNoProp ? prop_int(*p, infa_p, 0) : 0;
+            const std::int64_t iacc = iacc0 + dt * rate_milli;
+            const std::int64_t delta = iacc / 1000;
+            const std::int64_t ninf = std::min<std::int64_t>(1000, inf + delta);
+            const std::int64_t nacc = iacc - delta * 1000;
+            auto pc = [&](PropId pp, std::int64_t b4, std::int64_t af) {
+                if (pp == kNoProp || b4 == af) return;
+                StateChange ch; ch.entity = p->id; ch.prop = pp;
+                ch.had_before = true; ch.before = Value::integer(b4);
+                ch.after = Value::integer(af);
+                p->props.set(pp, Value::integer(af));
+                ev.changes.push_back(ch);
+            };
+            pc(inf_p, inf, ninf);
+            pc(infa_p, iacc0, nacc);
+            total_infection += ninf;
+            // necrosis / sepsis thresholds
+            const std::int64_t vital = vital_p != kNoProp ? prop_int(*p, vital_p, 0) : 0;
+            if (ninf >= 800 && vital < 1000 && nec_p != kNoProp) {
+                pc(nec_p, nec, 1);
+                if (integ2_p != kNoProp) pc(integ2_p, pi, 0);
+                ev.evidence += "necrosis; ";
+            } else if (ninf >= 1000 && vital >= 1000 && integ2_p != kNoProp) {
+                // sepsis: infection reaches a vital organ -> body dies
+                const std::int64_t bi = prop_int(e, integ2_p, 500);
+                StateChange ch; ch.entity = e.id; ch.prop = integ2_p;
+                ch.had_before = true; ch.before = Value::integer(bi);
+                ch.after = Value::integer(0);
+                e.props.set(integ2_p, Value::integer(0));
+                ev.changes.push_back(ch);
+                e.alive = false; spatial.erase(e.id);
+                ev.evidence += "sepsis; ";
+                return;
+            }
+        }
+    }
+
+    // ---- lumen mechanics & organ coupling (Phase 10.3) ----------------------
+    // Fully data-driven: any attached part carrying lumen_capacity>0 is a
+    // hollow organ. Awaiting matter (body undigested_mass/fluid, charged
+    // by "consume") seeps into phase-matched lumens; pressure, viscosity,
+    // contractility, upstream backpressure, rupture and toxin coupling all
+    // read part props — no organ names appear anywhere in this code.
+    const PropId lc_p = pid("lumen_capacity"), cl_p = pid("contents_load"),
+                 ca_p = pid("contents_accum"), cv_p = pid("content_viscosity"),
+                 va_p = pid("viscosity_accum"), ct_p = pid("contractility"),
+                 em_p = pid("evacuate_material"), us_p = pid("upstream_organ_slot"),
+                 osa_p = pid("organ_stress_accum"), fr_p = pid("filtration_rate"),
+                 rup_p = pid("ruptured"),
+                 tox_p = pid("toxin_load"), toa_p = pid("toxin_accum"),
+                 mat_p = pid("moisture"), met_p = pid("metabolism");
+    const PropId um2_p = pid("undigested_mass"), uf2_p = pid("undigested_fluid");
+    // gather lumen parts (alive, attached, non-severed, non-necrotic)
+    struct Lumen {
+        Entity* p = nullptr;
+        bool fluid = false;                  // waste material moisture >= 600
+        std::string evac;                    // evacuate_material name
+        std::int64_t evac_moist = 0, evac_contam = 0;
+        std::int64_t cap = 0, load = 0, visc = 0, contract = 0, integ = 1000;
+        std::string up_slot;
+    };
+    std::vector<Lumen> lumens;
+    if (lc_p != kNoProp) {
+        for (const Relation& rel : relations_of(e.id, "part_of")) {
+            if (rel.b != e.id) continue;
+            Entity* pt = find(rel.a);
+            if (!pt || !pt->alive) continue;
+            if (sev_p != kNoProp) {
+                const Value* sv = prop_of(*pt, sev_p);
+                if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+            }
+            if (nec_p != kNoProp) {
+                const Value* nv = prop_of(*pt, nec_p);
+                if (nv && nv->type == ValType::Integer && nv->i != 0) continue;
+            }
+            std::int64_t cap = prop_int(*pt, lc_p, 0);
+            if (cap <= 0) continue;
+            // Phase 10.4: a growing mass physically occupies the lumen —
+            // effective capacity shrinks, pressure mechanics do the rest.
+            const PropId nm0 = pid("neoplasm_mass");
+            if (nm0 != kNoProp) {
+                const std::int64_t nm0v = prop_int(*pt, nm0, 0);
+                if (nm0v > 0)
+                    cap = std::max<std::int64_t>(1, cap * (1000 - nm0v) / 1000);
+            }
+            Lumen L; L.p = pt; L.cap = cap;
+            L.load = cl_p != kNoProp ? prop_int(*pt, cl_p, 0) : 0;
+            L.visc = cv_p != kNoProp ? prop_int(*pt, cv_p, 0) : 0;
+            L.contract = ct_p != kNoProp ? prop_int(*pt, ct_p, 0) : 0;
+            L.integ = integ_p != kNoProp ? prop_int(*pt, integ_p, 1000) : 1000;
+            if (us_p != kNoProp) {
+                const Value* uv = prop_of(*pt, us_p);
+                if (uv && uv->type == ValType::Text) L.up_slot = uv->s;
+            }
+            if (em_p != kNoProp) {
+                const Value* ev = prop_of(*pt, em_p);
+                if (ev && ev->type == ValType::Text && !ev->s.empty()) {
+                    L.evac = ev->s;
+                    if (const MaterialDef* wm = materials.find_name(L.evac)) {
+                        L.evac_moist = mat_p != kNoProp
+                            ? prop_int(*pt, mat_p, 0) : 0;   // placeholder
+                        // waste material props live on the MATERIAL, read
+                        // through a temp lookup below
+                        (void)wm;
+                    }
+                }
+            }
+            // phase: the waste material's own moisture decides — watery
+            // waste (urine-like) fills fluid lumens, thick waste (feces-
+            // like) fills solid ones. No names, only numbers.
+            if (!L.evac.empty()) {
+                if (const MaterialDef* wm = materials.find_name(L.evac)) {
+                    Entity tmp; tmp.material = wm->id;
+                    L.evac_moist = mat_p != kNoProp ? prop_int(tmp, mat_p, 0) : 0;
+                    const PropId cp = pid("contamination");
+                    L.evac_contam = cp != kNoProp ? prop_int(tmp, cp, 0) : 0;
+                }
+            }
+            L.fluid = L.evac_moist >= 600;
+            lumens.push_back(L);
+        }
+    }
+    // fill: each lumen converts awaiting matter through contents_accum.
+    // LOD-exact scheme: the per-tick rate is CONSTANT per lumen (capacity-
+    // scaled), demand `d` is consumed from the accumulator standard-style,
+    // and only the pool-bounded transfer `xfer = min(d, pool)` moves mass —
+    // so dt=1 x N telescopes identically to dt=N (a pool-dependent rate
+    // would re-sample the shrinking pool at different granularities).
+    for (Lumen& L : lumens) {
+        const PropId pool_p = L.fluid ? uf2_p : um2_p;
+        const std::int64_t rate = 40 + L.cap / 25;    // milli-units/tick
+        if (ca_p == kNoProp || cl_p == kNoProp) continue;
+        const std::int64_t a0 = prop_int(*L.p, ca_p, 0);
+        const std::int64_t acc = a0 + dt * rate;
+        const std::int64_t d = acc / 1000;
+        const std::int64_t nacc = acc - d * 1000;
+        // transfer bounded by the awaiting pool, 1:1 (assimilation losses
+        // are already priced into the constant rate).
+        std::int64_t xfer = d;
+        if (pool_p != kNoProp && prop_of(e, pool_p)) {
+            const std::int64_t p0 = prop_int(e, pool_p, 0);
+            xfer = std::min(d, std::max<std::int64_t>(0, p0));
+            if (xfer > 0) change(pool_p, p0, p0 - xfer);
+        }
+        const std::int64_t nl = std::min<std::int64_t>(L.cap * 3 / 2,
+                                                    L.load + xfer);
+        auto pc = [&](PropId pp, std::int64_t b4, std::int64_t af) {
+            if (pp == kNoProp || b4 == af) return;
+            StateChange ch; ch.entity = L.p->id; ch.prop = pp;
+            ch.had_before = true;
+            ch.before = Value::integer(b4); ch.after = Value::integer(af);
+            L.p->props.set(pp, Value::integer(af));
+            ev.changes.push_back(ch);
+        };
+        pc(cl_p, L.load, nl); pc(ca_p, a0, nacc);
+        L.load = nl;
+        // viscosity: thick waste (moisture<600) hardens with thirst,
+        // softens with water — signed Euclid drift on viscosity_accum.
+        // Ungated on contents presence: a load>0 gate is not LOD-exact
+        // (batched fill reports contents for the whole interval while
+        // per-tick fill crosses 1 unit partway through). Viscosity is a
+        // property of the contents phase — only consulted when load>0.
+        if (cv_p != kNoProp && va_p != kNoProp && L.evac_moist < 600) {
+            const std::int64_t thirsty = thirst_p != kNoProp &&
+                prop_int(e, thirst_p, 0) > 600;
+            const std::int64_t v0 = prop_int(*L.p, cv_p, 0);
+            const std::int64_t s0 = prop_int(*L.p, va_p, 0);
+            const std::int64_t sa = s0 + dt * (thirsty ? 650 : -200);
+            const std::int64_t vd = sa / 1000;
+            const std::int64_t nv = std::min<std::int64_t>(1000,
+                std::max<std::int64_t>(0, v0 + vd));
+            pc(cv_p, v0, nv); pc(va_p, s0, sa - vd * 1000);
+            L.visc = nv;
+        }
+    }
+    // pressure consequences: backpressure wear, involuntary void, rupture
+    for (Lumen& L : lumens) {
+        if (L.cap <= 0) continue;
+        const std::int64_t pressure = L.load * 1000 / L.cap;
+        // backpressure: distension >=700 wears the upstream organ slot
+        if (pressure >= 700 && osa_p != kNoProp && !L.up_slot.empty()) {
+            const std::int64_t s0 = prop_int(*L.p, osa_p, 0);
+            const std::int64_t acc = s0 + dt * 120;
+            const std::int64_t wear = acc / 1000;
+            auto pc2 = [&](PropId pp, std::int64_t b4, std::int64_t af) {
+                if (pp == kNoProp || b4 == af) return;
+                StateChange ch; ch.entity = L.p->id; ch.prop = pp;
+                ch.had_before = true;
+                ch.before = Value::integer(b4); ch.after = Value::integer(af);
+                L.p->props.set(pp, Value::integer(af));
+                ev.changes.push_back(ch);
+            };
+            pc2(osa_p, s0, acc - wear * 1000);
+            if (wear > 0) {
+                for (const Relation& rel : relations_of(e.id, "part_of")) {
+                    if (rel.b != e.id || rel.a == L.p->id) continue;
+                    Entity* up = find(rel.a);
+                    if (!up || !up->alive) continue;
+                    if (sev_p != kNoProp) {
+                        const Value* sv = prop_of(*up, sev_p);
+                        if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+                    }
+                    if (nec_p != kNoProp) {
+                        const Value* nv = prop_of(*up, nec_p);
+                        if (nv && nv->type == ValType::Integer && nv->i != 0) continue;
+                    }
+                    const Value* sl = prop_of(*up, pid("body_slot"));
+                    if (!sl || sl->type != ValType::Text || sl->s != L.up_slot)
+                        continue;
+                    if (integ_p == kNoProp) continue;
+                    const std::int64_t ui = prop_int(*up, integ_p, 1000);
+                    const std::int64_t nu = std::max<std::int64_t>(0, ui - wear);
+                    if (nu == ui) continue;
+                    StateChange ch; ch.entity = up->id; ch.prop = integ_p;
+                    ch.had_before = true;
+                    ch.before = Value::integer(ui); ch.after = Value::integer(nu);
+                    up->props.set(integ_p, Value::integer(nu));
+                    ev.changes.push_back(ch);
+                }
+            }
+        }
+        // involuntary voiding: pressure 1000 + wall gives way (panic,
+        // unconsciousness, or exhaustion of retention) — only when the
+        // contents can actually pass (viscosity <= contractility).
+        if (pressure >= 1000 && L.visc <= L.contract && cl_p != kNoProp &&
+            rup_p != kNoProp && prop_int(*L.p, rup_p, 0) == 0) {
+            std::int64_t panic = 0, cs = 1000;
+            const auto mit = minds_.find(e.id);
+            if (mit != minds_.end()) panic = mit->second.neuro.panic;
+            if (cs_p != kNoProp) cs = prop_int(e, cs_p, 1000);
+            const bool give_way = panic >= 800 || cs < 300 || pressure >= 1200;
+            if (give_way) {
+                auto pc3 = [&](PropId pp, std::int64_t b4, std::int64_t af) {
+                    if (pp == kNoProp || b4 == af) return;
+                    StateChange ch; ch.entity = L.p->id; ch.prop = pp;
+                    ch.had_before = true;
+                    ch.before = Value::integer(b4); ch.after = Value::integer(af);
+                    L.p->props.set(pp, Value::integer(af));
+                    ev.changes.push_back(ch);
+                };
+                pc3(cl_p, L.load, 0);
+                if (ca_p != kNoProp) pc3(ca_p, prop_int(*L.p, ca_p, 0), 0);
+                if (!L.evac.empty()) {
+                    const MaterialDef* wm = materials.find_name(L.evac);
+                    pools.push_back({e.pos, L.load / 4 + 50,
+                                     wm ? wm->id : kNoMaterial, L.evac});
+                }
+                if (mit != minds_.end()) {
+                    mit->second.neuro.panic = std::min<std::int64_t>(1000,
+                        mit->second.neuro.panic + 400);
+                    mit->second.neuro.grief = std::min<std::int64_t>(1000,
+                        mit->second.neuro.grief + 300);
+                }
+                ev.evidence += "involuntary voiding; ";
+                L.load = 0;
+                continue;
+            }
+        }
+        // rupture: shattered wall under pressure, or pressure beyond what
+        // a failing wall can hold — contents' contamination soaks every
+        // sibling part (peritonitis), bleed_rate spikes, pain maxes.
+        const bool wall_shattered = L.integ <= 300 && pressure >= 800;
+        const bool over_max = pressure >= 1400 && L.visc > L.contract;
+        if ((wall_shattered || over_max) && rup_p != kNoProp &&
+            prop_int(*L.p, rup_p, 0) == 0) {
+            auto pc4 = [&](Entity& tgt, PropId pp, std::int64_t b4,
+                          std::int64_t af) {
+                if (pp == kNoProp || b4 == af) return;
+                StateChange ch; ch.entity = tgt.id; ch.prop = pp;
+                ch.had_before = true;
+                ch.before = Value::integer(b4); ch.after = Value::integer(af);
+                tgt.props.set(pp, Value::integer(af));
+                ev.changes.push_back(ch);
+            };
+            pc4(*L.p, rup_p, 0, 1);
+            pc4(*L.p, integ_p, L.integ, 0);
+            pc4(*L.p, br_p, prop_int(*L.p, br_p, 0),
+                std::min<std::int64_t>(1000,
+                    prop_int(*L.p, br_p, 0) + 300));
+            pc4(*L.p, cl_p, L.load, 0);
+            // contamination of the spilled contents infects siblings
+            const std::int64_t spill = L.evac_contam / 4;
+            if (spill > 0 && inf_p != kNoProp) {
+                for (const Relation& rel : relations_of(e.id, "part_of")) {
+                    if (rel.b != e.id || rel.a == L.p->id) continue;
+                    Entity* sib = find(rel.a);
+                    if (!sib || !sib->alive) continue;
+                    const std::int64_t si = prop_int(*sib, inf_p, 0);
+                    pc4(*sib, inf_p, si,
+                        std::min<std::int64_t>(1000, si + spill));
+                }
+            }
+            if (pain_p != kNoProp)
+                pc4(e, pain_p, prop_int(e, pain_p, 0), 1000);
+            ev.evidence += "organ rupture; ";
+            L.load = 0;
+        }
+    }
+    // ---- toxin coupling (Phase 10.3b) ---------------------------------------
+    // toxin_load on the body: generated by metabolism + distended lumens,
+    // filtered by attached parts carrying filtration_rate (scaled by their
+    // integrity). toxin_accum is the signed Euclid remainder — dt-exact.
+    if (tox_p != kNoProp && prop_of(e, tox_p) && toa_p != kNoProp) {
+        std::int64_t gen = 100 + (met_p != kNoProp ? prop_int(e, met_p, 0) / 10 : 0);
+        for (const Lumen& L : lumens) {
+            const std::int64_t pressure = L.cap > 0 ? L.load * 1000 / L.cap : 0;
+            if (pressure > 700) gen += (pressure - 700) * 10;
+        }
+        std::int64_t filt = 0;
+        for (const Relation& rel : relations_of(e.id, "part_of")) {
+            if (rel.b != e.id) continue;
+            Entity* pt = find(rel.a);
+            if (!pt || !pt->alive) continue;
+            if (sev_p != kNoProp) {
+                const Value* sv = prop_of(*pt, sev_p);
+                if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+            }
+            if (nec_p != kNoProp) {
+                const Value* nv = prop_of(*pt, nec_p);
+                if (nv && nv->type == ValType::Integer && nv->i != 0) continue;
+            }
+            if (fr_p == kNoProp || integ_p == kNoProp) continue;
+            const std::int64_t fr = prop_int(*pt, fr_p, 0);
+            if (fr <= 0) continue;
+            filt += fr * prop_int(*pt, integ_p, 1000) / 1000;
+        }
+        const std::int64_t t0 = prop_int(e, tox_p, 0);
+        const std::int64_t a0 = prop_int(e, toa_p, 0);
+        const std::int64_t acc = a0 + dt * (gen - filt);
+        const std::int64_t d = acc / 1000;      // signed trunc: LOD-safe
+        const std::int64_t nt = std::min<std::int64_t>(1000,
+            std::max<std::int64_t>(0, t0 + d));
+        change(tox_p, t0, nt);
+        change(toa_p, a0, acc - d * 1000);
+        if (nt >= 1000) {
+            if (integ_p != kNoProp && prop_of(e, integ_p)) {
+                change(integ_p, prop_int(e, integ_p, 0), 0);
+            }
+            e.alive = false; spatial.erase(e.id);
+            ev.evidence += "toxemia; ";
+        }
+    }
+
+
+    // ---- thermoregulation, adaptive immunity, neoplasm (Phase 10.4) ------
+    // Species-relative: every threshold derives from the entity's own
+    // normal_body_temp/thermoreg_gain/delta props — no fixed temperature
+    // and no organ name appears here. All accumulators are Euclid-exact.
+    {
+        // generic prop writer for OTHER entities (parts, infections)
+        auto change_on = [&](Entity& tgt, PropId p, std::int64_t before,
+                             std::int64_t after) {
+            if (p == kNoProp || before == after) return;
+            StateChange ch;
+            ch.entity = tgt.id; ch.prop = p; ch.had_before = true;
+            ch.before = Value::integer(before);
+            ch.after = Value::integer(after);
+            tgt.props.set(p, Value::integer(after));
+            ev.changes.push_back(ch);
+        };
+        const PropId nbt_p = pid("normal_body_temp"),
+                     bt_p = pid("body_temp"),
+                     tg_p = pid("thermoreg_gain"),
+                     hd_p = pid("hypothermia_delta"),
+                     fd_p = pid("fever_delta_max"),
+                     hp_p = pid("hyperpyrexia_delta"),
+                     ip_p = pid("immune_power"),
+                     dr_p = pid("dna_repair_gain"),
+                     ics_p = pid("immune_count"),
+                     pi_p = pid("passive_immune"),
+                     nm_p = pid("neoplasm_mass"),
+                     na_p = pid("neoplasm_accum"),
+                     nsa_p = pid("neoplasm_seed_accum"),
+                     ma_p = pid("metastasis_accum"),
+                     vn_p = pid("vital_neural"),
+                     ap_p = pid("antipyretic"),
+                     mu_p = pid("mutagenic"),
+                     sl_p = pid("target_slot"),
+                     bs_p = pid("body_slot"),
+                     ps_p = pid("pathogen_strain"),
+                     pl_p = pid("pathogen_load"),
+                     ab_p = pid("antibody_level"),
+                     ie_p = pid("infection_elapsed"),
+                     ila_p = pid("infection_load_accum"),
+                     iba_p = pid("infection_ab_accum"),
+                     ma2_p = pid("mutation_accum"),
+                     rl_p = pid("drift_rolls"),
+                     nr_p = pid("neoplasm_rolls"),
+                     mr_p = pid("metastasis_rolls"),
+                     da_p = pid("damage_accum"),
+                     ita_p = pid("infection_toxin_accum"),
+                     sg_p = pid("antigen_signature"),
+                     vir_p = pid("virulence");
+
+        // collect this host's active infections (carries edges host->inf)
+        struct Infect {
+            Entity* ie = nullptr;
+            Entity* strain = nullptr;
+            std::int64_t vir = 0, load = 0, ab = 0, elapsed = 0;
+            std::uint32_t antigen = 0;
+            std::string slot;
+        };
+        std::vector<Infect> infections;
+        std::int64_t burden = total_infection;
+        std::int64_t pathogen_sum = 0;
+        if (ps_p != kNoProp && pl_p != kNoProp && ab_p != kNoProp) {
+            for (const Relation& rel : relations_of(e.id, "carries")) {
+                if (rel.a != e.id) continue;
+                Entity* ie = find(rel.b);
+                if (!ie || !ie->alive) continue;
+                const std::int64_t se = ps_p != kNoProp
+                    ? prop_int(*ie, ps_p, 0) : 0;
+                Entity* st = se > 0 ? find(static_cast<EntityId>(se)) : nullptr;
+                if (!st || !st->alive) continue;
+                Infect I;
+                I.ie = ie; I.strain = st;
+                I.vir = prop_int(*st, vir_p, 0);
+                I.load = prop_int(*ie, pl_p, 0);
+                I.ab = prop_int(*ie, ab_p, 0);
+                I.elapsed = ie_p != kNoProp ? prop_int(*ie, ie_p, 0) : 0;
+                I.antigen = static_cast<std::uint32_t>(
+                    sg_p != kNoProp ? prop_int(*st, sg_p, 0) : 0);
+                if (sl_p != kNoProp) {
+                    const Value* sv = prop_of(*st, sl_p);
+                    if (sv && sv->type == ValType::Text) I.slot = sv->s;
+                }
+                pathogen_sum += I.load;
+                infections.push_back(I);
+            }
+        }
+        burden = std::min<std::int64_t>(2000, burden + pathogen_sum);
+
+        // ---- (a) species-relative thermoregulation -------------------------
+        std::int64_t dT = 0;          // body_temp - normal_body_temp
+        bool fever_active = total_infection > 200;
+        bool hyper_fever = false;
+        // a complete thermal phenotype is required — every threshold is a
+        // species-data delta, never an absolute mark in code.
+        if (nbt_p != kNoProp && prop_of(e, nbt_p) &&
+            hd_p != kNoProp && prop_of(e, hd_p) &&
+            fd_p != kNoProp && prop_of(e, fd_p) &&
+            hp_p != kNoProp && prop_of(e, hp_p)) {
+            const std::int64_t normal = prop_int(e, nbt_p, 0);
+            const std::int64_t hypo = prop_int(e, hd_p, 0);
+            const std::int64_t fmax = prop_int(e, fd_p, 0);
+            const std::int64_t hyper = prop_int(e, hp_p, 0);
+            const std::int64_t cur = bt_p != kNoProp
+                ? prop_int(e, bt_p, normal) : normal;
+            const std::int64_t therm = tg_p != kNoProp
+                ? prop_int(e, tg_p, 1000) : 1000;
+            // ambient pull: weak thermoregulators track the environment;
+            // cold + wet + exhausted pulls hardest (all data-driven deltas).
+            // no terrain -> neutral environment at the species set-point
+            std::int64_t env_t = normal, env_m = 500;
+            if (!terrain.empty() && terrain.contains(e.pos)) {
+                env_t = terrain.temp_at(e.pos);
+                env_m = terrain.moist_at(e.pos);
+            }
+            const std::int64_t energy_r = prop_int(e, energy_p, 60000);
+            std::int64_t pull = (1000 - therm);
+            if (env_t < normal - 10)
+                pull += std::min<std::int64_t>(400,
+                    (normal - 10 - env_t) * 3);
+            if (env_t > normal + 10)
+                pull += std::min<std::int64_t>(200,
+                    (env_t - normal - 10));
+            if (env_m > 700) pull += 60;
+            if (!terrain.empty() && terrain.contains(e.pos) &&
+                terrain.is_water(e.pos)) pull += 80;
+            if (energy_r < 20000) pull += 120;
+            pull = std::min<std::int64_t>(1000, pull);
+            std::int64_t target = normal +
+                (env_t - normal) * pull / 1000;
+            // defensive fever: infection burden elevates set-point by
+            // 15..fever_delta_max scaled by load — species-relative.
+            for (const Infect& I : infections)
+                if (ie_p != kNoProp && I.elapsed >=
+                    prop_int(*I.strain, pid("incubation_ticks"), 0))
+                    fever_active = true;
+            if (fever_active) {
+                const std::int64_t span = std::max<std::int64_t>(1,
+                    fmax - 15);
+                const std::int64_t rise = 15 +
+                    span * std::min<std::int64_t>(1000, burden) / 1000;
+                target = std::max(target, normal + rise);
+            }
+            // antipyretic materials nearby suppress fever toward the set-
+            // point; on a healthy body the same cooling overshoots into
+            // hypothermia — the dose makes the poison, emergently.
+            bool cool_near = false;
+            {
+                const std::int64_t r2 = 24 * 24;
+                for (const auto& ep : entities) {
+                    const Entity& o = *ep;
+                    if (!o.alive || o.id == e.id) continue;
+                    if (dist2(o.pos, e.pos) > r2) continue;
+                    if (ap_p != kNoProp &&
+                        prop_int(o, ap_p, 0) >= 400) { cool_near = true; break; }
+                }
+            }
+            if (cool_near)
+                target = fever_active ? normal
+                                      : normal - hypo - hypo / 10;
+            // LOD-exact approach: |move| <= 4 deciC per tick, linear in dt.
+            const std::int64_t diff = target - cur;
+            const std::int64_t maxmove = 4 * dt;
+            const std::int64_t mv = diff > 0
+                ? std::min(diff, maxmove)
+                : std::max(diff, -maxmove);
+            change(bt_p, cur, cur + mv);
+            const std::int64_t newt = cur + mv;
+            dT = newt - normal;
+            // immune_power: halved once hypothermia threshold is crossed.
+            // The BASE lives in immune_power_base so the halving is
+            // idempotent — effective value derives, never decays.
+            const PropId ipb_p = pid("immune_power_base");
+            // one-time migration: an entity carrying immune_power but no
+            // recorded base seeds the base from its current value, so the
+            // hypothermia halving stays reversible forever after.
+            if (ipb_p != kNoProp && ip_p != kNoProp &&
+                prop_of(e, ip_p) && !prop_of(e, ipb_p))
+                change(ipb_p, 0, prop_int(e, ip_p, 1000));
+            if (ip_p != kNoProp && prop_of(e, ip_p)) {
+                const std::int64_t ip_base =
+                    ipb_p != kNoProp && prop_of(e, ipb_p)
+                        ? prop_int(e, ipb_p, 1000)
+                        : prop_int(e, ip_p, 1000);
+                change(ip_p, prop_int(e, ip_p, 1000),
+                       dT < -hypo ? ip_base / 2 : ip_base);
+            }
+            hyper_fever = dT > hyper;
+            // hyperpyrexia: vital_neural parts take direct integrity loss
+            // and consciousness sags — the tag decides, never a name.
+            if (hyper_fever) {
+                const std::int64_t over = dT - hyper;
+                const std::int64_t neural_loss = dt * over / 4;
+                if (neural_loss > 0)
+                    for (const Relation& rel : relations_of(e.id, "part_of")) {
+                        if (rel.b != e.id) continue;
+                        Entity* pt = find(rel.a);
+                        if (!pt || !pt->alive || !prop_of(*pt, vn_p))
+                            continue;
+                        const Value* nv = prop_of(*pt, vn_p);
+                        if (!nv || nv->i == 0) continue;
+                        const std::int64_t pi2 =
+                            integ_p != kNoProp ? prop_int(*pt, integ_p, 1000) : 1000;
+                        change_on(*pt, integ_p, pi2,
+                                  std::max<std::int64_t>(0, pi2 - neural_loss));
+                    }
+                if (cs_p != kNoProp && prop_of(e, cs_p)) {
+                    const std::int64_t cs0 = prop_int(e, cs_p, 1000);
+                    change(cs_p, cs0,
+                          std::max<std::int64_t>(0, cs0 - over));
+                }
+            }
+            // fever cost once dT >= 15: extra energy + water burn.
+            if (dT >= 15) {
+                if (energy_p != kNoProp && prop_of(e, energy_p)) {
+                    const std::int64_t en = prop_int(e, energy_p, 0);
+                    change(energy_p, en, std::max<std::int64_t>(0, en - dt * 6));
+                }
+                if (thirst_p != kNoProp && prop_of(e, thirst_p)) {
+                    const std::int64_t th = prop_int(e, thirst_p, 0);
+                    change(thirst_p, th, std::min<std::int64_t>(1000, th + dt * 6));
+                }
+            }
+        }
+
+        // ---- (b) adaptive immunity: growth, antibody, drift, clearance ----
+        const std::int64_t ip_eff = ip_p != kNoProp && prop_of(e, ip_p)
+            ? prop_int(e, ip_p, 1000) : 1000;
+        std::int64_t sig_slot[8];
+        int sig_n = 0;
+        for (int i = 0; i < 8; ++i) {
+            const PropId sp = pid(("immune_sig" + std::to_string(i)).c_str());
+            sig_slot[i] = sp != kNoProp && prop_of(e, sp)
+                ? prop_int(e, sp, 0) : -1;
+        }
+        if (ics_p != kNoProp && prop_of(e, ics_p))
+            sig_n = static_cast<int>(std::min<std::int64_t>(8,
+                prop_int(e, ics_p, 0)));
+        auto has_memory = [&](std::uint32_t ag) {
+            for (int i = 0; i < sig_n; ++i)
+                if (sig_slot[i] == static_cast<std::int64_t>(ag)) return true;
+            return false;
+        };
+        // passive maternal immunity decays tick by tick
+        if (pi_p != kNoProp && prop_of(e, pi_p)) {
+            const std::int64_t pv = prop_int(e, pi_p, 0);
+            if (pv > 0) change(pi_p, pv, std::max<std::int64_t>(0, pv - dt));
+        }
+        const std::int64_t pi_left = pi_p != kNoProp
+            ? prop_int(e, pi_p, 0) : 0;
+        const bool fever_kill = dT >= 15;
+        for (Infect& I : infections) {
+            Entity& ie = *I.ie;
+            const std::int64_t inc = pid("incubation_ticks") != kNoProp
+                ? prop_int(*I.strain, pid("incubation_ticks"), 0) : 0;
+            I.elapsed += dt;
+            change_on(ie, ie_p, I.elapsed - dt, I.elapsed);
+            const bool incubated = I.elapsed >= inc;
+            // growth: strain virulence drives it; fever halves it and adds
+            // kill pressure; antibody_level brakes it proportionally.
+            std::int64_t g = I.vir * 8 - I.ab * 3;
+            if (fever_kill) g = g / 2 - 15;
+            if (!incubated) g = g / 4;    // incubation dampens symptoms
+            const std::int64_t la0 = ila_p != kNoProp
+                ? prop_int(ie, ila_p, 0) : 0;
+            const std::int64_t lacc = la0 + dt * g;
+            const std::int64_t dl = lacc / 1000;
+            const std::int64_t nl = std::min<std::int64_t>(1500,
+                std::max<std::int64_t>(0, I.load + dl));
+            change_on(ie, ila_p, la0, lacc - dl * 1000);
+            change_on(ie, pl_p, I.load, nl);
+            I.load = nl;
+            // adaptive antibody: faster with immune memory match and with
+            // maternally-transferred passive immunity still active.
+            std::int64_t ar = ip_eff / 2 + (incubated ? ip_eff / 4 : 0);
+            if (has_memory(I.antigen)) ar += ip_eff;
+            if (pi_left > 0) ar += ip_eff / 2;
+            const std::int64_t aa0 = iba_p != kNoProp
+                ? prop_int(ie, iba_p, 0) : 0;
+            const std::int64_t aacc = aa0 + dt * ar;
+            const std::int64_t da = aacc / 1000;
+            const std::int64_t nab = std::min<std::int64_t>(1500,
+                I.ab + da);
+            change_on(ie, iba_p, aa0, aacc - da * 1000);
+            change_on(ie, ab_p, I.ab, nab);
+            I.ab = nab;
+            // tissue damage on the preferred slot (or any wound if unset)
+            if (nl > 0 && integ_p != kNoProp) {
+                const std::int64_t dacc0 = da_p != kNoProp
+                    ? prop_int(ie, da_p, 0) : 0;
+                const std::int64_t dacc = dacc0 +
+                    dt * nl * I.vir / 200;
+                const std::int64_t dd = dacc / 100000;
+                // remainder persists every call — gating the write on
+                // dd>0 starves the accumulator under per-tick evaluation.
+                change_on(ie, da_p, dacc0, dacc - dd * 100000);
+                if (dd > 0) {
+                    for (const Relation& rel : relations_of(e.id, "part_of")) {
+                        if (rel.b != e.id) continue;
+                        Entity* pt = find(rel.a);
+                        if (!pt || !pt->alive) continue;
+                        if (sev_p != kNoProp) {
+                            const Value* sv = prop_of(*pt, sev_p);
+                            if (sv && sv->i != 0) continue;
+                        }
+                        bool match = I.slot.empty();
+                        if (!match && bs_p != kNoProp) {
+                            const Value* bv2 = prop_of(*pt, bs_p);
+                            if (bv2 && bv2->type == ValType::Text &&
+                                bv2->s == I.slot) match = true;
+                        }
+                        if (!match) continue;
+                        const std::int64_t pi3 = prop_int(*pt, integ_p, 1000);
+                        change_on(*pt, integ_p, pi3,
+                                  std::max<std::int64_t>(0, pi3 - dd));
+                    }
+                }
+            }
+            // virulence sheds toxin into the host's blood
+            if (nl > 0 && tox_p != kNoProp && prop_of(e, tox_p)) {
+                const std::int64_t ta0 = ita_p != kNoProp
+                    ? prop_int(ie, ita_p, 0) : 0;
+                const std::int64_t tacc = ta0 + dt * nl * I.vir / 500;
+                const std::int64_t td = tacc / 1000;
+                change_on(ie, ita_p, ta0, tacc - td * 1000);
+                if (td != 0) {
+                    const std::int64_t t0 = prop_int(e, tox_p, 0);
+                    change(tox_p, t0,
+                          std::min<std::int64_t>(1000, t0 + td));
+                    if (t0 + td >= 1000) {
+                        if (integ_p != kNoProp && prop_of(e, integ_p))
+                            change(integ_p, prop_int(e, integ_p, 0), 0);
+                        e.alive = false; spatial.erase(e.id);
+                        ev.evidence += "sepsis; ";
+                    }
+                }
+            }
+            // antigenic drift: high load rolls for a mutant strain —
+            // deterministic accumulator, bit-shifted signature escapes
+            // the host population's immune memory.
+            if (nl >= 800 && xspawns) {
+                const std::int64_t m0 = ma2_p != kNoProp
+                    ? prop_int(ie, ma2_p, 0) : 0;
+                const std::int64_t macc = m0 + dt * nl / 100;
+                std::int64_t rolls = macc / 1000;
+                change_on(ie, ma2_p, m0, macc - rolls * 1000);
+                if (rolls > 0) {
+                    // every roll is its own deterministic event. The epoch
+                    // is a monotonic per-carrier counter, NOT the
+                    // accumulator remainder — remainder levels repeat
+                    // under per-tick evaluation and would correlate all
+                    // rolls onto a few hash inputs.
+                    if (rolls > 256) rolls = 256;
+                    const std::int64_t rc0 = rl_p != kNoProp
+                        ? prop_int(ie, rl_p, 0) : 0;
+                    for (std::int64_t ri = 0; ri < rolls; ++ri) {
+                        const std::uint64_t h = Rng::stream_seed(world_seed,
+                            "antigenic_drift", ie.id ^
+                            static_cast<std::uint64_t>(rc0 + ri));
+                        if (h % 1000 < static_cast<std::uint64_t>(
+                                std::max<std::int64_t>(1, I.vir / 10))) {
+                            SpawnSpec ms;
+                            ms.kind = "pathogen_strain";
+                            ms.material = kNoMaterial;
+                            ms.pos = e.pos;
+                            for (const auto& [pp, vv] : I.strain->props.entries)
+                                ms.props.set(pp, vv);
+                            const std::uint32_t nsig = I.antigen ^
+                                (1u << (h % 29)) ^ (1u << ((h >> 8) % 29));
+                            if (sg_p != kNoProp)
+                                ms.props.set(sg_p, Value::integer(nsig));
+                            if (vir_p != kNoProp)
+                                ms.props.set(vir_p, Value::integer(
+                                    std::clamp<std::int64_t>(
+                                        I.vir + static_cast<std::int64_t>(h % 81) - 40,
+                                        0, 1000)));
+                            xspawns->push_back(std::move(ms));
+                            ev.evidence += "antigenic drift; ";
+                        }
+                    }
+                    change_on(ie, rl_p, rc0, rc0 + rolls);
+                }
+            }
+            // clearance: antibody dominance sterilizes the infection and
+            // writes the antigen into immune memory (max 8 signatures).
+            if (nl <= 0 || I.ab > nl) {
+                ie.alive = false; spatial.erase(ie.id);
+                ev.evidence += "cleared ";
+                if (!has_memory(I.antigen) && sig_n < 8) {
+                    const PropId slotp = pid(("immune_sig" +
+                        std::to_string(sig_n)).c_str());
+                    if (slotp != kNoProp)
+                        change(slotp, prop_int(e, slotp, 0),
+                               static_cast<std::int64_t>(I.antigen));
+                    if (ics_p != kNoProp)
+                        change(ics_p, prop_int(e, ics_p, 0), sig_n + 1);
+                }
+                relations.unrelate(e.id, "carries", ie.id);
+            }
+        }
+
+        // ---- (c) neoplasm initiation, growth, metastasis -------------------
+        if (dr_p != kNoProp && prop_of(e, dr_p)) {
+            // mutagenic exposure: worst mutagenic material within 64 units —
+            // scanned lazily only for organisms already under oncogenic
+            // pressure, keeping the common path cheap.
+            std::int64_t env_mut = 0;
+            {
+                const std::int64_t r2 = 64 * 64;
+                for (const auto& ep : entities) {
+                    const Entity& o = *ep;
+                    if (!o.alive || o.id == e.id) continue;
+                    if (dist2(o.pos, e.pos) > r2) continue;
+                    if (mu_p != kNoProp)
+                        env_mut = std::max(env_mut, prop_int(o, mu_p, 0));
+                }
+            }
+            const std::int64_t dr = std::max<std::int64_t>(1,
+                prop_int(e, dr_p, 1000));
+            std::int64_t risk = 1;   // baseline spontaneous rate
+            if (toxin_prev > 600) risk += 3;
+            if (env_mut > 400) risk += 2;
+            if (total_infection > 400) risk += 1;
+            risk = risk * 1000 / dr;    // repair gain brakes initiation
+            for (const Relation& rel : relations_of(e.id, "part_of")) {
+                if (rel.b != e.id) continue;
+                Entity* pt = find(rel.a);
+                if (!pt || !pt->alive) continue;
+                if (sev_p != kNoProp) {
+                    const Value* sv = prop_of(*pt, sev_p);
+                    if (sv && sv->i != 0) continue;
+                }
+                if (nec_p != kNoProp) {
+                    const Value* nv = prop_of(*pt, nec_p);
+                    if (nv && nv->i != 0) continue;
+                }
+                const std::int64_t nm = nm_p != kNoProp
+                    ? prop_int(*pt, nm_p, 0) : 0;
+                if (nm == 0) {
+                    // initiation accumulator (Euclid): each 1000 milli-risk
+                    // is one deterministic founding roll.
+                    const std::int64_t s0 = nsa_p != kNoProp
+                        ? prop_int(*pt, nsa_p, 0) : 0;
+                    const std::int64_t sacc = s0 + dt * risk;
+                    std::int64_t rolls = sacc / 1000;
+                    change_on(*pt, nsa_p, s0, sacc - rolls * 1000);
+                    if (rolls > 0) {
+                        if (rolls > 256) rolls = 256;
+                        const std::int64_t rc0 = nr_p != kNoProp
+                            ? prop_int(*pt, nr_p, 0) : 0;
+                        bool founded = false;
+                        std::int64_t done = 0;
+                        for (std::int64_t ri = 0; ri < rolls && !founded; ++ri) {
+                            const std::uint64_t h = Rng::stream_seed(world_seed,
+                                "neoplasm", pt->id ^
+                                static_cast<std::uint64_t>(rc0 + ri));
+                            ++done;
+                            if (h % 1000 < 500) {
+                                change_on(*pt, nm_p, 0, 10);
+                                ev.evidence += "neoplasm initiated; ";
+                                founded = true;
+                            }
+                        }
+                        change_on(*pt, nr_p, rc0, rc0 + done);
+                    }
+                    continue;
+                }
+                // growth: mass accrues, drains host energy + blood, erodes
+                // the part's own wall — all linear in dt.
+                const std::int64_t g0 = na_p != kNoProp
+                    ? prop_int(*pt, na_p, 0) : 0;
+                const std::int64_t gacc = g0 + dt * (2 + nm / 40);
+                const std::int64_t gd = gacc / 1000;
+                const std::int64_t nnm = std::min<std::int64_t>(1000, nm + gd);
+                change_on(*pt, na_p, g0, gacc - gd * 1000);
+                if (nnm != nm) change_on(*pt, nm_p, nm, nnm);
+                if (energy_p != kNoProp && prop_of(e, energy_p)) {
+                    const std::int64_t en = prop_int(e, energy_p, 0);
+                    change(energy_p, en,
+                          std::max<std::int64_t>(0, en - dt * nm / 300));
+                }
+                if (bv_p != kNoProp && prop_of(e, bv_p)) {
+                    const std::int64_t bvx = prop_int(e, bv_p, 1000);
+                    change(bv_p, bvx,
+                          std::max<std::int64_t>(0, bvx - dt * nm / 500));
+                }
+                if (integ_p != kNoProp) {
+                    const std::int64_t pi4 = prop_int(*pt, integ_p, 1000);
+                    change_on(*pt, integ_p, pi4,
+                              std::max<std::int64_t>(0, pi4 - dt * nm / 900));
+                }
+                // metastasis: mass >= 750 seeds a sibling part determin-
+                // istically; an amputated (severed) carrier cannot spread.
+                if (nnm >= 750 && nm_p != kNoProp) {
+                    const std::int64_t m0 = ma_p != kNoProp
+                        ? prop_int(*pt, ma_p, 0) : 0;
+                    const std::int64_t macc = m0 + dt * 4;
+                    std::int64_t mrolls = macc / 1000;
+                    change_on(*pt, ma_p, m0, macc - mrolls * 1000);
+                    if (mrolls > 0) {
+                        if (mrolls > 256) mrolls = 256;
+                        const std::int64_t rc0 = mr_p != kNoProp
+                            ? prop_int(*pt, mr_p, 0) : 0;
+                        // pick a deterministic sibling part per roll
+                        std::vector<EntityId> sibs;
+                        for (const Relation& r2 : relations_of(e.id, "part_of")) {
+                            if (r2.b != e.id || r2.a == rel.a) continue;
+                            Entity* sp = find(r2.a);
+                            if (!sp || !sp->alive) continue;
+                            if (sev_p != kNoProp) {
+                                const Value* sv = prop_of(*sp, sev_p);
+                                if (sv && sv->i != 0) continue;
+                            }
+                            if (prop_int(*sp, nm_p, 0) == 0)
+                                sibs.push_back(sp->id);
+                        }
+                        std::int64_t done = 0;
+                        if (!sibs.empty()) {
+                            for (std::int64_t ri = 0; ri < mrolls; ++ri) {
+                                const std::uint64_t h = Rng::stream_seed(
+                                    world_seed, "metastasis",
+                                    pt->id ^ static_cast<std::uint64_t>(rc0 + ri));
+                                ++done;
+                                Entity* tgt = find(sibs[h % sibs.size()]);
+                                if (tgt && prop_int(*tgt, nm_p, 0) == 0) {
+                                    change_on(*tgt, nm_p, 0, 10);
+                                    ev.evidence += "metastasis; ";
+                                    break;
+                                }
+                            }
+                        } else done = mrolls;
+                        change_on(*pt, mr_p, rc0, rc0 + done);
+                    }
+                }
+            }
+        }
+    }
+
+    const std::int64_t bv = prop_int(e, bv_p, 1000);
+    std::int64_t accum = ba_p != kNoProp ? prop_int(e, ba_p, 0) : 0;
+    std::int64_t nbv = bv;
+    if (total_bleed > 0) {
+        // hemorrhage: bleed_rate is permille blood per 1000 ticks, so
+        // accum (milli-blood) += dt * bleed_rate; drop = accum / 1000.
+        accum += dt * total_bleed;
+        const std::int64_t drop = accum / 1000;
+        accum -= drop * 1000;
+        nbv = std::max<std::int64_t>(0, bv - drop);
+        // deterministic blood pools: one per 500-tick boundary crossed,
+        // capped so a huge batch cannot flood the world in one call.
+        constexpr std::uint64_t kPoolEvery = 500;
+        const std::uint64_t before = (now - dt_u) / kPoolEvery;
+        const std::uint64_t after = now / kPoolEvery;
+        std::uint64_t n = after > before ? after - before : 0;
+        if (n > 4) n = 4;
+        const MaterialDef* bm = materials.find_name("blood");
+        for (std::uint64_t i = 0; i < n; ++i)
+            pools.push_back({e.pos, std::min<std::int64_t>(total_bleed / 5, 200),
+                             bm ? bm->id : kNoMaterial, "blood"});
+    } else {
+        // regeneration: only while fed and watered (energy>0, thirst<800).
+        const std::int64_t energy = energy_p != kNoProp ? prop_int(e, energy_p, 0) : 1;
+        const std::int64_t thirst = thirst_p != kNoProp ? prop_int(e, thirst_p, 0) : 0;
+        if (energy > 0 && thirst < 800 && bv < 1000 && toxin_prev < 400) {
+            accum += dt * 12;                    // +12 permille/tick regen
+            const std::int64_t gain = accum / 1000;
+            accum -= gain * 1000;
+            nbv = std::min<std::int64_t>(1000, bv + gain);
+        }
+    }
+    change(bv_p, bv, nbv);
+    change(ba_p, ba_p != kNoProp ? prop_int(e, ba_p, 0) : 0, accum);
+    // consciousness tracks circulatory volume 1:1 (permille scale),
+    // reduced by fever when total infection exceeds 300.
+    if (cs_p != kNoProp) {
+        const std::int64_t cs = prop_int(e, cs_p, 1000);
+        std::int64_t cs_t = nbv;
+        if (total_infection > 300)
+            cs_t = std::min(cs_t, std::max<std::int64_t>(0, 1000 - total_infection / 4));
+        change(cs_p, cs, cs_t);
+        if (total_infection > 300) {
+            // fever cost: extra energy burn + dehydration + panic
+            // (linear, clamp-once — same LOD contract as the need drift)
+            const PropId ep = pid("energy"), tp2 = pid("thirst");
+            if (ep != kNoProp && prop_of(e, ep)) {
+                const std::int64_t en = prop_int(e, ep, 0);
+                change(ep, en, std::max<std::int64_t>(0, en - dt * 4));
+            }
+            if (tp2 != kNoProp && prop_of(e, tp2)) {
+                const std::int64_t th = prop_int(e, tp2, 0);
+                change(tp2, th, std::min<std::int64_t>(1000, th + dt * 4));
+            }
+            auto mit = minds_.find(e.id);
+            if (mit != minds_.end())
+                mit->second.neuro.panic = std::min<std::int64_t>(1000,
+                    mit->second.neuro.panic + dt * 2);
+        }
+    }
+    // hypovolemic shock: no blood -> clinical death, same reap rule.
+    if (nbv <= 0 && integ_p != kNoProp && prop_of(e, integ_p)) {
+        change(integ_p, prop_int(e, integ_p, 0), 0);
+        e.alive = false;
+        spatial.erase(e.id);
+        ev.evidence += "hypovolemic shock; ";
+    }
+}
+
+void World::commit_drift_spawns(CausalEvent& ev,
+                                std::vector<SpawnSpec>& spawns) {
+    for (const SpawnSpec& s : spawns) {
+        const EntityId nid = create_entity(s.kind, s.material, s.pos, s.props);
+        if (nid == kNoEntity) {
+            ev.evidence += "drift spawn failed: " + s.kind + "; ";
+            continue;
+        }
+        if (!s.genome.loci.empty())
+            if (Entity* ne = find(nid)) ne->genome = s.genome;
+        for (const auto& [type, other] : s.rel_from)
+            relations.relate(other, type, nid);
+        ev.evidence += "spawned " + s.kind + " " + std::to_string(nid) + "; ";
+        ev.spawned.push_back(nid);
+    }
+    spawns.clear();
+}
+
+// Phase 10.4 epidemiology: each entity sheds transmission quanta from its
+// active infections (airborne + contact routes, one shed_accum on the
+// infection entity) or — when the entity IS contaminated waste carrying
+// strain_ref — from the waterborne route. Quanta are Euclid-exact in the
+// Phase 10.4: coupled physiology detector. Infection dynamics, neoplasm
+// growth and fever feedback are nonlinear ODEs — antibody level brakes
+// pathogen growth, pathogen load sets the fever target, toxin load gates
+// oncogenesis. A single batched pass freezes those inputs at call start
+// and diverges from per-tick evaluation; coupled entities therefore replay
+// pending ticks one-by-one (rare — only carriers of active infections,
+// growing tumours, tissue infection, or toxin near feedback thresholds).
+bool World::physiology_coupled(const Entity& e) const {
+    if (!e.alive) return false;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId pl_p = pid("pathogen_load"),
+                 nm_p = pid("neoplasm_mass"),
+                 nsa_p = pid("neoplasm_seed_accum"),
+                 inf_p = pid("infection_level"),
+                 tox_p = pid("toxin_load");
+    // active infections carried by this host
+    for (const Relation& r : relations_of(e.id, "carries")) {
+        if (r.a != e.id) continue;
+        const Entity* ie = find(r.b);
+        if (ie && ie->alive && pl_p != kNoProp &&
+            prop_of(*ie, pl_p) != nullptr)
+            return true;
+    }
+    // the host's own tissue-infection level feeds fever/consciousness
+    if (inf_p != kNoProp && prop_int(e, inf_p, 0) > 0) return true;
+    // parts carrying tumour or tissue-infection state
+    for (const Relation& r : relations_of(e.id, "part_of")) {
+        if (r.b != e.id) continue;
+        const Entity* p = find(r.a);
+        if (!p || !p->alive) continue;
+        if ((nm_p != kNoProp && prop_int(*p, nm_p, 0) > 0) ||
+            (nsa_p != kNoProp && prop_int(*p, nsa_p, 0) > 0) ||
+            (inf_p != kNoProp && prop_int(*p, inf_p, 0) > 0))
+            return true;
+    }
+    // toxin approaching the oncogenic threshold — the neoplasm risk term
+    // flips mid-batch otherwise.
+    if (tox_p != kNoProp && prop_int(e, tox_p, 0) > 300) return true;
+    return false;
+}
+
+// host's pending ticks, so dormant catch-up transmits identically.
+void World::epidemiology_drift(Entity& e, std::int64_t pending,
+                               std::uint64_t now, CausalEvent& ev,
+                               std::vector<SpawnSpec>& out) {
+    (void)now;
+    if (pending <= 0 || !e.alive) return;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId ps_p = pid("pathogen_strain"),
+                 pl_p = pid("pathogen_load"),
+                 ab_p = pid("antibody_level"),
+                 ie_p = pid("infection_elapsed"),
+                 sa_p = pid("shed_accum"),
+                 ila_p = pid("infection_load_accum"),
+                 iba_p = pid("infection_ab_accum"),
+                 sr_p = pid("strain_ref"),
+                 air_p = pid("airborne_rate"),
+                 wat_p = pid("waterborne_rate"),
+                 con_p = pid("contact_rate"),
+                 bv_p = pid("blood_volume"),
+                 br_p = pid("bleed_rate"),
+                 inf_p = pid("infection_level");
+    if (sa_p == kNoProp || ps_p == kNoProp) return;
+
+    auto change_on = [&](Entity& tgt, PropId p, std::int64_t before,
+                         std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch;
+        ch.entity = tgt.id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(before);
+        ch.after = Value::integer(after);
+        tgt.props.set(p, Value::integer(after));
+        ev.changes.push_back(ch);
+    };
+    // organism = circulatory entity (blood_volume resolves); parts, waste
+    // and flora never qualify, so they can neither catch nor spread.
+    auto is_host = [&](const Entity& o) {
+        return o.alive && bv_p != kNoProp && prop_of(o, bv_p) != nullptr;
+    };
+    auto carries_strain = [&](EntityId host, std::int64_t strain_eid) {
+        for (const Relation& r : relations_of(host, "carries")) {
+            if (r.a != host) continue;
+            const Entity* ie = find(r.b);
+            if (!ie || !ie->alive) continue;
+            if (ps_p != kNoProp && prop_int(*ie, ps_p, 0) == strain_eid)
+                return true;
+        }
+        return false;
+    };
+    auto spawn_infection = [&](EntityId host, std::int64_t strain_eid,
+                               std::int64_t load) {
+        Entity* h = find(host);
+        if (!h) return;
+        for (const SpawnSpec& s : out) {
+            bool is_carries = false;
+            for (const auto& [t, o] : s.rel_from)
+                if (t == "carries" && o == host) is_carries = true;
+            if (!is_carries) continue;
+            const Value* v = s.props.get(ps_p);
+            if (v && v->type == ValType::Integer && v->i == strain_eid)
+                return;   // identical infection already queued this pass
+        }
+        SpawnSpec s;
+        s.kind = "infection";
+        s.material = kNoMaterial;
+        s.pos = h->pos;
+        PropertyBag pb;
+        pb.set(ps_p, Value::integer(strain_eid));
+        pb.set(pl_p, Value::integer(load));
+        pb.set(ab_p, Value::integer(0));
+        if (ie_p != kNoProp) pb.set(ie_p, Value::integer(0));
+        if (ila_p != kNoProp) pb.set(ila_p, Value::integer(0));
+        if (iba_p != kNoProp) pb.set(iba_p, Value::integer(0));
+        if (sa_p != kNoProp) pb.set(sa_p, Value::integer(0));
+        s.props = pb;
+        s.rel_from.push_back({"carries", host});
+        out.push_back(std::move(s));
+    };
+    // deterministic target pick: sorted candidates + stream hash
+    auto pick_target = [&](const std::vector<EntityId>& cands,
+                           std::uint64_t mix, std::int64_t exclude_strain,
+                           std::int64_t radius_kind) -> EntityId {
+        std::vector<EntityId> ok;
+        for (EntityId cid : cands) {
+            const Entity* o = find(cid);
+            if (!o || !is_host(*o) || o->id == e.id) continue;
+            if (exclude_strain > 0 && carries_strain(cid, exclude_strain))
+                continue;
+            if (radius_kind == 1) {   // contact route: needs an open wound
+                bool wounded = br_p != kNoProp && prop_int(*o, br_p, 0) > 0;
+                if (!wounded && inf_p != kNoProp &&
+                    prop_int(*o, inf_p, 0) > 200) wounded = true;
+                if (!wounded) continue;
+            }
+            ok.push_back(cid);
+        }
+        if (ok.empty()) return kNoEntity;
+        std::sort(ok.begin(), ok.end());
+        const std::uint64_t h = Rng::stream_seed(seed, "epidemic_pick",
+                                                e.id * 1315423911ull ^ mix);
+        return ok[h % ok.size()];
+    };
+
+    // ---- waterborne: this entity is shed waste stamped with strain_ref ----
+    if (sr_p != kNoProp && prop_of(e, sr_p)) {
+        const std::int64_t seid = prop_int(e, sr_p, 0);
+        Entity* strain = seid > 0 ? find(static_cast<EntityId>(seid)) : nullptr;
+        if (strain && strain->alive) {
+            const std::int64_t rate = wat_p != kNoProp
+                ? prop_int(*strain, wat_p, 0) : 0;
+            if (rate > 0) {
+                const std::int64_t a0 = prop_int(e, sa_p, 0);
+                const std::int64_t acc = a0 + pending * rate;
+                const std::int64_t quanta = acc / 1000;
+                // remainder persists EVERY call — otherwise per-tick
+                // evaluation (rate < 1000) never crosses a quantum and
+                // the accumulator silently resets each tick.
+                change_on(e, sa_p, a0, acc - quanta * 1000);
+                if (quanta > 0) {
+                    const std::int64_t q = std::min<std::int64_t>(quanta, 8);
+                    for (std::int64_t i = 0; i < q; ++i) {
+                        const std::vector<EntityId> near =
+                            spatial.within(e.pos, 48);
+                        const EntityId t = pick_target(near,
+                            static_cast<std::uint64_t>(acc) +
+                            static_cast<std::uint64_t>(i) * 977,
+                            seid, 0);
+                        if (t != kNoEntity) {
+                            spawn_infection(t, seid, 60);
+                            ev.evidence += "waterborne transmission; ";
+                        }
+                    }
+                }
+            }
+        }
+        return;   // waste hosts no infections of its own
+    }
+
+    // ---- airborne + contact: shed by each active infection on this host --
+    if (!is_host(e)) return;
+    for (const Relation& rel : relations_of(e.id, "carries")) {
+        if (rel.a != e.id) continue;
+        Entity* ie = find(rel.b);
+        if (!ie || !ie->alive) continue;
+        const std::int64_t seid = ps_p != kNoProp
+            ? prop_int(*ie, ps_p, 0) : 0;
+        Entity* strain = seid > 0 ? find(static_cast<EntityId>(seid)) : nullptr;
+        if (!strain || !strain->alive) continue;
+        const std::int64_t air = air_p != kNoProp
+            ? prop_int(*strain, air_p, 0) : 0;
+        const std::int64_t con = con_p != kNoProp
+            ? prop_int(*strain, con_p, 0) : 0;
+        const std::int64_t rate = air + con;
+        if (rate <= 0) continue;
+        const std::int64_t a0 = prop_int(*ie, sa_p, 0);
+        const std::int64_t acc = a0 + pending * rate;
+        const std::int64_t quanta = acc / 1000;
+        // remainder persists every call (see waterborne branch above).
+        change_on(*ie, sa_p, a0, acc - quanta * 1000);
+        if (quanta <= 0) continue;
+        const std::int64_t q = std::min<std::int64_t>(quanta, 8);
+        for (std::int64_t i = 0; i < q; ++i) {
+            // route split by the strain's own channel rates
+            const std::uint64_t h = Rng::stream_seed(seed, "epidemic_route",
+                ie->id ^ static_cast<std::uint64_t>(acc + i));
+            const bool airborne = air > 0 &&
+                (con <= 0 || h % static_cast<std::uint64_t>(rate) <
+                 static_cast<std::uint64_t>(air));
+            const std::vector<EntityId> near = airborne
+                ? spatial.within(e.pos, 96) : spatial.within(e.pos, 24);
+            const EntityId t = pick_target(near,
+                static_cast<std::uint64_t>(acc) +
+                static_cast<std::uint64_t>(i) * 977 +
+                (airborne ? 0x9E3779B9ull : 0x85EBCA6Bull),
+                seid, airborne ? 0 : 1);
+            if (t != kNoEntity) {
+                spawn_infection(t, seid, airborne ? 50 : 80);
+                ev.evidence += airborne ? "airborne transmission; "
+                                        : "contact transmission; ";
+            }
+        }
+    }
 }
 
 void World::metabolize(std::int64_t dt) {
@@ -868,6 +2370,8 @@ void World::metabolize(std::int64_t dt) {
     ev.action = "metabolize";
     ev.applied_laws.push_back(6);                      // physiology.metabolism
     bool any = false;
+    std::vector<ShedPool> shed_pools;
+    std::vector<SpawnSpec> drift_spawns;
     for (const auto& ep : entities) {
         Entity& e = *ep;
         if (!e.alive) continue;
@@ -911,11 +2415,50 @@ void World::metabolize(std::int64_t dt) {
         }
         if (!maybe) { e.last_metabolized = now; continue; }
         if (pending == 0) { e.last_metabolized = now; continue; }
-        if (drift_needs(e, pending, np, ev)) {
+        bool drifted = false;
+        const std::size_t chg0 = ev.changes.size();
+        if (pending > 1 && physiology_coupled(e)) {
+            // coupled physiology replays tick-by-tick — the only way a
+            // batched catch-up stays bit-identical to advance(1) x N.
+            for (std::uint64_t k = 0; k < pending && e.alive; ++k) {
+                const std::uint64_t sub_now = now - pending + k + 1;
+                if (drift_needs(e, 1, np, ev)) drifted = true;
+                anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
+                epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
+            }
+        } else {
+            drifted = drift_needs(e, pending, np, ev);
+            // Phase 10: circulation for blood_volume carriers.
+            anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
+            epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                               drift_spawns);
+        }
+        if (drifted || ev.changes.size() != chg0) {
             ev.participants.push_back(e.id);
             any = true;
         }
         e.last_metabolized = now;
+    }
+    // shed waste lands as material entities — World Truth grows causally
+    // inside the same metabolize event (blood pools, feces, urine).
+    if (!shed_pools.empty()) {
+        const PropId qty = props.find_name("quantity")
+            ? props.find_name("quantity")->id : kNoProp;
+        for (const ShedPool& sp : shed_pools) {
+            PropertyBag pb;
+            if (qty != kNoProp) pb.set(qty, Value::integer(sp.amount));
+            const EntityId bid = create_entity(
+                sp.kind, sp.material, sp.pos, pb);
+            if (bid != kNoEntity) {
+                ev.spawned.push_back(bid);
+                ev.evidence += sp.kind + " " + std::to_string(bid) + "; ";
+                any = true;
+            }
+        }
+    }
+    if (!drift_spawns.empty()) {
+        commit_drift_spawns(ev, drift_spawns);
+        any = true;
     }
     if (any) {
         ev.evidence = "needs drift with metabolism; " + ev.evidence;
@@ -1259,6 +2802,23 @@ InteractionResult World::interact(const InteractionContext& ctx) {
                 parts.push_back(t);
         flush_needs(parts);
     }
+    // Phase 10: clinical unconsciousness (blood_volume < 300 ->
+    // consciousness < 300) bars ALL voluntary action — one gate, every
+    // verb. Non-circulatory entities have no consciousness prop -> pass.
+    if (ctx.actor != kNoEntity) {
+        if (const Entity* ae = find(ctx.actor)) {
+            const PropId cs_p = props.find_name("consciousness")
+                ? props.find_name("consciousness")->id : kNoProp;
+            if (cs_p != kNoProp) {
+                const Value* cv = prop_of(*ae, cs_p);
+                if (cv && cv->type == ValType::Integer && cv->i < 300) {
+                    res.failure = "unconscious (consciousness " +
+                        std::to_string(cv->i) + ")";
+                    return res;
+                }
+            }
+        }
+    }
     // Pass 1: first supporting law model predicts (deterministic order).
     PredictionResult pred;
     const INaturalLawModel* used = nullptr;
@@ -1436,6 +2996,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         }
         for (const auto& [type, other] : s.rel_from)
             relations.relate(other, type, nid);
+        // Phase 10: newborns of species with a body plan grow anatomy.
+        if (build_anatomy(nid))
+            ev.evidence += "anatomy " + std::to_string(nid) + "; ";
         ev.evidence += "spawned " + std::to_string(nid) + " " + s.kind + "; ";
         res.spawned.push_back(nid);
     }

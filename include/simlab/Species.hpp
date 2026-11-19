@@ -13,6 +13,19 @@ namespace simlab {
 // A species is HABITAT DATA: which climate/terrain conditions let an organism
 // live, plus the material/props of an individual. Adding a species = editing
 // data/species.txt; worldgen contains no species names.
+// One anatomical part in a species body plan (Phase 10): spawned as a
+// contained `part_of` child entity with its own layered material.
+struct PartSpec {
+    std::string name;          // entity kind suffix, e.g. "eye_l"
+    MaterialId material = kNoMaterial;
+    std::string slot;          // body_slot: head/torso/arm_l/leg_r/...
+    std::string role;          // part_role: eye/heart/lung/arm/leg/brain/...
+    std::int64_t vital = 0;    // vital_organ permille: 1000 = lethal to lose
+    std::int64_t size = 200;   // part_size permille: hit-weight within parent
+    PropId blood_p = kNoProp;  // resolved blood_volume prop (shared)
+    PropertyBag extra;         // optional key=value organ props (lumen mechanics)
+};
+
 struct SpeciesDef {
     std::uint32_t id = 0;
     std::string name;
@@ -22,6 +35,7 @@ struct SpeciesDef {
     std::vector<FormationCondition> conditions;  // habitat (all must hold)
     PropertyBag props;                           // per-individual props
     std::vector<PropId> genes;                   // hereditary loci (Phase 7)
+    std::vector<PartSpec> anatomy;               // body plan (Phase 10)
     std::string provenance;
 };
 

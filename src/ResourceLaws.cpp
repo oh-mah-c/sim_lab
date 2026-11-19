@@ -67,8 +67,10 @@ PredictionResult ExtractionModel::predict(const World& w, const InteractionConte
     const std::int64_t E0 = ctx.parameters.force > 0 ? ctx.parameters.force : 1000;
     // Nhịp 4c: motor_precision scales extraction yield AND fracture force.
     const PropId motor_pid = pid(w, "mind_motor_precision");
-    const std::int64_t motor = motor_pid != kNoProp
+    const std::int64_t motor0 = motor_pid != kNoProp
         ? w.prop_int(*actor, motor_pid, 1000) : 1000;
+    const std::int64_t motor = motor0 * anatomy_motor(w, *actor) / 1000;
+    if (!conscious_enough(w, *actor, r)) return r;
     const std::int64_t E = E0 * (1000 + tedge) / 1000 * motor / 1000;
     const PropId reach_pid = pid(w, "reach"), energy_pid = pid(w, "energy"),
                  contained_pid = pid(w, "contained");

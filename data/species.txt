@@ -85,6 +85,51 @@ species grazer
   mutation_rate 30
   energy 60000
   max_energy 100000
+  # circulation baseline (Phase 10): full blood, no pain, awake
+  blood_volume 1000
+  blood_accum 0
+  pain_level 0
+  consciousness 1000
+  bleed_rate 0
+  bleed_accum 0
+  # gut/toxin baseline (Phase 10.3): awaiting matter pools + clean blood
+  undigested_mass 0
+  undigested_fluid 0
+  toxin_load 0
+  toxin_accum 0
+  # thermoregulation & immunity baseline (Phase 10.4): species-relative —
+  # a 390-set-point species does not fever at 390, a 370 one does.
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1000
+  immune_power_base 1000
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  # body plan (Phase 10): head/torso/limbs/organs as contained part_of
+  # children. Materials are the dominant load layer; vital_organ 1000
+  # parts kill the body when destroyed or severed.
+  body_part head     skin    head  head   400  250
+  body_part eye_l    organ   head  eye    0    60
+  body_part eye_r    organ   head  eye    0    60
+  body_part brain    organ   head  brain  1000 80 vital_neural=1
+  body_part torso    muscle  torso torso  200  300
+  body_part heart    organ   torso heart  1000 90
+  body_part lung_l   organ   torso lung   800  110
+  body_part lung_r   organ   torso lung   800  110
+  body_part arm_l    muscle  arm_l arm    0    140
+  body_part arm_r    muscle  arm_r arm    0    140
+  body_part leg_l    bone    leg_l leg    0    160
+  body_part leg_r    bone    leg_r leg    0    160
+  body_part kidney_l organ   kidney kidney 500  70 filtration_rate=600
+  body_part kidney_r organ   kidney kidney 500  70 filtration_rate=600
+  body_part bladder  organ   torso bladder 400  80 lumen_capacity=1000 contractility=900 evacuate_material=urine upstream_organ_slot=kidney contents_load=0 contents_accum=0 content_viscosity=0 viscosity_accum=0 organ_stress_accum=0 ruptured=0
+  body_part bowel    organ   torso bowel   200  120 lumen_capacity=1000 contractility=850 evacuate_material=feces upstream_organ_slot=stomach contents_load=0 contents_accum=0 content_viscosity=0 viscosity_accum=0 organ_stress_accum=0 ruptured=0
   gene speed
   gene metabolism
   gene sight_range

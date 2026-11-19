@@ -217,6 +217,22 @@ public:
     std::unique_ptr<INaturalLawModel> clone() const override;
 };
 
+// Primitive medicine (Phase 10.2): one generic verb, zero recipe table.
+//   "treat" — actor applies targets[1] (a material/entity) onto targets[0]
+//   (the patient: self or another organism). The material's PHYSICAL props
+//   decide the effect — absorbency dresses wounds, antiseptic fights
+//   infection, temperature>=50C cauterizes. No herb names, no formulas:
+//   a material is a dressing because its numbers say so.
+class TreatModel final : public INaturalLawModel {
+public:
+    LawId id() const override;
+    const char* name() const override { return "physiology.treat"; }
+    std::vector<std::string> domains() const override { return {"biological", "physical"}; }
+    bool supports(const World& w, const InteractionContext& ctx) const override;
+    PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
+    std::unique_ptr<INaturalLawModel> clone() const override;
+};
+
 // Biological reproduction & heredity (TODO §8.4/§12.1). One generic action:
 //   "reproduce" — actor + one partner target. Both must be living organisms
 //   with compatible genomes (same kind + identical locus set), adult

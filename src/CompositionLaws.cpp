@@ -25,6 +25,7 @@
 
 #include "simlab/Laws.hpp"
 #include "simlab/World.hpp"
+#include "LawUtil.hpp"
 #include "simlab/Geometry.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -275,8 +276,11 @@ static PredictionResult predict_assemble(const World& w,
     // Nhịp 4c: a master's binding preserves more of the weakest link's
     // soundness; a clumsy artisan leaves a fragile composite (min 1 —
     // integrity 0 would mean the product dies at birth).
-    const std::int64_t motor = motor_pid != kNoProp
+    const std::int64_t motor0 = motor_pid != kNoProp
         ? w.prop_int(*actor, motor_pid, 1000) : 1000;
+    // Phase 10: lost arms / low blood degrade craft precision the same
+    // way they degrade strike force.
+    const std::int64_t motor = motor0 * lawutil::anatomy_motor(w, *actor) / 1000;
     seti(integ_pid, std::clamp<std::int64_t>(min_integ * motor / 1000, 1, 1000));
     if (hard_pid != kNoProp) seti(hard_pid, wavg(w_hard, total_mass));
     if (brit_pid != kNoProp) seti(brit_pid, wavg(w_brit, total_mass));

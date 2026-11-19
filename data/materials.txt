@@ -32,6 +32,8 @@ material dry_wood
   residue charcoal
   residue_share 250
 
+  absorbency 400
+  contamination 200
 material hardwood
   hardness 500
   brittleness 400
@@ -56,6 +58,8 @@ material hardwood
   residue charcoal
   residue_share 250
 
+  absorbency 300
+  contamination 250
 material stone
   hardness 800
   brittleness 300
@@ -78,6 +82,7 @@ material stone
   edge 500
   length 0
 
+  contamination 300
 material flint
   hardness 950
   brittleness 850
@@ -100,6 +105,7 @@ material flint
   edge 900
   length 0
 
+  contamination 350
 material obsidian
   hardness 980
   brittleness 900
@@ -123,6 +129,7 @@ material obsidian
   length 0
 
 # ---- raw substances (natural occurrences yield these before processing) ------
+  contamination 400
 material copper_ore
   hardness 600
   brittleness 500
@@ -142,6 +149,7 @@ material copper_ore
   geom_wid 100
   geom_thk 100
 
+  contamination 500
 material iron_ore
   hardness 700
   brittleness 450
@@ -161,6 +169,7 @@ material iron_ore
   geom_wid 100
   geom_thk 100
 
+  contamination 600
 material host_rock
   hardness 750
   brittleness 350
@@ -177,6 +186,7 @@ material host_rock
   opacity 1000
 
 # ---- geological materials (lithology: 1=igneous 2=sedimentary 3=metamorphic) --
+  contamination 400
 material granite
   hardness 900
   brittleness 250
@@ -193,6 +203,7 @@ material granite
   opacity 1000
   lithology 1
 
+  contamination 300
 material basalt
   hardness 950
   brittleness 300
@@ -209,6 +220,7 @@ material basalt
   opacity 1000
   lithology 1
 
+  contamination 350
 material sandstone
   hardness 650
   brittleness 500
@@ -225,6 +237,7 @@ material sandstone
   opacity 1000
   lithology 2
 
+  contamination 450
 material limestone
   hardness 800
   brittleness 400
@@ -241,6 +254,7 @@ material limestone
   opacity 1000
   lithology 2
 
+  contamination 400
 material shale
   hardness 500
   brittleness 600
@@ -257,6 +271,7 @@ material shale
   opacity 1000
   lithology 2
 
+  contamination 500
 material marble
   hardness 850
   brittleness 350
@@ -274,6 +289,7 @@ material marble
   lithology 3
 
 # ---- soils (top stratum; type follows parent rock + climate) -------------------
+  contamination 350
 material soil_sand
   hardness 150
   brittleness 800
@@ -290,6 +306,8 @@ material soil_sand
   opacity 1000
   soil_texture 1
 
+  contamination 800
+  absorbency 500
 material soil_loam
   hardness 200
   brittleness 700
@@ -306,6 +324,8 @@ material soil_loam
   opacity 1000
   soil_texture 2
 
+  contamination 800
+  absorbency 500
 material soil_clay
   hardness 250
   brittleness 650
@@ -323,6 +343,8 @@ material soil_clay
   soil_texture 3
 
 # ---- organic / energy substances ----------------------------------------------
+  contamination 800
+  absorbency 500
 material coal
   hardness 250
   brittleness 700
@@ -343,6 +365,7 @@ material coal
   geom_wid 80
   geom_thk 80
 
+  contamination 600
 material gold_placer
   hardness 400
   brittleness 550
@@ -363,6 +386,7 @@ material gold_placer
   geom_thk 60
 
 # Quartz-hosted gold: hydrothermal vein fill (forms along faults, see deposits.txt).
+  contamination 700
 material gold_quartz
   hardness 700
   brittleness 450
@@ -383,6 +407,7 @@ material gold_quartz
   geom_thk 60
 
 # Animal body (fauna species in species.txt are made of it).
+  contamination 500
 material flesh
   hardness 30
   brittleness 100
@@ -403,6 +428,8 @@ material flesh
   tensile 250
 
 # ---- processed / fuel / waste materials (Phase 3 processing outputs) ----------
+  contamination 300
+  absorbency 200
 material copper_metal
   hardness 700
   brittleness 300
@@ -423,6 +450,7 @@ material copper_metal
   geom_wid 60
   geom_thk 60
 
+  contamination 250
 material charcoal
   hardness 100
   brittleness 800
@@ -443,6 +471,11 @@ material charcoal
   geom_wid 60
   geom_thk 60
 
+  mutagenic 250
+
+  antiseptic 600
+  absorbency 700
+  contamination 100
 material slag
   hardness 800
   brittleness 200
@@ -462,6 +495,7 @@ material slag
   geom_wid 80
   geom_thk 80
 
+  contamination 600
 material iron_blade
   hardness 900
   brittleness 200
@@ -480,6 +514,7 @@ material iron_blade
 
 # ---- forageable wild food (physiology: nutrition/hydration are World Truth --
 # agents must discover edibility by consuming or by witness, never by lookup)
+  contamination 200
 material wild_berries
   hardness 50
   brittleness 900
@@ -503,8 +538,12 @@ material wild_berries
   geom_wid 60
   geom_thk 60
 
+  antipyretic 400
+
 # poisonous look-alike: edible-ish but toxic — consuming damages the eater's
 # integrity. Learned the hard way: taste-test, death, witnessed taboo.
+  antiseptic 300
+  contamination 150
 material nightshade
   hardness 50
   brittleness 900
@@ -523,6 +562,7 @@ material nightshade
   nutrition 150
   hydration 100
   toxicity 250
+  mutagenic 700
   tensile 100
   geom_type 3
   geom_len 60
@@ -532,6 +572,8 @@ material nightshade
 # living bush wood: the BODY of fruiting flora (berry_bush etc). Tough and
 # effectively non-perishing — it dies only to physical damage (strike/heat),
 # never because its fruit was eaten or spoiled.
+  antiseptic 500
+  contamination 400
 material living_wood
   hardness 200
   brittleness 300
@@ -560,6 +602,9 @@ material living_wood
 # terrain moisture/temperature satisfy the sprout_* band (material defaults,
 # instance-overridable). sprout_target on the instance names the species it
 # becomes; sprout_material is the fallback when the target is not a species.
+  absorbency 500
+  antiseptic 450
+  contamination 200
 material dormant_seed
   hardness 50
   brittleness 900
@@ -582,6 +627,7 @@ material dormant_seed
 
 # Dead-wood litter — the non-living half of a plant's death_drops manifest.
 # Pure debris: no sprout_* props, so it only rots away.
+  contamination 250
 material wood_debris
   hardness 80
   brittleness 950
@@ -597,3 +643,169 @@ material wood_debris
   sight_range 0
   speed 0
   opacity 1000
+
+# ---- biological tissue & body fluids (Phase 10 anatomy) -------------------
+# Layered body materials: skin resists cuts, muscle transmits force,
+# bone takes compression but snaps, organ is soft and vital, blood seeps.
+  absorbency 600
+  contamination 500
+material skin
+  hardness 200
+  brittleness 600
+  mass 8000
+  density 1090000
+  integrity 500
+  decay_rate 50
+  flammability 100
+  thermal_mass 3600
+  conductivity 40
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 900
+  nutrition 100
+  hydration 600
+  tensile 400
+  edge 100
+
+  absorbency 400
+  contamination 250
+material muscle
+  hardness 80
+  brittleness 300
+  mass 105000
+  density 1060000
+  integrity 400
+  decay_rate 200
+  flammability 0
+  thermal_mass 3700
+  conductivity 45
+  fertility 0
+  metabolism 50
+  sight_range 0
+  speed 0
+  opacity 950
+  nutrition 500
+  hydration 750
+  tensile 600
+  edge 150
+
+  contamination 300
+material bone
+  hardness 800
+  brittleness 850
+  mass 1900000
+  density 1900000
+  integrity 900
+  decay_rate 5
+  flammability 0
+  thermal_mass 500
+  conductivity 20
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 50
+  hydration 100
+  tensile 900
+  edge 300
+
+  contamination 150
+material organ
+  hardness 40
+  brittleness 200
+  mass 1030000
+  density 1030000
+  integrity 250
+  decay_rate 400
+  flammability 0
+  thermal_mass 3800
+  conductivity 55
+  fertility 0
+  metabolism 100
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 300
+  hydration 800
+  tensile 200
+  edge 50
+
+  contamination 400
+material blood
+  hardness 0
+  brittleness 100
+  mass 1060000
+  density 1060000
+  integrity 100
+  decay_rate 300
+  flammability 0
+  thermal_mass 3900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 600
+  nutrition 400
+  hydration 500
+  tensile 50
+  edge 0
+  odor 800
+
+  contamination 350
+
+# ---- metabolic waste (Phase 10.3): entity-level filth that fertilizes ----
+material feces
+  hardness 100
+  brittleness 0
+  mass 300
+  density 1200000
+  integrity 300
+  decay_rate 120
+  flammability 700
+  thermal_mass 800
+  conductivity 80
+  fertility 800
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 400
+  nutrition 0
+  hydration 0
+  tensile 10
+  edge 0
+  odor 800
+
+  contamination 900
+  nutrient 850
+  moisture 400
+  viscosity 650
+
+material urine
+  hardness 0
+  brittleness 0
+  mass 100
+  density 1000000
+  integrity 200
+  decay_rate 250
+  flammability 0
+  thermal_mass 3900
+  conductivity 60
+  fertility 300
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 200
+  nutrition 0
+  hydration 0
+  tensile 0
+  edge 0
+  odor 550
+
+  contamination 350
+  nutrient 500
+  moisture 950
+  viscosity 100

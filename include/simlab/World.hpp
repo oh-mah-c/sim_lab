@@ -59,6 +59,14 @@ public:
     bool load_content(const std::string& data_dir, std::string* err = nullptr);
 
     // ---- entities ----
+    // Phase 10 anatomy: if `kind_name` resolves to a species with a body
+    // plan, spawn contained part_of children (integrity 1000 each) and
+    // return true. Idempotent — bodies already carrying parts are skipped.
+    bool build_anatomy(EntityId body);
+    // Functional fraction (permille 0..1000) of attached, undamaged parts
+    // matching `role` (eye/leg/arm/...). Severed or destroyed parts count
+    // against function; entities without anatomy return 1000.
+    std::int64_t anatomy_function(EntityId body, const char* role) const;
     EntityId create_entity(const std::string& kind_name, MaterialId material,
                            Vec2 pos, const PropertyBag& overrides = {});
     Entity* find(EntityId id);
@@ -261,6 +269,38 @@ private:
     // Apply dt ticks of need/age drift to one entity; appends StateChanges
     // to ev. Returns true if the entity's props changed. Handles the
     // integrity-0 reap inline (starvation death is immediate, not next pass).
+    // A waste deposit an organism sheds (blood pool, feces, urine) —
+    // committed as a real entity after the drift loop, causally.
+    struct ShedPool {
+        Vec2 pos{};
+        std::int64_t amount = 0;
+        MaterialId material = kNoMaterial;
+        std::string kind;
+    };
+    // Phase 10 circulation + 10.3 excretion: blood loss/regen/clotting,
+    // consciousness, gut/bladder fill, retention pathology for
+    // anatomical bodies. Mutates entity props like drift_needs; appends
+    // shed-waste spawn requests to `pools` for post-loop commit.
+    void anatomy_drift(Entity& e, std::uint64_t dt, std::uint64_t now,
+                       CausalEvent& ev, std::vector<ShedPool>& pools,
+                       std::vector<SpawnSpec>* xspawns = nullptr);
+    // Phase 10.4 epidemiology: transmission quanta shed by this entity's
+    // active infections (airborne/contact routes) or by contaminated waste
+    // it IS (waterborne route via strain_ref). Appends infection SpawnSpecs
+    // to `out`; all bookkeeping writes are causal StateChanges.
+    void epidemiology_drift(Entity& e, std::int64_t pending,
+                            std::uint64_t now, CausalEvent& ev,
+                            std::vector<SpawnSpec>& out);
+    // True when this entity's physiology has state feedback that a single
+    // batched pass cannot reproduce bit-identically (active infections,
+    // neoplasm growth/initiation, tissue infection near fever thresholds,
+    // toxin load near the oncogenic threshold). Coupled entities replay
+    // pending ticks one-by-one inside metabolize — rare, and the only way
+    // dt=1 x N stays exact for nonlinear ODEs.
+    bool physiology_coupled(const Entity& e) const;
+    // Materialize drift-proposed spawns (infections, mutant strains) after
+    // the metabolize entity loop — create_entity + relations + ledger.
+    void commit_drift_spawns(CausalEvent& ev, std::vector<SpawnSpec>& spawns);
     bool drift_needs(Entity& e, std::uint64_t dt, const NeedProps& np,
                      CausalEvent& ev);
     // Catch dormant participants up to the current tick (ledgered as a

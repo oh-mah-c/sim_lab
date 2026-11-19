@@ -35,7 +35,9 @@ enum class ProblemKind : std::uint8_t {
     ExtraGoal,            // caller-supplied goal that has no satisfying plan yet
     Threat,               // recent ledger: the NPC's integrity was damaged
     CapabilityGap,        // recent ledger: attempts refused on force/reach/energy
-    BondedDistress        // a dearly-held engram shows inferred need/threat
+    BondedDistress,       // a dearly-held engram shows inferred need/threat
+    SomaticTrauma,        // own body: open wound bleeding or infected
+    Evacuate              // own hollow organ: contents_load demands relief
 };
 struct Problem {
     ProblemKind kind = ProblemKind::UnmetNeed;

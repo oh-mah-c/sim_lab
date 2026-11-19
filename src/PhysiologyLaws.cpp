@@ -18,10 +18,12 @@
 
 #include "simlab/Laws.hpp"
 #include "simlab/World.hpp"
+#include "LawUtil.hpp"
 #include <algorithm>
 #include <sstream>
 
 namespace simlab {
+using namespace lawutil;
 namespace {
 
 constexpr std::int64_t kDefaultReach = 64;
@@ -106,6 +108,8 @@ static PredictionResult predict_consume(const World& w,
     bool hunger_dirty = false, thirst_dirty = false;
     std::int64_t energy_gain = 0;   // milliJ metabolized from eaten nutrition
     std::int64_t harm = 0;          // integrity-scale damage from toxins
+    std::int64_t mass_gain = 0;     // solid matter awaiting the gut (10.3)
+    std::int64_t fluid_gain = 0;    // liquid awaiting the kidneys (10.3)
 
     for (EntityId tid : ctx.targets) {
         if (tid == ctx.actor) continue;                    // cannot eat oneself
@@ -200,6 +204,11 @@ static PredictionResult predict_consume(const World& w,
             thirst_after = std::max<std::int64_t>(0, thirst_after - hyd * units);
             thirst_dirty = true;
         }
+        // digestion bookkeeping: relief is instant, but the matter itself
+        // still has to pass through — undigested load feeds bowel/bladder
+        // fill in anatomy_drift (Phase 10.3).
+        if (nut > 0) mass_gain += nut * units * 4;
+        if (hyd > 0) fluid_gain += hyd * units * 4;
         // toxin: `toxicity` (permille of the integrity scale per unit, read
         // from the FOOD source — fruit material for flora, entity material
         // otherwise) damages the EATER — relief and poison arrive together,
@@ -217,6 +226,16 @@ static PredictionResult predict_consume(const World& w,
     }
 
     // emit accumulated need relief once per prop (see note above)
+    {
+        const PropId um_p = prop_id(w, "undigested_mass");
+        const PropId uf_p = prop_id(w, "undigested_fluid");
+        if (mass_gain > 0 && um_p != kNoProp && w.prop_of(*actor, um_p))
+            set_change(r, ctx.actor, um_p, w.prop_int(*actor, um_p, 0),
+                       w.prop_int(*actor, um_p, 0) + mass_gain);
+        if (fluid_gain > 0 && uf_p != kNoProp && w.prop_of(*actor, uf_p))
+            set_change(r, ctx.actor, uf_p, w.prop_int(*actor, uf_p, 0),
+                       w.prop_int(*actor, uf_p, 0) + fluid_gain);
+    }
     if (hunger_dirty)
         set_change(r, ctx.actor, hunger, w.prop_int(*actor, hunger, 0), hunger_after);
     if (thirst_dirty)
@@ -289,23 +308,306 @@ static PredictionResult predict_rest(const World& w,
     return r;
 }
 
+// ---- evacuate (Phase 10.3): generic hollow-organ voiding ---------------------
+// Actor-only-ish verb: targets[0] is the LUMEN PART to evacuate (must be a
+// part_of child of the actor). Everything reads part props — lumen_capacity,
+// contents_load, content_viscosity, contractility, infection_level,
+// evacuate_material — no organ names. Viscosity above contractility means
+// mechanical obstruction: the attempt fails physically, load stays, pain
+// spikes. Near-threshold or infected contents pass but hurt and bleed.
+static PredictionResult predict_evacuate(const World& w,
+                                         const InteractionContext& ctx) {
+    PredictionResult r;
+    r.law = 6; r.law_name = "physiology.metabolism";
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    if (ctx.targets.empty()) { r.failure = "evacuate needs an organ target"; return r; }
+    const EntityId part_id = ctx.targets[0];
+    const Entity* part = w.find(part_id);
+    if (!part || !part->alive) { r.failure = "no such organ"; return r; }
+    // must be an attached part of the actor
+    bool attached = false;
+    for (const Relation& rel : w.relations_of(ctx.actor, "part_of"))
+        if (rel.b == ctx.actor && rel.a == part_id) { attached = true; break; }
+    if (!attached) { r.failure = "organ is not part of the actor"; return r; }
+
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = w.props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId lc = pid("lumen_capacity"), cl = pid("contents_load"),
+               ca = pid("contents_accum"), cv = pid("content_viscosity"),
+               ct = pid("contractility"), em = pid("evacuate_material"),
+               pain = pid("pain_level"), bleed = pid("bleed_rate"),
+               inf = pid("infection_level"), energy = pid("energy"),
+               qty = pid("quantity"), integ = pid("integrity");
+    if (lc == kNoProp || w.prop_int(*part, lc, 0) <= 0) {
+        r.failure = "target has no lumen"; return r;
+    }
+    const std::int64_t load = cl != kNoProp ? w.prop_int(*part, cl, 0) : 0;
+    if (load < 50) { r.failure = "organ is empty"; return r; }
+    const std::int64_t visc = cv != kNoProp ? w.prop_int(*part, cv, 0) : 0;
+    const std::int64_t contract = ct != kNoProp ? w.prop_int(*part, ct, 0) : 0;
+    const std::int64_t pinf = inf != kNoProp ? w.prop_int(*part, inf, 0) : 0;
+
+    // mechanical obstruction: contents thicker than the wall can push —
+    // nothing passes, but the strain still hurts.
+    const bool obstructed = visc > contract;
+    // near-threshold or inflamed contents pass with trauma
+    const bool painful = !obstructed &&
+        ((visc >= contract - 200 && visc <= contract) || pinf > 200);
+
+    if (!lawutil::charge_energy(*actor, energy, 300, r)) {
+        r.possible = false; r.changes.clear(); r.spawns.clear(); r.notes.clear();
+        return r;
+    }
+    r.possible = true;
+    r.ticks = 100;
+    if (obstructed) {
+        if (pain != kNoProp && w.prop_of(*actor, pain))
+            set_change(r, ctx.actor, pain, w.prop_int(*actor, pain, 0),
+                       std::min<std::int64_t>(1000,
+                           w.prop_int(*actor, pain, 0) + 300));
+        r.notes.push_back("evacuate obstructed: viscosity " +
+                          std::to_string(visc) + " > contractility " +
+                          std::to_string(contract));
+        return r;
+    }
+    // success: contents leave through the wall as the declared material
+    set_change(r, part_id, cl, load, 0);
+    if (ca != kNoProp && w.prop_of(*part, ca))
+        set_change(r, part_id, ca, w.prop_int(*part, ca, 0), 0);
+    if (painful) {
+        if (pain != kNoProp && w.prop_of(*actor, pain))
+            set_change(r, ctx.actor, pain, w.prop_int(*actor, pain, 0),
+                       std::min<std::int64_t>(1000,
+                           w.prop_int(*actor, pain, 0) + 550));
+        if (bleed != kNoProp && w.prop_of(*part, bleed))
+            set_change(r, part_id, bleed, w.prop_int(*part, bleed, 0),
+                       std::min<std::int64_t>(1000,
+                           w.prop_int(*part, bleed, 0) + 15));
+    }
+    std::string evac_name = "waste";
+    if (em != kNoProp) {
+        const Value* ev = w.prop_of(*part, em);
+        if (ev && ev->type == ValType::Text && !ev->s.empty()) evac_name = ev->s;
+    }
+    SpawnSpec sp;
+    sp.kind = evac_name;
+    if (const MaterialDef* wm = w.materials.find_name(evac_name))
+        sp.material = wm->id;
+    sp.pos = actor->pos;
+    if (qty != kNoProp) sp.props.set(qty, Value::integer(load / 4 + 50));
+    // Phase 10.4 fecal-oral vector: shed waste carries the strain of the
+    // host's first active infection — the pathogen survives outside the
+    // body inside its own evacuate_material, fully data-driven.
+    {
+        const PropId ps = pid("pathogen_strain");
+        if (ps != kNoProp) {
+            for (const Relation& rel : w.relations_of(ctx.actor, "carries")) {
+                if (rel.a != ctx.actor) continue;
+                const Entity* ie = w.find(rel.b);
+                if (!ie || !ie->alive) continue;
+                const std::int64_t seid = w.prop_int(*ie, ps, 0);
+                if (seid > 0) {
+                    const PropId sr = pid("strain_ref");
+                    if (sr != kNoProp)
+                        sp.props.set(sr, Value::integer(seid));
+                    break;
+                }
+            }
+        }
+    }
+    r.spawns.push_back(sp);
+    r.notes.push_back("evacuate " + evac_name + " load " +
+                      std::to_string(load) + "->0" +
+                      (painful ? " (painful)" : ""));
+    return r;
+}
+
 }  // namespace
 
 LawId PhysiologyModel::id() const { return 6; }
 
 bool PhysiologyModel::supports(const World& /*w*/, const InteractionContext& ctx) const {
     if (ctx.parameters.action == "rest") return true;   // actor-only action
+    if (ctx.parameters.action == "evacuate") return true;
     return ctx.parameters.action == "consume" && !ctx.targets.empty();
 }
 
 PredictionResult PhysiologyModel::predict(const World& w,
                                           const InteractionContext& ctx) const {
     if (ctx.parameters.action == "rest") return predict_rest(w, ctx);
+    if (ctx.parameters.action == "evacuate") return predict_evacuate(w, ctx);
     return predict_consume(w, ctx);
 }
 
 std::unique_ptr<INaturalLawModel> PhysiologyModel::clone() const {
     return std::make_unique<PhysiologyModel>();
 }
+
+// ---- treat: primitive, property-driven medicine -----------------------------
+// The patient is targets[0]; the dressing/material is targets[1]. The law
+// finds the patient's WORST attached anatomical part (max bleed + infection)
+// and lets the material's absorbency / antiseptic / temperature decide the
+// outcome. Everything is integer, deterministic, and causal.
+
+LawId TreatModel::id() const { return 21; }
+
+bool TreatModel::supports(const World& /*w*/, const InteractionContext& ctx) const {
+    return ctx.parameters.action == "treat" && ctx.targets.size() >= 2;
+}
+
+PredictionResult TreatModel::predict(const World& w,
+                                     const InteractionContext& ctx) const {
+    PredictionResult r;
+    r.law = id(); r.law_name = name();
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    const EntityId patient_id = ctx.targets[0];
+    const EntityId med_id = ctx.targets[1];
+    const Entity* patient = w.find(patient_id);
+    const Entity* med = w.find(med_id);
+    if (!patient || !patient->alive || patient_id == med_id) {
+        r.failure = "bad treat targets"; return r;
+    }
+    if (!med || !med->alive) { r.failure = "no dressing material"; return r; }
+
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = w.props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId role_p = pid("part_role"), sev_p = pid("severed"),
+                 br_p = pid("bleed_rate"), inf_p = pid("infection_level"),
+                 nec_p = pid("necrotic"), band_p = pid("bandaged_integrity"),
+                 integ_p = pid("integrity"), vital_p = pid("vital_organ"),
+                 absorb_p = pid("absorbency"), anti_p = pid("antiseptic"),
+                 temp_p = pid("temperature"), pain_p = pid("pain_level"),
+                 reach_p = pid("reach"), energy_p = pid("energy"),
+                 contained_p = pid("contained");
+
+    // reach: actor must reach BOTH patient and material
+    const std::int64_t reach = reach_p != kNoProp
+        ? w.prop_int(*actor, reach_p, lawutil::kDefaultReach)
+        : lawutil::kDefaultReach;
+    if (dist2(actor->pos, patient->pos) > reach * reach ||
+        dist2(actor->pos, med->pos) > reach * reach) {
+        r.failure = "out of reach"; return r;
+    }
+
+    // worst wounded attached part of the patient (deterministic: sorted
+    // relations, strict > keeps the first/lowest-id on ties)
+    EntityId worst = kNoEntity;
+    std::int64_t worst_score = -1;
+    for (const Relation& rel : w.relations_of(patient_id, "part_of")) {
+        if (rel.b != patient_id) continue;
+        const Entity* p = w.find(rel.a);
+        if (!p || !p->alive) continue;
+        if (sev_p != kNoProp) {
+            const Value* sv = w.prop_of(*p, sev_p);
+            if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+        }
+        if (nec_p != kNoProp) {
+            const Value* nv = w.prop_of(*p, nec_p);
+            if (nv && nv->type == ValType::Integer && nv->i != 0) continue;
+        }
+        if (role_p != kNoProp) {
+            const Value* rv = w.prop_of(*p, role_p);
+            if (!rv || rv->type != ValType::Text || rv->s.empty()) continue;
+        }
+        const std::int64_t br = br_p != kNoProp ? w.prop_int(*p, br_p, 0) : 0;
+        const std::int64_t iv = inf_p != kNoProp ? w.prop_int(*p, inf_p, 0) : 0;
+        const std::int64_t integ = integ_p != kNoProp ? w.prop_int(*p, integ_p, 1000) : 1000;
+        const std::int64_t score = br * 3 + iv * 2 + std::max<std::int64_t>(0, 500 - integ);
+        if (score > worst_score) { worst_score = score; worst = rel.a; }
+    }
+    if (worst == kNoEntity || worst_score <= 0) {
+        r.failure = "patient has no treatable wound"; return r;
+    }
+    const Entity* part = w.find(worst);
+
+    const std::int64_t absorb = absorb_p != kNoProp ? w.prop_int(*med, absorb_p, 0) : 0;
+    const std::int64_t antiseptic = anti_p != kNoProp ? w.prop_int(*med, anti_p, 0) : 0;
+    const std::int64_t temp = temp_p != kNoProp ? w.prop_int(*med, temp_p, 0) : 0;
+    const std::int64_t mat_integ = integ_p != kNoProp ? w.prop_int(*med, integ_p, 500) : 500;
+
+    const std::int64_t p_br = br_p != kNoProp ? w.prop_int(*part, br_p, 0) : 0;
+    const std::int64_t p_inf = inf_p != kNoProp ? w.prop_int(*part, inf_p, 0) : 0;
+    const std::int64_t p_integ = integ_p != kNoProp ? w.prop_int(*part, integ_p, 1000) : 1000;
+    const std::int64_t p_band = band_p != kNoProp ? w.prop_int(*part, band_p, 0) : 0;
+
+    bool acted = false;
+    std::int64_t n_br = p_br, n_inf = p_inf, n_band = p_band, n_integ = p_integ;
+    std::int64_t med_wear = 0;
+    std::string what;
+
+    // cauterization: hot object burns the wound shut — bleed & infection
+    // zeroed, surface tissue damaged, max pain on the patient.
+    if (temp >= 500 && (p_br > 0 || p_inf > 0)) {
+        n_br = 0; n_inf = 0; n_integ = std::max<std::int64_t>(1, p_integ - 200);
+        med_wear = 50;
+        what = "cauterized";
+        acted = true;
+        if (pain_p != kNoProp) {
+            const std::int64_t pp = pain_p != kNoProp ? w.prop_int(*patient, pain_p, 0) : 0;
+            StateChange ch; ch.entity = patient_id; ch.prop = pain_p;
+            ch.had_before = true; ch.before = Value::integer(pp);
+            ch.after = Value::integer(std::min<std::int64_t>(1000, pp + 800));
+            r.changes.push_back(ch);
+        }
+    }
+    // antiseptic: potent materials drive infection down hard
+    if (antiseptic >= 400 && n_inf > 0) {
+        n_inf = std::max<std::int64_t>(0, n_inf - antiseptic * 3 / 2);
+        med_wear = std::max<std::int64_t>(med_wear, 100);
+        what = what.empty() ? "antiseptic" : what + "+antiseptic";
+        acted = true;
+    }
+    // absorbency: dressing soaks blood and mechanically covers the wound
+    if (absorb >= 400 && n_br > 0) {
+        n_band = std::min<std::int64_t>(1000,
+            (absorb * 3 / 4 + mat_integ / 4));
+        n_br = n_br * (1000 - std::min<std::int64_t>(800, absorb * 4 / 5)) / 1000;
+        med_wear = std::max<std::int64_t>(med_wear, 200);
+        what = what.empty() ? "bandaged" : what + "+bandaged";
+        acted = true;
+    }
+    // a bandage also shields existing infection from worsening while on
+    if (n_band >= 300 && n_inf > 0) {
+        n_inf = std::max<std::int64_t>(0, n_inf - 100);   // covered wound stabilizes
+        acted = true;
+    }
+    if (!acted) { r.failure = "material has no medicinal effect here"; return r; }
+
+    auto setp = [&](EntityId id, PropId p, std::int64_t b4, std::int64_t af) {
+        if (p == kNoProp || b4 == af) return;
+        StateChange ch; ch.entity = id; ch.prop = p; ch.had_before = true;
+        ch.before = Value::integer(b4); ch.after = Value::integer(af);
+        r.changes.push_back(ch);
+    };
+    setp(worst, br_p, p_br, n_br);
+    setp(worst, inf_p, p_inf, n_inf);
+    setp(worst, band_p, p_band, n_band);
+    setp(worst, integ_p, p_integ, n_integ);
+    if (med_wear > 0 && med_id != patient_id)
+        setp(med_id, integ_p, mat_integ, std::max<std::int64_t>(1, mat_integ - med_wear));
+    if (!lawutil::charge_energy(*actor, energy_p, 500, r)) {
+        r.possible = false; r.changes.clear(); r.notes.clear();
+        return r;
+    }
+    r.possible = true;
+    r.ticks = ctx.parameters.ticks;
+    r.notes.push_back("treat " + std::to_string(med_id) + " on part " +
+                      std::to_string(worst) + " of " + std::to_string(patient_id) +
+                      ": " + what);
+    return r;
+}
+
+std::unique_ptr<INaturalLawModel> TreatModel::clone() const {
+    return std::make_unique<TreatModel>();
+}
+
+
+
 
 }  // namespace simlab

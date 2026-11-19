@@ -415,6 +415,31 @@ PredictionResult BiologyModel::predict(const World& w,
     // used to mean "free actions forever").
     if (energy_p != kNoProp)
         s.props.set(energy_p, Value::integer(kChildInitEnergy));
+    // Phase 10.4 passive immunity: the mother passes up to 2 of her
+    // strongest cleared-antigen signatures to the newborn as temporary
+    // immune memory — not heritable alleles, a borrowed shield that fades
+    // with `passive_immune` ticks.
+    {
+        const PropId ic_p = prop_id(w, "immune_count");
+        int n = ic_p != kNoProp ? static_cast<int>(w.prop_int(*actor, ic_p, 0))
+                               : 0;
+        n = std::min(n, 8);
+        const int give = std::min(n, 2);
+        if (give > 0) {
+            for (int i = 0; i < give; ++i) {
+                const PropId sp = prop_id(w, ("immune_sig" +
+                                              std::to_string(i)).c_str());
+                if (sp == kNoProp) continue;
+                s.props.set(sp, Value::integer(
+                    w.prop_int(*actor, sp, 0)));
+            }
+            const PropId cc = prop_id(w, "immune_count");
+            if (cc != kNoProp) s.props.set(cc, Value::integer(give));
+            const PropId pp = prop_id(w, "passive_immune");
+            if (pp != kNoProp)
+                s.props.set(pp, Value::integer(2000));
+        }
+    }
     s.rel_from.push_back({"parent_of", actor->id});
     s.rel_from.push_back({"parent_of", partner->id});
     r.spawns.push_back(s);

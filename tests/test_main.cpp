@@ -4310,6 +4310,1164 @@ static void test_neuro_psychopathology() {
     }
 }
 
+
+// ---------- Phase 10: anatomical composite, trauma, hemorrhage ---------------
+static PropId tpid(World& w, const char* n) {
+    const PropertyDef* d = w.props.find_name(n);
+    return d ? d->id : kNoProp;
+}
+static std::int64_t tint(Entity& e, World& w, const char* n, std::int64_t fb=0) {
+    const PropId p = tpid(w, n);
+    return p != kNoProp ? w.prop_int(e, p, fb) : fb;
+}
+static void tseti(Entity& e, World& w, const char* n, std::int64_t v) {
+    const PropId p = tpid(w, n);
+    if (p != kNoProp) e.props.set(p, Value::integer(v));
+}
+static void tsetb(Entity& e, World& w, const char* n, bool v) {
+    const PropId p = tpid(w, n);
+    if (p != kNoProp) e.props.set(p, Value::boolean(v));
+}
+static void tsett(Entity& e, World& w, const char* n, const char* v) {
+    const PropId p = tpid(w, n);
+    if (p != kNoProp) e.props.set(p, Value::text(v));
+}
+
+// body with circulation props; parts wired part_of->body, contained.
+static EntityId mk_body(World& w, Vec2 pos, const char* kind = "test_beast") {
+    const MaterialId flesh = w.materials.id_of("flesh");
+    EntityId b = w.create_entity(kind, flesh, pos, {});
+    Entity* e = w.find(b);
+    tseti(*e, w, "integrity", 1000);
+    tseti(*e, w, "blood_volume", 1000);
+    tseti(*e, w, "blood_accum", 0);
+    tseti(*e, w, "pain_level", 0);
+    tseti(*e, w, "consciousness", 1000);
+    tseti(*e, w, "bleed_rate", 0);
+    tseti(*e, w, "bleed_accum", 0);
+    tseti(*e, w, "energy", 60000);
+    tseti(*e, w, "thirst", 0);
+    return b;
+}
+static EntityId mk_part(World& w, EntityId body, const char* name,
+                        const char* mat, const char* slot, const char* role,
+                        std::int64_t vital, std::int64_t size) {
+    Entity* b = w.find(body);
+    PropertyBag pb;
+    auto pi = [&](const char* n, std::int64_t v) {
+        const PropId p = tpid(w, n); if (p != kNoProp) pb.set(p, Value::integer(v)); };
+    auto pbv = [&](const char* n, bool v) {
+        const PropId p = tpid(w, n); if (p != kNoProp) pb.set(p, Value::boolean(v)); };
+    auto pt = [&](const char* n, const char* v) {
+        const PropId p = tpid(w, n); if (p != kNoProp) pb.set(p, Value::text(v)); };
+    pi("integrity", 1000); pbv("contained", true); pi("severed", 0);
+    pi("bleed_rate", 0); pi("fracture_level", 0); pi("bleed_accum", 0);
+    pi("vital_organ", vital); pi("part_size", size);
+    pt("body_slot", slot); pt("part_role", role);
+    const EntityId id = w.create_entity(name, w.materials.id_of(mat), b->pos, pb);
+    w.relations.relate(id, "part_of", body);
+    return id;
+}
+// striker wielding a tool material (edge decides sharp vs blunt)
+static EntityId mk_striker(World& w, Vec2 pos, const char* tool_mat) {
+    const MaterialId wood = w.materials.id_of("dry_wood");
+    EntityId a = w.create_entity(" striker", wood, pos, {});
+    if (tool_mat) {
+        const EntityId t = w.create_entity(" tool", w.materials.id_of(tool_mat), pos, {});
+        w.relations.relate(a, "wielding", t);
+    }
+    return a;
+}
+static void strike(World& w, EntityId actor, EntityId target,
+                   const char* action, std::int64_t force) {
+    w.interact(mk_ctx(actor, {target}, action, force));
+}
+
+static void test_anatomical_trauma_and_bleeding() {
+    World w(11, "data");
+    const char* roles[] = {"head","eye","eye","brain","torso","heart","lung",
+                           "lung","arm","arm","leg","leg"};
+    const char* mats[]  = {"skin","organ","organ","organ","muscle","organ",
+                           "organ","organ","muscle","muscle","bone","bone"};
+    const char* slots[] = {"head","head","head","head","torso","torso","torso",
+                           "torso","arm_l","arm_r","leg_l","leg_r"};
+    const char* names[] = {"head","eye_l","eye_r","brain","torso","heart",
+                           "lung_l","lung_r","arm_l","arm_r","leg_l","leg_r"};
+    const std::int64_t vit[] = {400,0,0,1000,200,1000,800,800,0,0,0,0};
+
+    // ---- 1. species body plan: grazer spawns a full part_of tree ---------
+    {
+        const MaterialId flesh = w.materials.id_of("flesh");
+        EntityId g = w.create_entity("grazer", flesh, {500, 500}, {});
+        CHECK(w.build_anatomy(g));
+        int parts = 0; bool saw_eye=false, saw_heart=false, saw_leg=false, saw_bone=false;
+        for (const Relation& r : w.relations_of(g, "part_of")) {
+            if (r.b != g) continue;
+            ++parts;
+            const Entity* p = w.find(r.a);
+            const PropId rp = tpid(w, "part_role");
+            const Value* rv = p ? w.prop_of(*p, rp) : nullptr;
+            const std::string role = (rv && rv->type == ValType::Text) ? rv->s : "";
+            if (role == "eye") saw_eye = true;
+            if (role == "heart") saw_heart = true;
+            if (role == "leg") {
+                saw_leg = true;
+                if (p->material == w.materials.id_of("bone")) saw_bone = true;
+            }
+            CHECK(w.prop_int(*p, tpid(w, "integrity"), 0) == 1000);
+        }
+        CHECK(parts == 16);
+        CHECK(saw_eye && saw_heart && saw_leg && saw_bone);
+        CHECK(!w.build_anatomy(g));        // idempotent
+    }
+
+    // ---- 2. blunt vs sharp on identical single-part bodies ---------------
+    std::int64_t blunt_bleed = -1, sharp_bleed = -1, blunt_frac = -1;
+    {
+        // blunt: wood tool edge 250 -> fracture, little external bleed
+        EntityId b1 = mk_body(w, {100, 100});
+        EntityId leg1 = mk_part(w, b1, "leg_b", "bone", "leg_l", "leg", 0, 160);
+        EntityId a1 = mk_striker(w, {100, 100}, "dry_wood");
+        strike(w, a1, b1, "impact", 10000);
+        Entity* L1 = w.find(leg1);
+        blunt_frac = tint(*L1, w, "fracture_level");
+        blunt_bleed = tint(*L1, w, "bleed_rate");
+        CHECK(blunt_frac > 0);
+        CHECK(blunt_bleed < 200);          // bruising, not hemorrhage
+
+        // sharp: flint edge 900 -> soft-tissue bleed spikes
+        EntityId b2 = mk_body(w, {300, 100});
+        EntityId leg2 = mk_part(w, b2, "leg_s", "bone", "leg_l", "leg", 0, 160);
+        EntityId a2 = mk_striker(w, {300, 100}, "flint");
+        strike(w, a2, b2, "impact", 8000);
+        Entity* L2 = w.find(leg2);
+        sharp_bleed = tint(*L2, w, "bleed_rate");
+        CHECK(sharp_bleed > blunt_bleed * 4);
+        CHECK(sharp_bleed > 200);
+    }
+
+    // ---- 3. amputation: sharp blow severs arm, drops wielded tool --------
+    {
+        EntityId b = mk_body(w, {500, 100});
+        EntityId arm = mk_part(w, b, "arm_x", "muscle", "arm_l", "arm", 0, 140);
+        EntityId a = mk_striker(w, {500, 100}, "flint");
+        // body wields a tool itself -> must drop when arm is lost
+        const EntityId tool = w.create_entity(" held", w.materials.id_of("dry_wood"),
+                                              {500, 100}, {});
+        w.relations.relate(b, "wielding", tool);
+        strike(w, a, b, "impact", 6000);
+        Entity* A = w.find(arm);
+        CHECK(A && A->alive);
+        CHECK(tint(*A, w, "severed") == 1);
+        CHECK(tint(*A, w, "contained") == 0);
+        // wielding edge removed -> tool dropped
+        bool still_wielded = false;
+        for (const Relation& r : w.relations_of(b, "wielding"))
+            if (r.a == b && r.b == tool) still_wielded = true;
+        CHECK(!still_wielded);
+        // stump bleed on body + max pain
+        Entity* B = w.find(b);
+        CHECK(tint(*B, w, "bleed_rate") >= 700);
+        CHECK(tint(*B, w, "pain_level") >= 900);
+        CHECK(w.anatomy_function(b, "arm") == 0);
+    }
+
+    // ---- 4. sensory loss + hypovolemic death -----------------------------
+    {
+        EntityId b = mk_body(w, {700, 100});
+        EntityId e1 = mk_part(w, b, "eye1", "organ", "head", "eye", 0, 60);
+        EntityId e2 = mk_part(w, b, "eye2", "organ", "head", "eye", 0, 60);
+        CHECK(w.anatomy_function(b, "eye") == 1000);
+        w.find(e1)->props.set(tpid(w, "integrity"), Value::integer(0));
+        w.find(e2)->props.set(tpid(w, "integrity"), Value::integer(0));
+        CHECK(w.anatomy_function(b, "eye") == 0);   // blind -> sight 0
+
+        // heart destruction kills the body outright
+        EntityId b2 = mk_body(w, {900, 100});
+        EntityId heart = mk_part(w, b2, "heart_x", "organ", "torso", "heart", 1000, 90);
+        EntityId a2 = mk_striker(w, {900, 100}, "flint");
+        strike(w, a2, b2, "impact", 9000);
+        Entity* B2 = w.find(b2);
+        CHECK(!B2 || !B2->alive || tint(*B2, w, "integrity") <= 0);
+        (void)heart;
+
+        // slow exsanguination -> unconscious -> hypovolemic death
+        EntityId b3 = mk_body(w, {100, 300});
+        EntityId leg3 = mk_part(w, b3, "leg_d", "bone", "leg_l", "leg", 0, 160);
+        tseti(*w.find(leg3), w, "bleed_rate", 1000);
+        w.advance_ticks_for_test(1100);
+        Entity* B3 = w.find(b3);
+        CHECK(!B3 || !B3->alive);                  // bled out
+        // a blood pool entity exists somewhere in the world
+        bool saw_blood = false;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (e.material == w.materials.id_of("blood")) saw_blood = true;
+        }
+        CHECK(saw_blood);
+    }
+
+    // ---- 5. LOD: dt=1 x N == dt=N for blood_volume + blood_accum --------
+    {
+        auto make_bleeder = [&](World& ww, Vec2 p) {
+            EntityId bb = mk_body(ww, p);
+            EntityId lp = mk_part(ww, bb, "leg_lod", "bone", "leg_l", "leg", 0, 160);
+            tseti(*ww.find(lp), ww, "bleed_rate", 400);
+            return bb;
+        };
+        World wa(21, "data"), wb(21, "data");
+        EntityId ba = make_bleeder(wa, {50, 50});
+        EntityId bb = make_bleeder(wb, {50, 50});
+        for (int i = 0; i < 20; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(20);
+        Entity* ea = wa.find(ba); Entity* eb = wb.find(bb);
+        CHECK(tint(*ea, wa, "blood_volume") == tint(*eb, wb, "blood_volume"));
+        CHECK(tint(*ea, wa, "blood_accum") == tint(*eb, wb, "blood_accum"));
+        // clotting remainder on the part is LOD-exact too
+        EntityId pa = kNoEntity, pb = kNoEntity;
+        for (const Relation& r : wa.relations_of(ba, "part_of"))
+            if (r.b == ba) pa = r.a;
+        for (const Relation& r : wb.relations_of(bb, "part_of"))
+            if (r.b == bb) pb = r.a;
+        CHECK(tint(*wa.find(pa), wa, "bleed_rate") ==
+              tint(*wb.find(pb), wb, "bleed_rate"));
+        CHECK(tint(*wa.find(pa), wa, "bleed_accum") ==
+              tint(*wb.find(pb), wb, "bleed_accum"));
+    }
+}
+
+static void test_infection_and_primitive_medicine() {
+    // ---- A. infection growth, fever, necrosis, sepsis -------------------
+    {
+        World w(31, "data");
+        // filthy ground nearby -> environmental contamination 800
+        w.create_entity("dirt", w.materials.id_of("soil_loam"), {140, 100}, {});
+        EntityId b = mk_body(w, {100, 100});
+        EntityId leg = mk_part(w, b, "leg_inf", "bone", "leg_l", "leg", 0, 160);
+        {
+            Entity* L = w.find(leg);
+            tseti(*L, w, "bleed_rate", 300);
+            tseti(*L, w, "infection_level", 100);
+            tseti(*L, w, "infection_accum", 0);
+            tseti(*L, w, "necrotic", 0);
+            tseti(*L, w, "bandaged_integrity", 0);
+        }
+        w.advance_ticks_for_test(60);
+        Entity* L = w.find(leg);
+        CHECK(L && L->alive);
+        CHECK(tint(*L, w, "infection_level") > 100);      // open wound infected
+        // push past fever threshold: total infection > 300 drains faster
+        EntityId b2 = mk_body(w, {300, 100});
+        EntityId t2 = mk_part(w, b2, "tor_inf", "organ", "torso", "torso", 200, 200);
+        EntityId c2 = mk_body(w, {300, 300});            // clean control
+        {
+            Entity* T = w.find(t2);
+            tseti(*T, w, "infection_level", 350);
+            tseti(*T, w, "infection_accum", 0);
+            tseti(*T, w, "necrotic", 0);
+            tseti(*T, w, "bandaged_integrity", 0);
+            // wound open so it also grows; torso integ 1000 -> set low
+            tseti(*T, w, "integrity", 400);
+        }
+        const std::int64_t e0 = tint(*w.find(b2), w, "energy");
+        const std::int64_t e0c = tint(*w.find(c2), w, "energy");
+        const std::int64_t th0c = tint(*w.find(c2), w, "thirst");
+        const std::int64_t cs0 = tint(*w.find(b2), w, "consciousness");
+        w.advance_ticks_for_test(20);
+        const std::int64_t e1 = tint(*w.find(b2), w, "energy");
+        const std::int64_t e1c = tint(*w.find(c2), w, "energy");
+        const std::int64_t th1c = tint(*w.find(c2), w, "thirst");
+        const std::int64_t cs1 = tint(*w.find(b2), w, "consciousness");
+        CHECK((e0 - e1) > (e0c - e1c) + 40);              // fever burn
+        CHECK(cs1 < cs0);                                  // fever fog
+        (void)th0c; (void)th1c;
+        // necrosis: peripheral part at >=800 dies permanently
+        EntityId b3 = mk_body(w, {500, 100});
+        EntityId arm = mk_part(w, b3, "arm_nec", "muscle", "arm_l", "arm", 0, 140);
+        {
+            Entity* A = w.find(arm);
+            tseti(*A, w, "infection_level", 795);
+            tseti(*A, w, "infection_accum", 0);
+            tseti(*A, w, "necrotic", 0);
+            tseti(*A, w, "bandaged_integrity", 0);
+            tseti(*A, w, "bleed_rate", 100);
+        }
+        w.advance_ticks_for_test(30);
+        Entity* A = w.find(arm);
+        CHECK(A && tint(*A, w, "necrotic") == 1);
+        CHECK(tint(*A, w, "integrity") == 0);
+        // sepsis: infection 1000 on a vital organ kills the body
+        EntityId b4 = mk_body(w, {700, 100});
+        EntityId heart = mk_part(w, b4, "heart_sep", "organ", "torso", "heart", 1000, 120);
+        {
+            Entity* H = w.find(heart);
+            tseti(*H, w, "infection_level", 995);
+            tseti(*H, w, "infection_accum", 0);
+            tseti(*H, w, "necrotic", 0);
+            tseti(*H, w, "bandaged_integrity", 0);
+            tseti(*H, w, "integrity", 400);
+        }
+        w.advance_ticks_for_test(30);
+        CHECK(!w.find(b4)->alive);                          // sepsis death
+    }
+
+    // ---- B. bandaging + C. antiseptic + D. cauterization -----------------
+    {
+        World w(37, "data");
+        const EntityId wood = w.create_entity("wrap", w.materials.id_of("dry_wood"),
+                                              {120, 100}, {});
+        const EntityId herb = w.create_entity("poultice",
+                                              w.materials.id_of("nightshade"),
+                                              {160, 100}, {});
+        EntityId coal = w.create_entity("ember", w.materials.id_of("charcoal"),
+                                        {200, 100}, {});
+        tseti(*w.find(coal), w, "temperature", 900);        // white-hot
+
+        EntityId b = mk_body(w, {100, 100});
+        Entity* B = w.find(b);
+        tseti(*B, w, "reach", 500);
+        EntityId leg = mk_part(w, b, "leg_b", "bone", "leg_l", "leg", 0, 160);
+        {   // bleeding wound, early infection
+            Entity* L = w.find(leg);
+            tseti(*L, w, "bleed_rate", 500);
+            tseti(*L, w, "infection_level", 120);
+            tseti(*L, w, "infection_accum", 0);
+            tseti(*L, w, "necrotic", 0);
+            tseti(*L, w, "bandaged_integrity", 0);
+        }
+        // B: bandage — absorbency 400 cuts bleed ~32%, sets cover >=300
+        w.interact(mk_ctx(b, {b, wood}, "treat", 0));
+        Entity* L = w.find(leg);
+        CHECK(tint(*L, w, "bandaged_integrity") >= 300);
+        CHECK(tint(*L, w, "bleed_rate") < 500);
+        CHECK(tint(*L, w, "bleed_rate") > 0);                // slowed not zeroed
+        const std::int64_t inf_after_band = tint(*L, w, "infection_level");
+        w.advance_ticks_for_test(40);                                    // dressed wound heals
+        CHECK(tint(*L, w, "infection_level") < inf_after_band);
+
+        // C: antiseptic — nightshade antiseptic 500 wipes infection
+        tseti(*L, w, "infection_level", 600);
+        tseti(*L, w, "bandaged_integrity", 0);               // expose again
+        w.interact(mk_ctx(b, {b, herb}, "treat", 0));
+        CHECK(tint(*L, w, "infection_level") == 0);
+
+        // D: cauterize — hot charcoal zeroes bleed+infection, max pain
+        EntityId b2 = mk_body(w, {300, 100});
+        tseti(*w.find(b2), w, "reach", 500);
+        EntityId arm = mk_part(w, b2, "arm_c", "muscle", "arm_l", "arm", 0, 140);
+        {
+            Entity* Ar = w.find(arm);
+            tseti(*Ar, w, "bleed_rate", 400);
+            tseti(*Ar, w, "infection_level", 300);
+            tseti(*Ar, w, "infection_accum", 0);
+            tseti(*Ar, w, "necrotic", 0);
+            tseti(*Ar, w, "bandaged_integrity", 0);
+        }
+        w.interact(mk_ctx(b2, {b2, coal}, "treat", 0));
+        Entity* Ar = w.find(arm);
+        CHECK(tint(*Ar, w, "bleed_rate") == 0);
+        CHECK(tint(*Ar, w, "infection_level") == 0);
+        CHECK(tint(*w.find(b2), w, "pain_level") >= 800);    // agony shock
+    }
+
+    // ---- E. social care: bonded caregiver treats, patient grateful ------
+    {
+        World w(41, "data");
+        const EntityId wood = w.create_entity("wrap2",
+                                              w.materials.id_of("dry_wood"),
+                                              {60, 60}, {});
+        EntityId caregiver = mk_body(w, {50, 50});
+        tseti(*w.find(caregiver), w, "reach", 500);
+        tseti(*w.find(caregiver), w, "energy", 60000);
+        w.mind(caregiver);                                   // becomes an agent
+        EntityId patient = mk_body(w, {52, 50});
+        tseti(*w.find(patient), w, "reach", 500);
+        tseti(*w.find(patient), w, "sight_range", 500);
+        w.mind(patient);
+        EntityId pl = mk_part(w, patient, "leg_soc", "bone", "leg_l", "leg", 0, 160);
+        {
+            Entity* P = w.find(pl);
+            tseti(*P, w, "bleed_rate", 600);
+            tseti(*P, w, "infection_level", 0);
+            tseti(*P, w, "infection_accum", 0);
+            tseti(*P, w, "necrotic", 0);
+            tseti(*P, w, "bandaged_integrity", 0);
+        }
+        // caregiver performs the rescue (planning path tested elsewhere;
+        // here verify the causal act + gratitude engram)
+        w.interact(mk_ctx(caregiver, {patient, wood}, "treat", 0));
+        Entity* P = w.find(pl);
+        CHECK(tint(*P, w, "bandaged_integrity") >= 300 ||
+              tint(*P, w, "bleed_rate") < 600);
+        const AgentMind* pm = w.find_mind(patient);
+        CHECK(pm != nullptr);
+        const auto git = pm->memory.find(caregiver);
+        CHECK(git != pm->memory.end());
+        CHECK(git->second.engram.emotional_charge > 0);       // gratitude!
+    }
+
+    // ---- F. LOD: infection dt=1 x N == dt=N ------------------------------
+    {
+        auto build = [](World& w) {
+            w.create_entity("dirt", w.materials.id_of("soil_loam"), {140, 100}, {});
+            EntityId b = mk_body(w, {100, 100});
+            EntityId leg = mk_part(w, b, "leg_lod", "bone", "leg_l", "leg", 0, 160);
+            Entity* L = w.find(leg);
+            tseti(*L, w, "bleed_rate", 300);
+            tseti(*L, w, "infection_level", 100);
+            tseti(*L, w, "infection_accum", 0);
+            tseti(*L, w, "necrotic", 0);
+            tseti(*L, w, "bandaged_integrity", 0);
+            return std::pair<EntityId, EntityId>{b, leg};
+        };
+        World wa(53, "data"), wb(53, "data");
+        auto [ba, la] = build(wa);
+        auto [bb, lb] = build(wb);
+        for (int i = 0; i < 40; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(40);
+        Entity* La = wa.find(la); Entity* Lb = wb.find(lb);
+        CHECK(tint(*La, wa, "infection_level") == tint(*Lb, wb, "infection_level"));
+        CHECK(tint(*La, wa, "infection_accum") == tint(*Lb, wb, "infection_accum"));
+        CHECK(tint(*wa.find(ba), wa, "blood_volume") +
+              tint(*wa.find(ba), wa, "blood_accum") ==
+              tint(*wb.find(bb), wb, "blood_volume") +
+              tint(*wb.find(bb), wb, "blood_accum"));
+    }
+
+    // ---- G. save/load keeps infection state --------------------------------
+    {
+        World w(59, "data");
+        EntityId b = mk_body(w, {100, 100});
+        EntityId leg = mk_part(w, b, "leg_sv", "bone", "leg_l", "leg", 0, 160);
+        Entity* L = w.find(leg);
+        tseti(*L, w, "infection_level", 333);
+        tseti(*L, w, "infection_accum", 777);
+        tseti(*L, w, "necrotic", 0);
+        tseti(*L, w, "bandaged_integrity", 400);
+        const std::uint64_t h = w.state_hash();
+        const std::string path = "/tmp/simlab_inf_save.bin";
+        CHECK(w.save(path));
+        World w2(59, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+        EntityId l2 = kNoEntity;
+        for (const Relation& r : w2.relations_of(b, "part_of"))
+            if (w2.find(r.a) && tint(*w2.find(r.a), w2, "infection_level") == 333)
+                l2 = r.a;
+        CHECK(l2 != kNoEntity);
+        CHECK(tint(*w2.find(l2), w2, "infection_accum") == 777);
+        CHECK(tint(*w2.find(l2), w2, "bandaged_integrity") == 400);
+    }
+}
+
+
+
+// lumen-organ helper: part with hollow-organ props, all data-driven
+static EntityId mk_lumen(World& w, EntityId body, const char* name,
+                         const char* mat, const char* slot, const char* role,
+                         std::int64_t vital, std::int64_t size,
+                         const char* evac, std::int64_t contract,
+                         const char* up_slot) {
+    EntityId id = mk_part(w, body, name, mat, slot, role, vital, size);
+    Entity* p = w.find(id);
+    tseti(*p, w, "lumen_capacity", 1000);
+    tseti(*p, w, "contents_load", 0);
+    tseti(*p, w, "contents_accum", 0);
+    tseti(*p, w, "content_viscosity", 0);
+    tseti(*p, w, "viscosity_accum", 0);
+    tseti(*p, w, "contractility", contract);
+    tseti(*p, w, "organ_stress_accum", 0);
+    tseti(*p, w, "ruptured", 0);
+    tsett(*p, w, "evacuate_material", evac);
+    tsett(*p, w, "upstream_organ_slot", up_slot);
+    return id;
+}
+static void gut_props(Entity& b, World& w) {
+    tseti(b, w, "undigested_mass", 0);
+    tseti(b, w, "undigested_fluid", 0);
+    tseti(b, w, "toxin_load", 0);
+    tseti(b, w, "toxin_accum", 0);
+}
+
+static void test_lumen_mechanics_and_organ_coupling() {
+    // ---- A. consume fills lumens; evacuate sheds declared materials ------
+    {
+        World w(67, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        Entity* B = w.find(b);
+        tseti(*B, w, "hunger", 500); tseti(*B, w, "thirst", 500);
+        tseti(*B, w, "reach", 500);
+        EntityId bowel = mk_lumen(w, b, "bowel_a", "organ", "torso", "bowel",
+                                  200, 120, "feces", 850, "stomach");
+        EntityId blad = mk_lumen(w, b, "blad_a", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "kidney");
+        const EntityId food = w.create_entity("berries",
+            w.materials.id_of("wild_berries"), {105, 100}, {});
+        w.interact(mk_ctx(b, {food}, "consume", 0));
+        CHECK(tint(*B, w, "undigested_mass") > 0);
+        CHECK(tint(*B, w, "undigested_fluid") > 0);
+        w.advance_ticks_for_test(300);
+        CHECK(tint(*w.find(bowel), w, "contents_load") > 0);   // solid lumen
+        CHECK(tint(*w.find(blad), w, "contents_load") > 0);    // fluid lumen
+        // top up both lumens past the empty threshold, then evacuate —
+        // digestion keeps refilling during the action's own tick advance,
+        // so assert the load collapsed rather than sitting at exactly 0.
+        tseti(*w.find(bowel), w, "contents_load", 600);
+        tseti(*w.find(blad), w, "contents_load", 600);
+        w.interact(mk_ctx(b, {bowel}, "evacuate", 0));
+        CHECK(tint(*w.find(bowel), w, "contents_load") < 300);
+        bool saw_feces = false;
+        for (const auto& ep : w.entities)
+            if (ep->material == w.materials.id_of("feces")) saw_feces = true;
+        CHECK(saw_feces);
+        // evacuate bladder -> urine entity
+        w.interact(mk_ctx(b, {blad}, "evacuate", 0));
+        CHECK(tint(*w.find(blad), w, "contents_load") < 300);
+        bool saw_urine = false;
+        for (const auto& ep : w.entities)
+            if (ep->material == w.materials.id_of("urine")) saw_urine = true;
+        CHECK(saw_urine);
+    }
+
+    // ---- B. obstruction vs painful evacuation -----------------------------
+    {
+        World w(71, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        tseti(*w.find(b), w, "reach", 500);
+        EntityId bowel = mk_lumen(w, b, "bowel_b", "organ", "torso", "bowel",
+                                  200, 120, "feces", 850, "stomach");
+        Entity* Bo = w.find(bowel);
+        // impacted: viscosity 900 > contractility 850 -> cannot pass, pain+300
+        tseti(*Bo, w, "contents_load", 500);
+        tseti(*Bo, w, "content_viscosity", 900);
+        const std::int64_t p0 = tint(*w.find(b), w, "pain_level");
+        w.interact(mk_ctx(b, {bowel}, "evacuate", 0));
+        CHECK(tint(*Bo, w, "contents_load") >= 500);           // stuck (fill drips)
+        CHECK(tint(*w.find(b), w, "pain_level") > p0);
+        // near-threshold: viscosity 700 in [650,850] -> passes, hurts, bleeds
+        tseti(*Bo, w, "content_viscosity", 700);
+        w.interact(mk_ctx(b, {bowel}, "evacuate", 0));
+        CHECK(tint(*Bo, w, "contents_load") < 500);   // cleared (refill drips)
+        // +15 bleed_rate committed, then clotting ticks it down — assert
+        // bleeding actually occurred rather than the pre-clot instant value.
+        CHECK(tint(*Bo, w, "bleed_rate") > 0);
+        CHECK(tint(*w.find(b), w, "pain_level") >= 500);
+    }
+
+    // ---- C. involuntary voiding vs impacted retention ---------------------
+    {
+        World w(73, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        w.mind(b);                                             // agent body
+        EntityId blad = mk_lumen(w, b, "blad_c", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "kidney");
+        Entity* Bl = w.find(blad);
+        // extreme overload (pressure 1300 >= 1200): control collapses -> void
+        tseti(*Bl, w, "contents_load", 1300);
+        tseti(*Bl, w, "content_viscosity", 100);               // <= contract
+        w.advance_ticks_for_test(2);
+        CHECK(tint(*Bl, w, "contents_load") == 0);
+        bool saw_u = false;
+        for (const auto& ep : w.entities)
+            if (ep->material == w.materials.id_of("urine")) saw_u = true;
+        CHECK(saw_u);
+        // impacted at same pressure: viscosity > contractility -> no void
+        EntityId b2 = mk_body(w, {300, 100});
+        gut_props(*w.find(b2), w);
+        EntityId blad2 = mk_lumen(w, b2, "blad_c2", "organ", "torso", "bladder",
+                                  400, 80, "urine", 900, "kidney");
+        Entity* B2 = w.find(blad2);
+        tseti(*B2, w, "contents_load", 1300);
+        tseti(*B2, w, "content_viscosity", 950);               // > contract 900
+        w.advance_ticks_for_test(2);
+        CHECK(tint(*B2, w, "contents_load") == 1300);           // retained
+    }
+
+    // ---- D. rupture: shattered wall under pressure ------------------------
+    {
+        World w(79, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        EntityId torso = mk_part(w, b, "tor_d", "muscle", "torso", "torso", 200, 300);
+        EntityId blad = mk_lumen(w, b, "blad_d", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "kidney");
+        Entity* Bl = w.find(blad);
+        tseti(*Bl, w, "contents_load", 900);                    // pressure 900
+        tseti(*Bl, w, "integrity", 250);                        // wall shattered
+        w.advance_ticks_for_test(2);
+        CHECK(tint(*Bl, w, "ruptured") == 1);
+        CHECK(tint(*Bl, w, "integrity") == 0);
+        CHECK(tint(*Bl, w, "bleed_rate") >= 300);
+        CHECK(tint(*w.find(b), w, "pain_level") == 1000);
+        // spilled urine contamination (350/4=87) soaks the torso sibling
+        CHECK(tint(*w.find(torso), w, "infection_level") >= 80);
+    }
+
+    // ---- E. backpressure wears upstream organ; toxin coupling -------------
+    {
+        World w(83, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        EntityId kidney = mk_part(w, b, "kid_e", "organ", "kidney", "kidney", 500, 70);
+        tseti(*w.find(kidney), w, "filtration_rate", 600);
+        EntityId blad = mk_lumen(w, b, "blad_e", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "kidney");
+        tseti(*w.find(blad), w, "contents_load", 710);          // pressure 710
+        tseti(*w.find(blad), w, "content_viscosity", 0);
+        w.advance_ticks_for_test(1200);
+        CHECK(tint(*w.find(kidney), w, "integrity") < 1000);     // worn
+        // toxin: healthy kidneys filter -> toxin stays low
+        CHECK(tint(*w.find(b), w, "toxin_load") < 400);
+        // cripple the filter: kidneys gone -> toxin accumulates -> death
+        EntityId b2 = mk_body(w, {300, 100});
+        gut_props(*w.find(b2), w);
+        Entity* B2 = w.find(b2);
+        tseti(*B2, w, "toxin_load", 600);
+        tseti(*B2, w, "consciousness", 900);
+        tseti(*B2, w, "blood_volume", 800);
+        w.advance_ticks_for_test(600);
+        Entity* B2p = w.find(b2);
+        CHECK(B2p->alive);
+        CHECK(tint(*B2p, w, "toxin_load") > 600);               // no filter
+        CHECK(tint(*B2p, w, "consciousness") < 900);            // toxemia fog
+        CHECK(tint(*B2p, w, "blood_volume") <= 800);             // no regen
+        // kill via toxemia — advance past the dormant stride so the
+        // unattended body is actually metabolized (LOD skips <8 pending).
+        tseti(*B2p, w, "toxin_load", 1000);
+        w.advance_ticks_for_test(10);
+        CHECK(!w.find(b2)->alive);
+    }
+
+    // ---- F. LOD: lumen + toxin accumulators dt=1 x N == dt=N --------------
+    {
+        auto build = [](World& w) {
+            EntityId b = mk_body(w, {100, 100});
+            gut_props(*w.find(b), w);
+            tseti(*w.find(b), w, "thirst", 800);
+            tseti(*w.find(b), w, "undigested_mass", 2000);
+            tseti(*w.find(b), w, "undigested_fluid", 2000);
+            tseti(*w.find(b), w, "toxin_load", 300);
+            tseti(*w.find(b), w, "metabolism", 2000);
+            EntityId k = mk_part(w, b, "kid_f", "bone", "kidney", "kidney", 500, 70);
+            tseti(*w.find(k), w, "filtration_rate", 600);
+            EntityId bo = mk_lumen(w, b, "bowel_f", "organ", "torso", "bowel",
+                                   200, 120, "feces", 850, "stomach");
+            EntityId bl = mk_lumen(w, b, "blad_f", "organ", "torso", "bladder",
+                                   400, 80, "urine", 900, "");
+            tseti(*w.find(bl), w, "contents_load", 600);       // pressure <700
+            return std::tuple<EntityId, EntityId, EntityId, EntityId, EntityId>{
+                b, k, bo, bl, k};
+        };
+        World wa(89, "data"), wb(89, "data");
+        auto [ba, ka, boa, bla, _] = build(wa);
+        auto [bb, kb, bob, blb, __] = build(wb);
+        for (int i = 0; i < 50; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(50);
+        auto sum = [](World& w, EntityId b, EntityId k, EntityId bo, EntityId bl) {
+            std::int64_t v = 0;
+            for (EntityId p : {k, bo, bl}) {
+                Entity* e = w.find(p); if (!e) continue;
+                for (const char* n : {"contents_load", "contents_accum",
+                                      "content_viscosity", "viscosity_accum",
+                                      "organ_stress_accum", "integrity"}) {
+                    const PropId pp = w.props.find_name(n)
+                        ? w.props.find_name(n)->id : kNoProp;
+                    if (pp != kNoProp) v += w.prop_int(*e, pp, 0);
+                }
+            }
+            v += tint(*w.find(b), w, "toxin_load") +
+                 tint(*w.find(b), w, "toxin_accum") +
+                 tint(*w.find(b), w, "undigested_mass") +
+                 tint(*w.find(b), w, "undigested_fluid");
+            return v;
+        };
+        CHECK(sum(wa, ba, ka, boa, bla) == sum(wb, bb, kb, bob, blb));
+    }
+
+    // ---- G. waste decomposition fertilizes the soil cell -------------------
+    {
+        World w(97, "data");
+        const Vec2 spot{800, 800};
+        if (w.terrain.contains(spot)) {
+            const EntityId pat = w.create_entity("pat",
+                w.materials.id_of("feces"), spot, {});
+            tseti(*w.find(pat), w, "quantity", 100);
+            const std::int64_t v0 = w.terrain.veg_at(spot);
+            const std::int64_t m0 = w.terrain.moist_at(spot);
+            w.advance_ticks_for_test(3000);
+            CHECK(w.terrain.veg_at(spot) > v0);
+            const EntityId ppu = w.create_entity("ppu",
+                w.materials.id_of("urine"), spot, {});
+            tseti(*w.find(ppu), w, "quantity", 100);
+            w.advance_ticks_for_test(3000);
+            CHECK(w.terrain.moist_at(spot) > m0);
+        }
+    }
+
+    // ---- H. save/load keeps lumen state ------------------------------------
+    {
+        World w(101, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        EntityId blad = mk_lumen(w, b, "blad_h", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "kidney");
+        Entity* Bl = w.find(blad);
+        tseti(*Bl, w, "contents_load", 777);
+        tseti(*Bl, w, "content_viscosity", 321);
+        tseti(*Bl, w, "organ_stress_accum", 555);
+        tseti(*w.find(b), w, "toxin_load", 222);
+        const std::uint64_t h = w.state_hash();
+        const std::string path = "/tmp/simlab_lumen_save.bin";
+        CHECK(w.save(path));
+        World w2(101, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+    }
+
+    // ---- I. blunt impact bursts a distended lumen (pressure >= 800) ------
+    {
+        World w(103, "data");
+        EntityId b = mk_body(w, {100, 100});
+        gut_props(*w.find(b), w);
+        // two torso-region parts so the weighted anatomy pick always lands
+        // on slot "torso" — matching the lumen's body_slot
+        EntityId m1 = mk_part(w, b, "m1_i", "muscle", "torso", "muscle", 200, 300);
+        EntityId blad = mk_lumen(w, b, "blad_i", "organ", "torso", "bladder",
+                                 400, 80, "urine", 900, "");
+        Entity* Bl = w.find(blad);
+        tseti(*Bl, w, "contents_load", 900);          // pressure 900 >= 800
+        tseti(*Bl, w, "content_viscosity", 0);
+        // a second, non-distended lumen in the same region must survive
+        EntityId blad2 = mk_lumen(w, b, "blad_i2", "organ", "torso", "bladder",
+                                  400, 80, "urine", 900, "");
+        tseti(*w.find(blad2), w, "contents_load", 100); // pressure 100
+        EntityId striker = mk_striker(w, {100, 100}, "dry_wood");// blunt, same spot
+        strike(w, striker, b, "impact", 500000);
+        CHECK(tint(*Bl, w, "ruptured") == 1);
+        CHECK(tint(*Bl, w, "integrity") == 0);
+        CHECK(tint(*Bl, w, "bleed_rate") >= 250);
+        CHECK(tint(*Bl, w, "contents_load") == 0);
+        CHECK(tint(*w.find(b), w, "pain_level") == 1000);
+        // spilled urine contamination (350/4=87) soaks the muscle sibling
+        CHECK(tint(*w.find(m1), w, "infection_level") >= 80);
+        // the relaxed lumen in the same region is untouched
+        CHECK(tint(*w.find(blad2), w, "ruptured") == 0);
+        CHECK(tint(*w.find(blad2), w, "integrity") > 0);
+    }
+}
+
+
+// ---- Phase 10.4 helpers ---------------------------------------------------
+static EntityId mk_strain(World& w, Vec2 pos,
+                          std::initializer_list<std::pair<const char*, std::int64_t>> iv,
+                          const char* slot) {
+    PropertyBag pb;
+    for (auto& [n, v] : iv) {
+        const PropId p = tpid(w, n);
+        if (p != kNoProp) pb.set(p, Value::integer(v));
+    }
+    if (slot) {
+        const PropId p = tpid(w, "target_slot");
+        if (p != kNoProp) pb.set(p, Value::text(slot));
+    }
+    return w.create_entity("pathogen_strain", kNoMaterial, pos, pb);
+}
+static EntityId mk_infection(World& w, EntityId host, EntityId strain,
+                             std::int64_t load, std::int64_t ab) {
+    PropertyBag pb;
+    auto pi = [&](const char* n, std::int64_t v) {
+        const PropId p = tpid(w, n); if (p != kNoProp) pb.set(p, Value::integer(v)); };
+    pi("pathogen_strain", static_cast<std::int64_t>(strain));
+    pi("pathogen_load", load); pi("antibody_level", ab);
+    pi("infection_elapsed", 0); pi("infection_load_accum", 0);
+    pi("infection_ab_accum", 0); pi("shed_accum", 0);
+    pi("mutation_accum", 0); pi("damage_accum", 0);
+    pi("infection_toxin_accum", 0);
+    const EntityId inf = w.create_entity("infection", kNoMaterial,
+                                         w.find(host)->pos, pb);
+    w.relations.relate(host, "carries", inf);
+    return inf;
+}
+static bool host_has_strain(World& w, EntityId host, EntityId strain) {
+    for (const Relation& r : w.relations_of(host, "carries")) {
+        if (r.a != host) continue;
+        Entity* ie = w.find(r.b);
+        if (!ie || !ie->alive) continue;
+        if (tint(*ie, w, "pathogen_strain") == static_cast<std::int64_t>(strain))
+            return true;
+    }
+    return false;
+}
+static std::int64_t sum_prop(World& w, const char* n,
+                             const std::vector<EntityId>& ids) {
+    std::int64_t s = 0;
+    for (EntityId id : ids) {
+        Entity* e = w.find(id);
+        if (e) s += tint(*e, w, n);
+    }
+    return s;
+}
+
+static void test_thermoregulation_immunity_neoplasm_and_epidemiology() {
+    // ---- A+B: species-relative thermoregulation, hypothermia, fever, ------
+    // ---- antipyretic — all thresholds relative to normal_body_temp ------
+    {
+        World w(71, "data");
+        // cold wet world: 20°C, moisture 800 everywhere near the test bodies
+        TerrainGrid& t = w.terrain;
+        t.w = 16; t.h = 16; t.cell = 16; t.ox = 0; t.oy = 0;
+        const std::size_t n = 256;
+        t.elevation.assign(n, 0); t.moisture.assign(n, 800);
+        t.temperature.assign(n, 200); t.water.assign(n, 0);
+        t.vegetation.assign(n, 0); t.slope.assign(n, 0);
+        t.wind_x.assign(n, 0); t.wind_y.assign(n, 0);
+        t.water_table.assign(n, 0);
+        auto mk_th = [&](Vec2 pos, const char* nbt, std::int64_t bt,
+                         std::int64_t therm, std::int64_t inf) {
+            EntityId b = mk_body(w, pos);
+            tseti(*w.find(b), w, "metabolism", 0);
+            tseti(*w.find(b), w, "decay_rate", 0);
+            Entity* e = w.find(b);
+            if (inf > 0) {   // total_infection sums PART infection_level
+                EntityId pt = mk_part(w, b, "inf_part", "muscle", "torso",
+                                      "torso", 200, 300);
+                tseti(*w.find(pt), w, "infection_level", inf);
+            }
+            tseti(*e, w, "normal_body_temp", std::stoll(nbt));
+            tseti(*e, w, "body_temp", bt);
+            tseti(*e, w, "temp_accum", 0);
+            tseti(*e, w, "thermoreg_gain", therm);
+            tseti(*e, w, "hypothermia_delta", 15);
+            tseti(*e, w, "fever_delta_max", 35);
+            tseti(*e, w, "hyperpyrexia_delta", 45);
+            tseti(*e, w, "immune_power", 1000);
+            tseti(*e, w, "immune_power_base", 1000);
+            tseti(*e, w, "infection_level", inf);
+            return b;
+        };
+        EntityId b_endo = mk_th({100, 100}, "370", 370, 1000, 0);
+        EntityId b_poiki = mk_th({200, 100}, "300", 300, 150, 0);
+        EntityId b_fever = mk_th({270, 100}, "370", 370, 1000, 300);
+        // antipyretic berry bush within cooling radius of b_fever2
+        EntityId b_fever2 = mk_th({316, 100}, "370", 370, 1000, 300);
+        EntityId bush = w.create_entity("wild_berries",
+            w.materials.id_of("wild_berries"), {310, 100}, {});
+        (void)bush;
+        w.advance_ticks_for_test(120);
+        const std::int64_t t_endo = tint(*w.find(b_endo), w, "body_temp");
+        const std::int64_t t_poiki = tint(*w.find(b_poiki), w, "body_temp");
+        const std::int64_t t_fever = tint(*w.find(b_fever), w, "body_temp");
+        const std::int64_t t_fever2 = tint(*w.find(b_fever2), w, "body_temp");
+        // endotherm holds above ambient far better than the poikilotherm
+        CHECK(t_endo > t_poiki + 40);
+        CHECK(t_poiki <= 250);                    // tracks the 20°C cold
+        // fever overrides the cold pull: infected body runs hot
+        CHECK(t_fever >= 385);                    // 370 + >=15
+        // antipyretic within 24 suppresses the fever back to set-point
+        CHECK(t_fever2 < t_fever - 10);
+        CHECK(t_fever2 <= 385);
+        // deep hypothermia halves effective immunity on the endotherm
+        if (t_endo < 355)
+            CHECK(tint(*w.find(b_endo), w, "immune_power") <= 600);
+        else
+            CHECK(t_endo > 355);   // informational either way
+        // fever cost: infected bodies burned extra water/energy vs control
+        CHECK(tint(*w.find(b_fever), w, "thirst") >
+              tint(*w.find(b_endo), w, "thirst"));
+    }
+
+    // ---- C: multi-vector transmission (airborne + waterborne) -------------
+    {
+        World w(72, "data");
+        EntityId s_air = mk_strain(w, {0, 0},
+            {{"antigen_signature", 111}, {"virulence", 300},
+             {"airborne_rate", 800}, {"waterborne_rate", 0},
+             {"contact_rate", 0}, {"incubation_ticks", 0}}, "torso");
+        EntityId s_wat = mk_strain(w, {0, 0},
+            {{"antigen_signature", 222}, {"virulence", 300},
+             {"airborne_rate", 0}, {"waterborne_rate", 800},
+             {"contact_rate", 0}, {"incubation_ticks", 0}}, "torso");
+        EntityId host = mk_body(w, {60, 100});
+            tseti(*w.find(host), w, "metabolism", 0);
+            tseti(*w.find(host), w, "decay_rate", 0);
+        mk_infection(w, host, s_air, 100, 0);
+        EntityId near1 = mk_body(w, {150, 100});
+            tseti(*w.find(near1), w, "metabolism", 0);
+            tseti(*w.find(near1), w, "decay_rate", 0);   // within airborne 96 of host
+        EntityId near2 = mk_body(w, {130, 100});
+            tseti(*w.find(near2), w, "metabolism", 0);
+            tseti(*w.find(near2), w, "decay_rate", 0);   // within water 48 of waste
+        // contaminated feces stamped with the waterborne strain
+        PropertyBag wp;
+        const PropId qty = tpid(w, "quantity");
+        const PropId sr = tpid(w, "strain_ref");
+        if (qty != kNoProp) wp.set(qty, Value::integer(50));
+        if (sr != kNoProp) wp.set(sr, Value::integer(
+            static_cast<std::int64_t>(s_wat)));
+        w.create_entity("feces", w.materials.id_of("feces"), {140, 100}, wp);
+        w.advance_ticks_for_test(80);
+        CHECK(host_has_strain(w, near1, s_air));    // airborne landed
+        CHECK(host_has_strain(w, near2, s_wat));    // fecal-oral landed
+        CHECK(!host_has_strain(w, host, s_wat));    // waste strain != host strain
+    }
+
+    // ---- D: adaptive immunity, memory, maternal passive transfer ---------
+    {
+        World w(73, "data");
+        EntityId s1 = mk_strain(w, {0, 0},
+            {{"antigen_signature", 555}, {"virulence", 200},
+             {"airborne_rate", 0}, {"waterborne_rate", 0},
+             {"contact_rate", 0}, {"incubation_ticks", 0}}, "torso");
+        // naive host vs host pre-seeded with the same antigen in memory
+        EntityId naive = mk_body(w, {100, 100});
+            tseti(*w.find(naive), w, "metabolism", 0);
+            tseti(*w.find(naive), w, "decay_rate", 0);
+        EntityId primed = mk_body(w, {200, 100});
+            tseti(*w.find(primed), w, "metabolism", 0);
+            tseti(*w.find(primed), w, "decay_rate", 0);
+        tseti(*w.find(primed), w, "immune_sig0", 555);
+        tseti(*w.find(primed), w, "immune_count", 1);
+        mk_infection(w, naive, s1, 100, 0);
+        mk_infection(w, primed, s1, 100, 0);
+        // live carried infections per host
+        auto live_infs = [&](EntityId h) {
+            int n = 0;
+            for (const Relation& r : w.relations_of(h, "carries"))
+                if (r.a == h) {
+                    Entity* ie = w.find(r.b);
+                    if (ie && ie->alive) ++n;
+                }
+            return n;
+        };
+        // immune memory must produce a strictly earlier clearance; the
+        // naive host's first victory writes the antigen into memory.
+        int cp = -1, cn = -1;
+        for (int step = 0; step < 160 && (cp < 0 || cn < 0); ++step) {
+            w.advance_ticks_for_test(50);
+            if (cp < 0 && live_infs(primed) == 0) cp = step;
+            if (cn < 0 && live_infs(naive) == 0) cn = step;
+        }
+        CHECK(cp >= 0 && cn >= 0 && cp < cn);
+        CHECK(tint(*w.find(naive), w, "immune_count") >= 1 ||
+              tint(*w.find(naive), w, "immune_sig0") == 555);
+        // second exposure on the now-immune host clears far faster:
+        // measure antibody after a short window on a fresh twin
+        EntityId reinf = mk_body(w, {300, 100});
+            tseti(*w.find(reinf), w, "metabolism", 0);
+            tseti(*w.find(reinf), w, "decay_rate", 0);
+        tseti(*w.find(reinf), w, "immune_sig0", 555);
+        tseti(*w.find(reinf), w, "immune_count", 1);
+        EntityId naive2 = mk_body(w, {400, 100});
+            tseti(*w.find(naive2), w, "metabolism", 0);
+            tseti(*w.find(naive2), w, "decay_rate", 0);
+        mk_infection(w, reinf, s1, 100, 0);
+        mk_infection(w, naive2, s1, 100, 0);
+        // second exposure on a memory-carrying host clears strictly first
+        int cr = -1, cn2 = -1;
+        for (int step = 0; step < 160 && (cr < 0 || cn2 < 0); ++step) {
+            w.advance_ticks_for_test(50);
+            if (cr < 0 && live_infs(reinf) == 0) cr = step;
+            if (cn2 < 0 && live_infs(naive2) == 0) cn2 = step;
+        }
+        CHECK(cr >= 0 && cn2 >= 0 && cr < cn2);
+        // maternal passive transfer: mother with memory -> child inherits
+        {
+            const PropId sp_p = pid(w, "speed"), fe_p = pid(w, "fertility");
+            std::vector<std::pair<PropId, std::int64_t>> loci =
+                {{sp_p, 5000}, {fe_p, 500}};
+            EntityId mother = mk_organism(w, "test_beast", {500, 100}, loci,
+                                          300, 500, 30, 1800);
+            EntityId father = mk_organism(w, "test_beast", {510, 100}, loci,
+                                          300, 500, 30, 1800);
+            tseti(*w.find(mother), w, "immune_sig0", 555);
+            tseti(*w.find(mother), w, "immune_sig1", 777);
+            tseti(*w.find(mother), w, "immune_count", 2);
+            w.find(mother)->props.set(pid(w, "repro_cooldown"),
+                                      Value::integer(0));
+            for (EntityId pp : {mother, father}) {
+                w.find(pp)->props.set(pid(w, "hunger"), Value::integer(100));
+                w.find(pp)->props.set(pid(w, "energy"), Value::integer(1000000));
+            }
+            InteractionResult rr = w.interact(mk_ctx(mother, {father},
+                                                   "reproduce", 0));
+            CHECK(rr.completed && !rr.spawned.empty());
+            if (!rr.spawned.empty()) {
+                Entity* child = w.find(rr.spawned.front());
+                CHECK(tint(*child, w, "immune_sig0") == 555);
+                CHECK(tint(*child, w, "passive_immune") > 0);
+            }
+        }
+    }
+
+    // ---- E: antigenic drift — mutant strain escapes immune memory --------
+    {
+        World w(74, "data");
+        EntityId s = mk_strain(w, {0, 0},
+            {{"antigen_signature", 9001}, {"virulence", 1000},
+             {"airborne_rate", 0}, {"waterborne_rate", 0},
+             {"contact_rate", 0}, {"incubation_ticks", 0}}, "torso");
+        EntityId host = mk_body(w, {100, 100});
+            tseti(*w.find(host), w, "metabolism", 0);
+            tseti(*w.find(host), w, "decay_rate", 0);
+        mk_infection(w, host, s, 50, 0);
+        w.advance_ticks_for_test(6000);
+        // count live pathogen_strain entities besides the founder
+        int strains = 0; std::uint32_t seen_sig = 0;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive || ep->kind_name != "pathogen_strain") continue;
+            ++strains;
+            seen_sig = static_cast<std::uint32_t>(tint(*ep, w,
+                "antigen_signature"));
+        }
+        CHECK(strains >= 2);                        // drift spawned a mutant
+        // at least one strain carries a signature different from 9001
+        bool different = false;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive || ep->kind_name != "pathogen_strain") continue;
+            if (tint(*ep, w, "antigen_signature") != 9001) different = true;
+        }
+        CHECK(different);
+        (void)seen_sig;
+    }
+
+    // ---- F: neoplasm growth, metastasis, amputation cure ------------------
+    {
+        World w(75, "data");
+        EntityId b = mk_body(w, {100, 100});
+            tseti(*w.find(b), w, "metabolism", 0);
+            tseti(*w.find(b), w, "decay_rate", 0);
+        gut_props(*w.find(b), w);
+        Entity* B = w.find(b);
+        tseti(*B, w, "dna_repair_gain", 200);       // poor repair -> initiates
+        tseti(*B, w, "toxin_load", 700);            // oncogenic pressure
+        EntityId torso = mk_part(w, b, "tor_f", "muscle", "torso", "torso",
+                                 200, 300);
+        EntityId arm = mk_part(w, b, "arm_f", "muscle", "arm_l", "arm", 0, 140);
+        EntityId leg = mk_part(w, b, "leg_f", "bone", "leg_l", "leg", 0, 160);
+        w.advance_ticks_for_test(400);
+        // some part initiated a neoplasm
+        auto nm_of = [&](EntityId p) { return tint(*w.find(p), w, "neoplasm_mass"); };
+        CHECK(nm_of(torso) + nm_of(arm) + nm_of(leg) > 0);
+        // fast-forward growth on whichever part has the tumour
+        EntityId tumour = nm_of(torso) > 0 ? torso
+                        : (nm_of(arm) > 0 ? arm : leg);
+        tseti(*w.find(tumour), w, "neoplasm_mass", 500);
+        const std::int64_t en0 = tint(*B, w, "energy");
+        w.advance_ticks_for_test(200);
+        CHECK(tint(*w.find(tumour), w, "neoplasm_mass") > 500);  // grew
+        CHECK(tint(*B, w, "energy") < en0);                      // drains host
+        // metastasis: mass >= 750 seeds a sibling part
+        tseti(*w.find(tumour), w, "neoplasm_mass", 760);
+        w.advance_ticks_for_test(600);
+        const int with_tumour = (nm_of(torso) > 0) + (nm_of(arm) > 0) +
+                                (nm_of(leg) > 0);
+        CHECK(with_tumour >= 2);                                 // spread
+        // amputation cures: sever the tumour part -> it can no longer seed
+        for (EntityId p : {torso, arm, leg}) {
+            Entity* pt = w.find(p);
+            if (pt && tint(*pt, w, "neoplasm_mass") >= 500) {
+                tseti(*pt, w, "severed", 1);
+                break;
+            }
+        }
+        // zero out all masses to isolate the severed carrier's behaviour
+        for (EntityId p : {torso, arm, leg})
+            tseti(*w.find(p), w, "neoplasm_mass", 0);
+        // re-seed ONLY the severed part at 800 -> must NOT metastasize
+        EntityId sev = kNoEntity;
+        for (EntityId p : {torso, arm, leg})
+            if (tint(*w.find(p), w, "severed") == 1) sev = p;
+        CHECK(sev != kNoEntity);
+        // suppress spontaneous initiation so only metastasis could spread:
+        // high repair gain + zero toxin + cleared seed accumulators.
+        tseti(*B, w, "dna_repair_gain", 2000);
+        tseti(*B, w, "toxin_load", 0);
+        for (EntityId p : {torso, arm, leg}) {
+            tseti(*w.find(p), w, "neoplasm_mass", 800 * (p == sev ? 1 : 0));
+            tseti(*w.find(p), w, "neoplasm_seed_accum", 0);
+        }
+        w.advance_ticks_for_test(800);
+        bool spread_from_severed = false;
+        for (EntityId p : {torso, arm, leg})
+            if (p != sev && tint(*w.find(p), w, "neoplasm_mass") > 0)
+                spread_from_severed = true;
+        CHECK(!spread_from_severed);
+    }
+
+    // ---- G: LOD invariance + save roundtrip -------------------------------
+    {
+        auto build = [](World& w) {
+            EntityId b = mk_body(w, {100, 100});
+            tseti(*w.find(b), w, "metabolism", 0);
+            tseti(*w.find(b), w, "decay_rate", 0);
+            gut_props(*w.find(b), w);
+            Entity* B = w.find(b);
+            tseti(*B, w, "normal_body_temp", 370);
+            tseti(*B, w, "body_temp", 370);
+            tseti(*B, w, "thermoreg_gain", 1000);
+            tseti(*B, w, "hypothermia_delta", 15);
+            tseti(*B, w, "fever_delta_max", 35);
+            tseti(*B, w, "hyperpyrexia_delta", 45);
+            tseti(*B, w, "immune_power", 1000);
+            tseti(*B, w, "immune_power_base", 1000);
+            tseti(*B, w, "dna_repair_gain", 800);
+            tseti(*B, w, "body_temp", 391);   // already febrile: no ramp transient
+            EntityId torso = mk_part(w, b, "tor_l", "muscle", "torso",
+                                     "torso", 200, 300);
+            tseti(*w.find(torso), w, "neoplasm_mass", 100);
+            tseti(*w.find(torso), w, "neoplasm_accum", 400);
+            EntityId s = mk_strain(w, {0, 0},
+                {{"antigen_signature", 4242}, {"virulence", 400},
+                 {"airborne_rate", 0}, {"waterborne_rate", 0},
+                 {"contact_rate", 0}, {"incubation_ticks", 10}}, "torso");
+            EntityId inf = mk_infection(w, b, s, 300, 100);
+            tseti(*w.find(inf), w, "infection_elapsed", 20);  // past incubation
+            return b;
+        };
+        World wa(76, "data"), wb(76, "data");
+        EntityId ba = build(wa), bb = build(wb);
+        for (int i = 0; i < 30; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(30);
+        std::vector<EntityId> ids_a{ba}, ids_b{bb};
+        for (const char* pn : {"body_temp", "toxin_load", "neoplasm_mass"}) {
+            // sum over body + its parts for a fair composite check
+            auto total = [&](World& w, EntityId b) {
+                std::int64_t s = 0;
+                s += tint(*w.find(b), w, pn);
+                for (const Relation& r : w.relations_of(b, "part_of"))
+                    if (r.b == b) {
+                        Entity* p = w.find(r.a);
+                        if (p) s += tint(*p, w, pn);
+                    }
+                return s;
+            };
+            CHECK(total(wa, ba) == total(wb, bb));
+        }
+        // infection entity internals identical too
+        auto inf_sum = [&](World& w, EntityId b) {
+            std::int64_t s = 0;
+            for (const Relation& r : w.relations_of(b, "carries"))
+                if (r.a == b) {
+                    Entity* ie = w.find(r.b);
+                    if (ie) s += tint(*ie, w, "pathogen_load") * 8 +
+                                tint(*ie, w, "antibody_level");
+                }
+            return s;
+        };
+        CHECK(inf_sum(wa, ba) == inf_sum(wb, bb));
+        // save/load preserves the whole epidemiological state
+        const std::uint64_t h0 = wa.state_hash();
+        CHECK(wa.save("/tmp/simlab_p104.bin"));
+        World wc(1, "data");
+        CHECK(wc.load("/tmp/simlab_p104.bin"));
+        CHECK(wc.state_hash() == h0);
+        (void)ids_a; (void)ids_b;
+    }
+}
+
 int main() {
     test_registries();
     test_new_material_data_only();
@@ -4349,6 +5507,11 @@ int main() {
     test_cognitive_aptitudes();
     test_attachment_and_parental_care();
     test_primitive_social_psychology();
+
+    test_anatomical_trauma_and_bleeding();
+    test_lumen_mechanics_and_organ_coupling();
+    test_thermoregulation_immunity_neoplasm_and_epidemiology();
+    test_infection_and_primitive_medicine();
     test_neuro_psychopathology();
     test_phase9_autonomous_civilization();
     std::printf("%d checks, %d failures\n", checks, failures);

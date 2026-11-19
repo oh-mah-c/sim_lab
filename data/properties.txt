@@ -168,3 +168,98 @@ mind_parental_drive     integer permille     range 0 2500   domain=cognitive  # 
 mind_conformity_gain      integer permille     range 0 2500   domain=cognitive  # herd-pressure: bonus for joining >=3 familiar actors' shared action
 mind_xenophobia_bias      integer permille     range 0 2500   domain=cognitive  # stranger wariness on first sight of a conspecific
 mind_ego_defense_gain     integer permille     range 0 2500   domain=cognitive  # scapegoating/sublimation when grief or rage has no clear target
+
+# ---- anatomy domain: layered body, circulation, pain (Phase 10) ------------
+blood_volume      integer permille     range 0 1000   domain=physical   # circulating blood; 0 = hypovolemic death
+blood_accum       integer milli-units  range 0 1000000 domain=physical  # Euclid remainder for blood drift (internal)
+pain_level        integer permille     range 0 1000   domain=physical   # somatic pain; feeds NeuroState panic/rage
+consciousness     integer permille     range 0 1000   domain=physical   # 1000 awake; <300 unconscious; 0 clinical death
+body_slot         text     slot        domain=physical   # anatomical position key (head/torso/arm_l/leg_r/...)
+part_role         text     role        domain=physical   # function key (eye/heart/lung/arm/leg/brain/...)
+vital_organ       integer permille     range 0 1000   domain=physical   # 1000 = destroying it kills the body
+bleed_rate        integer permille     range 0 1000   domain=physical   # blood lost per 1000 ticks while attached
+fracture_level    integer permille     range 0 1000   domain=physical   # bone/tissue structural damage
+severed           integer flag         range 0 1      domain=physical   # part detached from its body
+part_size         integer permille     range 0 1000   domain=physical   # hit-weight of the part within its parent
+bleed_accum       integer milli-units  range 0 1000000 domain=physical  # Euclid remainder for clotting (internal)
+odor              integer permille     range 0 1000   domain=physical   # scent intensity — carrion/blood draws predators
+# ---- primitive medicine domain (Phase 10.2) ---------------------------------
+absorbency         integer permille     range 0 1000   domain=observable # dressing quality: soaks blood, mechanical cover
+antiseptic         integer permille     range 0 1000   domain=observable # natural antimicrobial potency of a material
+contamination      integer permille     range 0 1000   domain=observable # filth/pathogen load a material carries
+infection_level    integer permille     range 0 1000   domain=physical   # tissue infection; >=800 necrosis, 1000 sepsis
+infection_accum    integer milli-units  range 0 1000000 domain=physical  # Euclid remainder for infection drift (internal)
+necrotic           integer flag         range 0 1      domain=physical   # irreversible tissue death
+bandaged_integrity integer permille     range 0 1000   domain=physical   # mechanical dressing strength currently covering a wound
+# ---- digestion, lumen mechanics & organ coupling (Phase 10.3) ---------------
+undigested_mass     integer units        range 0 10000000 domain=physical  # solid matter awaiting passage
+undigested_fluid    integer units        range 0 10000000 domain=physical  # fluid awaiting excretion
+ruptured            integer flag         range 0 1       domain=physical  # hollow organ burst open
+lumen_capacity      integer permille     range 0 3000    domain=physical  # hollow-organ volume; 0/absent = solid part
+contents_load       integer units        range 0 1500    domain=physical  # matter pooled inside the lumen
+contents_accum      integer milli-units  range 0 1000000 domain=physical  # Euclid remainder for fill (internal)
+content_viscosity   integer permille     range 0 1000    domain=physical  # internal consistency of the contents
+viscosity_accum     integer milli-units  range -1000000 1000000 domain=physical # hardness drift remainder (internal)
+contractility       integer permille     range 0 1000    domain=physical  # max expulsive force of the organ wall
+evacuate_material   text     material    domain=physical  # material shed on evacuate (feces/urine/...)
+upstream_organ_slot text     slot        domain=physical  # body_slot suffering backpressure when distended
+organ_stress_accum  integer milli-units  range 0 100000000 domain=physical # backpressure wear remainder (internal)
+filtration_rate     integer permille     range 0 1000    domain=physical  # toxin clearance per 1000 ticks at full integrity
+toxin_load          integer permille     range 0 1000    domain=physical  # metabolic toxin in blood; 1000 = toxemia
+toxin_accum         integer milli-units  range -1000000 1000000 domain=physical # generation-filtration remainder (internal)
+viscosity           integer permille     range 0 1000    domain=physical  # material internal consistency (waste)
+nutrient            integer permille     range 0 1000    domain=physical  # soil-amendment value a decaying material leaves
+moisture            integer permille     range 0 1000    domain=physical  # water content of a material/waste
+# ---- thermoregulation, immunity, neoplasm & pathogens (Phase 10.4) ----------
+# Species-relative thresholds: every delta is declared per species — no
+# fixed temperature ever appears in code.
+normal_body_temp   integer  deciC       range 0 600      domain=biological # species physiological set-point
+thermoreg_gain     integer  permille    range 0 1000    domain=biological # endogenous heat capacity; low = poikilotherm
+hypothermia_delta  integer  deciC       range 0 100     domain=biological # |dT| below normal that counts as hypothermia
+fever_delta_max    integer  deciC       range 0 100     domain=biological # max defensive-fever elevation above normal
+hyperpyrexia_delta integer  deciC       range 0 100     domain=biological # |dT| above normal that damages vital_neural parts
+body_temp          integer  deciC       range 0 600     domain=observable # current core temperature — a visible sign
+temp_accum          integer  milli-units range 0 1000000 domain=biological # Euclid remainder for thermal drift (internal)
+immune_power       integer  permille    range 0 2000    domain=biological # effective immunity (hypothermia halves it)
+immune_power_base  integer  permille    range 0 2000    domain=biological # undegraded immunity the effective value derives from
+dna_repair_gain    integer  permille    range 0 2000    domain=biological # cell-division error correction; neoplasm brake
+neoplasm_mass      integer  permille    range 0 1000    domain=physical   # growing-cell mass on a part; 0 = none
+neoplasm_accum     integer  milli-units range 0 1000000 domain=physical   # Euclid remainder for tumour growth (internal)
+neoplasm_seed_accum integer milli-units range 0 1000000 domain=physical   # deterministic initiation accumulator (internal)
+metastasis_accum   integer  milli-units range 0 1000000 domain=physical   # seeding accumulator once mass >= 750 (internal)
+vital_neural       integer  flag        range 0 1      domain=physical   # CNS part tag: hyperpyrexia + sepsis target
+# ---- pathogen strains & active infections (entity-carried, World Truth) ----
+antigen_signature  integer  units       range 0 4294967295 domain=biological # strain fingerprint; immune memory key
+virulence          integer  permille    range 0 1000    domain=biological # tissue destruction + toxin rate of a strain
+airborne_rate      integer  permille    range 0 1000    domain=biological # shed quantum frequency, respired route
+waterborne_rate    integer  permille    range 0 1000    domain=biological # shed quantum frequency, waste/water route
+contact_rate       integer  permille    range 0 1000    domain=biological # shed quantum frequency, touch/blood route
+incubation_ticks   integer  ticks       range 0 1000000 domain=biological # latency before symptoms/fever engage
+target_slot        text     slot        domain=biological # preferred body_slot for tissue damage
+pathogen_strain    integer  units       range 0 9223372036854775807 domain=biological # strain entity id carried by an infection/waste
+pathogen_load      integer  permille    range 0 1500    domain=biological # live pathogen mass inside the host
+antibody_level     integer  permille    range 0 1500    domain=biological # adaptive response magnitude
+infection_elapsed  integer  ticks       range 0 1000000000 domain=biological # ticks since establishment
+infection_load_accum integer milli-units range -100000000 100000000 domain=biological # growth remainder (internal)
+infection_ab_accum  integer milli-units range 0 100000000 domain=biological # antibody remainder (internal)
+shed_accum         integer  milli-units range 0 100000000 domain=biological # transmission quantum remainder (internal)
+strain_ref         integer  units       range 0 9223372036854775807 domain=biological # strain id stamped on shed waste
+immune_sig0        integer  units       range 0 4294967295 domain=biological # immune memory slot 0 (antigen_signature)
+immune_sig1        integer  units       range 0 4294967295 domain=biological # immune memory slot 1
+immune_sig2        integer  units       range 0 4294967295 domain=biological # immune memory slot 2
+immune_sig3        integer  units       range 0 4294967295 domain=biological # immune memory slot 3
+immune_sig4        integer  units       range 0 4294967295 domain=biological # immune memory slot 4
+immune_sig5        integer  units       range 0 4294967295 domain=biological # immune memory slot 5
+immune_sig6        integer  units       range 0 4294967295 domain=biological # immune memory slot 6
+immune_sig7        integer  units       range 0 4294967295 domain=biological # immune memory slot 7
+immune_count       integer  permille    range 0 8      domain=biological # occupied immune-memory slots
+passive_immune     integer  ticks       range 0 1000000 domain=biological # ticks of maternally-transferred immunity left
+# ---- biomedical material potency (Phase 10.4) --------------------------------
+antipyretic        integer  permille    range 0 1000    domain=observable # cooling/fever-suppressing potency of a material
+mutagenic          integer  permille    range 0 1000    domain=biological # cell-mutation exposure a material carries
+mutation_accum     integer  milli-units range 0 100000000 domain=biological # antigenic-drift roll accumulator (internal)
+drift_rolls         integer  units       range 0 1000000000 domain=biological # monotonic roll counter — LOD-invariant epoch source (internal)
+neoplasm_rolls      integer  units       range 0 1000000000 domain=biological # neoplasm founding roll counter (internal)
+metastasis_rolls    integer  units       range 0 1000000000 domain=biological # metastasis seed roll counter (internal)
+damage_accum        integer  milli-units range 0 100000000 domain=biological # tissue-damage remainder on an infection (internal)
+infection_toxin_accum integer milli-units range -100000000 100000000 domain=biological # toxin-shedding remainder (internal)

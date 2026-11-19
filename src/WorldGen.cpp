@@ -630,6 +630,9 @@ void WorldGenerator::stage_ecology(GenCtx& ctx, int gx0, int gy0, int gw, int gh
                         }
                     }
                 }
+                // Phase 10: species with a body plan spawn as anatomical
+                // composites — contained part_of children, integrity 1000.
+                if (nid != kNoEntity) w.build_anatomy(nid);
                 ++spawned;
                 if (!sp.fauna) flora_here = true;
             }

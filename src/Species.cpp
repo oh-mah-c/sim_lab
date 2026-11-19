@@ -80,6 +80,36 @@ bool SpeciesRegistry::parse(const std::string& text, const PropertyRegistry& pro
                 c.lo = parse_i64(lo); c.hi = parse_i64(hi);
                 if (c.lo > c.hi) return bad("condition lo > hi");
                 d.conditions.push_back(c);
+            } else if (key == "body_part") {
+                // anatomy (Phase 10): `body_part <name> <material> <slot>
+                // <role> <vital> <size>` — child entities spawned contained
+                // under the body via part_of edges.
+                PartSpec ps; std::string mat, vital, size;
+                ls >> ps.name >> mat >> ps.slot >> ps.role >> vital >> size;
+                const MaterialDef* md = materials.find_name(mat);
+                if (ps.name.empty() || !md) return bad("bad body_part line");
+                ps.material = md->id;
+                ps.vital = parse_i64(vital);
+                ps.size = size.empty() ? 200 : parse_i64(size);
+                // optional trailing key=value organ props — lumen_capacity,
+                // contractility, evacuate_material, filtration_rate, ...
+                // Any registered property is allowed; text props take the
+                // raw token, integer props parse it.
+                std::string kv;
+                while (ls >> kv) {
+                    const auto eq = kv.find('=');
+                    if (eq == std::string::npos)
+                        return bad("bad body_part extra '" + kv + "'");
+                    const std::string k = kv.substr(0, eq);
+                    const std::string v = kv.substr(eq + 1);
+                    const PropertyDef* pd = props.find_name(k);
+                    if (!pd) return bad("unknown body_part prop '" + k + "'");
+                    if (pd->type == ValType::Text)
+                        ps.extra.set(pd->id, Value::text(v));
+                    else
+                        ps.extra.set(pd->id, Value::integer(parse_i64(v)));
+                }
+                d.anatomy.push_back(ps);
             } else if (key == "gene") {
                 // hereditary locus (Phase 7): `gene <prop>` declares which
                 // props pass to offspring. PropId only — no trait semantics.

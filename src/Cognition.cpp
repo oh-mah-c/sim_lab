@@ -407,7 +407,18 @@ void upsert_memory_g(const World& w, AgentMind& mind, EntityId eid,
 // sight radius of `e` — the honest perception bound for generalization.
 std::int64_t sight_radius_of(const World& w, const Entity& e) {
     const PropertyDef* d = w.props.find_name("sight_range");
-    return d ? w.prop_int(e, d->id, 256) : 256;
+    std::int64_t r = d ? w.prop_int(e, d->id, 256) : 256;
+    // Phase 10: lost eyes blind proportionally; blood_volume < 600 dims
+    // vision (hypotension). Non-anatomical entities unaffected (1000).
+    r = r * w.anatomy_function(e.id, "eye") / 1000;
+    const PropId bv = w.props.find_name("blood_volume")
+        ? w.props.find_name("blood_volume")->id : kNoProp;
+    if (bv != kNoProp) {
+        const Value* v = w.prop_of(e, bv);
+        if (v && v->type == ValType::Integer && v->i < 600)
+            r = r * std::max<std::int64_t>(200, v->i * 1000 / 600) / 1000;
+    }
+    return r;
 }
 
 Vec2 recalled_pos(const AgentMind::MemorySnapshot& s, EntityId eid,
@@ -607,6 +618,25 @@ std::int64_t bonded_distress(const World& w, const AgentMind& mind,
     if (const Value* ig = pv("integrity"))
         if (ig->type == ValType::Integer && ig->i < 400)
             d = std::max(d, static_cast<std::int64_t>(500));   // visible wounds
+    // Phase 10.2: a blood pool remembered near the bonded is an observable
+    // hemorrhage sign — memory snapshots carry material + position, both
+    // legitimately perceivable. No private prop is read.
+    {
+        const MaterialId blood = w.materials.find_name("blood")
+            ? w.materials.find_name("blood")->id : kNoMaterial;
+        if (blood != kNoMaterial) {
+            const auto bit = mind.memory.find(eid);
+            if (bit != mind.memory.end()) {
+                for (const auto& [mid, ms] : mind.memory) {
+                    if (mid == eid || ms.material != blood) continue;
+                    if (dist2(ms.pos, bit->second.pos) <= 96 * 96) {
+                        d = std::max(d, static_cast<std::int64_t>(600));
+                        break;
+                    }
+                }
+            }
+        }
+    }
     return std::min<std::int64_t>(d, 1000);
 }
 
@@ -656,6 +686,107 @@ std::int64_t care_bonus(const World& w, EntityId npc,
 bool share_collective(const World& w, EntityId a, EntityId b);
 void gratitude_engram(World& w, EntityId who, EntityId benefactor,
                       std::uint64_t tick, const MindParams& mp);
+std::int64_t wound_bonus(const World& w, EntityId npc,
+                         const AgentMind& mind,
+                         const InteractionContext& c);
+std::int64_t excrete_penalty(const World& w, EntityId npc,
+                             const AgentMind& mind,
+                             const InteractionContext& c);
+
+
+// Wound care (Phase 10.2): "treat" on a wounded self/bonded earns a bonus
+// scaled by the dressing's absorbency+antiseptic (observable props the
+// agent can see) and the actor's abstraction/motor gains — the emergent
+// "physician" is just high-gain minds winning the same Score(H) arena.
+std::int64_t wound_bonus(const World& w, EntityId npc,
+                         const AgentMind& mind,
+                         const InteractionContext& c) {
+    if (c.parameters.action != "treat" || c.targets.size() < 2) return 0;
+    const Entity* me = w.find(npc);
+    if (!me) return 0;
+    const MindParams mp = mind_params(w, *me);
+    const EntityId patient = c.targets[0], med = c.targets[1];
+    // patient must be self or a bonded charge
+    const bool self = patient == npc;
+    if (!self) {
+        const auto it = mind.memory.find(patient);
+        if (it == mind.memory.end() ||
+            it->second.engram.emotional_charge < 600) return 0;
+    }
+    // dressing quality from OBSERVABLE props (what the agent can see)
+    const Entity* md = w.find(med);
+    if (!md) return 0;
+    const PropId ap = w.props.find_name("absorbency")
+        ? w.props.find_name("absorbency")->id : kNoProp;
+    const PropId sp = w.props.find_name("antiseptic")
+        ? w.props.find_name("antiseptic")->id : kNoProp;
+    const PropId tp = w.props.find_name("temperature")
+        ? w.props.find_name("temperature")->id : kNoProp;
+    const std::int64_t absorb = ap != kNoProp ? w.prop_int(*md, ap, 0) : 0;
+    const std::int64_t anti = sp != kNoProp ? w.prop_int(*md, sp, 0) : 0;
+    const std::int64_t temp = tp != kNoProp ? w.prop_int(*md, tp, 0) : 0;
+    const std::int64_t quality = std::max(absorb,
+        std::max(anti, static_cast<std::int64_t>(temp >= 500 ? 600 : 0)));
+    if (quality < 400) return 0;
+    // wound severity on the patient (self = World Truth own body; bonded
+    // severity already priced by care_bonus — here a flat medical pull)
+    std::int64_t sev = 400;
+    if (self) {
+        const PropId br = w.props.find_name("bleed_rate")
+            ? w.props.find_name("bleed_rate")->id : kNoProp;
+        const PropId iv = w.props.find_name("infection_level")
+            ? w.props.find_name("infection_level")->id : kNoProp;
+        sev = 0;
+        for (const Relation& rel : w.relations_of(npc, "part_of")) {
+            if (rel.b != npc) continue;
+            const Entity* pt = w.find(rel.a);
+            if (!pt || !pt->alive) continue;
+            sev = std::max(sev, br != kNoProp ? w.prop_int(*pt, br, 0) * 2 : 0);
+            sev = std::max(sev, iv != kNoProp ? w.prop_int(*pt, iv, 0) : 0);
+        }
+        if (sev <= 0) return 0;
+    }
+    // physician factor: abstraction sees the remedy, motor applies it
+    const std::int64_t phys =
+        (mp.abstraction_gain + mp.motor_precision) / 2;
+    std::int64_t bonus = quality * sev / 1000 * phys / 1000 * 4;
+    if (!self) bonus = bonus * 3 / 4;    // care slightly discounted vs self
+    return std::min<std::int64_t>(bonus, 1200000);
+}
+
+
+// Excretion privacy (Phase 10.3): voiding in front of conspecifics, near
+// food/water, or while threatened carries a shame penalty scored from
+// conformity_gain x abstraction_gain — high-conformity minds hold it in
+// and seek a latrine (dig), low ones relieve themselves anywhere. The
+// penalty is a score subtraction, never a block: urgency still wins.
+std::int64_t excrete_penalty(const World& w, EntityId npc,
+                             const AgentMind& mind,
+                             const InteractionContext& c) {
+    if (c.parameters.action != "evacuate") return 0;
+    const Entity* me = w.find(npc);
+    if (!me) return 0;
+    const MindParams mp = mind_params(w, *me);
+    std::int64_t base = 0;
+    int neighbors = 0; bool threat = false;
+    for (const auto& [id, ms] : mind.memory) {
+        if (id == npc) continue;
+        if (dist2(ms.pos, me->pos) > 128 * 128) continue;
+        if (!ms.kind_name.empty() && ms.kind_name == me->kind_name)
+            ++neighbors;
+        if (ms.engram.emotional_charge <= -400) threat = true;
+    }
+    base += neighbors * 500;
+    if (mind.neuro.panic >= 400) base += 800;   // too scared to linger
+    if (threat) base += 1200;                     // hostile nearby: hide it
+    if (base == 0) return 0;
+    // shame scales with herd instinct AND self-awareness; abstraction lets
+    // the mind convert pressure into planning (latrine digging) rather
+    // than simply suffering it — capped so the urge always remains winnable.
+    std::int64_t pen = base * mp.conformity_gain / 1000;
+    pen = pen * mp.abstraction_gain / 1000;
+    return std::min<std::int64_t>(pen, 8000);
+}
 
 // Herd pressure (Nhịp 5a): count DISTINCT familiar/collective
 // conspecifics that recently performed this action. >=3 -> conformity
@@ -1132,6 +1263,37 @@ bool bereavement_check(World& w, AgentMind& mind, EntityId npc,
     return true;
 }
 
+
+// Primitive medicine gratitude (Phase 10.2): being treated for a real
+// wound writes a deep positive engram on the healer — the recipient's
+// own body state is first-person knowledge. Called from both the actor
+// path (self-treatment) and the witness path (bonded rescue).
+static void treat_gratitude(World& w, EntityId npc, const CausalEvent& ev,
+                            const MindParams& mp) {
+    if (ev.action != "treat" || ev.participants.empty() ||
+        ev.participants.front() == npc) return;
+    const PropId br = w.props.find_name("bleed_rate")
+        ? w.props.find_name("bleed_rate")->id : kNoProp;
+    const PropId iv = w.props.find_name("infection_level")
+        ? w.props.find_name("infection_level")->id : kNoProp;
+    if (br == kNoProp && iv == kNoProp) return;
+    // treat writes bleed/infection deltas on the patient's PART entities —
+    // gather them plus the body itself.
+    std::set<EntityId> mine{npc};
+    for (const Relation& rel : w.relations_of(npc, "part_of"))
+        if (rel.b == npc) mine.insert(rel.a);
+    for (const StateChange& ch : ev.changes) {
+        if (!mine.count(ch.entity)) continue;
+        const bool hit = (br != kNoProp && ch.prop == br) ||
+                         (iv != kNoProp && ch.prop == iv);
+        if (hit && ch.before.type == ValType::Integer &&
+            ch.after.type == ValType::Integer && ch.after.i < ch.before.i) {
+            gratitude_engram(w, npc, ev.participants.front(), ev.tick, mp);
+            return;
+        }
+    }
+}
+
 void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
     const CausalEvent* ev = w.ledger.find(event_id);
     if (!ev) return;
@@ -1158,6 +1320,40 @@ void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
         }
         // Sleeping consolidates: emotional traces strengthen, noise prunes.
         if (ev->action == "rest") sleep_consolidate(mind, mp);
+        treat_gratitude(w, npc, *ev, mp);
+        // Nociception (Phase 10d): a pain_level jump on the actor is a
+        // somatic shock — panic vs rage split by the threat axis, and a
+        // deep negative engram on the attacker (first participant).
+        {
+            const PropId pain_p = w.props.find_name("pain_level")
+                ? w.props.find_name("pain_level")->id : kNoProp;
+            if (pain_p != kNoProp) {
+                std::int64_t dpain = 0;
+                for (const StateChange& ch : ev->changes)
+                    if (ch.entity == npc && ch.prop == pain_p &&
+                        ch.before.type == ValType::Integer &&
+                        ch.after.type == ValType::Integer &&
+                        ch.after.i > ch.before.i)
+                        dpain += ch.after.i - ch.before.i;
+                if (dpain > 0) {
+                    mind.neuro.panic = std::min<std::int64_t>(1000,
+                        mind.neuro.panic + dpain * mp.threat_gain / 2000);
+                    mind.neuro.rage = std::min<std::int64_t>(1000,
+                        mind.neuro.rage + dpain * (2000 - std::min<std::int64_t>(mp.threat_gain, 2000)) / 2000);
+                    // trauma engram keyed on the attacker's kind/material
+                    for (EntityId tid : ev->participants) {
+                        if (tid == npc || tid == kNoEntity) continue;
+                        const Entity* te = w.find(tid);
+                        if (!te) break;
+                        AgentMind::MemorySnapshot snap = snapshot_now(w, tid, ev->tick);
+                        upsert_memory_g(w, mind, tid, snap,
+                            -std::min<std::int64_t>(800, dpain * 2), mp,
+                            me ? sight_radius_of(w, *me) : 0);
+                        break;                      // first participant = attacker
+                    }
+                }
+            }
+        }
         apply_event_shock(w, mind, npc, *ev);
     }
 }
@@ -1240,6 +1436,7 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
                 }
             }
         }
+        treat_gratitude(w, npc, ev, mp);
         apply_event_shock(w, mind, npc, ev);
     }
 }
@@ -1301,7 +1498,7 @@ std::vector<InteractionContext> plan(const World& w, EntityId npc, const Goal& g
     static const std::vector<std::string> kVerbs = {
         "dig", "chop", "strike", "impact", "carve", "assemble",
         "disassemble", "process", "heat", "wield", "unwield",
-        "consume", "rest"};
+        "consume", "rest", "evacuate", "treat"};
 
     struct Scored { InteractionContext ctx; std::int64_t score; };
     std::vector<Scored> cand;
@@ -1339,7 +1536,9 @@ std::vector<InteractionContext> plan(const World& w, EntityId npc, const Goal& g
                 // does the prediction reduce the need on the ACTOR, or spawn
                 // something edible/drinkable (material props, World Truth)?
                 for (const StateChange& ch : best.changes)
-                    if (ch.entity == npc && ch.prop == goal.need) {
+                    if ((ch.entity == npc ||
+                         (goal.target != kNoEntity && ch.entity == goal.target)) &&
+                        ch.prop == goal.need) {
                         std::int64_t after = ch.after.type == ValType::Integer
                             ? ch.after.i : 0;
                         std::int64_t before = ch.before.type == ValType::Integer
@@ -1385,7 +1584,9 @@ std::vector<InteractionContext> plan(const World& w, EntityId npc, const Goal& g
                 if (!p.possible) continue;
                 std::int64_t score = 0;
                 for (const StateChange& ch : p.changes)
-                    if (ch.entity == npc && ch.prop == goal.need &&
+                    if ((ch.entity == npc ||
+                         (goal.target != kNoEntity && ch.entity == goal.target)) &&
+                        ch.prop == goal.need &&
                         ch.after.type == ValType::Integer &&
                         ch.before.type == ValType::Integer &&
                         ch.after.i < ch.before.i) score += 600;
@@ -1530,7 +1731,10 @@ EvalResult evaluate(const World& w, EntityId npc, const Goal& goal,
     if (!actor || !actor->alive) { r.score = -1000000; return r; }
 
     if (goal.kind == Goal::Kind::SatisfyNeed) {
-        const std::int64_t cur = need_value(w, npc, goal.need);
+        // the "need" prop may live on a body PART (lumen contents_load) —
+        // goal.target names it; body needs live on the npc itself.
+        const std::int64_t cur = need_value(
+            w, goal.target != kNoEntity ? goal.target : npc, goal.need);
         if (cur <= goal.value) {
             r.satisfied = true; r.score = 1000000 - steps * 50; return r;
         }
@@ -1621,7 +1825,9 @@ bool rank_candidate(const World& w, const InteractionContext& c, EntityId npc,
             if (ch.before.type != ValType::Integer || ch.after.type != ValType::Integer)
                 continue;
             if (goal.kind == Goal::Kind::SatisfyNeed) {
-                if (ch.entity == npc && ch.prop == goal.need && ch.after.i < ch.before.i)
+                if ((ch.entity == npc ||
+                     (goal.target != kNoEntity && ch.entity == goal.target)) &&
+                    ch.prop == goal.need && ch.after.i < ch.before.i)
                     q += 1000;
             } else if (ch.prop == goal.prop &&
                        (goal.target == kNoEntity || ch.entity == goal.target)) {
@@ -1710,7 +1916,9 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
     const std::int64_t radius = sight_r + reach_r + 128;   // see + act margin
     World root_world = w.clone_local(me->pos, radius, npc);
     const std::int64_t root_need = goal.kind == Goal::Kind::SatisfyNeed
-        ? need_value(root_world, npc, goal.need) : 0;
+        ? need_value(root_world,
+                     goal.target != kNoEntity ? goal.target : npc,
+                     goal.need) : 0;
     {
         EvalResult ev = evaluate(root_world, npc, goal, root_need,
                                  mind->known_entities, 0);
@@ -1793,6 +2001,8 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
                                      c.parameters.action)
                                      + bond_bonus(*lmind, c)
                                      + care_bonus(*spec, npc, *lmind, c)
+                                     + wound_bonus(*spec, npc, *lmind, c)
+                                     - excrete_penalty(*spec, npc, *lmind, c)
                                      + sublimation_bonus(*lmind,
                                                         c.parameters.action)
                                      : 0);

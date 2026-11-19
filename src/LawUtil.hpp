@@ -112,4 +112,36 @@ inline void apply_tool_wear(const World& w, EntityId tool, std::int64_t wear,
     r.notes.push_back("tool " + std::to_string(tool) + " worn -" + std::to_string(wear));
 }
 
+// Phase 10: effective motor precision factor (permille) from anatomy —
+// arm function (severed/broken arms weaken grip and craft) scaled by
+// circulatory status (blood_volume < 600 -> shaky hands). Entities without
+// anatomy or circulation return 1000.
+inline std::int64_t anatomy_motor(const World& w, const Entity& actor) {
+    std::int64_t f = 1000;
+    if (actor.alive)
+        f = f * w.anatomy_function(actor.id, "arm") / 1000;
+    const PropId bv = pid(w, "blood_volume");
+    if (bv != kNoProp) {
+        const Value* v = w.prop_of(actor, bv);
+        if (v && v->type == ValType::Integer) {
+            const std::int64_t b = v->i;
+            if (b < 600) f = f * std::max<std::int64_t>(200, b * 1000 / 600) / 1000;
+        }
+    }
+    return f;
+}
+
+// Consciousness gate (Phase 10): blood_volume < 300 -> consciousness < 300
+// -> no voluntary action. Returns false + note when the actor is out.
+inline bool conscious_enough(const World& w, const Entity& actor,
+                             PredictionResult& r) {
+    const PropId cs = pid(w, "consciousness");
+    if (cs == kNoProp) return true;
+    const Value* v = w.prop_of(actor, cs);
+    if (!v || v->type != ValType::Integer) return true;
+    if (v->i >= 300) return true;
+    r.failure = "unconscious (consciousness " + std::to_string(v->i) + ")";
+    return false;
+}
+
 }  // namespace simlab::lawutil

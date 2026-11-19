@@ -29,7 +29,7 @@ const std::vector<std::string>& action_verbs() {
     static const std::vector<std::string> kVerbs = {
         "dig", "chop", "strike", "impact", "carve", "assemble",
         "disassemble", "process", "heat", "wield", "unwield",
-        "consume", "rest"};
+        "consume", "rest", "evacuate", "treat"};
     return kVerbs;
 }
 
@@ -726,6 +726,72 @@ std::vector<Problem> detect_problems(const World& w, EntityId npc,
         out.push_back(p);
     }
 
+    // Somatic trauma (Phase 10.2): the NPC's OWN body is first-person
+    // knowledge — attached parts bleeding or infected are a survival
+    // problem competing in the same Score(H) arena as hunger.
+    {
+        std::int64_t sev = 0;
+        const PropId br_p = w.props.find_name("bleed_rate")
+            ? w.props.find_name("bleed_rate")->id : kNoProp;
+        const PropId iv_p = w.props.find_name("infection_level")
+            ? w.props.find_name("infection_level")->id : kNoProp;
+        const PropId sev_p = w.props.find_name("severed")
+            ? w.props.find_name("severed")->id : kNoProp;
+        const PropId nec_p = w.props.find_name("necrotic")
+            ? w.props.find_name("necrotic")->id : kNoProp;
+        if (br_p != kNoProp && iv_p != kNoProp) {
+            for (const Relation& rel : w.relations_of(npc, "part_of")) {
+                if (rel.b != npc) continue;
+                const Entity* pt = w.find(rel.a);
+                if (!pt || !pt->alive) continue;
+                if (sev_p != kNoProp) {
+                    const Value* sv = w.prop_of(*pt, sev_p);
+                    if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+                }
+                if (nec_p != kNoProp) {
+                    const Value* nv = w.prop_of(*pt, nec_p);
+                    if (nv && nv->type == ValType::Integer && nv->i != 0) continue;
+                }
+                const std::int64_t br = w.prop_int(*pt, br_p, 0);
+                const std::int64_t iv = w.prop_int(*pt, iv_p, 0);
+                sev = std::max(sev, br * 2 + iv);
+            }
+        }
+        if (sev > 200) {
+            Problem p; p.kind = ProblemKind::SomaticTrauma;
+            p.subject = npc; p.urgency = std::min<std::int64_t>(950, 400 + sev / 2);
+            out.push_back(p);
+        }
+    }
+
+    // Evacuation urge (Phase 10.3): a distended hollow organ is
+    // first-person body state — luminal pressure >=700 is a problem.
+    {
+        const PropId lc = w.props.find_name("lumen_capacity")
+            ? w.props.find_name("lumen_capacity")->id : kNoProp;
+        const PropId cl = w.props.find_name("contents_load")
+            ? w.props.find_name("contents_load")->id : kNoProp;
+        if (lc != kNoProp && cl != kNoProp)
+            for (const Relation& rel : w.relations_of(npc, "part_of")) {
+                if (rel.b != npc) continue;
+                const Entity* pt = w.find(rel.a);
+                if (!pt || !pt->alive) continue;
+                const std::int64_t cap = w.prop_int(*pt, lc, 0);
+                if (cap <= 0) continue;
+                const std::int64_t load = w.prop_int(*pt, cl, 0);
+                const std::int64_t pressure = load * 1000 / cap;
+                if (pressure >= 700) {
+                    Problem p; p.kind = ProblemKind::Evacuate;
+                    p.subject = rel.a; p.urgency =
+                        std::min<std::int64_t>(950, 300 + pressure / 2);
+                    p.goal.kind = Goal::Kind::SatisfyNeed;
+                    p.goal.target = rel.a; p.goal.need = cl; p.goal.value = 0;
+                    out.push_back(p);
+                    break;                    // one urge at a time
+                }
+            }
+    }
+
     // Bonded distress (Nhịp 4.5): a charge >= +600 whose inferred welfare
     // is low becomes a problem of its own — care then competes with
     // self-preservation inside the same Score(H) machinery.
@@ -769,9 +835,13 @@ std::vector<Hypothesis> generate_hypotheses(const World& w, EntityId npc,
 
     if (p.kind == ProblemKind::Threat || p.kind == ProblemKind::CapabilityGap ||
         p.kind == ProblemKind::UnmetNeed || p.kind == ProblemKind::ExtraGoal ||
-        p.kind == ProblemKind::BondedDistress) {
+        p.kind == ProblemKind::BondedDistress ||
+        p.kind == ProblemKind::SomaticTrauma ||
+        p.kind == ProblemKind::Evacuate) {
         if (p.kind == ProblemKind::UnmetNeed || p.kind == ProblemKind::ExtraGoal ||
-            p.kind == ProblemKind::BondedDistress) {
+            p.kind == ProblemKind::BondedDistress ||
+            p.kind == ProblemKind::SomaticTrauma ||
+            p.kind == ProblemKind::Evacuate) {
             // need / caller goal: multi-step speculative candidates.
             // Nhịp 4a: lookahead depth AND branch budget come from the
             // individual's genome-expressed `mind_plan_horizon` (1..6) —
@@ -789,6 +859,25 @@ std::vector<Hypothesis> generate_hypotheses(const World& w, EntityId npc,
                 beam = std::clamp<std::int64_t>(4 + 2 * horizon, 4, 16);
             }
             Goal g = p.goal;
+            if (p.kind == ProblemKind::Evacuate) {
+                g = p.goal;                    // payload already set
+            }
+            if (p.kind == ProblemKind::SomaticTrauma) {
+                // same well-formed payload trick: care/wound plans are
+                // scored by wound_bonus inside plan_multi.
+                g.kind = Goal::Kind::SatisfyNeed; g.target = kNoEntity;
+                g.value = 0;
+                if (const Entity* me = w.find(npc))
+                    for (const char* nn : {"hunger", "thirst", "fatigue"}) {
+                        const PropertyDef* pd = w.props.find_name(nn);
+                        if (pd && w.prop_of(*me, pd->id)) {
+                            g.need = pd->id; break;
+                        }
+                    }
+                if (g.need == kNoProp) g.need =
+                    w.props.find_name("hunger")
+                        ? w.props.find_name("hunger")->id : kNoProp;
+            }
             if (p.kind == ProblemKind::BondedDistress) {
                 // care plans are scored by care_bonus inside plan_multi;
                 // the goal payload only keeps evaluate() well-formed —
@@ -831,7 +920,8 @@ std::vector<Hypothesis> generate_hypotheses(const World& w, EntityId npc,
         // means are how stuck NPCs invent tools (§11.2, §19E budget inside).
         const bool plans_empty = best.empty();
         if (p.kind == ProblemKind::Threat || p.kind == ProblemKind::CapabilityGap ||
-            plans_empty)
+            p.kind == ProblemKind::SomaticTrauma ||
+            p.kind == ProblemKind::Evacuate || plans_empty)
             add_synthesis_hypotheses(best, w, npc, p);
     }
 
@@ -970,6 +1060,19 @@ bool discover_step(World& w, EntityId npc, ExploreGoal* out_explore) {
 
     std::vector<Problem> problems = detect_problems(w, npc);
     if (problems.empty()) return false;
+    // Somatic trauma teaches the verb: an NPC bleeding learns that
+    // materials can be applied to wounds (the law already exists; the
+    // mind must know the action name to plan with it).
+    for (const Problem& p : problems) {
+        if (p.kind == ProblemKind::SomaticTrauma) {
+            AgentMind& m = w.mind(npc);
+            m.learn_action("treat");
+        }
+        if (p.kind == ProblemKind::Evacuate) {
+            AgentMind& m = w.mind(npc);
+            m.learn_action("evacuate");
+        }
+    }
 
     // gather hypotheses for the top few problems, best score first
     std::vector<Hypothesis> cands;

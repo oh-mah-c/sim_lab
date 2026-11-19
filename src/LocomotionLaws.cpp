@@ -35,8 +35,11 @@ PredictionResult LocomotionModel::predict(const World& w,
 
     const PropId speed_p = lawutil::pid(w, "speed");
     const PropId energy_p = lawutil::pid(w, "energy");
-    const std::int64_t speed = speed_p != kNoProp
+    std::int64_t speed = speed_p != kNoProp
         ? w.prop_int(*actor, speed_p, 0) : 0;
+    // Phase 10: broken/severed legs slow locomotion proportionally.
+    speed = speed * w.anatomy_function(actor->id, "leg") / 1000;
+    if (!lawutil::conscious_enough(w, *actor, r)) return r;
     lawutil::add_cond(r, "speed", speed, 1);
     if (speed <= 0) { r.failure = "actor cannot move (no speed)"; return r; }
 

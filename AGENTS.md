@@ -151,3 +151,32 @@ no engine code changes.
   (pattern>1500 & empathy<800) or sublimate into sublimation_relief
   craft bonus (abstraction>1500, grief/rage *2/3).
 - Save v15 adds recent_witnessed, sublimation_relief, ostracism_accum.
+## Phase 10 — anatomy, trauma, circulation
+
+- Species body plans live in `data/species.txt` as `body_part <name>
+  <material> <slot> <role> <vital> <size>` lines inside a `species`
+  block (`SpeciesDef::anatomy`). `World::build_anatomy` spawns them as
+  contained `part_of` children (integrity 1000); called from worldgen and
+  the interact spawn-commit (reproduce).
+- Anatomy parts are identified by the `part_role` text prop — ordinary
+  composite structure parts (spear head/shaft) do NOT have it, so
+  `PhysicsModel` routes blows into anatomy only when role-marked parts
+  exist; composites keep plain integrity damage.
+- Severed parts KEEP their `part_of` edge (anatomical record) with
+  `severed=1` + `contained=false`; `anatomy_function(body, role)` counts
+  them against function. Amputating an arm removes the body's `wielding`
+  edges (the tool drops).
+- Circulation runs in `World::anatomy_drift` (inside `metabolize` and
+  `flush_needs`): attached-part `bleed_rate` sum drains `blood_volume`
+  via `blood_accum` Euclid remainder; clotting uses per-part
+  `bleed_accum`; regen (+12/tick) needs energy>0 && thirst<800;
+  `consciousness` mirrors `blood_volume`; bv<=0 -> integrity 0 + reap.
+  Blood pools spawn as `blood`-material entities at 500-tick boundaries.
+- `consciousness < 300` blocks ALL actions in `World::interact` (one
+  gate) plus per-law `conscious_enough`/`anatomy_motor` (LawUtil.hpp)
+  scale motor precision by arm function and blood volume.
+- `sight_radius_of` (Cognition.cpp) scales by eye function and blood
+  volume; LocomotionLaws scales speed by leg function.
+- Pain: PhysicsModel adds `pain_level` changes on the body; delta pain
+  in `learn_from_event` pumps `neuro.panic`/`neuro.rage` (split by
+  threat_gain) and writes a negative trauma engram on the attacker.
