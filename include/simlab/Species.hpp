@@ -36,6 +36,7 @@ struct SpeciesDef {
     PropertyBag props;                           // per-individual props
     std::vector<PropId> genes;                   // hereditary loci (Phase 7)
     std::vector<PartSpec> anatomy;               // body plan (Phase 10)
+    std::vector<std::string> innate;             // instinct verbs a founder mind starts with
     std::string provenance;
 };
 

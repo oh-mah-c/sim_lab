@@ -41,8 +41,8 @@ constexpr std::int64_t kDefaultMaxLoad = 500000;  // milli-units, actor prop `ma
 constexpr std::size_t kMaxParts = 8;              // solver bound on structure size
 
 PropId prop_id(const World& w, const char* name) {
-    const PropertyDef* d = w.props.find_name(name);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, name);
 }
 
 bool prop_bool(const World& w, const Entity& e, PropId p) {
@@ -164,7 +164,7 @@ static PredictionResult predict_assemble(const World& w,
             r.failure = "part " + std::to_string(tid) + " already contained";
             return r;
         }
-        if (t->kind_name == "composite") {
+        if (t->kind_name == SIMLAB_KIND("composite")) {
             r.failure = "cannot nest composites (part " +
                         std::to_string(tid) + ")";
             return r;
@@ -295,6 +295,44 @@ static PredictionResult predict_assemble(const World& w,
     if (len_pid != kNoProp) seti(len_pid, sum_len);
     if (edge_pid != kNoProp) seti(edge_pid, max_edge);
 
+    // Phase 12.6 war channels: a structure is as keen/heavy/protective/
+    // energetic as its strongest part (max), coatings ride along.
+    {
+        static const char* const kMaxProps[] = {
+            "edge_sharpness", "blunt_mass", "elasticity",
+            "armor_penetration_resist", "volatility", "expansion_force",
+            "coat_toxin", "coat_strain"};
+        for (const char* nm : kMaxProps) {
+            const PropId q = prop_id(w, nm);
+            if (q == kNoProp) continue;
+            std::int64_t mx = 0;
+            for (const Part& pp : parts)
+                if (const Entity* pe = w.find(pp.id)) mx = std::max(mx, w.prop_int(*pe, q, 0));
+            if (mx > 0) seti(q, mx);
+        }
+        // EMERGENT launcher: a flexing frame (elasticity) strung with a
+        // high-tension part (tensile) stores strain energy neither has
+        // alone — launch_impulse ∝ elasticity x tension x builder precision.
+        const PropId el_p = prop_id(w, "elasticity"), li_p = prop_id(w, "launch_impulse");
+        if (el_p != kNoProp && li_p != kNoProp && tensile_pid != kNoProp) {
+            std::int64_t best = 0;
+            for (const Part& fa : parts) {
+                const Entity* fe = w.find(fa.id);
+                const std::int64_t el = fe ? w.prop_int(*fe, el_p, 0) : 0;
+                if (el < 300) continue;
+                for (const Part& sb : parts) {
+                    if (sb.id == fa.id) continue;
+                    const Entity* se = w.find(sb.id);
+                    const std::int64_t tn = se ? w.prop_int(*se, tensile_pid, 0) : 0;
+                    if (tn < 300) continue;
+                    // frame mass scales stored energy: big frames = siege engines
+                    best = std::max(best, el * tn / 1000 * (1000 + fa.mass / 10) / 1000);
+                }
+            }
+            if (best > 0) seti(li_p, best * motor / 1000);
+        }
+    }
+
     // emergent capability: edge organized with length -> thrust_range.
     std::int64_t thrust = 0;
     if (thrust_pid != kNoProp && max_edge > 0 && sum_len > 0)
@@ -355,7 +393,7 @@ static PredictionResult predict_disassemble(const World& w,
     for (EntityId tid : ctx.targets) {
         const Entity* t = w.find(tid);
         if (!t || !t->alive) continue;
-        if (t->kind_name == "composite" ||
+        if (t->kind_name == SIMLAB_KIND("composite") ||
             (prop_id(w, "made_of") != kNoProp &&
              w.prop_of(*t, prop_id(w, "made_of")) != nullptr)) { comp = tid; break; }
     }
@@ -417,6 +455,12 @@ static PredictionResult predict_wield(const World& w, const InteractionContext& 
         const Entity* t = w.find(tid);
         if (!t || !t->alive || tid == ctx.actor) continue;
         if (contained_pid != kNoProp && prop_bool(w, *t, contained_pid)) continue;
+        // a living organism (a species individual: rooted plant or animal)
+        // is not a hand tool — branches/stones must be broken off first.
+        if (!unwield && (w.ruleset & World::kRulePrimordial) &&
+            w.species.find_name(t->kind_name.str())) {
+            r.failure = "target " + std::to_string(tid) + " is a living organism"; continue;
+        }
         if (!unwield && !in_reach(w, *actor, *t, reach_pid)) {
             r.failure = "tool " + std::to_string(tid) + " out of reach"; return r;
         }
@@ -569,7 +613,7 @@ bool arch_load_part(const World& w, const Entity& t, ArchPart& p,
     if (contained != kNoProp && prop_bool(w, t, contained)) {
         fail = "part already contained"; return false;
     }
-    if (t.kind_name == "enclosure" || t.kind_name == "portal") {
+    if (t.kind_name == SIMLAB_KIND("enclosure") || t.kind_name == SIMLAB_KIND("portal")) {
         fail = "cannot build from a finished space"; return false;
     }
     p.id = t.id; p.material = t.material; p.pos = t.pos;
@@ -735,7 +779,7 @@ PredictionResult predict_enclose(const World& w,
     std::int64_t inner_enc = 0;
     for (const auto& ep : w.entities) {
         const Entity& o = *ep;
-        if (!o.alive || o.kind_name != "enclosure" || o.id == ctx.actor)
+        if (!o.alive || o.kind_name != SIMLAB_KIND("enclosure") || o.id == ctx.actor)
             continue;
         const std::int64_t ox = o.pos.x - centroid.x;
         const std::int64_t oy = o.pos.y - centroid.y;
@@ -844,7 +888,7 @@ PredictionResult predict_bypass_barrier(const World& w,
     const Entity* enc = ctx.targets.empty() ? nullptr
         : w.find(ctx.targets.front());
     if (!enc || !enc->alive) { r.failure = "no living target"; return r; }
-    if (enc->kind_name != "enclosure") {
+    if (enc->kind_name != SIMLAB_KIND("enclosure")) {
         r.failure = "target is not an enclosure"; return r;
     }
     if (!in_reach(w, *actor, *enc, reach)) {
@@ -889,7 +933,7 @@ PredictionResult predict_repair(const World& w,
     const Entity* actor = w.find(ctx.actor);
     if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
     const Entity* enc = w.find(ctx.targets.front());
-    if (!enc || enc->kind_name != "enclosure") {
+    if (!enc || enc->kind_name != SIMLAB_KIND("enclosure")) {
         r.failure = "repair target is not an enclosure"; return r;
     }
     if (!in_reach(w, *actor, *enc, reach)) {

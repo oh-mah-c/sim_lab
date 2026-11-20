@@ -4,12 +4,21 @@
 #include "simlab/Cognition.hpp"
 #include "simlab/Discovery.hpp"
 #include <algorithm>
+#include <unordered_set>
+#include <cctype>
 #include <limits>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
 
 namespace simlab {
+
+namespace {
+// literal names (static storage) so PropId caches can key on the address
+constexpr const char* kImmuneSigNames[8] = {
+    "immune_sig0", "immune_sig1", "immune_sig2", "immune_sig3",
+    "immune_sig4", "immune_sig5", "immune_sig6", "immune_sig7"};
+}  // namespace
 namespace {
 // Phase 11 props that make an entity worth a metabolize pass even when it
 // has no need/metabolism props: corpse rot bookkeeping, standing-water
@@ -61,6 +70,20 @@ std::uint32_t EntityRegistry::kind_id(const std::string& name) {
     by_name_[name] = id;
     return id;
 }
+const std::string* intern_kind(std::string_view s) {
+    // node-based set: element addresses never move, entries never erased
+    static std::unordered_set<std::string> pool;
+    auto it = pool.find(std::string(s));
+    if (it == pool.end()) it = pool.emplace(s).first;
+    return &*it;
+}
+
+const std::vector<EntityId>& World::entities_of_kind(const KindName& k) const {
+    static const std::vector<EntityId> kEmpty;
+    const auto it = by_kind_.find(k.interned());
+    return it == by_kind_.end() ? kEmpty : it->second;
+}
+
 const std::string* EntityRegistry::kind_name(std::uint32_t id) const {
     if (id == 0 || id > names_.size()) return nullptr;
     return &names_[id - 1];
@@ -78,6 +101,7 @@ World::World(std::uint64_t s, const std::string& data_dir) : seed(s) {
     laws.push_back(std::make_unique<BiologyModel>());
     laws.push_back(std::make_unique<SocialModel>());
     laws.push_back(std::make_unique<LocomotionModel>());
+    laws.push_back(std::make_unique<WarfareModel>());
     load_content(data_dir, &content_error);
 }
 
@@ -121,32 +145,19 @@ bool World::build_anatomy(EntityId body) {
     // already has parts? (idempotent for re-loads / double calls)
     for (const Relation& r : relations_of(body, "part_of"))
         if (r.b == body) return false;
-    const PropId contained = props.find_name("contained")
-        ? props.find_name("contained")->id : kNoProp;
-    const PropId integ = props.find_name("integrity")
-        ? props.find_name("integrity")->id : kNoProp;
-    const PropId slot = props.find_name("body_slot")
-        ? props.find_name("body_slot")->id : kNoProp;
-    const PropId role = props.find_name("part_role")
-        ? props.find_name("part_role")->id : kNoProp;
-    const PropId vital = props.find_name("vital_organ")
-        ? props.find_name("vital_organ")->id : kNoProp;
-    const PropId bleed = props.find_name("bleed_rate")
-        ? props.find_name("bleed_rate")->id : kNoProp;
-    const PropId frac = props.find_name("fracture_level")
-        ? props.find_name("fracture_level")->id : kNoProp;
-    const PropId sev = props.find_name("severed")
-        ? props.find_name("severed")->id : kNoProp;
-    const PropId psz = props.find_name("part_size")
-        ? props.find_name("part_size")->id : kNoProp;
-    const PropId inf = props.find_name("infection_level")
-        ? props.find_name("infection_level")->id : kNoProp;
-    const PropId infa = props.find_name("infection_accum")
-        ? props.find_name("infection_accum")->id : kNoProp;
-    const PropId nec = props.find_name("necrotic")
-        ? props.find_name("necrotic")->id : kNoProp;
-    const PropId band = props.find_name("bandaged_integrity")
-        ? props.find_name("bandaged_integrity")->id : kNoProp;
+    const PropId contained = SIMLAB_PID(props, "contained");
+    const PropId integ = SIMLAB_PID(props, "integrity");
+    const PropId slot = SIMLAB_PID(props, "body_slot");
+    const PropId role = SIMLAB_PID(props, "part_role");
+    const PropId vital = SIMLAB_PID(props, "vital_organ");
+    const PropId bleed = SIMLAB_PID(props, "bleed_rate");
+    const PropId frac = SIMLAB_PID(props, "fracture_level");
+    const PropId sev = SIMLAB_PID(props, "severed");
+    const PropId psz = SIMLAB_PID(props, "part_size");
+    const PropId inf = SIMLAB_PID(props, "infection_level");
+    const PropId infa = SIMLAB_PID(props, "infection_accum");
+    const PropId nec = SIMLAB_PID(props, "necrotic");
+    const PropId band = SIMLAB_PID(props, "bandaged_integrity");
     for (const PartSpec& ps : sp->anatomy) {
         PropertyBag pb;
         if (contained != kNoProp) pb.set(contained, Value::boolean(true));
@@ -199,6 +210,7 @@ EntityId World::create_entity(const std::string& kind_name, MaterialId material,
     e->last_metabolized = clock_.tick();
     const EntityId id = e->id;
     index_[id] = entities.size();
+    by_kind_[e->kind_name.interned()].push_back(id);
     entities.push_back(std::move(e));
     spatial.insert(id, pos);
     return id;
@@ -295,6 +307,7 @@ World World::clone() const {
     out.species = species;
     out.influx = influx;
     out.gen_sea_level = gen_sea_level;
+    out.ruleset = ruleset;
     out.relations = relations;
     out.social_ = social_;
     out.kinds = kinds;
@@ -311,8 +324,10 @@ World World::clone() const {
         out.rngs_[name] = std::make_unique<Rng>(*r);
     out.minds_ = minds_;
     out.index_ = index_;
+    out.by_kind_ = by_kind_;
     out.touched_ = touched_;
     out.content_error = content_error;
+    out.speculative = speculative;
     return out;
 }
 
@@ -343,6 +358,7 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
     out.species = species;
     out.influx = influx;
     out.gen_sea_level = gen_sea_level;
+    out.ruleset = ruleset;
     out.kinds = kinds;
     out.spatial = SpatialIndex{1024};
     out.laws = laws;   // law models are stateless: share, don't re-allocate
@@ -380,6 +396,7 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
         if (!keep.count(e->id)) continue;
         out.entities.push_back(std::make_unique<Entity>(*e));
         out.index_[e->id] = idx++;
+        out.by_kind_[e->kind_name.interned()].push_back(e->id);
         out.spatial.insert(e->id, e->pos);
     }
     // relations + social ties only between copied entities (no dangling edges)
@@ -475,9 +492,20 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
 
 void World::advance_ticks(std::int64_t n) {
     for (std::int64_t i = 0; i < n; ++i) clock_.advance();
-    if (n > 0) { metabolize(n); dissipate_heat(n); ecology_tick(n);
-                 language_tick(clock_.tick()); decay_minds(n); political_drift(n);
-                 terrain_wear_decay(n); }
+    if (n <= 0) return;
+    if (speculative) {
+        // planning copy (see World.hpp): only the THINKING agent's body runs
+        // forward — its needs/anatomy/infection catch up (flush_needs; other
+        // participants are flushed by interact() itself before prediction),
+        // plus heat physics and its own memory decay. The rest of the local
+        // world stays frozen for the few ticks a plan spans.
+        flush_needs(minded_entities());
+        dissipate_heat(n); decay_minds(n);
+        return;
+    }
+    metabolize(n); dissipate_heat(n); ecology_tick(n);
+    language_tick(clock_.tick()); decay_minds(n); political_drift(n); myth_drift(n);
+    terrain_wear_decay(n);
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -485,10 +513,8 @@ void World::advance_ticks(std::int64_t n) {
 // ledger explains WHY a need changed, exactly like any interaction.
 World::NeedProps World::need_props() const {
     NeedProps np;
-    auto pid = [&](const char* n) -> PropId {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     np.metabolism = pid("metabolism"); np.hunger = pid("hunger");
     np.thirst = pid("thirst");       np.fatigue = pid("fatigue");
     np.age = pid("age");             np.integrity = pid("integrity");
@@ -656,10 +682,8 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     // trade-off that keeps resistance selection from running away: a
     // hyper-immune lineage pays for every allele it keeps.
     if (np.energy != kNoProp) {
-        auto ipid = [&](const char* n) {
-            const PropertyDef* d = props.find_name(n);
-            return d ? d->id : kNoProp;
-        };
+        static thread_local SeqPidCache ipid_c_;
+    SeqPid ipid(ipid_c_, props);
         const PropId ipb = ipid("immune_power_base"),
                      ict = ipid("immune_cost_threshold"),
                      icp = ipid("immune_cost_permille"),
@@ -979,6 +1003,7 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
                 if (drift_needs(e, 1, np, ev)) drifted = true;
                 anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
+                morale_drift(e, 1, ev);
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -987,6 +1012,7 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
             anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
             epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
                                drift_spawns);
+            morale_drift(e, pending, ev);
         }
         if (drifted || ev.changes.size() != chg0) {
             ev.participants.push_back(e.id);
@@ -997,8 +1023,7 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
     // shed waste lands as material entities — World Truth grows causally
     // inside the same metabolize event (blood pools, feces, urine).
     if (!shed_pools.empty()) {
-        const PropId qty = props.find_name("quantity")
-            ? props.find_name("quantity")->id : kNoProp;
+        const PropId qty = SIMLAB_PID(props, "quantity");
         for (const ShedPool& sp : shed_pools) {
             PropertyBag pb;
             if (qty != kNoProp) pb.set(qty, Value::integer(sp.amount));
@@ -1043,12 +1068,9 @@ const std::vector<PropId>& World::observable_props() const {
 // keep the edge as anatomical record; `severed` is the detach truth).
 // Numerator = attached (severed==0), alive, integrity>0. No anatomy -> 1000.
 std::int64_t World::anatomy_function(EntityId body, const char* role) const {
-    const PropId role_p = props.find_name("part_role")
-        ? props.find_name("part_role")->id : kNoProp;
-    const PropId sev_p = props.find_name("severed")
-        ? props.find_name("severed")->id : kNoProp;
-    const PropId integ_p = props.find_name("integrity")
-        ? props.find_name("integrity")->id : kNoProp;
+    const PropId role_p = SIMLAB_PID(props, "part_role");
+    const PropId sev_p = SIMLAB_PID(props, "severed");
+    const PropId integ_p = SIMLAB_PID(props, "integrity");
     if (role_p == kNoProp) return 1000;
     std::int64_t total = 0, func = 0;
     for (const Relation& rel : relations_of(body, "part_of")) {
@@ -1075,10 +1097,8 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                           std::vector<SpawnSpec>* xspawns) {
     if (dt_u == 0 || !e.alive) return;
     const std::int64_t dt = static_cast<std::int64_t>(dt_u);
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId bv_p = pid("blood_volume"), ba_p = pid("blood_accum"),
                  br_p = pid("bleed_rate"), bac_p = pid("bleed_accum"),
                  cs_p = pid("consciousness"), integ_p = pid("integrity"),
@@ -1686,15 +1706,13 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             // shelter is physics (enclosure_ratio x shell material), not a
             // flag. Innermost footprint wins.
             {
-                const PropId p_ins = props.find_name("insulation_factor")
-                    ? props.find_name("insulation_factor")->id : kNoProp;
-                const PropId p_rad2 = props.find_name("footprint_radius")
-                    ? props.find_name("footprint_radius")->id : kNoProp;
+                const PropId p_ins = SIMLAB_PID(props, "insulation_factor");
+                const PropId p_rad2 = SIMLAB_PID(props, "footprint_radius");
                 if (p_ins != kNoProp && p_rad2 != kNoProp) {
                     std::int64_t best_ins = 0, best_r = INT64_MAX;
                     for (const auto& sep : entities) {
                         const Entity& s = *sep;
-                        if (!s.alive || s.kind_name != "enclosure")
+                        if (!s.alive || s.kind_name != SIMLAB_KIND("enclosure"))
                             continue;
                         const std::int64_t r = prop_int(s, p_rad2, 0);
                         if (r <= 0) continue;
@@ -1829,7 +1847,7 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
         std::int64_t sig_slot[8];
         int sig_n = 0;
         for (int i = 0; i < 8; ++i) {
-            const PropId sp = pid(("immune_sig" + std::to_string(i)).c_str());
+            const PropId sp = pid(kImmuneSigNames[i]);
             sig_slot[i] = sp != kNoProp && prop_of(e, sp)
                 ? prop_int(e, sp, 0) : -1;
         }
@@ -2272,12 +2290,99 @@ void World::commit_drift_spawns(CausalEvent& ev,
 // and diverges from per-tick evaluation; coupled entities therefore replay
 // pending ticks one-by-one (rare — only carriers of active infections,
 // growing tumours, tissue infection, or toxin near feedback thresholds).
+// Phase 12.6 combat morale: drifts toward a TARGET set by the soldier's
+// real situation — hunger, pain, a leader it defers to standing near, a
+// supply line (stocked depot reached directly or along a worn trail) and
+// the community's sung epics it carries in memory. 5 permille per tick
+// toward the target; < 200 routs, >= 400 rallies. Pure function of state
+// that is frozen during advance_ticks (positions, depot stock, beliefs), with
+// hunger/pain stepped tick-wise via physiology_coupled -> LOD-exact.
+void World::morale_drift(Entity& e, std::uint64_t ticks, CausalEvent& ev) {
+    if (!e.alive || ticks == 0) return;
+    static thread_local SeqPidCache c_;
+    SeqPid pid(c_, props);
+    const PropId wt_p = pid("war_target"), cm_p = pid("combat_morale"),
+                 ro_p = pid("routed"), sd_p = pid("supply_depot_link"),
+                 hu_p = pid("hunger"), pa_p = pid("pain_level"),
+                 cr_p = pid("communicate_range"), fr_p = pid("footprint_radius"),
+                 nu_p = pid("nutrition"), q_p = pid("quantity"),
+                 og_p = pid("oral_genre");
+    if (wt_p == kNoProp || cm_p == kNoProp || prop_int(e, wt_p, 0) <= 0) return;
+    std::int64_t target = 500;
+    const AgentMind* m = find_mind(e.id);
+    // a leader it defers to, within earshot
+    if (m) {
+        EntityId lead = kNoEntity; std::int64_t best = 399;
+        for (const auto& [k, b] : m->beliefs)
+            if (k.rfind("defer_to:", 0) == 0 && b.confidence > best) {
+                try { lead = static_cast<EntityId>(std::stoull(k.substr(9))); }
+                catch (...) { continue; }
+                best = b.confidence;
+            }
+        const Entity* le = lead != kNoEntity ? find(lead) : nullptr;
+        const std::int64_t cr = cr_p != kNoProp ? prop_int(e, cr_p, 400) : 400;
+        if (le && le->alive && dist2(le->pos, e.pos) <= cr * cr) target += 150;
+    }
+    // supply line: a stocked depot reached directly or along a worn trail
+    const std::int64_t depot = sd_p != kNoProp ? prop_int(e, sd_p, 0) : 0;
+    if (depot > 0) {
+        const Entity* de = find(static_cast<EntityId>(depot));
+        if (de && de->alive && de->kind_name == SIMLAB_KIND("enclosure")) {
+            const std::int64_t rad = fr_p != kNoProp ? prop_int(*de, fr_p, 0) : 0;
+            bool stocked = false;
+            for (const EntityId id : entities_near(de->pos, rad)) {
+                const Entity* g = find(id);
+                if (!g || !g->alive || g->id == e.id) continue;
+                if (nu_p != kNoProp && prop_int(*g, nu_p, 0) > 0 &&
+                    (q_p == kNoProp || !g->props.get(q_p) || prop_int(*g, q_p, 0) > 0)) {
+                    stocked = true; break;
+                }
+            }
+            const bool at_depot = dist2(de->pos, e.pos) <= rad * rad;
+            const bool on_trail = !terrain.empty() && terrain.contains(e.pos) &&
+                                  terrain.wear_at(e.pos) >= 100;
+            if (stocked && (at_depot || on_trail)) target += 150;
+        }
+    }
+    const std::int64_t hunger = hu_p != kNoProp ? prop_int(e, hu_p, 0) : 0;
+    if (hunger >= 700) target -= 500;          // starving: no leader holds them
+    else if (hunger >= 500) target -= 200;
+    if (pa_p != kNoProp) target -= prop_int(e, pa_p, 0) / 3;
+    // a sung epic in memory steadies the ranks
+    if (m && og_p != kNoProp) {
+        for (const auto& [k, b] : m->beliefs) {
+            if (k.rfind("lex:", 0) != 0 || b.confidence < 500) continue;
+            EntityId le = kNoEntity;
+            try { le = static_cast<EntityId>(std::stoull(k.substr(4))); } catch (...) { continue; }
+            const Entity* lx = find(le);
+            const Value* gv = lx ? prop_of(*lx, og_p) : nullptr;
+            if (gv && gv->type == ValType::Text && !gv->s.empty()) { target += 100; break; }
+        }
+    }
+    target = std::clamp<std::int64_t>(target, 0, 1000);
+    const std::int64_t cur0 = prop_int(e, cm_p, 500);
+    std::int64_t cur = cur0;
+    for (std::uint64_t k = 0; k < ticks && cur != target; ++k)
+        cur += std::clamp<std::int64_t>(target - cur, -5, 5);
+    auto set_int = [&](PropId p, std::int64_t before, std::int64_t after) {
+        if (p == kNoProp || before == after) return;
+        StateChange ch; ch.entity = e.id; ch.prop = p;
+        ch.had_before = prop_of(e, p) != nullptr;
+        ch.before = Value::integer(before); ch.after = Value::integer(after);
+        e.props.set(p, ch.after);
+        ev.changes.push_back(ch);
+    };
+    set_int(cm_p, cur0, cur);
+    const std::int64_t ro0 = ro_p != kNoProp ? prop_int(e, ro_p, 0) : 0;
+    std::int64_t ro = ro0;
+    if (cur < 200) ro = 1; else if (cur >= 400) ro = 0;
+    set_int(ro_p, ro0, ro);
+}
+
 bool World::physiology_coupled(const Entity& e) const {
     if (!e.alive) return false;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId pl_p = pid("pathogen_load"),
                  nm_p = pid("neoplasm_mass"),
                  nsa_p = pid("neoplasm_seed_accum"),
@@ -2303,6 +2408,12 @@ bool World::physiology_coupled(const Entity& e) const {
             (inf_p != kNoProp && prop_int(*p, inf_p, 0) > 0))
             return true;
     }
+    // soldiers on campaign (Phase 12.6): morale follows hunger tick by tick,
+    // so a batched catch-up must replay per tick to stay bit-identical.
+    {
+        const PropId wt_p = SIMLAB_PID(props, "war_target");
+        if (wt_p != kNoProp && prop_int(e, wt_p, 0) > 0) return true;
+    }
     // toxin approaching the oncogenic threshold — the neoplasm risk term
     // flips mid-batch otherwise.
     if (tox_p != kNoProp && prop_int(e, tox_p, 0) > 300) return true;
@@ -2318,10 +2429,8 @@ void World::queue_infection(std::vector<SpawnSpec>& out, EntityId host,
                             std::int64_t strain_eid, std::int64_t load) {
     Entity* h = find(host);
     if (!h) return;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId ps_p = pid("pathogen_strain"),
                  pl_p = pid("pathogen_load"),
                  ab_p = pid("antibody_level"),
@@ -2363,10 +2472,8 @@ void World::queue_infection(std::vector<SpawnSpec>& out, EntityId host,
 bool World::host_immune_to(EntityId host, std::int64_t strain_id) const {
     const Entity* st = find(static_cast<EntityId>(strain_id));
     if (!st || !st->alive) return false;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId ag_p = pid("antigen_signature"),
                  ics_p = pid("immune_count");
     if (ag_p == kNoProp) return false;
@@ -2378,7 +2485,7 @@ bool World::host_immune_to(EntityId host, std::int64_t strain_id) const {
         ? static_cast<int>(std::min<std::int64_t>(8, prop_int(*h, ics_p, 0)))
         : 0;
     for (int i = 0; i < n; ++i) {
-        const PropId sp = pid(("immune_sig" + std::to_string(i)).c_str());
+        const PropId sp = pid(kImmuneSigNames[i]);
         if (sp != kNoProp && prop_of(*h, sp) &&
             prop_int(*h, sp, 0) == ag)
             return true;
@@ -2391,10 +2498,8 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
                                std::vector<SpawnSpec>& out) {
     (void)now;
     if (pending <= 0 || !e.alive) return;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId ps_p = pid("pathogen_strain"),
                  sa_p = pid("shed_accum"),
                  sr_p = pid("strain_ref"),
@@ -2557,6 +2662,14 @@ void World::epidemiology_drift(Entity& e, std::int64_t pending,
 }
 
 void World::metabolize(std::int64_t dt) {
+    // env-drift opt-in props, resolved once per call (not per entity)
+    static thread_local SeqPidCache env_c_;
+    std::vector<PropId> env_pids;
+    {
+        SeqPid ep(env_c_, props);
+        for (const char* en : kEnvPropNames) env_pids.push_back(ep(en));
+    }
+    const PropId symbiont_p = SIMLAB_PID(props, "symbiont_signature");
     (void)dt;   // per-entity pending time replaces the bulk dt (Phase 9 LOD)
     const NeedProps np = need_props();
     const PropertyDef* idv_d = props.find_name("is_disease_vector");
@@ -2621,21 +2734,18 @@ void World::metabolize(std::int64_t dt) {
                 if (p != kNoProp && md.props.count(p)) {
                     mat_need_flags_[md.id - 1] = 1; break;
                 }
-        for (const char* en : kEnvPropNames) {
-            const PropertyDef* ed = props.find_name(en);
-            if (!ed) continue;
+        for (const PropId edp : env_pids) {
+            if (edp == kNoProp) continue;
             for (const MaterialDef& md : materials.defs())
-                if (md.props.count(ed->id)) {
+                if (md.props.count(edp)) {
                     mat_need_flags_[md.id - 1] = 1; break;
                 }
         }
     }
 
     // Phase 12.2: entities carrying ONLY economic props still need a pass
-    const PropId econ_poss = props.find_name("possessed_by")
-        ? props.find_name("possessed_by")->id : kNoProp;
-    const PropId econ_theft = props.find_name("theft_flag")
-        ? props.find_name("theft_flag")->id : kNoProp;
+    const PropId econ_poss = SIMLAB_PID(props, "possessed_by");
+    const PropId econ_theft = SIMLAB_PID(props, "theft_flag");
 
     CausalEvent ev;
     ev.tick = now;
@@ -2700,18 +2810,16 @@ void World::metabolize(std::int64_t dt) {
             for (PropId p : watch)
                 if (p != kNoProp && e.props.get(p)) { maybe = true; break; }
             if (!maybe)
-                for (const char* en : kEnvPropNames) {
-                    const PropertyDef* ed = props.find_name(en);
-                    if (ed && e.props.get(ed->id)) { maybe = true; break; }
-                }
+                for (const PropId edp : env_pids)
+                    if (edp != kNoProp && e.props.get(edp)) { maybe = true; break; }
             if (!maybe && (econ_poss != kNoProp &&
                            e.props.get(econ_poss)) ||
                           (econ_theft != kNoProp &&
                            e.props.get(econ_theft)) ||
-                          e.kind_name == "debt_obligation")
+                          e.kind_name == SIMLAB_KIND("debt_obligation"))
                 maybe = true;
-            if (!maybe && (e.kind_name == "enclosure" ||
-                           e.kind_name == "portal"))
+            if (!maybe && (e.kind_name == SIMLAB_KIND("enclosure") ||
+                           e.kind_name == SIMLAB_KIND("portal")))
                 maybe = true;
             if (!maybe && e.material != kNoMaterial &&
                 e.material - 1 < mat_need_flags_.size() &&
@@ -2735,11 +2843,14 @@ void World::metabolize(std::int64_t dt) {
                 if (drift_needs(e, 1, np, ev)) drifted = true;
                 anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
+                morale_drift(e, 1, ev);
                 flora_drift(e, 1, sub_now, ev, drift_spawns);
                 if (is_vec) vector_drift(e, 1, sub_now, ev, drift_spawns);
-                language_drift(e, 1, sub_now, ev);
-                econ_drift(e, 1, sub_now, ev);
-                arch_drift(e, 1, sub_now, ev, drift_spawns);
+                if (!speculative) {
+                    language_drift(e, 1, sub_now, ev);
+                    econ_drift(e, 1, sub_now, ev);
+                    arch_drift(e, 1, sub_now, ev, drift_spawns);
+                }
             }
         } else {
             drifted = drift_needs(e, pending, np, ev);
@@ -2747,14 +2858,17 @@ void World::metabolize(std::int64_t dt) {
             anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
             epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
                                drift_spawns);
+            morale_drift(e, pending, ev);
             flora_drift(e, static_cast<std::int64_t>(pending), now, ev,
                         drift_spawns);
             vector_drift(e, static_cast<std::int64_t>(pending), now, ev,
                          drift_spawns);
-            language_drift(e, static_cast<std::int64_t>(pending), now, ev);
-            econ_drift(e, static_cast<std::int64_t>(pending), now, ev);
-            arch_drift(e, static_cast<std::int64_t>(pending), now, ev,
-                       drift_spawns);
+            if (!speculative) {
+                language_drift(e, static_cast<std::int64_t>(pending), now, ev);
+                econ_drift(e, static_cast<std::int64_t>(pending), now, ev);
+                arch_drift(e, static_cast<std::int64_t>(pending), now, ev,
+                           drift_spawns);
+            }
         }
         // Phase 11: standing water fouls into a stagnation reservoir on the
         // same batched, accumulator-exact contract as every other drift.
@@ -2762,8 +2876,7 @@ void World::metabolize(std::int64_t dt) {
         // Lazy symbiont: hosts carrying a symbiont_signature template get
         // their commensal strain seeded post-loop with real entity ids.
         {
-            const PropertyDef* sd = props.find_name("symbiont_signature");
-            if (sd && prop_int(e, sd->id, 0) > 0)
+            if (symbiont_p != kNoProp && prop_int(e, symbiont_p, 0) > 0)
                 symbiont_hosts.push_back(e.id);
         }
         if (drifted || ev.changes.size() != chg0) {
@@ -2779,8 +2892,7 @@ void World::metabolize(std::int64_t dt) {
     // shed waste lands as material entities — World Truth grows causally
     // inside the same metabolize event (blood pools, feces, urine).
     if (!shed_pools.empty()) {
-        const PropId qty = props.find_name("quantity")
-            ? props.find_name("quantity")->id : kNoProp;
+        const PropId qty = SIMLAB_PID(props, "quantity");
         for (const ShedPool& sp : shed_pools) {
             PropertyBag pb;
             if (qty != kNoProp) pb.set(qty, Value::integer(sp.amount));
@@ -2816,10 +2928,8 @@ void World::environmental_drift(Entity& e, std::uint64_t pending_u,
     // window — stagnation is affine in elapsed ticks, so one mark plus
     // the material rate reconstructs the whole trajectory exactly.
     if (record_hist && e.alive) {
-        auto hpid = [&](const char* n) {
-            const PropertyDef* d = props.find_name(n);
-            return d ? d->id : kNoProp;
-        };
+        static thread_local SeqPidCache hpid_c_;
+    SeqPid hpid(hpid_c_, props);
         const PropId stl = hpid("stagnation_level"),
                      sta = hpid("stagnation_accum"),
                      sra = hpid("stagnation_rate"),
@@ -2859,10 +2969,8 @@ void World::environmental_drift(Entity& e, std::uint64_t pending_u,
     // the whole window while dt=1 ticks emit only after crossing — the
     // spread/odor accumulators would diverge. Replay tick-wise instead.
     if (pending > 1) {
-        auto xpid = [&](const char* n) {
-            const PropertyDef* d = props.find_name(n);
-            return d ? d->id : kNoProp;
-        };
+        static thread_local SeqPidCache xpid_c_;
+    SeqPid xpid(xpid_c_, props);
         bool cross = false;
         if (!e.alive) {
             const PropId cdl = xpid("corpse_decay_level"),
@@ -2908,10 +3016,8 @@ void World::environmental_drift(Entity& e, std::uint64_t pending_u,
             return;
         }
     }
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId cdl_p = pid("corpse_decay_level"),
                  cda_p = pid("corpse_decay_accum"),
                  buried_p = pid("buried"),
@@ -3188,10 +3294,8 @@ void World::environmental_drift(Entity& e, std::uint64_t pending_u,
 void World::vector_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                          CausalEvent& ev, std::vector<SpawnSpec>& out) {
     if (pending <= 0 || !e.alive) return;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId idv_p = pid("is_disease_vector"),
                  dm_p = pid("vector_dormant"),
                  tmin_p = pid("vector_optimal_temp_min"),
@@ -3556,10 +3660,8 @@ void World::flora_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                         CausalEvent& ev, std::vector<SpawnSpec>& out) {
     (void)now;
     if (pending <= 0 || !e.alive) return;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId susc_p = pid("blight_susceptibility"),
                  ps_p = pid("pathogen_strain"),
                  pl_p = pid("pathogen_load"),
@@ -3752,10 +3854,8 @@ void World::flora_drift(Entity& e, std::int64_t pending, std::uint64_t now,
 // created here — real ids, inside the metabolize causal event.
 void World::seed_symbionts(CausalEvent& ev,
                            const std::vector<EntityId>& hosts) {
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId sig_p = pid("symbiont_signature"),
                  ps_p = pid("pathogen_strain"),
                  pl_p = pid("pathogen_load"),
@@ -3832,10 +3932,8 @@ void World::zoonotic_spillover(const InteractionContext& ctx,
     if (ctx.parameters.action != "consume") return;
     Entity* actor = find(ctx.actor);
     if (!actor || !actor->alive) return;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId rt_p = pid("reservoir_tolerance"),
                  cooked_p = pid("cooked_state"),
                  bias_p = pid("zoonotic_jump_bias"),
@@ -3954,7 +4052,7 @@ void World::dissipate_heat(std::int64_t dt) {
     const PropertyDef* tp = props.find_name("temperature");
     if (!tp) return;
     const PropId temp = tp->id;
-    const PropId cond = props.find_name("conductivity") ? props.find_name("conductivity")->id : kNoProp;
+    const PropId cond = SIMLAB_PID(props, "conductivity");
     constexpr std::int64_t kAmbient = 200;               // 20°C when no terrain field
     CausalEvent ev;
     ev.tick = clock_.tick();
@@ -3996,10 +4094,8 @@ void World::dissipate_heat(std::int64_t dt) {
 
 void World::ecology_tick(std::int64_t n) {
     if (n <= 0) return;
-    auto pid = [&](const char* nm) -> PropId {
-        const PropertyDef* d = props.find_name(nm);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
     const PropId p_drops = pid("death_drops");
     const PropId p_drops_done = pid("death_drops_done");
     const PropId p_sprout_target = pid("sprout_target");
@@ -4358,8 +4454,7 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // verb. Non-circulatory entities have no consciousness prop -> pass.
     if (ctx.actor != kNoEntity) {
         if (const Entity* ae = find(ctx.actor)) {
-            const PropId cs_p = props.find_name("consciousness")
-                ? props.find_name("consciousness")->id : kNoProp;
+            const PropId cs_p = SIMLAB_PID(props, "consciousness");
             if (cs_p != kNoProp) {
                 const Value* cv = prop_of(*ae, cs_p);
                 if (cv && cv->type == ValType::Integer && cv->i < 300) {
@@ -4463,8 +4558,7 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // `wielding` edges to/from the dead are dropped. Without this, parts
     // would be orphaned inside a structure that no longer exists.
     if (!died.empty()) {
-        const PropId cont = props.find_name("contained")
-            ? props.find_name("contained")->id : kNoProp;
+        const PropId cont = SIMLAB_PID(props, "contained");
         std::vector<Relation> cut;
         for (const Relation& rel : relations.edges())
             for (EntityId d : died)
@@ -4599,7 +4693,8 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // metabolizes needs (ledgered as "metabolize" events).
     const std::int64_t dt = pred.ticks > 0 ? pred.ticks : ctx.parameters.ticks;
     ev.spawned = res.spawned;
-    advance_ticks(dt);
+    if (defer_time) deferred_dt = std::max(deferred_dt, dt);
+    else advance_ticks(dt);
     res.completed = true;
     res.law_used = used->id();
     res.event = ledger.append(std::move(ev));
@@ -4614,11 +4709,11 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // covers the actor observe the event and learn the verb + WEAK evidence.
     // Only entities that already have a mind count — an entity becomes an
     // agent by perceiving, not by existing.
+    if (speculative) return res;   // planning copy: no witness/social bookkeeping
     if (const CausalEvent* pev = ledger.find(res.event)) {
         const Entity* ae = find(ctx.actor);
         if (ae) {
-            const PropId sight = props.find_name("sight_range")
-                ? props.find_name("sight_range")->id : kNoProp;
+            const PropId sight = SIMLAB_PID(props, "sight_range");
             for (auto& [wid, wm] : minds_) {
                 (void)wm;
                 if (wid == ctx.actor) continue;
@@ -4639,6 +4734,8 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         simlab::econ_from_event(*this, ctx.actor, ctx.targets, *sev);
         simlab::political_from_event(*this, ctx.actor, ctx.targets, *sev);
         simlab::arch_from_event(*this, ctx.actor, ctx.targets, *sev);
+        simlab::myth_from_event(*this, ctx.actor, ctx.targets, *sev);
+        simlab::war_from_event(*this, ctx.actor, ctx.targets, *sev);
     }
     return res;
 }
@@ -4667,14 +4764,10 @@ bool World::claim_spawn(std::uint32_t tag, int gx, int gy) {
 void World::social_tithe(CausalEvent& ev, EntityId actor,
                          const std::vector<EntityId>& spawned) {
     if (actor == kNoEntity) return;
-    const PropId coll = props.find_name("collective")
-        ? props.find_name("collective")->id : kNoProp;
-    const PropId ration = props.find_name("ration_share")
-        ? props.find_name("ration_share")->id : kNoProp;
-    const PropId qty = props.find_name("quantity")
-        ? props.find_name("quantity")->id : kNoProp;
-    const PropId nut = props.find_name("nutrition")
-        ? props.find_name("nutrition")->id : kNoProp;
+    const PropId coll = SIMLAB_PID(props, "collective");
+    const PropId ration = SIMLAB_PID(props, "ration_share");
+    const PropId qty = SIMLAB_PID(props, "quantity");
+    const PropId nut = SIMLAB_PID(props, "nutrition");
     if (coll == kNoProp || ration == kNoProp || qty == kNoProp) return;
     // collectives the actor belongs to that levy a tithe
     std::vector<EntityId> groups;
@@ -4827,12 +4920,9 @@ void World::learn_from_event(EntityId npc, EventId ev) {
 
 std::pair<std::int64_t, std::int64_t> World::tool_bonus(EntityId actor) const {
     std::int64_t reach = 0, edge = 0;
-    const PropId thrust = props.find_name("thrust_range")
-        ? props.find_name("thrust_range")->id : kNoProp;
-    const PropId edgep = props.find_name("edge")
-        ? props.find_name("edge")->id : kNoProp;
-    const PropId cont = props.find_name("contained")
-        ? props.find_name("contained")->id : kNoProp;
+    const PropId thrust = SIMLAB_PID(props, "thrust_range");
+    const PropId edgep = SIMLAB_PID(props, "edge");
+    const PropId cont = SIMLAB_PID(props, "contained");
     for (const Relation& rel : relations_of(actor, "wielding")) {
         if (rel.a != actor) continue;                    // actor wields rel.b
         const Entity* t = find(rel.b);
@@ -4952,6 +5042,7 @@ std::uint64_t World::state_hash() const {
     mix(clock_.tick());
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_sea_level)));
     mix(world_seed); mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(generator_version)));
+    if (ruleset != 0) mix(0x52554C45ull ^ ruleset);   // legacy worlds (0) hash as before
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_origin_x)));
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_origin_y)));
     mix(kinds.counter());
@@ -5147,6 +5238,7 @@ std::uint64_t World::state_hash() const {
         }
         mix(static_cast<std::uint64_t>(m.ostracism_accum));
         mix(static_cast<std::uint64_t>(m.political_accum));
+        mix(static_cast<std::uint64_t>(m.myth_accum));
     }
     return h;
 }
@@ -5158,7 +5250,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 17;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear
+constexpr std::uint32_t kSaveFormat = 19;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset
 
 struct Writer {
     std::ofstream f;
@@ -5446,12 +5538,14 @@ bool World::save(const std::string& path, std::string* err) const {
         }
         w.put(static_cast<std::int64_t>(m.ostracism_accum));
         w.put(static_cast<std::int64_t>(m.political_accum));
+        w.put(static_cast<std::int64_t>(m.myth_accum));
     }
     // rng stream counters; v5: event failed/failure/conditions (v4): stochastic laws must replay after load
     w.put(seed);
     w.put(gen_sea_level);
     w.put(static_cast<std::uint32_t>(rngs_.size()));
     for (const auto& [name, rg] : rngs_) { w.str(name); w.put(rg->state()); }
+    w.put(ruleset);                                   // v19
     w.f.close();
     if (!w.ok()) { if (err) *err = "save: write failed"; return false; }
     return true;
@@ -5474,7 +5568,7 @@ bool World::load(const std::string& path, std::string* err) {
     if (gver > kGeneratorVersion) return fail("generator_version too new for this build");
 
     // reset world truth (content registries stay — names must resolve)
-    entities.clear(); index_.clear(); touched_.clear(); spatial.clear(); relations.clear(); social_.clear(); ledger.clear(); minds_.clear();
+    entities.clear(); index_.clear(); by_kind_.clear(); touched_.clear(); spatial.clear(); relations.clear(); social_.clear(); ledger.clear(); minds_.clear();
     rngs_.clear();
     gen_spawned_.clear();
     kinds = EntityRegistry{};
@@ -5522,6 +5616,7 @@ bool World::load(const std::string& path, std::string* err) {
         }
         if (!r.get(e->last_metabolized)) return fail("truncated entity tick");
         index_[id] = entities.size();
+        by_kind_[e->kind_name.interned()].push_back(id);
         entities.push_back(std::move(e));
         spatial.insert(id, {px, py});
     }
@@ -5873,6 +5968,11 @@ bool World::load(const std::string& path, std::string* err) {
                 std::int64_t pa2 = 0;
                 if (!r.get(pa2)) return fail("truncated political_accum");
                 m.political_accum = pa2;
+                if (fmt >= 18) {
+                    std::int64_t ma2 = 0;
+                    if (!r.get(ma2)) return fail("truncated myth_accum");
+                    m.myth_accum = ma2;
+                }
             }
             minds_[nid] = std::move(m);
         }
@@ -5906,6 +6006,8 @@ bool World::load(const std::string& path, std::string* err) {
             rng(name).set_state(ctr);
         }
     }
+    ruleset = 0;
+    if (fmt >= 19 && !r.get(ruleset)) return fail("truncated ruleset");
     r.f.close();
     if (!r.ok()) return fail("read failed");
     return true;
@@ -5916,8 +6018,8 @@ bool World::load(const std::string& path, std::string* err) {
 namespace {
 
 std::uint32_t lang_prop_id(const World& w, const char* n) {
-    const PropertyDef* d = w.props.find_name(n);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, n);
 }
 
 // Deterministic u32 seed: FNV-style mix over a composed key. Every "random"
@@ -5954,11 +6056,11 @@ std::string render_seed(std::uint32_t seed, std::int64_t syllables,
     return out;
 }
 
-bool lang_is_lang_entity(const Entity& e) { return e.kind_name == "language"; }
-bool lang_is_entry(const Entity& e)    { return e.kind_name == "lexical_entry"; }
-bool lang_is_concept(const Entity& e)  { return e.kind_name == "semantic_concept"; }
-bool lang_is_atom(const Entity& e)    { return e.kind_name == "semantic_atom"; }
-bool lang_is_inscription(const Entity& e){ return e.kind_name == "inscription"; }
+bool lang_is_lang_entity(const Entity& e) { return e.kind_name == SIMLAB_KIND("language"); }
+bool lang_is_entry(const Entity& e)    { return e.kind_name == SIMLAB_KIND("lexical_entry"); }
+bool lang_is_concept(const Entity& e)  { return e.kind_name == SIMLAB_KIND("semantic_concept"); }
+bool lang_is_atom(const Entity& e)    { return e.kind_name == SIMLAB_KIND("semantic_atom"); }
+bool lang_is_inscription(const Entity& e){ return e.kind_name == SIMLAB_KIND("inscription"); }
 
 // Familiarity an NPC holds for a lexical_entry entity, stored as an ordinary
 // belief keyed "lex:<entry_id>" — beliefs already serialize, decay-adjacent
@@ -6037,9 +6139,19 @@ void World::language_tick(std::uint64_t now) {
     constexpr std::size_t kMaxCoinagePerPass = 64;
     // verb vocabulary of the whole community: a decomposed token matching a
     // known action is an action atom (kind 2), everything else kind 1.
+    // Built lazily: only a pass that actually coins a compositional word
+    // needs it (known_actions never change during this pass, so the lazy
+    // set equals the eager one — this used to be rebuilt every tick).
     std::set<std::string> verbs;
-    for (const auto& [mid, m] : minds_)
-        for (const std::string& a : m.known_actions) verbs.insert(a);
+    bool verbs_built = false;
+    auto get_verbs = [&]() -> const std::set<std::string>& {
+        if (!verbs_built) {
+            for (const auto& [mid, m] : minds_)
+                for (const std::string& a : m.known_actions) verbs.insert(a);
+            verbs_built = true;
+        }
+        return verbs;
+    };
 
     for (auto& [mid, m] : minds_) {
         if (coined >= kMaxCoinagePerPass) break;
@@ -6149,7 +6261,7 @@ void World::language_tick(std::uint64_t now) {
             // and coin one word per atom — CausalClauses recombine these at
             // inscription time instead of minting a word per situation.
             if (p_akey != kNoProp) {
-                const std::vector<AtomRef> ats = decompose_key(d.key, verbs);
+                const std::vector<AtomRef> ats = decompose_key(d.key, get_verbs());
                 for (const AtomRef& at : ats) {
                     if (coined >= kMaxCoinagePerPass) break;
                     const std::string ahk =
@@ -6215,20 +6327,22 @@ void World::language_tick(std::uint64_t now) {
 
 void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*/,
                            CausalEvent& ev) {
+    static thread_local SeqPidCache lp_c_;
+    SeqPid lpid(lp_c_, props);
     if (pending <= 0 || !e.alive) return;
-    const PropId p_lname = lang_prop_id(*this, "language_name");
-    const PropId p_dacc  = lang_prop_id(*this, "dialect_drift_accum");
-    const PropId p_drate = lang_prop_id(*this, "dialect_drift_rate");
-    const PropId p_diso  = lang_prop_id(*this, "dialect_drift_iso");
-    const PropId p_droll = lang_prop_id(*this, "dialect_drift_rolls");
-    const PropId p_dthr  = lang_prop_id(*this, "dialect_drift_threshold");
-    const PropId p_lang  = lang_prop_id(*this, "language_id");
-    const PropId p_ps    = lang_prop_id(*this, "phoneme_seed");
-    const PropId p_lvl   = lang_prop_id(*this, "erosion_level");
-    const PropId p_cktxt = lang_prop_id(*this, "concept_keys");
-    const PropId p_eacc  = lang_prop_id(*this, "erosion_accum");
-    const PropId p_dur   = lang_prop_id(*this, "inscription_durability");
-    const PropId p_gtxt  = lang_prop_id(*this, "glyph_text");
+    const PropId p_lname = lpid("language_name");
+    const PropId p_dacc  = lpid("dialect_drift_accum");
+    const PropId p_drate = lpid("dialect_drift_rate");
+    const PropId p_diso  = lpid("dialect_drift_iso");
+    const PropId p_droll = lpid("dialect_drift_rolls");
+    const PropId p_dthr  = lpid("dialect_drift_threshold");
+    const PropId p_lang  = lpid("language_id");
+    const PropId p_ps    = lpid("phoneme_seed");
+    const PropId p_lvl   = lpid("erosion_level");
+    const PropId p_cktxt = lpid("concept_keys");
+    const PropId p_eacc  = lpid("erosion_accum");
+    const PropId p_dur   = lpid("inscription_durability");
+    const PropId p_gtxt  = lpid("glyph_text");
 
     if (lang_is_lang_entity(e)) {
         if (p_lname == kNoProp || p_dacc == kNoProp || p_drate == kNoProp ||
@@ -6239,7 +6353,7 @@ void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*
         // isolation: the community counts as isolated when NO member has a
         // fellow speaker inside communicate_range. Positions do not move
         // during metabolize, so the flag is constant across the window.
-        const PropId p_crange = lang_prop_id(*this, "communicate_range");
+        const PropId p_crange = lpid("communicate_range");
         const std::int64_t crange = p_crange != kNoProp
             ? prop_int(e, p_crange, 400) : 400;
         bool isolated = true;
@@ -6248,9 +6362,9 @@ void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*
             for (const auto& ep : entities) {
                 const Entity& o = *ep;
                 if (!o.alive || o.id == e.id) continue;
-                if (o.kind_name == "language" || o.kind_name == "lexical_entry" ||
-                    o.kind_name == "semantic_concept" ||
-                    o.kind_name == "inscription") continue;
+                if (o.kind_name == SIMLAB_KIND("language") || o.kind_name == SIMLAB_KIND("lexical_entry") ||
+                    o.kind_name == SIMLAB_KIND("semantic_concept") ||
+                    o.kind_name == SIMLAB_KIND("inscription")) continue;
                 if (p_lang != kNoProp && prop_int(o, p_lang, 0) == lang)
                     members.push_back(o.id);
             }
@@ -6262,10 +6376,10 @@ void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*
                     if (nid == mid) continue;
                     const Entity* ne = find(nid);
                     if (!ne || !ne->alive) continue;
-                    if (ne->kind_name == "language" ||
-                        ne->kind_name == "lexical_entry" ||
-                        ne->kind_name == "semantic_concept" ||
-                        ne->kind_name == "inscription") continue;
+                    if (ne->kind_name == SIMLAB_KIND("language") ||
+                        ne->kind_name == SIMLAB_KIND("lexical_entry") ||
+                        ne->kind_name == SIMLAB_KIND("semantic_concept") ||
+                        ne->kind_name == SIMLAB_KIND("inscription")) continue;
                     if (p_lang != kNoProp && prop_int(*ne, p_lang, 0) == lang) {
                         near = true; break;
                     }
@@ -6385,22 +6499,14 @@ void World::language_drift(Entity& e, std::int64_t pending, std::uint64_t /*now*
 void World::econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                        CausalEvent& ev) {
     if (pending <= 0 || !e.alive) return;
-    const PropId p_poss  = props.find_name("possessed_by")
-        ? props.find_name("possessed_by")->id : kNoProp;
-    const PropId p_ptick = props.find_name("possession_ticks")
-        ? props.find_name("possession_ticks")->id : kNoProp;
-    const PropId p_theft = props.find_name("theft_flag")
-        ? props.find_name("theft_flag")->id : kNoProp;
-    const PropId p_ds    = props.find_name("debt_status")
-        ? props.find_name("debt_status")->id : kNoProp;
-    const PropId p_due   = props.find_name("due_tick")
-        ? props.find_name("due_tick")->id : kNoProp;
-    const PropId p_dv    = props.find_name("debt_value")
-        ? props.find_name("debt_value")->id : kNoProp;
-    const PropId p_db    = props.find_name("debtor_id")
-        ? props.find_name("debtor_id")->id : kNoProp;
-    const PropId p_rep   = props.find_name("trade_reputation")
-        ? props.find_name("trade_reputation")->id : kNoProp;
+    const PropId p_poss  = SIMLAB_PID(props, "possessed_by");
+    const PropId p_ptick = SIMLAB_PID(props, "possession_ticks");
+    const PropId p_theft = SIMLAB_PID(props, "theft_flag");
+    const PropId p_ds    = SIMLAB_PID(props, "debt_status");
+    const PropId p_due   = SIMLAB_PID(props, "due_tick");
+    const PropId p_dv    = SIMLAB_PID(props, "debt_value");
+    const PropId p_db    = SIMLAB_PID(props, "debtor_id");
+    const PropId p_rep   = SIMLAB_PID(props, "trade_reputation");
     auto setp = [&](Entity& ent, PropId p, std::int64_t v) {
         if (p == kNoProp) return;
         const Value* old = prop_of(ent, p);
@@ -6413,7 +6519,7 @@ void World::econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
     };
 
     // ---- debt_obligation overdue -> default --------------------------------
-    if (e.kind_name == "debt_obligation" && p_ds != kNoProp &&
+    if (e.kind_name == SIMLAB_KIND("debt_obligation") && p_ds != kNoProp &&
         p_due != kNoProp) {
         const std::int64_t st = prop_int(e, p_ds, 0);
         const std::int64_t due = prop_int(e, p_due, 0);
@@ -6457,8 +6563,7 @@ void World::econ_drift(Entity& e, std::int64_t pending, std::uint64_t now,
             // against flag>0 (pre-decrement) to stay LOD-exact.
             bool exposed = false;
             if (holder != 0) {
-                const PropId sight = props.find_name("sight_range")
-                    ? props.find_name("sight_range")->id : kNoProp;
+                const PropId sight = SIMLAB_PID(props, "sight_range");
                 for (const auto& [wid, wm] : minds_) {
                     (void)wm;
                     if (wid == static_cast<EntityId>(holder)) continue;
@@ -6505,8 +6610,7 @@ void World::political_drift(std::int64_t n) {
     ev.tick = now;
     ev.action = "political_drift";
     bool ledgered = false;
-    const PropId p_leg = props.find_name("social_legitimacy")
-        ? props.find_name("social_legitimacy")->id : kNoProp;
+    const PropId p_leg = SIMLAB_PID(props, "social_legitimacy");
     for (auto& [eid, mind] : minds_) {
         Entity* e = find(eid);
         if (!e || !e->alive) continue;
@@ -6590,6 +6694,163 @@ void World::political_drift(std::int64_t n) {
     if (ledgered) {
         ev.evidence = "deference network & grievance drift; ";
         ledger.append(std::move(ev));
+    }
+}
+
+// Phase 12.5 mythogenesis: a mind that lived through an unexplained shock —
+// a discovery record that was tested but never Verified, carrying strong
+// emotional charge of EITHER sign (trauma < 0: plague, collapse; salvation
+// > 0: a cure nobody can explain) — and whose agency_attribution_bias is
+// high begins reading WILL into the causal key. Conviction grows per period
+// by (agency-300)/2 scaled by abstraction_gain; the first crossing of 600
+// crystallizes ONE shared semantic_concept per key with a seed-derived
+// agent name, a derived appeasement act and a valence ("curse" for trauma,
+// "blessing" for salvation) — nothing named in code.
+//
+// The same period runs oral attrition: a `lex:` familiarity not rehearsed
+// (spoken, heard or chanted) for kLexStale ticks fades by kLexFade per
+// period — but a word that crystallized into a proverb/epic (oral_genre set
+// on the ENTRY, World Truth) fades only kLexFadeOral: meter resists oblivion.
+// Per-mind accumulator, per-fire evaluation at each fire's historical tick
+// — identical contract to political_drift, so dt=1xN == dt=N exactly.
+void World::myth_drift(std::int64_t n) {
+    if (n <= 0) return;
+    constexpr std::int64_t kPeriod = 100;
+    constexpr std::int64_t kLexStale = 5000;
+    constexpr std::int64_t kLexFade = 10, kLexFadeOral = 1;
+    const std::uint64_t now = clock_.tick();
+    static thread_local SeqPidCache pidn_c_;
+    SeqPid pidn(pidn_c_, props);
+    const PropId p_skey  = pidn("sacred_key");
+    const PropId p_sagent= pidn("sacred_agent");
+    const PropId p_appe  = pidn("appeasement_action");
+    const PropId p_val   = pidn("sacred_valence");
+    const PropId p_ckey  = pidn("concept_key");
+    const PropId p_chron = pidn("chronicle");
+    const PropId p_cause = pidn("cause_key");
+    const PropId p_abias = pidn("agency_attribution_bias");
+    const PropId p_genre = pidn("oral_genre");
+    if (p_skey == kNoProp || p_ckey == kNoProp) return;
+
+    // cheap precheck: advance every accumulator; only minds with a period
+    // boundary in this call do any work (no O(entities) scan otherwise).
+    std::vector<std::pair<EntityId, std::int64_t>> due;   // (mind, fires)
+    for (auto& [eid, mind] : minds_) {
+        const Entity* le = find(eid);
+        if (!le || !le->alive) continue;          // the dead dream no myths
+        mind.myth_accum += n;
+        const std::int64_t fires = mind.myth_accum / kPeriod;
+        mind.myth_accum %= kPeriod;
+        if (fires > 0) due.emplace_back(eid, fires);
+    }
+    if (due.empty()) return;
+
+    // existing sacred concepts by causal key — one World-Truth concept per myth
+    std::map<std::string, EntityId> sacred_seen;
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive) continue;
+        const Value* sk = prop_of(e, p_skey);
+        if (sk && sk->type == ValType::Text && !sk->s.empty())
+            sacred_seen.emplace(sk->s, e.id);
+    }
+    // is a lexical entry an oral classic? (memoized per call — World Truth)
+    std::map<EntityId, bool> oral;
+    auto is_oral = [&](EntityId le) {
+        const auto it = oral.find(le);
+        if (it != oral.end()) return it->second;
+        bool o = false;
+        if (p_genre != kNoProp)
+            if (const Entity* ee = find(le)) {
+                const Value* gv = prop_of(*ee, p_genre);
+                o = gv && gv->type == ValType::Text && !gv->s.empty();
+            }
+        oral.emplace(le, o);
+        return o;
+    };
+
+    CausalEvent ev;
+    ev.tick = now;
+    ev.action = "myth_drift";
+    ev.applied_laws.push_back(8);                 // social.interaction family
+    bool ledgered = false;
+    for (const auto& [eid, fires0] : due) {
+        AgentMind& mind = minds_[eid];
+        Entity* e = find(eid);
+        if (!e || !e->alive) continue;
+        const std::int64_t rem = mind.myth_accum;
+        const std::int64_t agency = p_abias != kNoProp
+            ? prop_int(*e, p_abias, 500) : 500;
+        const MindParams mp = mind_params(*this, *e);
+        std::int64_t fires = fires0;
+        while (fires-- > 0) {
+            const std::int64_t ftick = std::max<std::int64_t>(0,
+                static_cast<std::int64_t>(now) - rem - fires * kPeriod);
+            // ---- oral attrition (every mind, every period) ----------------
+            for (auto& [bk, b] : mind.beliefs) {
+                if (bk.rfind("lex:", 0) != 0 || b.confidence <= 0) continue;
+                if (ftick - static_cast<std::int64_t>(b.last_tick) < kLexStale)
+                    continue;
+                EntityId le = kNoEntity;
+                try { le = static_cast<EntityId>(std::stoull(bk.substr(4))); }
+                catch (...) { continue; }
+                b.confidence = std::max<std::int64_t>(0,
+                    b.confidence - (is_oral(le) ? kLexFadeOral : kLexFade));
+            }
+            // ---- mythogenesis (only minds that read will into events) -----
+            if (agency < 400) continue;      // materialist minds need no myth
+            const std::int64_t gain = std::max<std::int64_t>(0,
+                (agency - 300) / 2 * mp.abstraction_gain / 1000);
+            if (gain <= 0) continue;
+            for (const auto& [dkey, d] : mind.discoveries) {
+                if (d.status == DiscoveryStatus::Verified ||
+                    d.status == DiscoveryStatus::Open) continue;
+                if (d.trials == 0 && d.evidence_for + d.evidence_against == 0)
+                    continue;
+                const std::int64_t charge = d.engram.emotional_charge;
+                if ((charge < 0 ? -charge : charge) < mp.trauma_charge) continue;
+                Belief& sb = mind.belief("sacred:" + d.key);
+                if (sb.confidence >= 1000) continue;
+                const std::int64_t before = sb.confidence;
+                sb.confidence = std::min<std::int64_t>(1000, sb.confidence + gain);
+                sb.status = BeliefStatus::Observed;
+                sb.last_tick = static_cast<std::uint64_t>(ftick);
+                if (before >= 600 || sb.confidence < 600) continue;
+                if (sacred_seen.count(d.key)) continue;
+                // crystallize: one shared concept per causal key
+                const std::uint32_t hseed = static_cast<std::uint32_t>(
+                    lang_seed(world_seed, "agent|" + d.key));
+                const std::string agent = render_seed(hseed, 2, world_seed);
+                std::string appease = "heat";
+                if (mind.known_actions.count("share") &&
+                    !mind.known_actions.count("heat"))
+                    appease = "share";
+                const std::string valence = charge < 0 ? "curse" : "blessing";
+                PropertyBag pb;
+                pb.set(p_ckey, Value::text("sacred|" + d.key));
+                pb.set(p_skey, Value::text(d.key));
+                if (p_sagent != kNoProp) pb.set(p_sagent, Value::text(agent));
+                if (p_appe   != kNoProp) pb.set(p_appe, Value::text(appease));
+                if (p_val    != kNoProp) pb.set(p_val, Value::text(valence));
+                if (p_chron  != kNoProp) pb.set(p_chron,
+                    Value::text(d.claim + " — " + valence + " of " + agent));
+                if (p_cause  != kNoProp) pb.set(p_cause, Value::text(d.key));
+                const EntityId cid = create_entity(
+                    "semantic_concept", kNoMaterial, e->pos, pb);
+                if (cid != kNoEntity) {
+                    sacred_seen.emplace(d.key, cid);
+                    ev.spawned.push_back(cid);
+                    ev.participants.push_back(eid);
+                    ev.evidence += "sacred concept " + d.key + " agent=" +
+                        agent + " valence=" + valence + "; ";
+                    ledgered = true;
+                }
+            }
+        }
+    }
+    if (ledgered) {
+        const EventId id = ledger.append(std::move(ev));
+        if (const CausalEvent* ce = ledger.find(id)) note_touched(*ce);
     }
 }
 
@@ -6717,6 +6978,76 @@ std::string World::export_lexicon_codex() const {
           << " clause=" << (cl && cl->type == ValType::Text ? cl->s : "")
           << "\n";
     }
+    // Phase 12.5 oral literature: words that survived transmission with
+    // meter crystallize into proverbs/epics — exported under EPIC / PROVERB
+    // with the verse itself (raw_phonemes: every sibling entry of the same
+    // concept+tongue rendered in order), the historical chronicle it carries
+    // (chronicle_english), its cadence/transmissions and how far it has been
+    // MYTHOLOGIZED (myth: strongest `sacred:<concept>` conviction any mind
+    // holds, permille — 0 = remembered history, 1000 = revealed scripture).
+    {
+        const PropId p_genre = lang_prop_id(*this, "oral_genre");
+        const PropId p_tcount = lang_prop_id(*this, "transmission_count");
+        const PropId p_cad   = lang_prop_id(*this, "poetic_cadence");
+        const PropId p_ps2   = lang_prop_id(*this, "phoneme_seed");
+        if (p_genre != kNoProp) {
+            for (const auto& ep : entities) {
+                const Entity& e = *ep;
+                if (!e.alive || !lang_is_entry(e)) continue;
+                const Value* gv = prop_of(e, p_genre);
+                if (!gv || gv->type != ValType::Text || gv->s.empty())
+                    continue;
+                const Value* tv = p_tcount != kNoProp
+                    ? prop_of(e, p_tcount) : nullptr;
+                const Value* cv = p_cad != kNoProp
+                    ? prop_of(e, p_cad) : nullptr;
+                const Value* ck = prop_of(e, p_ckey);
+                const std::string cks =
+                    ck && ck->type == ValType::Text ? ck->s : "";
+                const Value* lv = p_lang != kNoProp ? prop_of(e, p_lang) : nullptr;
+                const std::int64_t lg =
+                    lv && lv->type == ValType::Integer ? lv->i : 0;
+                // the verse: this entry + its siblings (same concept+tongue)
+                std::string verse;
+                for (const auto& sp : entities) {
+                    const Entity& s2 = *sp;
+                    if (!s2.alive || !lang_is_entry(s2)) continue;
+                    const Value* k2 = prop_of(s2, p_ckey);
+                    const Value* l2 = p_lang != kNoProp ? prop_of(s2, p_lang) : nullptr;
+                    if (!k2 || k2->type != ValType::Text || k2->s != cks) continue;
+                    if ((l2 && l2->type == ValType::Integer ? l2->i : 0) != lg) continue;
+                    const Value* pv = p_ps2 != kNoProp ? prop_of(s2, p_ps2) : nullptr;
+                    const std::uint32_t ps = pv && pv->type == ValType::Integer
+                        ? static_cast<std::uint32_t>(pv->i) : 0;
+                    if (!verse.empty()) verse.push_back(' ');
+                    verse += render_seed(ps, 2, world_seed);
+                }
+                std::int64_t myth = 0;
+                for (const auto& [mid, mm] : minds_) {
+                    (void)mid;
+                    for (const std::string& k : {std::string("sacred:") + cks}) {
+                        const Belief* b = mm.find_belief(k);
+                        if (b) myth = std::max(myth, b->confidence);
+                    }
+                }
+                const auto ci = chronicles.find(cks);
+                std::string tag = gv->s;
+                for (char& c : tag) c = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(c)));
+                o << tag << " entry " << e.id
+                  << " concept=" << cks
+                  << " raw_phonemes=" << verse
+                  << " cadence=" << (cv && cv->type == ValType::Integer
+                                     ? cv->i : 0)
+                  << " transmissions=" << (tv && tv->type == ValType::Integer
+                                           ? tv->i : 0)
+                  << " myth=" << myth
+                  << " chronicle_english=" << (ci != chronicles.end()
+                                              ? ci->second : "")
+                  << "\n";
+            }
+        }
+    }
     return o.str();
 }
 
@@ -6755,24 +7086,19 @@ void World::terrain_wear_decay(std::int64_t n) {
 void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                        CausalEvent& ev, std::vector<SpawnSpec>& out) {
     if (pending <= 0 || !e.alive) return;
-    const PropId p_da = props.find_name("decay_accum")
-        ? props.find_name("decay_accum")->id : kNoProp;
-    const PropId p_wres = props.find_name("weather_resistance")
-        ? props.find_name("weather_resistance")->id : kNoProp;
-    const PropId p_integ = props.find_name("integrity")
-        ? props.find_name("integrity")->id : kNoProp;
-    const PropId p_rad = props.find_name("footprint_radius")
-        ? props.find_name("footprint_radius")->id : kNoProp;
-    const PropId p_ratio = props.find_name("enclosure_ratio")
-        ? props.find_name("enclosure_ratio")->id : kNoProp;
+    const PropId p_da = SIMLAB_PID(props, "decay_accum");
+    const PropId p_wres = SIMLAB_PID(props, "weather_resistance");
+    const PropId p_integ = SIMLAB_PID(props, "integrity");
+    const PropId p_rad = SIMLAB_PID(props, "footprint_radius");
+    const PropId p_ratio = SIMLAB_PID(props, "enclosure_ratio");
 
-    if (e.kind_name == "portal") {
+    if (e.kind_name == SIMLAB_KIND("portal")) {
         // A portal lives only while an enclosure footprint still covers it;
         // collapse or relocation orphans the passage and it fails.
         bool hosted = false;
         for (const auto& ep : entities) {
             const Entity& h = *ep;
-            if (!h.alive || h.id == e.id || h.kind_name != "enclosure" ||
+            if (!h.alive || h.id == e.id || h.kind_name != SIMLAB_KIND("enclosure") ||
                 p_rad == kNoProp) continue;
             const std::int64_t r = prop_int(h, p_rad, 0);
             if (r <= 0) continue;
@@ -6787,7 +7113,7 @@ void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
         }
         return;
     }
-    if (e.kind_name != "enclosure" || p_da == kNoProp) return;
+    if (e.kind_name != SIMLAB_KIND("enclosure") || p_da == kNoProp) return;
 
     // ---- trespass / consent scan -----------------------------------------
     // Every minded agent inside the footprint is either consented (owner,
@@ -6812,8 +7138,7 @@ void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
             if (b && b->confidence >= 600) owners.push_back(oid);
         }
         if (r > 0 && !owners.empty()) {
-            const PropId p_sight = props.find_name("sight_range")
-                ? props.find_name("sight_range")->id : kNoProp;
+            const PropId p_sight = SIMLAB_PID(props, "sight_range");
             for (auto& [mid, mm] : minds_) {
                 const Entity* me = find(mid);
                 if (!me || !me->alive) continue;
@@ -6895,10 +7220,8 @@ void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
                       e.pos.y + static_cast<std::int32_t>(
                           r * kOff[i][1] / 2)};
             PropertyBag pb;
-            const PropId pq = props.find_name("quantity")
-                ? props.find_name("quantity")->id : kNoProp;
-            const PropId pi = props.find_name("integrity")
-                ? props.find_name("integrity")->id : kNoProp;
+            const PropId pq = SIMLAB_PID(props, "quantity");
+            const PropId pi = SIMLAB_PID(props, "integrity");
             if (pq != kNoProp) pb.set(pq, Value::integer(std::max<
                 std::int64_t>(1, r / 20)));
             if (pi != kNoProp) pb.set(pi, Value::integer(80));
@@ -6956,3 +7279,9 @@ void World::arch_drift(Entity& e, std::int64_t pending, std::uint64_t now,
 
 }  // namespace simlab
 
+namespace simlab {
+// public display codec for the viewer/patron layer (same as the codex)
+std::string lang_render_word(std::uint32_t seed, std::int64_t syllables, std::uint64_t world_seed) {
+    return render_seed(seed, syllables, world_seed);
+}
+}  // namespace simlab

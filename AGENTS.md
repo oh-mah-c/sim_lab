@@ -180,3 +180,177 @@ no engine code changes.
 - Pain: PhysicsModel adds `pain_level` changes on the body; delta pain
   in `learn_from_event` pumps `neuro.panic`/`neuro.rage` (split by
   threat_gain) and writes a negative trauma engram on the attacker.
+
+## Phase 12.5 — myth, oral literature, ritual, diplomacy
+
+- Mythogenesis runs in `World::myth_drift` (per-mind `myth_accum`, period
+  100, each fire evaluated at its own historical tick, so dt=1xN == dt=N).
+  A discovery that was tried but never Verified, whose engram has
+  |emotional_charge| >= `mind_trauma_charge` (either sign), grows a
+  `sacred:<key>` belief by `(agency_attribution_bias-300)/2 *
+  abstraction_gain/1000` per period (agency < 400 = materialist, no myth).
+  The first crossing of 600 spawns ONE `semantic_concept` per key with
+  `sacred_key`, seed-derived `sacred_agent`, derived `appeasement_action`
+  and `sacred_valence` ("curse" for trauma < 0, "blessing" for salvation
+  > 0). No deity, rite or treaty names exist in code.
+- Oral attrition shares the same period: a `lex:` belief not rehearsed for
+  5000 ticks loses 10 per period; if its ENTRY has `oral_genre` set it
+  loses only 1. Speaking (`communicate`) and chanting (`perform_ritual`)
+  refresh `last_tick` in `myth_from_event`.
+- `communicate` bumps `transmission_count` on up to 8 confident entries;
+  at >= 150 transmissions with `oral_cadence_of` >= 500 the entry gets
+  `poetic_cadence` + `oral_genre` ("proverb" with <= 3 siblings, else
+  "epic"). Classic entries teach 3x (social_from_event) and lift the
+  reciter's `social_legitimacy` by 15. `export_lexicon_codex` prints
+  `EPIC`/`PROVERB` rows with raw_phonemes, cadence, transmissions, myth
+  degree and chronicle_english.
+- `consecrate` carves the sacred key (+ CausalClause via `compose_clause`)
+  on a surface. An enclosure containing such an INSCRIPTION is inferred as
+  `sanctuary` by `arch_function` (abstract concepts don't count).
+- `perform_ritual` needs a sacred conviction or a mandate; offerings drain,
+  legitimacy gain = clamp(80 + offered marginal value/50, 80, 300); a fire
+  rite heats entities within 200 units and sterilizes by the Phase 11 rule.
+  Grievance relief = 60 + sanctuary pull/5 for same-tongue minds in range.
+- Diplomacy ledger: `diplo_table` text on `language` entities, codec in
+  Cognition.cpp (`diplo_parse/render/bump/mark_trade`):
+  `peer:trust[:ft][:host];`. Trust is always stored numerically; `host`
+  follows trust <= -600; `ft` is set ONLY by a free_trade treaty and lapses
+  below trust 0. Gifts move real goods and add clamp(value/20, 50, 400);
+  cross-border `steal` subtracts 150; hostile pairs refuse `trade`, and
+  every mind of both tongues gets `hostile_tongue:<peer>` = 1000.
+  `treaty` needs trust >= 500 and a bilingual envoy (>= 600); clause is
+  free_trade at trust >= 700, else non_aggression, carved as a Rosetta
+  inscription (`language_id2` + `clause_atoms` from the envoy's words).
+- Save format v18 adds `myth_accum`.
+
+## Performance conventions (optimization pass, state_hash-neutral)
+
+- Builds: `make` (build/, -O2), `make MODE=release` (build-release/,
+  -O3 -flto), `make MODE=profile` (build-profile/, -pg for gprof). The
+  engine is integer-only, so every mode yields the same `state_hash`.
+- Property ids by name: NEVER call `props.find_name("x")` on a hot path.
+  Use `SIMLAB_PID(w.props, "x")` (per-call-site cache keyed on
+  `PropertyRegistry::uid()`), or for functions resolving many names per
+  call `static thread_local SeqPidCache c; SeqPid pid(c, w.props);` then
+  `pid("x")`. Both REQUIRE string literals (pointer-keyed caches; temporary
+  strings must go through a static literal table, see kImmuneSigNames).
+  `PropertyRegistry::uid()` changes on every mutation/copy, invalidating
+  caches automatically.
+- Content registries (`props/materials/deposits/processes/species/influx`)
+  are `SharedReg<R>` copy-on-write handles: clones share one registry; a
+  write through `add/parse/load_file/mut()` detaches first.
+- `Entity::kind_name` is a `KindName` (interned `const std::string*`,
+  process-wide append-only pool). Compare literals with
+  `e.kind_name == SIMLAB_KIND("enclosure")` (pointer compare).
+  `World::entities_of_kind(k)` lists ids of a kind in creation order
+  (dead included) — use it instead of scanning `entities` for one kind.
+- `World::speculative` (set by `plan_multi` on its clones): advance_ticks
+  only runs `flush_needs(minds)`, `dissipate_heat`, `decay_minds`; no
+  per-entity metabolize pass, ecology/language/political/myth/terrain
+  drift, witness learning or `*_from_event` hooks. Never true on a real world.
+- The capstone test prints `capstone fingerprint: ... state_hash=...`;
+  baseline hashes for SIMLAB_CYCLES 100/300/500/800 are b01e7e33ed7962ff /
+  fb3ddce7393e6e5e / 82715b8f27ec0cfc / d47683031ca69ffc. A pure
+  optimization must reproduce them exactly.
+
+## Phase 12.6 — warfare, logistics & emergent weapons R&D
+
+- `WarfareModel` (law 23, src/WarfareLaws.cpp): `launch` (target, ammo
+  [, launcher]), `coat` (source), `don`/`doff` (armor), `mobilize` (foe;
+  note `depot:<enclosure>`). Peace is `diplomatic_parley` note
+  `peace:<enclosure|0>:<material|->:<qty>` (SocialLaws).
+- Material channels (data only): `edge_sharpness` (cut/bleed),
+  `blunt_mass` (impulse through soft armor), `elasticity` + `tensile`
+  (launchers), `armor_penetration_resist` (worn via `wearing` relation:
+  sharp x (1000-apr)/1000, blunt x (1000-apr/3)/1000), `volatility` +
+  `expansion_force` (blast), `coat_toxin`/`coat_strain` (penetrating
+  edge -> blood `toxin_load` / ActiveInfection). Composites take the MAX of
+  parts; `launch_impulse` EMERGES from elastic frame x tensile part x
+  (1000 + frame_mass/10)/1000 x motor — heavy frames are siege engines.
+- `lawutil::deliver_blow(w,r,target,E,Blow,striker,wear)` is the single
+  body/structure damage path (PhysicsModel impact, launch, blast). Wounds
+  note `victim=<id> mech=<bleed|blunt|projectile|blast|toxin|thermal>`.
+- `lawutil::blast`: impulse = expansion x (500+casing/2)/1000 x
+  (1000+mass/50)/1000, radius 50+expansion/4, linear falloff; bodies take a
+  blunt "blast" blow, enclosures lose integrity. ThermalModel fires it when
+  a charge (volatility>=300, expansion>=300) crosses 4000-3*volatility.
+- Structures: launch/blast damage = E x (500+blunt)/(5000 x (500+barrier));
+  below integrity 300 the wall is BREACHED (access_barrier -> 0). `take`/
+  `steal` of goods inside a barred (>=500) enclosure fails from outside its
+  footprint unless the actor owns it.
+- Morale: `World::morale_drift` inside metabolize/flush_needs, per tick
+  (soldiers = war_target>0 are physiology_coupled -> LOD-exact). Target =
+  500 +150 leader (defer_to within communicate_range) +150 supply (stocked
+  depot reached directly or on terrain wear>=100) -500 hunger>=700 / -200
+  >=500 - pain/3 +100 known epic; step 5/tick; <200 sets `routed`=1,
+  >=400 clears it.
+- `war_from_event` (Cognition): arms race (`weapon_counter:<mech>`,
+  `armor_tech_bias` beliefs on victim and same-tongue kin within 600),
+  `war:<tongue>` beliefs from war_target changes, peace ownership transfer
+  (`owns:<enc>`). `arms_race_bonus` feeds plan_multi scoring.
+- Defeat (peace precondition): >= 2/3 of the tongue's soldiers marching on
+  the other routed or dead, or their depot breached.
+
+## Phase 13 - observation gate (renderer)
+
+- Render CORE is SDL-free and linked into the tests: `src/render/*.cpp`,
+  `include/simlab/render/` - `ProceduralAtlas` (every sprite generated from
+  data/*.txt at load: material tiles/icons from physical props, species
+  standees from `body_part` anatomy or inferred from reach/vocal props,
+  fruit dots exactly proportional to fruit_count/max_fruit, 47-shape wall
+  autotiling with integrity cracks, weapon icons from edge/blunt/elastic/
+  coat channels, per-language procedural glyph scripts) and
+  `capture(const World&, ViewRect, FogOfWar&) -> RenderSnapshot` (viewport
+  culled, back-to-front). `FogOfWar` (viewer state, not World Truth):
+  Unexplored / Shrouded (architecture remembered, motion hidden) / Visible;
+  Tribe vision (minds of one language_id) or God Eye.
+- `build/sunnyworld_viewer` (`make viewer`, src/render/sdl/viewer_main.cpp):
+  SDL3 (vendored third_party/SDL-main, static, X11 dlopen'ed; compile-time
+  X11 headers in third_party/x11-headers) + Dear ImGui 1.92.9
+  (third_party/imgui). Software renderer only (GL never loaded). The sim
+  runs on a worker thread under a mutex; the UI thread only snapshots/reads.
+  Ground pre-composited into one target texture; world drawn at 1/2 res and
+  upscaled nearest; ImGui layer cached, re-rasterized on input or every 4th
+  frame. `--selftest N` (SDL_VIDEO_DRIVER=dummy) checks render-only frames
+  leave state_hash unchanged and prints frame ms / RSS. Diagnostics:
+  SIMLAB_VDEBUG=1 (per-pass ms), SIMLAB_VSKIP bitmask.
+- `EventLedger::set_byte_budget(bytes)`: optional RAM bound on the retained
+  ledger window (0 = off, the default; the viewer uses 16 MB). Eviction is
+  the same deterministic fold into archived_hash.
+
+## Phase 14 — Primordial Genesis & Patron gameplay layer
+
+- `simlab/Genesis.hpp` `build_primordial(World&, PrimordialParams)`: naked
+  tick-0 world (worldgen with `skip_species={founder}`), drinkable shoreline
+  `water` stock entities, founders with ONLY the species `innate` verbs
+  (data/species.txt `innate <verb>`), personality genes
+  (`mind_abstraction/threat/reward/empathy_gain`), energy = max_energy,
+  `last_reproduce = 0`. Sets `World::ruleset |= kRulePrimordial`.
+  `primordial_violations()` counts pre-made culture (must be 0 at tick 0).
+- `World::ruleset` (save v19, hashed ONLY when non-zero → legacy hashes
+  unchanged). `kRulePrimordial`: an awake animal (consciousness >= 300, no
+  stock) resists being eaten whole; a living species individual is not a
+  wieldable tool.
+- Planet mode is encoded in the WORLDGEN seed
+  (`WorldGenerator::planet_seed/planet_dims/planet_latitude`, bit 63): climate
+  belts by latitude, ocean rim, ridged ranges, several continents. Legacy
+  seeds (bit 63 clear) keep the original analytic fields.
+- `DriverState` flags (all default OFF → every pre-existing scenario is
+  bit-identical): `curiosity` (babble_step: idle minds try unknown verbs on
+  remembered non-animal THINGS in reach; `omen:<verb>[:<mat>]` beliefs are
+  heeded by personality and fade when ignored; `beacon:x:y` / `site:x:y:r`
+  beliefs walk scouts/builders, builders try `enclose` with remembered loose
+  solids; round-robin discover budget; wield reflex needs the verb),
+  `concurrent` (World::defer_time: one round's actions share the clock, the
+  world advances once by the longest action), `possessed` (driver skips the
+  player's avatar — it only perceives).
+- Viewer-side `simlab/render/Patron.hpp` (SDL-free, linked into tests):
+  `PatronJournal` (Rosetta lexicon per tongue: heard/carved words, player
+  guess + tag, CONFIRMED only when the guess matches the word's concept gloss
+  and it was witnessed; milestones = first completed verb by a sapient + first
+  culture kind; Resonance; pins; notes) saved as `slotN.sav.journal`.
+  `patron_scan(const World&, ...)` is incremental and read-only.
+- `FogOfWar::Mode::Avatar` = only the possessed body's eyes.
+- Viewer: player commands are queued and run on the UI thread while it holds
+  the world lock (never blocks on a sim cycle). Demo screenshot:
+  `SDL_VIDEO_DRIVER=dummy SIMLAB_VDEMO=80 SIMLAB_VTAB=1 sunnyworld_viewer --selftest 4 --shot f.bmp`.

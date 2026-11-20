@@ -114,6 +114,7 @@ bool PropertyRegistry::parse(const std::string& text, std::string* err) {
         }
     defs_ = std::move(tmp.defs_);
     by_name_ = std::move(tmp.by_name_);
+    uid_ = next_uid();                    // content changed: invalidate caches
     return true;
 }
 
@@ -123,6 +124,7 @@ PropId PropertyRegistry::add(PropertyDef def) {
     def.id = static_cast<PropId>(defs_.size() + 1);
     by_name_[def.name] = def.id;
     defs_.push_back(std::move(def));
+    uid_ = next_uid();
     return defs_.back().id;
 }
 

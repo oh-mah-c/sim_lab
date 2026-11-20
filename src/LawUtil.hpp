@@ -9,12 +9,30 @@
 
 namespace simlab::lawutil {
 
+// Weapon profile of one blow (Phase 12.6). All channels are material/
+// composite properties: edge_sharpness (cut), blunt_mass (impulse),
+// coat_toxin / coat_strain (what a penetrating edge injects). `mech`
+// overrides the damage-mechanism tag ("projectile", "blast").
+struct Blow {
+    std::int64_t sharp = 0, blunt = 0, coat_toxin = 0, coat_strain = 0;
+    const char* mech = nullptr;
+};
+std::int64_t armor_resist(const World& w, EntityId body);
+Blow blow_of(const World& w, EntityId weapon, std::int64_t base_edge);
+void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
+                  std::int64_t E, const Blow& b, EntityId striker,
+                  std::int64_t& wear_total);
+// Energetic release around `center` (WarfareLaws.cpp). 0 = too weak to blast.
+std::int64_t blast(const World& w, PredictionResult& r, Vec2 center,
+                   std::int64_t expansion, std::int64_t casing,
+                   std::int64_t mass, const std::vector<EntityId>& exclude);
+
 // Actors without a `reach` prop get a default arm-span of 64 map units.
 constexpr std::int64_t kDefaultReach = 64;
 
 inline PropId pid(const World& w, const char* name) {
-    const PropertyDef* d = w.props.find_name(name);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, name);
 }
 
 inline void add_cond(PredictionResult& r, const char* what, std::int64_t actual,

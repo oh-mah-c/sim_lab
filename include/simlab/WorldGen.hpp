@@ -59,6 +59,9 @@ struct WorldGenParams {
     // call with defer_entities=false materializes entities for cells whose
     // entity stage has not run yet (tracked in World::gen_cells_).
     bool defer_entities = false;
+    // Species names the ecology stage must NOT spawn (Primordial Genesis
+    // places its founders itself). Empty = every species (default).
+    std::vector<std::string> skip_species;
 };
 
 class WorldGenerator {
@@ -84,6 +87,20 @@ public:
     // no grid required. These define the continuous world; grids/entities are
     // materializations of it.
     static std::int32_t elevation_at(std::uint64_t seed, int gx, int gy);
+
+    // ---- Planetary mode (Primordial Genesis) ----------------------------------
+    // A closed planet is encoded IN the worldgen seed (bit 63 set, width in
+    // bits 32..46, height in bits 47..61, user seed in the low 32 bits), so
+    // every pure field function above stays a function of (seed, gx, gy) and
+    // legacy seeds (bit 63 clear) are untouched. In planet mode:
+    //   * climate belts by latitude: hot wet equator (centre row) -> temperate
+    //     -> frozen poles (top/bottom rows), minus an altitude lapse rate;
+    //   * the map rim is ocean (east/west seas, a closed world, no void);
+    //   * ridged mountain ranges + several continental masses isolate basins.
+    static std::uint64_t planet_seed(std::uint32_t user_seed, int w, int h);
+    static bool planet_dims(std::uint64_t seed, int& w, int& h);
+    // latitude in permille: 0 = equator, 1000 = pole (planet seeds only)
+    static std::int32_t planet_latitude(std::uint64_t seed, int gy);
     static bool is_sea(std::uint64_t seed, int gx, int gy, std::int32_t sea_level);
     static bool is_river(std::uint64_t seed, int gx, int gy, std::int32_t sea_level);
     static std::int32_t moisture_at(std::uint64_t seed, int gx, int gy,

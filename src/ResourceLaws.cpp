@@ -21,10 +21,8 @@ struct PropIds {
 
 PropIds resolve_props(const World& w) {
     PropIds p;
-    auto get = [&](const char* n) {
-        const PropertyDef* d = w.props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache get_c_;
+    SeqPid get(get_c_, w.props);
     p.exposed = get("exposed"); p.min_force = get("min_force");
     p.dig_resistance = get("dig_resistance"); p.yield_rate = get("yield_rate");
     p.deposit_remaining = get("deposit_remaining"); p.quantity = get("quantity");
@@ -414,6 +412,24 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
         const std::int64_t delta = E / (100 * tmass);
         const std::int64_t nw = std::min<std::int64_t>(t_max, cur + delta);
         set_change(r, tid, P.temperature, cur, nw);
+        // Phase 12.6 energetic charge: a volatile mix that reaches its
+        // ignition point (lower for more volatile mixes) releases its gas all
+        // at once — a blast scaled by expansion_force and by how tightly the
+        // casing (its own integrity) held the pressure. The charge is spent.
+        {
+            const PropId vol_p = SIMLAB_PID(w.props, "volatility");
+            const PropId exf_p = SIMLAB_PID(w.props, "expansion_force");
+            const std::int64_t vol = vol_p != kNoProp ? w.prop_int(*t, vol_p, 0) : 0;
+            const std::int64_t exf = exf_p != kNoProp ? w.prop_int(*t, exf_p, 0) : 0;
+            if (vol >= 300 && exf >= 300 && nw >= 4000 - vol * 3 && cur < 4000 - vol * 3) {
+                const std::int64_t casing = w.prop_int(*t, P.integrity, 200);
+                const std::int64_t mass = w.prop_int(*t, SIMLAB_PID(w.props, "mass"), 500);
+                blast(w, r, t->pos, exf, casing, mass, {tid});   // the one who lit it is NOT spared
+                set_change(r, tid, P.integrity, casing, 0);
+                r.possible = true;
+                continue;
+            }
+        }
         if (!t->alive) {
             // Phase 11 cremation: dead remains still conduct heat; past the
             // material's data-defined cremation_temp they burn down to the

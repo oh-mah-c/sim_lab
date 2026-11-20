@@ -1,6 +1,7 @@
 #pragma once
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "Materials.hpp"
 #include "Properties.hpp"
@@ -23,6 +24,61 @@ struct Genome {
     std::size_t size() const { return loci.size(); }
 };
 
+// ---- Interned kind names ------------------------------------------------------
+// Kind labels repeat across thousands of entities and clones; storing a
+// std::string per entity cost 32 bytes each and made every `kind == "x"`
+// test a strcmp. KindName holds a pointer into a process-wide, append-only
+// intern pool (node-based set: stable addresses), so equality between kinds
+// is a pointer compare and copying an entity copies 8 bytes. Text semantics
+// are unchanged: it converts to `const std::string&` everywhere a string is
+// expected (hashing, save files, printing). Single-threaded engine: the pool
+// must be guarded before simulation runs on multiple threads.
+const std::string* intern_kind(std::string_view s);
+
+class KindName {
+public:
+    KindName() : p_(intern_kind("")) {}
+    KindName(const std::string& s) : p_(intern_kind(s)) {}
+    KindName(const char* s) : p_(intern_kind(s)) {}
+    KindName& operator=(const std::string& s) { p_ = intern_kind(s); return *this; }
+    KindName& operator=(const char* s) { p_ = intern_kind(s); return *this; }
+    operator const std::string&() const { return *p_; }
+    const std::string& str() const { return *p_; }
+    const char* c_str() const { return p_->c_str(); }
+    bool empty() const { return p_->empty(); }
+    std::size_t size() const { return p_->size(); }
+    std::size_t find(const char* s, std::size_t pos = 0) const { return p_->find(s, pos); }
+    std::size_t find(const std::string& s, std::size_t pos = 0) const { return p_->find(s, pos); }
+    std::size_t rfind(const char* s, std::size_t pos = std::string::npos) const { return p_->rfind(s, pos); }
+    std::string substr(std::size_t pos, std::size_t n = std::string::npos) const { return p_->substr(pos, n); }
+    const std::string* interned() const { return p_; }
+
+    friend bool operator==(const KindName& a, const KindName& b) { return a.p_ == b.p_; }
+    friend bool operator!=(const KindName& a, const KindName& b) { return a.p_ != b.p_; }
+    friend bool operator==(const KindName& a, const std::string& b) { return *a.p_ == b; }
+    friend bool operator!=(const KindName& a, const std::string& b) { return *a.p_ != b; }
+    friend bool operator==(const std::string& b, const KindName& a) { return *a.p_ == b; }
+    friend bool operator!=(const std::string& b, const KindName& a) { return *a.p_ != b; }
+    // literal compare: resolved through a per-call-site cache of the
+    // interned pointer (see SIMLAB_KIND) when written as kind_is(); the
+    // plain operator stays correct for any C string.
+    friend bool operator==(const KindName& a, const char* b) { return *a.p_ == b; }
+    friend bool operator!=(const KindName& a, const char* b) { return *a.p_ != b; }
+    friend bool operator<(const KindName& a, const KindName& b) { return *a.p_ < *b.p_; }
+    friend std::string operator+(const KindName& a, const std::string& b) { return *a.p_ + b; }
+    friend std::string operator+(const std::string& a, const KindName& b) { return a + *b.p_; }
+    friend std::string operator+(const KindName& a, const char* b) { return *a.p_ + b; }
+    friend std::string operator+(const char* a, const KindName& b) { return a + *b.p_; }
+private:
+    const std::string* p_;
+};
+
+// Interned pointer of a LITERAL kind name, cached per call site:
+// `e.kind_name == SIMLAB_KIND("enclosure")` is a single pointer compare.
+#define SIMLAB_KIND(lit) \
+    ([]() -> ::simlab::KindName { \
+        static const ::simlab::KindName k_(lit); return k_; }())
+
 // ---- Entity & ontology ------------------------------------------------------
 // Entities are composition, not classes: identity + material + position +
 // property overrides + lifecycle flag. Adding a new KIND of thing never
@@ -30,7 +86,7 @@ struct Genome {
 struct Entity {
     EntityId id = kNoEntity;
     std::uint32_t kind = 0;               // open kind id (0 = unclassified)
-    std::string kind_name;                // optional label, never load-bearing
+    KindName kind_name;                   // interned label (8 bytes), never load-bearing
     MaterialId material = kNoMaterial;    // 0 = no material (abstract entity)
     DepositId deposit = kNoDeposit;       // >0 = natural occurrence (World Truth)
     Vec2 pos;

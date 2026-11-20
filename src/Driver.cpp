@@ -4,6 +4,7 @@
 #include "simlab/Laws.hpp"
 #include "simlab/WorldGen.hpp"
 #include <algorithm>
+#include <iterator>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -31,11 +32,12 @@ constexpr std::int64_t kCooldown[7] = {48, 24, 220, 32, 96, 128, 8};
 constexpr int kDiscoverPerCycle = 8;
 constexpr std::uint64_t kPendingTicks = 240;
 
-enum VerbSlot { kWield = 0, kWithdraw, kReproduce, kCommunicate, kEngrave, kFound, kConsume };
+enum VerbSlot { kWield = 0, kWithdraw, kReproduce, kCommunicate, kEngrave, kFound, kConsume,
+                kBabble, kSite };
 
 PropId dpid(const World& w, const char* n) {
-    const PropertyDef* d = w.props.find_name(n);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, n);
 }
 
 std::int64_t dint(const World& w, const Entity& e, PropId p, std::int64_t fb = 0) {
@@ -72,6 +74,233 @@ InteractionContext mk(EntityId actor, std::vector<EntityId> targets,
     c.parameters.action = action; c.parameters.ticks = ticks;
     return c;
 }
+
+// ---- Primordial curiosity: affordance babbling (DriverState::curiosity) ----
+// An idle mind with an incomplete verb repertoire pokes at the world: it
+// picks a verb it has never used (or the one a whispered omen suggests) and
+// tries it on things it REMEMBERS within reach. Nothing here grants
+// knowledge: the attempt is an ordinary interact(); the laws decide, and only
+// a completed event teaches the verb (learn_from_event) — witnesses copy it.
+// Personality decides the tempo and whether an omen is heeded:
+//   openness = abstraction + reward/2 - threat/2   (neutral 1000)
+// Deterministic: choices come from a hash of (seed, agent, tick).
+const char* const kBabbleVerbs[] = {
+    "impact", "strike", "dig", "chop", "carve", "assemble", "disassemble",
+    "process", "heat", "wield", "combine", "consume", "treat"};
+
+std::uint64_t bhash(std::uint64_t a, std::uint64_t b, std::uint64_t c) {
+    std::uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) ^
+                      (c * 0xD6E8FEB86659FD93ull);
+    x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+    x *= 0x94D049BB133111EBull; x ^= x >> 32;
+    return x;
+}
+
+std::int64_t babble_openness(const MindParams& mp) {
+    return std::clamp<std::int64_t>(
+        mp.abstraction_gain + mp.reward_gain / 2 - mp.threat_gain / 2, 200, 2500);
+}
+
+bool law_allows(const World& w, const InteractionContext& c) {
+    for (const auto& m : w.laws) {
+        if (!m->supports(w, c)) continue;
+        if (m->predict(w, c).possible) return true;
+    }
+    return false;
+}
+
+bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
+    const Entity* me = w.find(npc);
+    const AgentMind* mm = w.find_mind(npc);
+    if (!me || !mm) return false;
+    const MindParams mp = mind_params(w, *me);
+    const std::int64_t open = babble_openness(mp);
+    // tempo: open minds poke often, anxious ones rarely; need pressure
+    // (hunger/thirst > 600) doubles the drive.
+    std::int64_t cd = std::clamp<std::int64_t>(40 * 1000 / open, 12, 200);
+    const bool pressed = dint(w, *me, dpid(w, "hunger"), 0) > 600 ||
+                         dint(w, *me, dpid(w, "thirst"), 0) > 600;
+    if (pressed) cd = std::max<std::int64_t>(6, cd / 2);
+
+    // omen: strongest `omen:` belief; heeded with a personality probability
+    std::string omen_key, omen_verb;
+    MaterialId omen_mat = kNoMaterial;
+    std::int64_t omen_conf = 0;
+    for (auto it = mm->beliefs.lower_bound("omen:");
+         it != mm->beliefs.end() && it->first.rfind("omen:", 0) == 0; ++it)
+        if (it->second.confidence > omen_conf) {
+            omen_conf = it->second.confidence; omen_key = it->first;
+        }
+    if (!omen_key.empty()) {
+        const std::string rest = omen_key.substr(5);
+        const std::size_t c = rest.find(':');
+        omen_verb = rest.substr(0, c);
+        if (c != std::string::npos)
+            omen_mat = static_cast<MaterialId>(std::atoll(rest.c_str() + c + 1));
+        const std::int64_t heed = std::clamp<std::int64_t>(
+            200 + (open - 1000) / 2 + omen_conf / 3 - mm->neuro.panic / 2, 50, 950);
+        if (static_cast<std::int64_t>(bhash(w.seed, npc, now ^ 0x0E0Eu) % 1000) >= heed) {
+            omen_verb.clear();                         // ignored this time
+            AgentMind& m = w.mind(npc);                // an unheeded whisper fades
+            auto it = m.beliefs.find(omen_key);
+            if (it != m.beliefs.end() && (it->second.confidence -= 100) <= 0) {
+                m.beliefs.erase(it);
+                omen_key.clear();
+            }
+            mm = w.find_mind(npc);
+        }
+        cd = std::max<std::int64_t>(6, cd / 2);        // an omen stirs curiosity
+    }
+    cool(st, npc, kBabble, now, cd);
+
+    std::vector<std::string> verbs;
+    if (!omen_verb.empty()) verbs.push_back(omen_verb);
+    {
+        std::vector<std::string> unk;
+        for (const char* v : kBabbleVerbs)
+            if (!mm->known_actions.count(v) && omen_verb != v) unk.emplace_back(v);
+        if (!unk.empty()) {
+            const std::size_t off = bhash(w.seed, npc, now) % unk.size();
+            for (std::size_t i = 0; i < unk.size(); ++i)
+                verbs.push_back(unk[(off + i) % unk.size()]);
+        }
+    }
+    if (verbs.empty()) return false;
+
+    // things remembered within reach (memory, not World Truth)
+    const std::int64_t rr = dint(w, *me, dpid(w, "reach"), 64);
+    struct T { EntityId id; std::int64_t d; bool hinted; };
+    std::vector<T> near;
+    for (const auto& [kid, s] : mm->memory) {
+        if (kid == npc) continue;
+        // idle curiosity pokes at THINGS, not at living animals: harming a
+        // creature only happens through need (hunting via discover_step),
+        // threat or rage — never as a pastime
+        if (const SpeciesDef* sd = w.species.find_name(s.kind_name); sd && sd->fauna) continue;
+        if (w.find_mind(kid)) continue;
+        const std::int64_t d = dist2(me->pos, s.pos);
+        if (d > rr * rr) continue;
+        near.push_back({kid, d, omen_mat != kNoMaterial && s.material == omen_mat});
+    }
+    std::sort(near.begin(), near.end(), [](const T& a, const T& b) {
+        if (a.hinted != b.hinted) return a.hinted;
+        if (a.d != b.d) return a.d < b.d;
+        return a.id < b.id;
+    });
+    if (near.size() > 6) near.resize(6);
+    if (near.empty()) return false;
+
+    int budget = 12;                                   // predict() calls
+    for (const std::string& v : verbs) {
+        std::vector<std::vector<EntityId>> tries;
+        const bool pair = v == "assemble" || v == "combine";
+        if (pair) {
+            for (std::size_t i = 0; i < near.size() && tries.size() < 3; ++i)
+                for (std::size_t j = i + 1; j < near.size() && tries.size() < 3; ++j)
+                    tries.push_back({near[i].id, near[j].id});
+        } else {
+            for (std::size_t i = 0; i < near.size() && tries.size() < 3; ++i)
+                tries.push_back({near[i].id});
+        }
+        for (const auto& tg : tries) {
+            if (--budget < 0) break;
+            InteractionContext c = mk(npc, tg, v.c_str(), 1);
+            c.parameters.force = 100000;
+            if (!law_allows(w, c)) continue;
+            if (w.interact(c).completed) {
+                if (!omen_key.empty() && v == omen_verb)
+                    w.mind(npc).beliefs.erase(omen_key);   // the omen came true
+                return true;
+            }
+        }
+        if (budget < 0) break;
+    }
+    if (!omen_verb.empty()) {                          // heeded but nothing gave
+        AgentMind& m = w.mind(npc);
+        auto it = m.beliefs.find(omen_key);
+        if (it != m.beliefs.end() && (it->second.confidence -= 200) <= 0)
+            m.beliefs.erase(it);
+    }
+    return false;
+}
+
+// ---- Patron signs (curiosity mode): beacons and building sites -------------
+// A beacon (`beacon:<x>:<y>` belief) draws an idle scout toward a place; a
+// site (`site:<x>:<y>:<r>` belief) draws a builder there, who then tries to
+// `enclose` the loose solids it REMEMBERS around the spot (>= 4 parts; the
+// architecture law decides whether a shelter stands). Both are agent
+// knowledge only — a sign never moves matter by itself.
+bool parse_xy(const std::string& rest, std::int64_t& x, std::int64_t& y, std::int64_t* r) {
+    const std::size_t a = rest.find(':');
+    if (a == std::string::npos) return false;
+    x = std::atoll(rest.c_str());
+    y = std::atoll(rest.c_str() + a + 1);
+    if (r) {
+        const std::size_t b = rest.find(':', a + 1);
+        *r = b == std::string::npos ? 96 : std::atoll(rest.c_str() + b + 1);
+    }
+    return true;
+}
+
+bool patron_sign_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
+    const AgentMind* mm = w.find_mind(npc);
+    const Entity* me = w.find(npc);
+    if (!mm || !me) return false;
+    std::string key;
+    for (const char* pre : {"site:", "beacon:"}) {
+        const auto it = mm->beliefs.lower_bound(pre);
+        if (it != mm->beliefs.end() && it->first.rfind(pre, 0) == 0) { key = it->first; break; }
+    }
+    if (key.empty()) return false;
+    const bool site = key.rfind("site:", 0) == 0;
+    std::int64_t x = 0, y = 0, r = 96;
+    if (!parse_xy(key.substr(site ? 5 : 7), x, y, site ? &r : nullptr)) {
+        w.mind(npc).beliefs.erase(key); return false;
+    }
+    const Vec2 tgt{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)};
+    const std::int64_t rr = dint(w, *me, dpid(w, "reach"), 64);
+    const std::int64_t d2 = dist2(me->pos, tgt);
+    if (!site && d2 <= 96 * 96) { w.mind(npc).beliefs.erase(key); return false; }   // arrived
+    if (d2 > (r + rr) * (r + rr) || (!site && d2 > 96 * 96)) {
+        InteractionContext mc = mk(npc, {}, "move", 1);
+        mc.parameters.destination = tgt; mc.parameters.has_destination = true;
+        if (w.interact(mc).completed) return true;
+        // unreachable (water/cliff): the sign fades
+        AgentMind& m = w.mind(npc);
+        if (auto it = m.beliefs.find(key); it != m.beliefs.end() && (it->second.confidence -= 100) <= 0)
+            m.beliefs.erase(it);
+        return false;
+    }
+    if (!cooled(st, npc, kSite, now)) return false;
+    cool(st, npc, kSite, now, 24);
+    // at the site: done when a remembered enclosure already stands there
+    struct P { EntityId id; std::int64_t d; };
+    std::vector<P> parts;
+    for (const auto& [kid, s] : mm->memory) {
+        if (kid == npc) continue;
+        const std::int64_t ds = dist2(s.pos, tgt);
+        if (s.kind_name == "enclosure" && ds <= r * r) { w.mind(npc).beliefs.erase(key); return false; }
+        if (ds > (r + rr) * (r + rr) || dist2(me->pos, s.pos) > rr * rr * 4) continue;
+        if (w.species.find_name(s.kind_name) || w.find_mind(kid)) continue;   // living things
+        if (s.kind_name == "water") continue;
+        parts.push_back({kid, ds});
+    }
+    std::sort(parts.begin(), parts.end(), [](const P& a, const P& b) {
+        return a.d != b.d ? a.d < b.d : a.id < b.id; });
+    if (parts.size() > 8) parts.resize(8);
+    AgentMind& m = w.mind(npc);
+    if (parts.size() >= 4) {
+        std::vector<EntityId> ids;
+        for (const P& p : parts) ids.push_back(p.id);
+        InteractionContext c = mk(npc, ids, "enclose", 2);
+        c.parameters.force = 100000;
+        if (w.interact(c).completed) { w.mind(npc).beliefs.erase(key); return true; }
+    }
+    if (auto it = m.beliefs.find(key); it != m.beliefs.end() && (it->second.confidence -= 60) <= 0)
+        m.beliefs.erase(it);
+    return false;
+}
+
 
 // ---- maintenance -------------------------------------------------------------
 
@@ -303,8 +532,15 @@ EntityId nearest_agent(const World& w, EntityId npc, std::int64_t range2) {
 
 }  // namespace
 
+const std::vector<const char*>& curiosity_verbs() {
+    static const std::vector<const char*> v(std::begin(kBabbleVerbs), std::end(kBabbleVerbs));
+    return v;
+}
+
 void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
     const std::uint64_t now = w.clock_.tick();
+    const bool concurrent = st && st->concurrent;
+    if (concurrent) { w.defer_time = true; w.deferred_dt = 0; }
     if (st) ++st->cycles;
     if (tally) ++tally->cycles;
 
@@ -346,7 +582,17 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
 
     const std::vector<EntityId> agents = w.minded_entities();   // sorted ids
     int discover_budget = kDiscoverPerCycle;   // deterministic: sorted order
+    // Primordial fairness (curiosity mode only): founders are created after
+    // worldgen, so their ids sort AFTER every promoted animal and a plain
+    // first-come budget would starve them of discovery forever. In curiosity
+    // mode the discover budget is a deterministic round-robin instead:
+    // agent #i may plan when (i + cycle) % stride == 0, and urgent
+    // hunger/thirst always may (survival reasoning never queues).
+    const std::size_t rr_stride = std::max<std::size_t>(
+        1, (agents.size() + kDiscoverPerCycle - 1) / kDiscoverPerCycle);
+    std::size_t agent_idx = 0;
     for (EntityId npc : agents) {
+        const std::size_t my_idx = agent_idx++;
         Entity* me = w.find(npc);
         if (!me || !me->alive) continue;
 
@@ -357,6 +603,7 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
         // 1b. lazy worldgen: materialize entity stages around the agent when
         // it nears the edge of the generated zone (World bookkeeping only).
         ensure_region(w, npc);
+        if (st && st->possessed.count(npc)) continue;   // player drives it
 
         const PropId hunger = dpid(w, "hunger");
         const PropId thirst = dpid(w, "thirst");
@@ -370,7 +617,10 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
         if (!me_c) continue;
 
         // 2a. maintenance: wield best tool when hands are empty
-        if (!already_wielding(w, npc) && cooled(st, npc, kWield, now)) {
+        // (primordial: a reflex needs the verb — nobody "knows" tools yet)
+        const bool wield_known = !(st && st->curiosity) ||
+            (w.find_mind(npc) && w.find_mind(npc)->known_actions.count("wield"));
+        if (wield_known && !already_wielding(w, npc) && cooled(st, npc, kWield, now)) {
             const EntityId tool = best_tool(w, npc);
             if (tool != kNoEntity) {
                 cool(st, npc, kWield, now, kCooldown[kWield]);
@@ -587,7 +837,32 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
             const auto gi = st->next_discover.find(npc);
             gated = !urgent && gi != st->next_discover.end() && now < gi->second;
         }
-        if (!walking_pending && !gated && discover_budget > 0) {
+        // a whispered omen stirs curiosity BEFORE routine deliberation
+        // (the mind may still ignore it — babble_step rolls personality)
+        if (st && st->curiosity && !walking_pending && cooled(st, npc, kBabble, now)) {
+            const AgentMind* om = w.find_mind(npc);
+            const auto ob = om ? om->beliefs.lower_bound("omen:") : decltype(om->beliefs.end()){};
+            if (om && ob != om->beliefs.end() && ob->first.rfind("omen:", 0) == 0 &&
+                babble_step(w, st, npc, now)) {
+                if (tally) ++tally->experiments;
+                continue;
+            }
+        }
+        // patron signs (beacon / building site) — only when not in need
+        if (st && st->curiosity && !walking_pending &&
+            dint(w, *me, hunger, 0) <= 600 && dint(w, *me, dpid(w, "thirst"), 0) <= 600 &&
+            patron_sign_step(w, st, npc, now)) {
+            if (tally) ++tally->moves;
+            continue;
+        }
+        bool may_discover = discover_budget > 0;
+        if (st && st->curiosity) {
+            const bool urgent = dint(w, *me, hunger, 0) > 600 ||
+                                dint(w, *me, dpid(w, "thirst"), 0) > 600;
+            may_discover = urgent ||
+                (my_idx + static_cast<std::size_t>(st->cycles)) % rr_stride == 0;
+        }
+        if (!walking_pending && !gated && may_discover) {
             --discover_budget;
             acted = discover_step(w, npc, &goal);
             if (st) {
@@ -603,6 +878,13 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
         if (acted) {
             if (tally) ++tally->experiments;
             continue;                            // time was consumed inside
+        }
+        // 4b. primordial curiosity — poke the world with an untried verb
+        if (st && st->curiosity && !walking_pending &&
+            goal.target.x == 0 && goal.target.y == 0 &&
+            cooled(st, npc, kBabble, now) && babble_step(w, st, npc, now)) {
+            if (tally) ++tally->experiments;
+            continue;
         }
 
         // 5. locomotion toward the survey waypoint Discovery reported
@@ -742,6 +1024,14 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
         }
 
     }
+    if (concurrent) {
+        // the round lasted as long as its longest action (>= 1 tick)
+        w.defer_time = false;
+        const std::int64_t dt = std::max<std::int64_t>(1, w.deferred_dt);
+        w.deferred_dt = 0;
+        w.advance_ticks_for_test(dt);
+        return;
+    }
     w.advance_ticks_for_test(1);  // ambient drift: needs, heat, clock
 }
 
@@ -773,11 +1063,11 @@ static void print_census_tick(const World& w, std::int64_t cycle) {
                 w.minded_entities().size(), w.ledger.size(),
                 (long)nconsume, (long)nrepro, (long)nmove);
     // debug: every genome carrier's body state (alive and dead)
-    const PropId hp = w.props.find_name("hunger") ? w.props.find_name("hunger")->id : kNoProp;
-    const PropId tp = w.props.find_name("thirst") ? w.props.find_name("thirst")->id : kNoProp;
-    const PropId ip = w.props.find_name("integrity") ? w.props.find_name("integrity")->id : kNoProp;
-    const PropId ep = w.props.find_name("energy") ? w.props.find_name("energy")->id : kNoProp;
-    const PropId mp = w.props.find_name("metabolism") ? w.props.find_name("metabolism")->id : kNoProp;
+    const PropId hp = SIMLAB_PID(w.props, "hunger");
+    const PropId tp = SIMLAB_PID(w.props, "thirst");
+    const PropId ip = SIMLAB_PID(w.props, "integrity");
+    const PropId ep = SIMLAB_PID(w.props, "energy");
+    const PropId mp = SIMLAB_PID(w.props, "metabolism");
     for (const auto& e : w.entities) {
         if (e->genome.loci.empty()) continue;
         std::printf("    e%lu %s h=%ld th=%ld i=%ld en=%ld met=%ld pos=(%d,%d)\n",

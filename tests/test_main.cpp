@@ -13,8 +13,12 @@
 #include "simlab/World.hpp"
 #include "simlab/Geometry.hpp"
 #include "simlab/WorldGen.hpp"
+#include "simlab/render/Atlas.hpp"
+#include "simlab/render/Snapshot.hpp"
+#include "simlab/render/Patron.hpp"
 #include "simlab/Discovery.hpp"
 #include "simlab/Driver.hpp"
+#include "simlab/Genesis.hpp"
 #include "simlab/Chronicle.hpp"
 
 using namespace simlab;
@@ -3161,22 +3165,32 @@ static void test_phase9_autonomous_civilization() {
     CHECK(!ch.allele_sums.empty());     // allele means computable for drift
     if (full_run) CHECK(!ch.verified_methods.empty()); // Verified MethodKeys exist
     CHECK(ch.energy.first > 0);         // energy was really spent
-    // fruit is CONSERVED: total fruit_count over every fruiting plant never
-    // exceeds the planted ceiling (20 bushes x max_fruit 40 = 800) — fruit is
-    // gained only by regrowth toward max_fruit, never created ex nihilo.
+    // fruit is CONSERVED per plant: every LIVING fruiting plant holds at most
+    // its own max_fruit, so the total never exceeds the sum of the living
+    // plants' ceilings — fruit is gained only by regrowth toward max_fruit,
+    // never created ex nihilo. (The seed bank germinates NEW bushes, so a
+    // fixed "20 bushes x 40" ceiling would be wrong; the law is per plant.)
     // (Bush bodies are living_wood; the wild_berries material only exists as
     // detached fruit, so material inventory cannot see on-branch stock.)
     {
         const PropId fcp = pid(wA, "fruit_count");
         const PropId fmp = pid(wA, "fruit_material");
-        std::int64_t fruit_total = 0;
+        const PropId fmx = pid(wA, "max_fruit");
+        std::int64_t fruit_total = 0, fruit_ceiling = 0;
+        bool per_plant_ok = true;
         for (const auto& ep : wA.entities) {
+            if (!ep->alive) continue;
             const Value* fv = wA.prop_of(*ep, fmp);
             if (!fv || fv->type != ValType::Text || fv->s != "wild_berries")
                 continue;
-            fruit_total += wA.prop_int(*ep, fcp, 0);
+            const std::int64_t fc = wA.prop_int(*ep, fcp, 0);
+            const std::int64_t mx = wA.prop_int(*ep, fmx, 0);
+            if (fc < 0 || fc > mx) per_plant_ok = false;
+            fruit_total += fc;
+            fruit_ceiling += mx;
         }
-        if (full_run) CHECK(fruit_total <= 800);
+        CHECK(per_plant_ok);
+        CHECK(fruit_total <= fruit_ceiling);
     }
     // ---- two-layer flora over the whole run ---------------------------------
     // every bush BODY survives (eating/spoiling fruit never kills it), and the
@@ -3288,6 +3302,12 @@ static void test_phase9_autonomous_civilization() {
     // ---- deterministic replay ------------------------------------------------
     autonomous_run(wB, cycles);
     CHECK(wA.state_hash() == wB.state_hash());
+    std::printf("  capstone fingerprint: cycles=%lld tick=%llu entities=%zu "
+                "ledger=%zu state_hash=%016llx content_hash=%016llx\n",
+                (long long)cycles, (unsigned long long)wA.clock_.tick(),
+                wA.entities.size(), wA.ledger.size(),
+                (unsigned long long)wA.state_hash(),
+                (unsigned long long)wA.content_hash());
     Chronicle chB = analyze_world(wB);
     CHECK(chB.verified_methods == ch.verified_methods);
     CHECK(chB.genome_lineages == ch.genome_lineages);
@@ -7910,6 +7930,1220 @@ static void test_architectural_base_core_enclosures_ergonomics_and_decay() {
     }
 }
 
+
+// ================= Phase 12.5: Myth, Oral Literature, Ritual & Diplomacy ======
+static void test_myth_oral_literature_rituals_and_diplomacy_base_core() {
+    auto mk_lang = [](World& w, std::int64_t lg) {
+        PropertyBag b;
+        const PropId p = tpid(w, "language_name");
+        if (p != kNoProp) b.set(p, Value::integer(lg));
+        return w.create_entity("language", kNoMaterial, {0, 0}, b);
+    };
+    auto mk_entry = [](World& w, const char* ck, std::int64_t lang,
+                       std::int64_t seed, std::int64_t tc) {
+        PropertyBag b;
+        auto si = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) b.set(p, Value::integer(v));
+        };
+        si("language_id", lang); si("phoneme_seed", seed);
+        si("transmission_count", tc);
+        const PropId pck = tpid(w, "concept_key");
+        if (pck != kNoProp) b.set(pck, Value::text(ck));
+        return w.create_entity("lexical_entry", kNoMaterial, {0, 0}, b);
+    };
+    auto shock = [](World& w, EntityId who, const char* key,
+                    std::int64_t charge) {
+        DiscoveryRecord d = mk_record(key, DiscoveryStatus::Refuted);
+        d.evidence_against = 300;                 // tried, never explained
+        d.engram.emotional_charge = charge;
+        w.mind(who).discoveries[key] = d;
+    };
+    auto concepts = [](World& w) {
+        std::vector<EntityId> out;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == "semantic_concept" &&
+                !ttext(*ep, w, "sacred_key").empty())
+                out.push_back(ep->id);
+        return out;
+    };
+
+    // ---- 1: causal mythogenesis (trauma -> curse, salvation -> blessing) ----
+    World w(41, "data");
+    EntityId sage = kNoEntity;
+    {
+        sage = mk_person(w, {100, 100});
+        tseti(*w.find(sage), w, "language_id", 77);
+        tseti(*w.find(sage), w, "agency_attribution_bias", 950);
+        tseti(*w.find(sage), w, "metabolism", 50);
+        tseti(*w.find(sage), w, "energy", 900000);
+        shock(w, sage, "method:blight_curse", -1000);   // plague: TRAUMA (< 0)
+        const EntityId healer = mk_person(w, {140, 100});
+        tseti(*w.find(healer), w, "language_id", 77);
+        tseti(*w.find(healer), w, "agency_attribution_bias", 900);
+        tseti(*w.find(healer), w, "metabolism", 50);
+        shock(w, healer, "method:spring_cure", 1000);   // salvation (> 0)
+        const EntityId skeptic = mk_person(w, {180, 100});
+        tseti(*w.find(skeptic), w, "agency_attribution_bias", 200);
+        tseti(*w.find(skeptic), w, "metabolism", 50);
+        shock(w, skeptic, "method:rockfall", -1000);
+        w.advance_ticks_for_test(260);          // >= 2 myth periods
+        const Belief* sb = w.find_mind(sage)->find_belief("sacred:method:blight_curse");
+        CHECK(sb != nullptr && sb->confidence >= 600);
+        CHECK(w.find_mind(skeptic)->find_belief("sacred:method:rockfall") == nullptr);
+        const std::vector<EntityId> cs = concepts(w);
+        CHECK(cs.size() == 2);                  // one per myth, none for the skeptic
+        for (EntityId c : cs) {
+            Entity& ce = *w.find(c);
+            const std::string key = ttext(ce, w, "sacred_key");
+            CHECK(!ttext(ce, w, "sacred_agent").empty());
+            CHECK(!ttext(ce, w, "appeasement_action").empty());
+            if (key == "method:blight_curse")
+                CHECK(ttext(ce, w, "sacred_valence") == "curse");
+            if (key == "method:spring_cure")
+                CHECK(ttext(ce, w, "sacred_valence") == "blessing");
+        }
+        // weak shocks never become myth
+        World wq(42, "data");
+        const EntityId calm = mk_person(wq, {0, 0});
+        tseti(*wq.find(calm), wq, "agency_attribution_bias", 950);
+        tseti(*wq.find(calm), wq, "metabolism", 50);
+        shock(wq, calm, "method:drizzle", -100);
+        wq.advance_ticks_for_test(500);
+        CHECK(concepts(wq).empty());
+    }
+
+    // ---- 1b: consecrated carving turns an enclosure into a Sanctuary ------
+    EntityId shrine = kNoEntity;
+    {
+        PropertyBag eb;
+        auto se = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) eb.set(p, Value::integer(v));
+        };
+        se("footprint_radius", 300); se("integrity", 600); se("access_barrier", 0);
+        shrine = w.create_entity("enclosure", kNoMaterial, {100, 100}, eb);
+        const EntityId stone = w.create_entity("rock", w.materials.id_of("stone"),
+                                               {110, 100}, {});
+        CHECK(arch_function(w, shrine) != "sanctuary");
+        InteractionResult cr = w.interact(mk_ctx(sage, {stone}, "consecrate", 0));
+        CHECK(cr.completed);
+        EntityId carving = kNoEntity;
+        for (EntityId sp : cr.spawned) if (w.find(sp)->kind_name == "inscription") carving = sp;
+        CHECK(carving != kNoEntity);
+        if (carving != kNoEntity) {
+            CHECK(ttext(*w.find(carving), w, "sacred_key") == "method:blight_curse");
+            CHECK(ttext(*w.find(carving), w, "glyph_text").find("->") != std::string::npos);
+        }
+        CHECK(arch_function(w, shrine) == "sanctuary");
+        CHECK(arch_utility_bonus(w, sage, "perform_ritual") > 0);   // the faithful feel the pull
+    }
+
+    // ---- 2: oral literature — retelling crystallizes an epic --------------
+    EntityId epic0 = kNoEntity;
+    {
+        const EntityId poet = mk_person(w, {300, 300});
+        const EntityId hearer = mk_person(w, {310, 300});
+        tseti(*w.find(poet), w, "language_id", 88);
+        tseti(*w.find(hearer), w, "language_id", 88);
+        tseti(*w.find(poet), w, "metabolism", 50);
+        tseti(*w.find(poet), w, "energy", 900000);
+        std::vector<EntityId> ents;
+        for (int i = 0; i < 5; ++i)
+            ents.push_back(mk_entry(w, "epic:blight", 88, 777, 149));
+        epic0 = ents[0];
+        w.mind(poet).belief("lex:" + std::to_string(ents[0])).confidence = 600;
+        w.mind(hearer);
+        CHECK(w.interact(mk_ctx(poet, {hearer}, "communicate", 0)).completed);
+        CHECK(tint(*w.find(ents[0]), w, "transmission_count", 0) == 150);
+        CHECK(tint(*w.find(ents[0]), w, "poetic_cadence", 0) >= 500);   // identical seeds
+        CHECK(ttext(*w.find(ents[0]), w, "oral_genre") == "epic");       // 4 siblings
+        // a chanted epic teaches 3x harder than plain speech (250 -> 750)
+        CHECK(w.find_mind(hearer)->find_belief("lex:" + std::to_string(ents[0])) &&
+              w.find_mind(hearer)->find_belief("lex:" + std::to_string(ents[0]))->confidence >= 750);
+        // reciting a crystallized classic lifts the reciter's standing
+        const std::int64_t leg0 = tint(*w.find(poet), w, "social_legitimacy", 0);
+        CHECK(w.interact(mk_ctx(poet, {hearer}, "communicate", 0)).completed);
+        CHECK(tint(*w.find(poet), w, "social_legitimacy", 0) >= leg0 + 15);
+        // a two-word saying is a proverb, not an epic
+        const EntityId pa = mk_entry(w, "saw:fire_herb", 88, 4242, 149);
+        mk_entry(w, "saw:fire_herb", 88, 4242, 149);
+        w.mind(poet).belief("lex:" + std::to_string(pa)).confidence = 600;
+        CHECK(w.interact(mk_ctx(poet, {hearer}, "communicate", 0)).completed);
+        CHECK(ttext(*w.find(pa), w, "oral_genre") == "proverb");
+        const std::string codex = w.export_lexicon_codex();
+        CHECK(codex.find("EPIC entry") != std::string::npos);
+        CHECK(codex.find("PROVERB entry") != std::string::npos);
+        CHECK(codex.find("concept=epic:blight") != std::string::npos);
+        CHECK(codex.find("raw_phonemes=") != std::string::npos);
+        CHECK(codex.find("chronicle_english=") != std::string::npos);
+        CHECK(codex.find("myth=") != std::string::npos);
+    }
+
+    // ---- 2b: meter resists oblivion (epic vs plain word, no rehearsal) ----
+    {
+        World wm(44, "data");
+        const EntityId bard = mk_person(wm, {0, 0});
+        tseti(*wm.find(bard), wm, "metabolism", 0);
+        const EntityId epic = mk_entry(wm, "tale:flood", 5, 999, 0);
+        const PropId pg = tpid(wm, "oral_genre");
+        wm.find(epic)->props.set(pg, Value::text("epic"));
+        const EntityId plain = mk_entry(wm, "word:pebble", 5, 123, 0);
+        AgentMind& bm = wm.mind(bard);
+        for (EntityId le : {epic, plain}) {
+            Belief& b = bm.belief("lex:" + std::to_string(le));
+            b.confidence = 800; b.last_tick = 0;
+        }
+        wm.advance_ticks_for_test(20000);
+        const std::int64_t ce = wm.find_mind(bard)->find_belief("lex:" + std::to_string(epic))->confidence;
+        const std::int64_t cp = wm.find_mind(bard)->find_belief("lex:" + std::to_string(plain))->confidence;
+        CHECK(ce >= 600);                      // ~150 stale periods x 1
+        CHECK(cp <= 100);                      // ~150 stale periods x 10
+        CHECK(ce > cp);
+    }
+
+    // ---- 3: collective ritual in the Sanctuary — relief + REAL sterilization
+    {
+        const EntityId neighbor = mk_person(w, {120, 100});
+        tseti(*w.find(neighbor), w, "language_id", 77);
+        tseti(*w.find(neighbor), w, "metabolism", 50);
+        w.mind(neighbor).belief("grievance").confidence = 500;
+        const EntityId food = mk_goods(w, "wild_berries", 10, {105, 100}, sage);
+        PropertyBag cb;
+        auto si = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n);
+            if (p != kNoProp) cb.set(p, Value::integer(v));
+        };
+        si("temperature", 200); si("sterilization_temp", 700);
+        si("strain_ref", 500); si("contamination", 500); si("cooked_state", 0);
+        const EntityId contam = w.create_entity("goods", kNoMaterial, {115, 100}, cb);
+        w.mind(sage).known_actions.insert("heat");
+        const std::int64_t leg0 = tint(*w.find(sage), w, "social_legitimacy", 0);
+        InteractionResult rr = w.interact(mk_ctx(sage, {food}, "perform_ritual", 0));
+        CHECK(rr.completed);
+        CHECK(tint(*w.find(food), w, "quantity", 10) == 0);              // offering burned
+        CHECK(tint(*w.find(contam), w, "strain_ref", 1) == 0);           // pathogen gone
+        CHECK(tint(*w.find(contam), w, "contamination", 1) == 0);
+        CHECK(tint(*w.find(contam), w, "cooked_state", 0) == 1000);
+        CHECK(tint(*w.find(sage), w, "social_legitimacy", 0) >= leg0 + 80);
+        // in the Sanctuary the relief doubles: 500 - (60 + 300/5) = 380
+        const Belief* gb = w.find_mind(neighbor)->find_belief("grievance");
+        CHECK(gb != nullptr && gb->confidence <= 380);
+        // no conviction, no mandate -> no rite
+        const EntityId nobody = mk_person(w, {130, 100});
+        CHECK(!w.interact(mk_ctx(nobody, {food}, "perform_ritual", 0)).completed);
+    }
+
+    // ---- 4+5: envoy gifts raise trust; bilingual Rosetta treaty -----------
+    World w3(43, "data");
+    {
+        const EntityId a1 = mk_person(w3, {0, 0});
+        const EntityId a2 = mk_person(w3, {60, 0});
+        tseti(*w3.find(a1), w3, "language_id", 11);
+        tseti(*w3.find(a2), w3, "language_id", 22);
+        tseti(*w3.find(a1), w3, "metabolism", 50);
+        tseti(*w3.find(a2), w3, "metabolism", 50);
+        tseti(*w3.find(a1), w3, "bilingual_familiarity", 800);
+        tseti(*w3.find(a1), w3, "energy", 900000);
+        mk_lang(w3, 11); mk_lang(w3, 22);
+        // the envoy speaks words of both tongues (Rosetta material)
+        const EntityId e11 = mk_entry(w3, "salt", 11, 31, 0);
+        const EntityId e22 = mk_entry(w3, "salt", 22, 32, 0);
+        w3.mind(a1).belief("lex:" + std::to_string(e11)).confidence = 900;
+        w3.mind(a1).belief("lex:" + std::to_string(e22)).confidence = 900;
+        CHECK(diplo_trust(w3, 11, 22) == 0);
+        // a treaty before trust is earned is refused
+        CHECK(!w3.interact(mk_ctx(a1, {a2}, "diplomatic_parley", 0, "treaty")).completed);
+        std::int64_t prev = 0;
+        for (int i = 0; i < 20 && diplo_trust(w3, 11, 22) < 700; ++i) {
+            mk_goods(w3, "salt", 300, {5 + i, 1}, a1);
+            InteractionResult r = w3.interact(mk_ctx(a1, {a2},
+                "diplomatic_parley", 0, "gift:salt:300"));
+            CHECK(r.completed);
+            const std::int64_t t = diplo_trust(w3, 11, 22);
+            CHECK(t > prev);                    // every real gift warms relations
+            CHECK(t == diplo_trust(w3, 22, 11));  // the ledger is symmetric
+            prev = t;
+        }
+        CHECK(prev >= 700);
+        CHECK(!diplo_free_trade(w3, 11, 22));   // trust alone opens no road
+        InteractionResult tr = w3.interact(mk_ctx(a1, {a2}, "diplomatic_parley", 0, "treaty"));
+        CHECK(tr.completed);
+        EntityId treaty = kNoEntity;
+        for (EntityId sp : tr.spawned) if (w3.find(sp)->kind_name == "inscription") treaty = sp;
+        CHECK(treaty != kNoEntity);
+        if (treaty != kNoEntity) {
+            CHECK(ttext(*w3.find(treaty), w3, "treaty_clause") == "free_trade");
+            CHECK(tint(*w3.find(treaty), w3, "language_id2", 0) == 22);
+            const std::string cl = ttext(*w3.find(treaty), w3, "clause_atoms");
+            CHECK(cl.find("11:" + std::to_string(e11)) != std::string::npos);
+            CHECK(cl.find("22:" + std::to_string(e22)) != std::string::npos);
+        }
+        CHECK(diplo_free_trade(w3, 11, 22));
+        // a non-bilingual envoy cannot carve a treaty even with trust
+        tseti(*w3.find(a1), w3, "bilingual_familiarity", 300);
+        CHECK(!w3.interact(mk_ctx(a1, {a2}, "diplomatic_parley", 0, "treaty")).completed);
+    }
+
+    // ---- 6: cross-border theft escalates to community-wide hostility -------
+    World w4(47, "data");
+    {
+        const EntityId t1 = mk_person(w4, {0, 0});
+        const EntityId v1 = mk_person(w4, {80, 0});
+        const EntityId kin = mk_person(w4, {900, 900});   // far away, same tongue as victim
+        tseti(*w4.find(t1), w4, "language_id", 33);
+        tseti(*w4.find(v1), w4, "language_id", 44);
+        tseti(*w4.find(kin), w4, "language_id", 44);
+        tseti(*w4.find(t1), w4, "metabolism", 50);
+        tseti(*w4.find(t1), w4, "energy", 900000);
+        w4.mind(t1); w4.mind(v1); w4.mind(kin);
+        mk_lang(w4, 33); mk_lang(w4, 44);
+        CHECK(!diplo_hostile(w4, 33, 44));
+        for (int i = 0; i < 5; ++i) {
+            const EntityId it = mk_goods(w4, "copper_metal", 2, {10 + i, 5}, v1);
+            CHECK(w4.interact(mk_ctx(t1, {it}, "steal", 0)).completed);
+        }
+        CHECK(diplo_trust(w4, 33, 44) <= -600);
+        CHECK(diplo_hostile(w4, 33, 44));
+        // the ultimatum is common knowledge on BOTH sides, even far away
+        const Belief* hk = w4.find_mind(kin)->find_belief("hostile_tongue:33");
+        const Belief* ht = w4.find_mind(t1)->find_belief("hostile_tongue:44");
+        CHECK(hk != nullptr && hk->confidence == 1000);
+        CHECK(ht != nullptr && ht->confidence == 1000);
+        mk_goods(w4, "salt", 50, {20, 5}, t1);
+        InteractionResult bad = w4.interact(mk_ctx(t1, {v1}, "trade", 0,
+            "give:salt:2|get:copper_metal:2"));
+        CHECK(!bad.completed);
+        CHECK(bad.failure.find("hostile") != std::string::npos);
+    }
+
+    // ---- 7: LOD invariance — dt=1 x N vs dt=N ------------------------------
+    {
+        struct Rig { EntityId sage, poet, hearer, envoy, host; std::vector<EntityId> ents; };
+        auto build = [&](World& ww) {
+            Rig g;
+            g.sage = mk_person(ww, {50, 50});
+            tseti(*ww.find(g.sage), ww, "language_id", 55);
+            tseti(*ww.find(g.sage), ww, "agency_attribution_bias", 950);
+            tseti(*ww.find(g.sage), ww, "metabolism", 50);
+            tseti(*ww.find(g.sage), ww, "energy", 900000);
+            shock(ww, g.sage, "method:famine_ghost", -1000);
+            g.poet = mk_person(ww, {60, 50});
+            g.hearer = mk_person(ww, {70, 50});
+            for (EntityId x : {g.poet, g.hearer}) {
+                tseti(*ww.find(x), ww, "language_id", 55);
+                tseti(*ww.find(x), ww, "metabolism", 50);
+                tseti(*ww.find(x), ww, "energy", 900000);
+            }
+            for (int i = 0; i < 4; ++i) g.ents.push_back(mk_entry(ww, "epic:famine", 55, 555, 140));
+            ww.mind(g.poet).belief("lex:" + std::to_string(g.ents[0])).confidence = 700;
+            ww.mind(g.hearer).belief("grievance").confidence = 600;
+            g.envoy = mk_person(ww, {80, 50});
+            g.host = mk_person(ww, {90, 50});
+            tseti(*ww.find(g.envoy), ww, "language_id", 55);
+            tseti(*ww.find(g.host), ww, "language_id", 66);
+            tseti(*ww.find(g.envoy), ww, "energy", 900000);
+            mk_lang(ww, 55); mk_lang(ww, 66);
+            return g;
+        };
+        auto act = [&](World& ww, const Rig& g, int step) {
+            if (step % 3 == 0) ww.interact(mk_ctx(g.poet, {g.hearer}, "communicate", 0));
+            if (step % 4 == 1) {
+                mk_goods(ww, "salt", 100, {81, 50}, g.envoy);
+                ww.interact(mk_ctx(g.envoy, {g.host}, "diplomatic_parley", 0, "gift:salt:100"));
+            }
+            if (step == 7) {
+                mk_goods(ww, "wild_berries", 5, {51, 50}, g.sage);
+                for (const auto& ep : ww.entities)
+                    if (ep->alive && ep->kind_name == "goods" &&
+                        ep->material == ww.materials.id_of("wild_berries")) {
+                        ww.interact(mk_ctx(g.sage, {ep->id}, "perform_ritual", 0));
+                        break;
+                    }
+            }
+        };
+        World wa(53, "data"), wb(53, "data");
+        const Rig ga = build(wa), gb = build(wb);
+        for (int step = 0; step < 12; ++step) {
+            act(wa, ga, step); act(wb, gb, step);
+            for (int k = 0; k < 50; ++k) wa.advance_ticks_for_test(1);   // dt = 1 x 50
+            wb.advance_ticks_for_test(50);                              // dt = 50
+        }
+        CHECK(tint(*wa.find(ga.ents[0]), wa, "transmission_count", 0) ==
+              tint(*wb.find(gb.ents[0]), wb, "transmission_count", 0));
+        CHECK(tint(*wa.find(ga.ents[0]), wa, "transmission_count", 0) > 140);
+        CHECK(ttext(*wa.find(ga.ents[0]), wa, "oral_genre") ==
+              ttext(*wb.find(gb.ents[0]), wb, "oral_genre"));
+        CHECK(diplo_trust(wa, 55, 66) == diplo_trust(wb, 55, 66));
+        CHECK(diplo_trust(wa, 55, 66) > 0);
+        const Belief* ba = wa.find_mind(ga.sage)->find_belief("sacred:method:famine_ghost");
+        const Belief* bb = wb.find_mind(gb.sage)->find_belief("sacred:method:famine_ghost");
+        CHECK(ba && bb && ba->confidence == bb->confidence);
+        CHECK(wa.find_mind(ga.sage)->myth_accum == wb.find_mind(gb.sage)->myth_accum);
+        CHECK(tint(*wa.find(ga.sage), wa, "social_legitimacy", 0) ==
+              tint(*wb.find(gb.sage), wb, "social_legitimacy", 0));
+        CHECK(wa.find_mind(ga.hearer)->find_belief("grievance")->confidence ==
+              wb.find_mind(gb.hearer)->find_belief("grievance")->confidence);
+        CHECK(concepts(wa).size() == concepts(wb).size());
+        CHECK(wa.content_hash() == wb.content_hash());
+    }
+
+    // ---- 8: save/load roundtrip -------------------------------------------
+    for (World* ww : {&w, &w3, &w4}) {
+        const std::string path = "/tmp/simlab_test_125.bin";
+        const std::uint64_t h = ww->state_hash();
+        CHECK(ww->save(path));
+        World wr(1, "data");
+        CHECK(wr.load(path));
+        CHECK(wr.state_hash() == h);
+    }
+    (void)epic0; (void)shrine;
+}
+
+
+// ================= Phase 12.6: Warfare, Logistics & Emergent Weapons R&D ======
+static void test_warfare_logistics_siege_and_emergent_weapons_rd() {
+    // ---- shared fixtures ----------------------------------------------------
+    // a body with ONE anatomical part (deterministic blow routing)
+    auto mk_body = [](World& w, Vec2 pos, std::int64_t brit) {
+        const EntityId b = mk_person(w, pos);
+        PropertyBag pb;
+        auto si = [&](const char* n, std::int64_t v) {
+            const PropId p = tpid(w, n); if (p != kNoProp) pb.set(p, Value::integer(v));
+        };
+        si("integrity", 1000); si("hardness", 300); si("brittleness", brit);
+        si("mass", 1000); si("part_size", 100); si("bleed_rate", 0);
+        si("fracture_level", 0);
+        pb.set(tpid(w, "part_role"), Value::text("torso"));
+        pb.set(tpid(w, "body_slot"), Value::text("torso"));
+        pb.set(tpid(w, "contained"), Value::boolean(true));
+        const EntityId part = w.create_entity("body_part", kNoMaterial, pos, pb);
+        w.relate(part, "part_of", b);
+        return std::make_pair(b, part);
+    };
+    auto mk_item = [](World& w, const char* mat, Vec2 pos, std::int64_t mass = -1) {
+        PropertyBag pb;
+        if (mass >= 0) pb.set(tpid(w, "mass"), Value::integer(mass));
+        return w.create_entity("item", w.materials.id_of(mat), pos, pb);
+    };
+    auto mk_lang = [](World& w, std::int64_t lg, const std::string& table) {
+        PropertyBag b;
+        b.set(tpid(w, "language_name"), Value::integer(lg));
+        b.set(tpid(w, "diplo_table"), Value::text(table));
+        return w.create_entity("language", kNoMaterial, {0, 0}, b);
+    };
+    auto mk_enclosure = [](World& w, Vec2 pos, std::int64_t integ,
+                           std::int64_t bar, std::int64_t rad) {
+        PropertyBag b;
+        b.set(tpid(w, "integrity"), Value::integer(integ));
+        b.set(tpid(w, "access_barrier"), Value::integer(bar));
+        b.set(tpid(w, "footprint_radius"), Value::integer(rad));
+        return w.create_entity("enclosure", w.materials.id_of("stone"), pos, b);
+    };
+    auto sized_terrain = [](World& w, int n) {
+        TerrainGrid& t = w.terrain; t.w = n; t.h = n; t.cell = 16; t.ox = 0; t.oy = 0;
+        const std::size_t c = static_cast<std::size_t>(n) * n;
+        t.elevation.assign(c, 200); t.moisture.assign(c, 500); t.temperature.assign(c, 200);
+        t.water.assign(c, 0); t.vegetation.assign(c, 0); t.slope.assign(c, 0);
+        t.wind_x.assign(c, 0); t.wind_y.assign(c, 0); t.water_table.assign(c, 10);
+        t.traffic_wear.assign(c, 0);
+    };
+    auto bleed = [](World& w, EntityId part) { return tint(*w.find(part), w, "bleed_rate", 0); };
+
+    // ---- 1: sharp vs blunt, armor -------------------------------------------
+    World w(61, "data");
+    {
+        const EntityId fighter = mk_person(w, {0, 0});
+        tseti(*w.find(fighter), w, "energy", 900000000);
+        const EntityId blade = mk_item(w, "iron_blade", {5, 0});
+        const EntityId maul = mk_item(w, "granite", {5, 5});
+        const auto [va, pa] = mk_body(w, {40, 0}, 300);          // unarmored
+        const auto [vb, pbp] = mk_body(w, {0, 40}, 300);         // will wear plate
+        const auto [vc, pc] = mk_body(w, {40, 40}, 300);         // soft hide armor
+        const EntityId plate = mk_item(w, "metal_plate", {0, 45});
+        const EntityId hide = mk_item(w, "cured_hide", {40, 45});
+        CHECK(w.interact(mk_ctx(vb, {plate}, "don", 0)).completed);
+        CHECK(w.interact(mk_ctx(vc, {hide}, "don", 0)).completed);
+        CHECK(!w.interact(mk_ctx(va, {blade}, "don", 0)).completed);   // a blade protects nothing
+        CHECK(w.interact(mk_ctx(fighter, {blade}, "wield", 0)).completed);
+        CHECK(w.interact(mk_ctx(fighter, {va}, "impact", 150)).completed);
+        CHECK(w.interact(mk_ctx(fighter, {vb}, "impact", 150)).completed);
+        const std::int64_t bl_a = bleed(w, pa), bl_b = bleed(w, pbp);
+        CHECK(bl_a > 0);
+        CHECK(bl_a > bl_b * 4);                                    // plate stops the edge
+        // the maul: impulse goes THROUGH soft armor into the bone
+        CHECK(w.interact(mk_ctx(fighter, {blade}, "unwield", 0)).completed);
+        CHECK(w.interact(mk_ctx(fighter, {maul}, "wield", 0)).completed);
+        CHECK(w.interact(mk_ctx(fighter, {vc}, "impact", 150)).completed);
+        CHECK(tint(*w.find(pc), w, "fracture_level", 0) > 0);       // broken under the hide
+        CHECK(tint(*w.find(pc), w, "integrity", 1000) < 1000);
+        CHECK(w.interact(mk_ctx(vb, {plate}, "doff", 0)).completed);
+        CHECK(!w.related(vb, "wearing", plate));
+    }
+
+    // ---- 2: elastic ballistics & elevation ---------------------------------
+    World w2(62, "data");
+    {
+        sized_terrain(w2, 128);
+        const EntityId archer = mk_person(w2, {16, 16});
+        tseti(*w2.find(archer), w2, "energy", 900000000);
+        tseti(*w2.find(archer), w2, "metabolism", 50);
+        const EntityId frame = mk_item(w2, "hardwood", {20, 16});
+        const EntityId string = mk_item(w2, "sinew", {22, 16});
+        InteractionResult ar = w2.interact(mk_ctx(archer, {frame, string}, "assemble", 1000));
+        CHECK(ar.completed);
+        EntityId bow = kNoEntity;
+        for (EntityId s : ar.spawned) if (w2.find(s)->kind_name == "composite") bow = s;
+        CHECK(bow != kNoEntity);
+        const std::int64_t li = tint(*w2.find(bow), w2, "launch_impulse", 0);
+        CHECK(li > 0);                                             // emerged from the parts
+        // a frame without stretch + string makes no launcher
+        const EntityId club_a = mk_item(w2, "dry_wood", {24, 16});
+        const EntityId club_b = mk_item(w2, "stone", {25, 16});
+        InteractionResult cr = w2.interact(mk_ctx(archer, {club_a, club_b}, "assemble", 1000));
+        CHECK(cr.completed);
+        for (EntityId s : cr.spawned)
+            if (w2.find(s)->kind_name == "composite")
+                CHECK(tint(*w2.find(s), w2, "launch_impulse", 0) == 0);
+        CHECK(w2.interact(mk_ctx(archer, {bow}, "wield", 0)).completed);
+        // in range: the point wounds; ammo is spent
+        const auto [near_v, near_p] = mk_body(w2, {static_cast<std::int32_t>(16 + li / 2), 16}, 300);
+        const EntityId arrow = mk_item(w2, "flint", {18, 16});
+        CHECK(w2.interact(mk_ctx(archer, {near_v, arrow}, "launch", 0)).completed);
+        CHECK(bleed(w2, near_p) > 0);
+        CHECK(!w2.find(arrow)->alive);
+        // beyond range on flat ground: refused with the range condition
+        const Vec2 far_pos{static_cast<std::int32_t>(16 + li + li / 4), 16};
+        const auto [far_v, far_p] = mk_body(w2, far_pos, 300);
+        const EntityId arrow2 = mk_item(w2, "flint", {18, 16});
+        InteractionResult fr = w2.interact(mk_ctx(archer, {far_v, arrow2}, "launch", 0));
+        CHECK(!fr.completed);
+        bool range_cond = false;
+        if (const CausalEvent* fe = w2.ledger.find(fr.failed_event))
+            for (const Condition& c : fe->conditions) if (c.what == "range" && !c.met) range_cond = true;
+        CHECK(range_cond);
+        // from a height the same shot carries (elevation -> impulse)
+        TerrainGrid& t = w2.terrain;
+        t.elevation[t.index({16, 16})] = 300;                      // archer on a ridge
+        t.elevation[t.index(far_pos)] = 200;
+        CHECK(w2.interact(mk_ctx(archer, {far_v, arrow2}, "launch", 0)).completed);
+        CHECK(bleed(w2, far_p) > 0);
+    }
+
+    // ---- 3: toxic, bio-tipped & energetic ----------------------------------
+    World w3(63, "data");
+    {
+        const EntityId alch = mk_person(w3, {0, 0});
+        tseti(*w3.find(alch), w3, "energy", 900000000);
+        tseti(*w3.find(alch), w3, "mind_abstraction_gain", 1500);
+        const EntityId dull = mk_person(w3, {300, 0});
+        tseti(*w3.find(dull), w3, "mind_abstraction_gain", 1000);
+        const EntityId dagger = mk_item(w3, "flint", {5, 0});
+        const EntityId dagger2 = mk_item(w3, "flint", {305, 0});
+        CHECK(w3.interact(mk_ctx(alch, {dagger}, "wield", 0)).completed);
+        CHECK(w3.interact(mk_ctx(dull, {dagger2}, "wield", 0)).completed);
+        const EntityId berries = mk_goods(w3, "nightshade", 5, {8, 0}, 0);
+        const EntityId berries2 = mk_goods(w3, "nightshade", 5, {308, 0}, 0);
+        CHECK(!w3.interact(mk_ctx(dull, {berries2}, "coat", 0)).completed);   // no abstraction
+        CHECK(w3.interact(mk_ctx(alch, {berries}, "coat", 0)).completed);
+        CHECK(tint(*w3.find(dagger), w3, "coat_toxin", 0) > 0);
+        // a "strain" + infected waste carrying it
+        const EntityId strain = w3.create_entity("pathogen", kNoMaterial, {900, 900}, {});
+        PropertyBag wb; wb.set(tpid(w3, "strain_ref"), Value::integer(static_cast<std::int64_t>(strain)));
+        const EntityId waste = w3.create_entity("waste", w3.materials.id_of("feces"), {9, 0}, wb);
+        CHECK(w3.interact(mk_ctx(alch, {waste}, "coat", 0)).completed);
+        CHECK(tint(*w3.find(dagger), w3, "coat_strain", 0) == static_cast<std::int64_t>(strain));
+        const auto [vic, vpart] = mk_body(w3, {30, 0}, 300);
+        tseti(*w3.find(vic), w3, "toxin_load", 0);
+        CHECK(w3.interact(mk_ctx(alch, {vic}, "impact", 150)).completed);
+        CHECK(tint(*w3.find(vic), w3, "toxin_load", 0) > 0);       // poison in the blood
+        bool infected = false;
+        for (const Relation& rel : w3.relations_of(vic, "carries")) if (rel.a == vic) infected = true;
+        CHECK(infected);                                           // pathogen in the blood
+        (void)vpart;
+        // energetic charge: heat -> blast hits flesh AND walls
+        const EntityId wall = mk_enclosure(w3, {600, 600}, 900, 800, 100);
+        const auto [bv, bpart] = mk_body(w3, {660, 600}, 300);
+        PropertyBag cb; cb.set(tpid(w3, "integrity"), Value::integer(800));    // sealed casing
+        const EntityId charge = w3.create_entity("charge", w3.materials.id_of("energetic_mix"), {640, 640}, cb);
+        const EntityId sapper = mk_person(w3, {640, 800});
+        tseti(*w3.find(sapper), w3, "energy", 900000000);
+        tseti(*w3.find(sapper), w3, "reach", 200);
+        const std::int64_t wall0 = tint(*w3.find(wall), w3, "integrity", 0);
+        InteractionResult br = w3.interact(mk_ctx(sapper, {charge}, "heat", 60000000));
+        CHECK(br.completed);
+        CHECK(!w3.find(charge)->alive);                             // the charge is spent
+        CHECK(tint(*w3.find(wall), w3, "integrity", 0) < wall0 - 100);
+        CHECK(tint(*w3.find(bpart), w3, "integrity", 1000) < 1000);
+        CHECK(w3.ledger.find(br.event)->evidence.find("BLAST") != std::string::npos);
+        // the same mix, loose (no casing), is a weaker flash
+        World w3b(63, "data");
+        const EntityId wall_b = mk_enclosure(w3b, {600, 600}, 900, 800, 100);
+        PropertyBag lb; lb.set(tpid(w3b, "integrity"), Value::integer(50));
+        const EntityId loose = w3b.create_entity("charge", w3b.materials.id_of("energetic_mix"), {640, 640}, lb);
+        const EntityId sap_b = mk_person(w3b, {640, 800});
+        tseti(*w3b.find(sap_b), w3b, "energy", 900000000);
+        CHECK(w3b.interact(mk_ctx(sap_b, {loose}, "heat", 60000000)).completed);
+        CHECK(900 - tint(*w3b.find(wall_b), w3b, "integrity", 0) <
+              wall0 - tint(*w3.find(wall), w3, "integrity", 0));
+    }
+
+    // ---- 4+7+8 shared: two tongues at war, a depot, a march -----------------
+    struct Front { EntityId leader, envoy, foe, depot, food; std::vector<EntityId> fed, cut; };
+    auto build_front = [&](World& ww) {
+        Front f;
+        sized_terrain(ww, 128);
+        mk_lang(ww, 11, "22:-800:host;");
+        mk_lang(ww, 22, "11:-800:host;");
+        f.depot = mk_enclosure(ww, {100, 100}, 900, 800, 150);
+        f.food = mk_goods(ww, "wild_berries", 50, {110, 100}, 0);
+        f.leader = mk_person(ww, {400, 400});
+        f.foe = mk_person(ww, {450, 400});
+        tseti(*ww.find(f.leader), ww, "language_id", 11);
+        tseti(*ww.find(f.foe), ww, "language_id", 22);
+        tseti(*ww.find(f.leader), ww, "communicate_range", 2000);
+        tseti(*ww.find(f.leader), ww, "energy", 900000000);
+        tseti(*ww.find(f.leader), ww, "metabolism", 50);
+        tseti(*ww.find(f.foe), ww, "metabolism", 50);
+        ww.mind(f.foe);
+        for (int i = 0; i < 3; ++i) {
+            // fed squad: on a worn trail far from the depot, low metabolism
+            const EntityId s = mk_person(ww, {static_cast<std::int32_t>(800 + i * 20), 800});
+            tseti(*ww.find(s), ww, "language_id", 11);
+            tseti(*ww.find(s), ww, "metabolism", 50);
+            ww.mind(s).belief("defer_to:" + std::to_string(f.leader)).confidence = 800;
+            ww.terrain.add_wear(ww.find(s)->pos, 300);
+            f.fed.push_back(s);
+            // starving squad: off-trail, hungry, fast metabolism
+            const EntityId c = mk_person(ww, {static_cast<std::int32_t>(1500 + i * 20), 1500});
+            tseti(*ww.find(c), ww, "language_id", 11);
+            tseti(*ww.find(c), ww, "hunger", 720);
+            tseti(*ww.find(c), ww, "metabolism", 2000);
+            ww.mind(c).belief("defer_to:" + std::to_string(f.leader)).confidence = 800;
+            f.cut.push_back(c);
+        }
+        // a bilingual elder of tongue 11 — the would-be envoy, not a soldier
+        f.envoy = mk_person(ww, {420, 400});
+        tseti(*ww.find(f.envoy), ww, "language_id", 11);
+        tseti(*ww.find(f.envoy), ww, "metabolism", 50);
+        tseti(*ww.find(f.envoy), ww, "energy", 900000000);
+        ww.mind(f.envoy);
+        return f;
+    };
+
+    // ---- 4: mobilization, supply lines & morale collapse -------------------
+    World w4(64, "data");
+    Front F = build_front(w4);
+    {
+        // no casus belli -> no war
+        World wp(64, "data");
+        Front P = build_front(wp);
+        wp.find(kNoEntity);
+        for (const auto& ep : wp.entities)
+            if (ep->kind_name == "language") ep->props.set(tpid(wp, "diplo_table"), Value::text(""));
+        CHECK(!wp.interact(mk_ctx(P.leader, {P.foe}, "mobilize", 0, ("depot:" + std::to_string(P.depot)).c_str())).completed);
+
+        InteractionResult mr = w4.interact(mk_ctx(F.leader, {F.foe}, "mobilize", 0,
+            ("depot:" + std::to_string(F.depot)).c_str()));
+        CHECK(mr.completed);
+        for (EntityId s : F.fed) {
+            CHECK(tint(*w4.find(s), w4, "war_target", 0) == 22);
+            CHECK(tint(*w4.find(s), w4, "combat_morale", 0) >= 600);
+            CHECK(w4.find_mind(s)->find_belief("war:22") != nullptr);
+        }
+        w4.advance_ticks_for_test(120);
+        for (EntityId s : F.fed) {
+            CHECK(tint(*w4.find(s), w4, "combat_morale", 0) >= 600);   // supplied, they hold
+            CHECK(tint(*w4.find(s), w4, "routed", 0) == 0);
+        }
+        for (EntityId c : F.cut) {
+            CHECK(tint(*w4.find(c), w4, "combat_morale", 1000) < 200); // starving, they break
+            CHECK(tint(*w4.find(c), w4, "routed", 0) == 1);
+        }
+        // the convoy is intercepted: depot stores lost -> the fed squad falls
+        // back to merely holding (supply bonus gone)
+        const std::int64_t m_before = tint(*w4.find(F.fed[0]), w4, "combat_morale", 0);
+        w4.find(F.food)->props.set(tpid(w4, "quantity"), Value::integer(0));
+        w4.advance_ticks_for_test(80);
+        CHECK(tint(*w4.find(F.fed[0]), w4, "combat_morale", 0) < m_before);
+    }
+
+    // ---- 5: siege breaching ------------------------------------------------
+    World w5(65, "data");
+    {
+        const EntityId keep = mk_enclosure(w5, {500, 0}, 900, 800, 120);
+        const EntityId owner = mk_person(w5, {500, 0});
+        w5.mind(owner).belief("owns:" + std::to_string(keep)).confidence = 1000;
+        const EntityId hoard = mk_goods(w5, "copper_metal", 10, {520, 0}, static_cast<std::int64_t>(owner));
+        const EntityId raider = mk_person(w5, {360, 0});
+        tseti(*w5.find(raider), w5, "energy", 900000000);
+        tseti(*w5.find(raider), w5, "reach", 200);
+        InteractionResult barred = w5.interact(mk_ctx(raider, {hoard}, "steal", 0));
+        CHECK(!barred.completed);
+        CHECK(barred.failure.find("walls") != std::string::npos);
+        // a hand launcher barely scratches stone
+        const EntityId f1 = mk_item(w5, "hardwood", {370, 0});
+        const EntityId s1 = mk_item(w5, "sinew", {372, 0});
+        InteractionResult hb = w5.interact(mk_ctx(raider, {f1, s1}, "assemble", 1000));
+        EntityId bow = kNoEntity;
+        for (EntityId s : hb.spawned) if (w5.find(s)->kind_name == "composite") bow = s;
+        CHECK(bow != kNoEntity);
+        CHECK(w5.interact(mk_ctx(raider, {bow}, "wield", 0)).completed);
+        const EntityId pebble = mk_item(w5, "granite", {375, 0});
+        CHECK(w5.interact(mk_ctx(raider, {keep, pebble}, "launch", 0)).completed);
+        const std::int64_t after_bow = tint(*w5.find(keep), w5, "integrity", 0);
+        CHECK(after_bow > 800);                                    // a scratch
+        // a great frame (heavy timber) strung with sinew is a siege engine
+        const EntityId beam = mk_item(w5, "hardwood", {360, 20}, 40000);
+        const EntityId rope = mk_item(w5, "sinew", {362, 20});
+        CHECK(w5.interact(mk_ctx(raider, {bow}, "unwield", 0)).completed);
+        InteractionResult eb = w5.interact(mk_ctx(raider, {beam, rope}, "assemble", 1000));
+        EntityId engine = kNoEntity;
+        for (EntityId s : eb.spawned) if (w5.find(s)->kind_name == "composite") engine = s;
+        CHECK(engine != kNoEntity);
+        CHECK(tint(*w5.find(engine), w5, "launch_impulse", 0) > 3 * tint(*w5.find(bow), w5, "launch_impulse", 0));
+        int shots = 0;
+        while (tint(*w5.find(keep), w5, "access_barrier", 0) > 0 && shots < 10) {
+            PropertyBag bb; bb.set(tpid(w5, "quantity"), Value::integer(1));
+            const EntityId boulder = w5.create_entity("ammo", w5.materials.id_of("granite"), {378, 0}, bb);
+            CHECK(w5.interact(mk_ctx(raider, {keep, boulder, engine}, "launch", 0)).completed);
+            ++shots;
+        }
+        CHECK(shots >= 2 && shots <= 5);                           // a few great shots, not one
+        CHECK(tint(*w5.find(keep), w5, "integrity", 1000) < 300);
+        CHECK(tint(*w5.find(keep), w5, "access_barrier", 1) == 0);  // breached
+        CHECK(w5.interact(mk_ctx(raider, {hoard}, "steal", 0)).completed);   // stores taken
+    }
+
+    // ---- 6: emergent arms race ---------------------------------------------
+    {
+        // reuse w2-style shot on a minded victim with minded kin nearby
+        World w6(66, "data");
+        const EntityId shooter = mk_person(w6, {0, 0});
+        tseti(*w6.find(shooter), w6, "energy", 900000000);
+        const EntityId fr = mk_item(w6, "hardwood", {4, 0});
+        const EntityId st = mk_item(w6, "sinew", {6, 0});
+        InteractionResult ar = w6.interact(mk_ctx(shooter, {fr, st}, "assemble", 1000));
+        EntityId bow = kNoEntity;
+        for (EntityId s : ar.spawned) if (w6.find(s)->kind_name == "composite") bow = s;
+        CHECK(w6.interact(mk_ctx(shooter, {bow}, "wield", 0)).completed);
+        const auto [vic, vpart] = mk_body(w6, {200, 0}, 300);
+        const EntityId kin = mk_person(w6, {260, 0});
+        const EntityId stranger = mk_person(w6, {3000, 3000});
+        tseti(*w6.find(vic), w6, "language_id", 7);
+        tseti(*w6.find(kin), w6, "language_id", 7);
+        tseti(*w6.find(stranger), w6, "language_id", 7);
+        w6.mind(vic); w6.mind(kin); w6.mind(stranger);
+        const EntityId arrow = mk_item(w6, "obsidian", {2, 0});
+        CHECK(w6.interact(mk_ctx(shooter, {vic, arrow}, "launch", 0)).completed);
+        (void)vpart;
+        const Belief* vb = w6.find_mind(vic)->find_belief("weapon_counter:projectile");
+        const Belief* va = w6.find_mind(vic)->find_belief("armor_tech_bias");
+        const Belief* kb = w6.find_mind(kin)->find_belief("weapon_counter:projectile");
+        CHECK(vb && vb->confidence >= 300);
+        CHECK(va && va->confidence >= 250);
+        CHECK(kb && kb->confidence >= 150 && kb->confidence < vb->confidence);
+        CHECK(w6.find_mind(stranger)->find_belief("weapon_counter:projectile") == nullptr);
+        // the wounded now PREFER protection and counter-launchers in planning
+        const EntityId plate = mk_item(w6, "metal_plate", {205, 0});
+        InteractionContext don = mk_ctx(vic, {plate}, "don", 0);
+        CHECK(arms_race_bonus(w6, *w6.find_mind(vic), don) > 0);
+        CHECK(arms_race_bonus(w6, *w6.find_mind(stranger), don) == 0);
+        InteractionContext treat = mk_ctx(vic, {vic}, "treat", 0);
+        CHECK(arms_race_bonus(w6, *w6.find_mind(vic), treat) == 0);   // not poisoned (yet)
+    }
+
+    // ---- 7: surrender & Rosetta peace (continues the w4 front) -------------
+    {
+        // the squads of tongue 11 all break -> defeat is World Truth
+        for (EntityId s : F.fed) {
+            tseti(*w4.find(s), w4, "hunger", 900);
+            tseti(*w4.find(s), w4, "metabolism", 2000);
+        }
+        // before defeat, no peace
+        tseti(*w4.find(F.envoy), w4, "bilingual_familiarity", 800);
+        w4.mind(F.leader).belief("owns:" + std::to_string(F.depot)).confidence = 1000;
+        mk_goods(w4, "salt", 20, {420, 405}, static_cast<std::int64_t>(F.envoy));
+        w4.advance_ticks_for_test(200);
+        for (EntityId s : F.fed) CHECK(!w4.find(s)->alive || tint(*w4.find(s), w4, "routed", 0) == 1);
+        // the envoy speaks both tongues (Rosetta words)
+        PropertyBag e1, e2;
+        e1.set(tpid(w4, "language_id"), Value::integer(11)); e1.set(tpid(w4, "concept_key"), Value::text("peace"));
+        e2.set(tpid(w4, "language_id"), Value::integer(22)); e2.set(tpid(w4, "concept_key"), Value::text("peace"));
+        const EntityId w11 = w4.create_entity("lexical_entry", kNoMaterial, {0, 0}, e1);
+        const EntityId w22 = w4.create_entity("lexical_entry", kNoMaterial, {0, 0}, e2);
+        w4.mind(F.envoy).belief("lex:" + std::to_string(w11)).confidence = 900;
+        w4.mind(F.envoy).belief("lex:" + std::to_string(w22)).confidence = 900;
+        // the foe stands at the envoy's side for the parley
+        w4.find(F.foe)->pos = w4.find(F.envoy)->pos;
+        w4.spatial.move(F.foe, w4.find(F.envoy)->pos);
+        InteractionResult pr = w4.interact(mk_ctx(F.envoy, {F.foe}, "diplomatic_parley", 0,
+            ("peace:" + std::to_string(F.depot) + ":salt:5").c_str()));
+        CHECK(pr.completed);
+        EntityId stone = kNoEntity, debt = kNoEntity;
+        for (EntityId s : pr.spawned) {
+            if (w4.find(s)->kind_name == "inscription") stone = s;
+            if (w4.find(s)->kind_name == "debt_obligation") debt = s;
+        }
+        CHECK(stone != kNoEntity && debt != kNoEntity);
+        if (stone != kNoEntity) {
+            CHECK(ttext(*w4.find(stone), w4, "treaty_clause") == "peace");
+            CHECK(tint(*w4.find(stone), w4, "language_id2", 0) == 22);
+            const std::string cl = ttext(*w4.find(stone), w4, "clause_atoms");
+            CHECK(cl.find("11:" + std::to_string(w11)) != std::string::npos);
+            CHECK(cl.find("22:" + std::to_string(w22)) != std::string::npos);
+        }
+        if (debt != kNoEntity) {
+            CHECK(tint(*w4.find(debt), w4, "debtor_id", 0) == static_cast<std::int64_t>(F.envoy));
+            CHECK(tint(*w4.find(debt), w4, "creditor_id", 0) == static_cast<std::int64_t>(F.foe));
+            CHECK(tint(*w4.find(debt), w4, "debt_value", 0) > 0);
+        }
+        CHECK(!diplo_hostile(w4, 11, 22));
+        std::size_t stood_down = 0;
+        for (EntityId s : F.fed) if (w4.find(s)->alive) { CHECK(tint(*w4.find(s), w4, "war_target", 0) == 0); ++stood_down; }
+        for (EntityId s : F.cut) if (w4.find(s)->alive) { CHECK(tint(*w4.find(s), w4, "war_target", 0) == 0); ++stood_down; }
+        CHECK(tint(*w4.find(F.leader), w4, "war_target", 0) == 0);
+        (void)stood_down;
+        CHECK(w4.find_mind(F.foe)->find_belief("owns:" + std::to_string(F.depot)) != nullptr);
+        CHECK(w4.find_mind(F.leader)->find_belief("owns:" + std::to_string(F.depot)) == nullptr);
+        CHECK(arch_owner_of(w4, F.depot) == F.foe);
+        CHECK(w4.find_mind(F.fed[1])->find_belief("war:22") == nullptr);
+    }
+    {
+        // a side that has NOT lost cannot sue for peace
+        World wn(67, "data");
+        Front N = build_front(wn);
+        CHECK(wn.interact(mk_ctx(N.leader, {N.foe}, "mobilize", 0, "")).completed);
+        tseti(*wn.find(N.envoy), wn, "bilingual_familiarity", 800);
+        wn.find(N.foe)->pos = wn.find(N.envoy)->pos;
+        wn.spatial.move(N.foe, wn.find(N.envoy)->pos);
+        CHECK(!wn.interact(mk_ctx(N.envoy, {N.foe}, "diplomatic_parley", 0, "peace:0:-:0")).completed);
+    }
+
+    // ---- 8: LOD invariance — dt=1 x N vs dt=N ------------------------------
+    {
+        World wa(68, "data"), wb(68, "data");
+        Front A = build_front(wa), B = build_front(wb);
+        CHECK(wa.interact(mk_ctx(A.leader, {A.foe}, "mobilize", 0, ("depot:" + std::to_string(A.depot)).c_str())).completed);
+        CHECK(wb.interact(mk_ctx(B.leader, {B.foe}, "mobilize", 0, ("depot:" + std::to_string(B.depot)).c_str())).completed);
+        for (int i = 0; i < 150; ++i) wa.advance_ticks_for_test(1);
+        wb.advance_ticks_for_test(150);
+        for (std::size_t i = 0; i < A.cut.size(); ++i) {
+            for (const char* p : {"combat_morale", "routed", "hunger"}) {
+                CHECK(tint(*wa.find(A.cut[i]), wa, p, -1) == tint(*wb.find(B.cut[i]), wb, p, -1));
+                CHECK(tint(*wa.find(A.fed[i]), wa, p, -1) == tint(*wb.find(B.fed[i]), wb, p, -1));
+            }
+        }
+        CHECK(wa.content_hash() == wb.content_hash());
+        // siege damage is event-driven: same shots, any tick schedule
+        CHECK(tint(*wa.find(A.depot), wa, "integrity", 0) == tint(*wb.find(B.depot), wb, "integrity", 0));
+    }
+
+    // ---- 9: save/load roundtrip --------------------------------------------
+    for (World* ww : {&w, &w2, &w3, &w4, &w5}) {
+        const std::string path = "/tmp/simlab_test_126.bin";
+        const std::uint64_t h = ww->state_hash();
+        CHECK(ww->save(path));
+        World wr(1, "data");
+        CHECK(wr.load(path));
+        CHECK(wr.state_hash() == h);
+    }
+}
+
+
+// ================= Phase 13: render snapshot, procedural atlas, fog of war =====
+// Primordial Genesis: naked tick-0 world + curiosity-driven verb discovery,
+// player possession and whispered omens — all through the causal pipeline.
+static void test_primordial_genesis_true_playable() {
+    PrimordialParams pp; pp.seed = 7; pp.grid = 48; pp.tribes = 2; pp.per_tribe = 4;
+    World w(7, "data");
+    const PrimordialWorld pw = build_primordial(w, pp);
+    const SpeciesDef* sap = w.species.find_name("sapient");
+    CHECK(sap && sap->innate.size() >= 3);
+    CHECK(pw.founders.size() == 8);
+    CHECK(pw.homes.size() == 2 && pw.tribe_lang.size() == 2 &&
+          pw.tribe_lang[0] != pw.tribe_lang[1]);
+    CHECK(primordial_violations(w) == 0);
+    std::size_t sapients = 0;
+    for (EntityId id : w.entities_of_kind(KindName("sapient")))
+        if (const Entity* e = w.find(id); e && e->alive) ++sapients;
+    CHECK(sapients == 8);                      // no wild sapients from worldgen
+    const std::set<std::string> innate(sap->innate.begin(), sap->innate.end());
+    for (EntityId f : pw.founders) {
+        const AgentMind* m = w.find_mind(f);
+        CHECK(m && m->known_actions == innate);
+        CHECK(m && m->beliefs.empty() && m->discoveries.empty());
+        CHECK(w.relations_of(f, "wielding").empty());
+    }
+    {   // bands start far apart (beyond each other's sight)
+        const std::int64_t d2 = dist2(pw.homes[0], pw.homes[1]);
+        const std::int64_t s = 400;              // most of the map width apart
+        CHECK(d2 > s * s);
+    }
+    std::size_t flora = 0;
+    for (const auto& ep : w.entities) if (ep->alive && ep->kind_name != KindName("sapient")) ++flora;
+    CHECK(flora > 50);                          // a living world around them
+
+    // replay determinism of the genesis itself
+    World w2(7, "data");
+    build_primordial(w2, pp);
+    CHECK(w.state_hash() == w2.state_hash());
+
+    // curiosity drives verb discovery; the default driver does not
+    World off = w.clone();
+    DriverState st; st.curiosity = true; st.concurrent = true;
+    DriverState st_off;
+    const std::int64_t cycles = std::getenv("SIMLAB_GENESIS_CYCLES")
+        ? std::atoll(std::getenv("SIMLAB_GENESIS_CYCLES")) : 60;
+    autonomous_run(w, cycles, &st);
+    autonomous_run(off, cycles, &st_off);
+    auto learned = [&](const World& ww) {
+        std::set<std::string> u;
+        for (EntityId f : pw.founders)
+            if (const AgentMind* m = ww.find_mind(f))
+                for (const std::string& a : m->known_actions)
+                    if (!innate.count(a)) u.insert(a);
+        return u;
+    };
+    const std::set<std::string> lw = learned(w), lo = learned(off);
+    std::printf("  genesis: %lld cycles tick=%llu learned(curious)=%zu learned(off)=%zu alive=%zu [",
+                static_cast<long long>(cycles), static_cast<unsigned long long>(w.clock_.tick()),
+                lw.size(), lo.size(), [&] { std::size_t n = 0;
+                    for (EntityId f : pw.founders) if (const Entity* e = w.find(f); e && e->alive) ++n;
+                    return n; }());
+    for (const std::string& a : lw) std::printf(" %s", a.c_str());
+    std::printf(" ] violations=%zu\n", primordial_violations(w));
+    CHECK(lw.size() >= 2);
+    CHECK(lw.size() > lo.size());
+
+    // replay: same world + same driver flags -> same hash
+    World r = w2.clone();
+    DriverState st_r; st_r.curiosity = true; st_r.concurrent = true;
+    autonomous_run(r, cycles, &st_r);
+    CHECK(r.state_hash() == w.state_hash());
+
+    // possession: the driver never acts for a possessed avatar
+    EntityId av = kNoEntity;
+    for (EntityId f : pw.founders) if (const Entity* e = w.find(f); e && e->alive) { av = f; break; }
+    CHECK(av != kNoEntity);
+    if (av != kNoEntity) {
+        st.possessed.insert(av);
+        const EventId before = w.ledger.next_id();
+        autonomous_run(w, 15, &st);
+        std::size_t acted = 0;
+        for (EventId i = before; i < w.ledger.next_id(); ++i) {
+            const CausalEvent* ev = w.ledger.find(i);
+            if (ev && !ev->participants.empty() && ev->participants.front() == av &&
+                ev->action != "metabolize" && ev->action != "ecology") ++acted;
+        }
+        CHECK(acted == 0);
+        // player action through interact(): the avatar learns like anyone
+        InteractionContext c; c.actor = av; c.parameters.action = "rest"; c.parameters.ticks = 1;
+        CHECK(w.interact(c).completed);
+        st.possessed.erase(av);
+    }
+
+    // whispered omen: a strongly heeded hint gets tried and then cleared
+    // (or decays) — never a direct grant of knowledge.
+    if (av != kNoEntity) {
+        AgentMind& m = w.mind(av);
+        std::string verb;
+        for (const char* v : {"impact", "strike", "dig", "chop", "assemble", "heat", "carve"})
+            if (!m.known_actions.count(v)) { verb = v; break; }
+        if (!verb.empty()) {
+            const bool knew = m.known_actions.count(verb) != 0;
+            m.belief("omen:" + verb).confidence = 1000;
+            CHECK(!knew && !w.find_mind(av)->known_actions.count(verb));   // not granted
+            const EventId e0 = w.ledger.next_id();
+            autonomous_run(w, 40, &st);
+            // if the verb was learned, a real completed event by the avatar
+            // taught it — knowledge only ever comes through the ledger
+            const AgentMind* m2 = w.find_mind(av);
+            if (m2 && m2->known_actions.count(verb)) {
+                bool via_event = false;
+                for (EventId i = e0; i < w.ledger.next_id(); ++i)
+                    if (const CausalEvent* ev = w.ledger.find(i);
+                        ev && !ev->failed && ev->action == verb) via_event = true;
+                CHECK(via_event);
+            }
+        }
+    }
+
+    // save/load round-trip keeps the primordial world bit-exact
+    const std::string path = "build/genesis_rt.sav";
+    CHECK(w.save(path));
+    World l(1, "data");
+    CHECK(l.load(path));
+    CHECK(l.state_hash() == w.state_hash());
+    std::remove(path.c_str());
+}
+
+// Patron layer + planet: climate belts, closed ocean rim, warm camps; the
+// player's journal (Rosetta guesses, milestones, resonance) is viewer state —
+// scanning never changes World Truth; beacons steer agents only via beliefs.
+static void test_patron_journal_planet_and_beacons() {
+    using namespace simlab::render;
+    // ---- planet: belts + rim ------------------------------------------------
+    PrimordialParams pp; pp.seed = 11; pp.grid = 96; pp.planet = true; pp.tribes = 3; pp.per_tribe = 3;
+    World pw(11, "data");
+    const PrimordialWorld pr = build_primordial(pw, pp);
+    const TerrainGrid& t = pw.terrain;
+    auto band_t = [&](int y0, int y1) {
+        long s = 0, n = 0;
+        for (int y = y0; y < y1; ++y) for (int x = 0; x < t.w; ++x) { s += t.temperature[std::size_t(y) * t.w + x]; ++n; }
+        return n ? s / n : 0;
+    };
+    const long eq = band_t(t.h / 2 - 4, t.h / 2 + 4), mid = band_t(t.h / 4 - 4, t.h / 4 + 4), pole = band_t(0, 6);
+    std::printf("  planet: equator %ld temperate %ld pole %ld\n", eq, mid, pole);
+    CHECK(eq > mid && mid > pole && pole < 0);
+    std::size_t rim_water = 0;
+    for (int y = 0; y < t.h; ++y) rim_water += t.water[std::size_t(y) * t.w] != 0;
+    CHECK(rim_water * 10 >= std::size_t(t.h) * 9);          // west rim is sea
+    CHECK(pr.founders.size() == 9 && pr.homes.size() == 3);
+    for (const Vec2& h : pr.homes) CHECK(t.temp_at(h) >= 250);   // bands start warm
+    CHECK(primordial_violations(pw) == 0);
+    // legacy (non-planet) seeds keep the old analytic fields
+    int dw = 0, dh = 0;
+    CHECK(!WorldGenerator::planet_dims(2026, dw, dh));
+    CHECK(WorldGenerator::planet_dims(WorldGenerator::planet_seed(5, 96, 64), dw, dh) && dw == 96 && dh == 64);
+
+    // ---- journal: guesses are confirmed only against the real concept --------
+    World w(13, "data");
+    PrimordialParams vp; vp.seed = 13; vp.grid = 48; vp.tribes = 1; vp.per_tribe = 4;
+    const PrimordialWorld vw = build_primordial(w, vp);
+    const MaterialDef* berries = w.materials.find_name("wild_berries");
+    CHECK(berries != nullptr);
+    JournalWord jw;
+    jw.truth = "method:consume(f" + std::to_string(berries ? berries->id : 0) + "+)";
+    jw.guess = "berries";
+    CHECK(!guess_confirmed(w, jw));                          // never witnessed in context
+    jw.heard = 1;
+    CHECK(guess_confirmed(w, jw));
+    jw.guess = "fire";
+    CHECK(!guess_confirmed(w, jw));
+    jw.guess = "eat / consume";
+    CHECK(guess_confirmed(w, jw));
+
+    // ---- scan is read-only; milestones + resonance come from real events ----
+    PatronJournal j; j.tribe = vw.tribe_lang.front();
+    DriverState st; st.curiosity = true; st.concurrent = true;
+    autonomous_run(w, 30, &st);
+    const std::uint64_t h0 = w.state_hash();
+    patron_scan(w, j, nullptr);
+    CHECK(w.state_hash() == h0);
+    std::printf("  patron: milestones=%zu resonance=%lld words=%zu\n", j.milestones.size(),
+                (long long)j.resonance, j.lexicon.size());
+    CHECK(!j.milestones.empty());
+    for (const Milestone& m : j.milestones) CHECK(!m.title.empty() && m.tick <= w.clock_.tick());
+    // re-scan finds nothing new (cursor)
+    CHECK(patron_scan(w, j, nullptr) == 0);
+
+    // ---- journal save/load round trip ----------------------------------------
+    j.pins.insert(vw.founders.front());
+    j.lexicon[j.tribe]["ka-tu"] = jw;
+    j.lexicon[j.tribe]["ka-tu"].guess = "ăn quả";            // UTF-8 guesses survive
+    j.lexicon[j.tribe]["ka-tu"].tag = WordTag::Danger;
+    j.notes = "line one\nline two";
+    const std::string jp = "build/patron_rt.journal";
+    CHECK(j.save(jp));
+    PatronJournal j2;
+    CHECK(j2.load(jp));
+    CHECK(j2.tribe == j.tribe && j2.resonance == j.resonance && j2.scanned == j.scanned);
+    CHECK(j2.pins == j.pins && j2.notes == j.notes);
+    CHECK(j2.milestones.size() == j.milestones.size() && j2.milestone_keys == j.milestone_keys);
+    CHECK(j2.lexicon[j.tribe]["ka-tu"].guess == "ăn quả" &&
+          j2.lexicon[j.tribe]["ka-tu"].tag == WordTag::Danger &&
+          j2.lexicon[j.tribe]["ka-tu"].truth == jw.truth);
+    std::remove(jp.c_str());
+
+    // ---- beacon: a belief, followed by a sated calm scout ---------------------
+    EntityId scout = kNoEntity;
+    for (EntityId f : vw.founders) if (const Entity* e = w.find(f); e && e->alive) { scout = f; break; }
+    CHECK(scout != kNoEntity);
+    if (scout != kNoEntity) {
+        Entity* se = w.find(scout);
+        Vec2 goal{se->pos.x + 200, se->pos.y};
+        if (!w.terrain.contains(goal) || w.terrain.is_water(goal)) goal = Vec2{se->pos.x - 200, se->pos.y};
+        const std::int64_t d0 = dist2(se->pos, goal);
+        AgentMind& m = w.mind(scout);
+        m.belief("beacon:" + std::to_string(goal.x) + ":" + std::to_string(goal.y)).confidence = 800;
+        tseti(*se, w, "hunger", 0); tseti(*se, w, "thirst", 0);
+        m.neuro.panic = m.neuro.rage = m.neuro.grief = 0;
+        autonomous_run(w, 6, &st);
+        const Entity* se2 = w.find(scout);
+        const AgentMind* m2 = w.find_mind(scout);
+        const bool kept = m2 && m2->beliefs.count("beacon:" + std::to_string(goal.x) + ":" + std::to_string(goal.y));
+        std::printf("  beacon: d0=%lld d1=%lld kept=%d\n", (long long)d0, se2 ? (long long)dist2(se2->pos, goal) : -1LL, int(kept));
+        CHECK(se2 && (dist2(se2->pos, goal) < d0 || !kept));
+    }
+}
+
+static void test_render_snapshot_and_procedural_atlas() {
+    using namespace simlab::render;
+    World w(91, "data");
+    ProceduralAtlas atlas;
+    atlas.build(w);
+    auto mean = [](const Sprite& s, int ch) {
+        long long sum = 0, n = 0;
+        for (std::uint32_t p : s.px) if (p >> 24) { sum += (p >> (16 - 8 * ch)) & 0xFF; ++n; }
+        return n ? sum / n : 0;
+    };
+    // ---- every material: a full tile + an icon, all distinct ----------------
+    std::set<std::uint64_t> digests;
+    for (const MaterialDef& m : w.materials.defs()) {
+        const Sprite* t = atlas.material(m.id);
+        const Sprite* ic = atlas.material_icon(m.id);
+        CHECK(t && t->w == ProceduralAtlas::kTile && t->h == ProceduralAtlas::kTile);
+        CHECK(t && t->opaque_count() == static_cast<std::size_t>(t->w * t->h));
+        CHECK(ic && ic->w == ProceduralAtlas::kIcon && ic->opaque_count() > 40);
+        if (t) digests.insert(t->digest());
+    }
+    CHECK(digests.size() == w.materials.defs().size());          // no two look alike
+    // ---- the art follows the physics ----------------------------------------
+    auto cls = [&](const char* n) { return atlas.look(w.materials.id_of(n))->cls; };
+    for (const char* n : {"copper_metal", "metal_plate", "iron_blade"}) CHECK(cls(n) == MatClass::Metal);
+    for (const char* n : {"granite", "flint", "basalt"}) CHECK(cls(n) == MatClass::Rock);
+    for (const char* n : {"dry_wood", "hardwood"}) CHECK(cls(n) == MatClass::Wood);
+    for (const char* n : {"soil_sand", "soil_loam", "soil_clay"}) CHECK(cls(n) == MatClass::Soil);
+    CHECK(cls("water") == MatClass::Liquid);
+    CHECK(cls("energetic_mix") == MatClass::Energetic);
+    CHECK(atlas.look(w.materials.id_of("nightshade"))->toxic);   // toxicity -> violet
+    CHECK(!atlas.look(w.materials.id_of("wild_berries"))->toxic);
+    {   // metal sheen: the brightest pixel of a metal tile is near-white
+        const Sprite& cu = *atlas.material(w.materials.id_of("copper_metal"));
+        int maxv = 0;
+        for (std::uint32_t p : cu.px) maxv = std::max<int>(maxv, std::min({(p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF}));
+        CHECK(maxv >= 200);
+        const Sprite& ns = *atlas.material(w.materials.id_of("nightshade"));
+        CHECK(mean(ns, 2) > mean(ns, 1));                         // more blue than green: poison
+        const Sprite& wa = *atlas.material(w.materials.id_of("water"));
+        CHECK(mean(wa, 2) > mean(wa, 0));                          // water is blue
+    }
+    // ---- every species: a standee read from its anatomy ---------------------
+    for (const SpeciesDef& sp : w.species.defs()) {
+        const Sprite* s = atlas.species(sp.name);
+        CHECK(s && s->w == ProceduralAtlas::kStandee && s->h == ProceduralAtlas::kStandee);
+        CHECK(s && s->opaque_count() > 40);
+        CHECK(atlas.plan(sp.name) && atlas.plan(sp.name)->flora == !sp.fauna);
+    }
+    if (const BodyPlan* gp = atlas.plan("grazer")) {                // read from its body_part lines
+        CHECK(gp->arms == 2 && gp->legs == 2 && gp->heads == 1 && gp->eyes == 2);
+    }
+    if (const BodyPlan* hp = atlas.plan("sapient")) {                // no anatomy: reach -> hands
+        CHECK(hp->arms == 2 && hp->legs == 2);
+    }
+    CHECK(atlas.plan("boreal_tree")->tree);
+    CHECK(atlas.plan("berry_bush")->fruiting && !atlas.plan("berry_bush")->tree);
+    // ---- fruit dots: exactly proportional to fruit_count / max_fruit ---------
+    {
+        const std::size_t f0 = atlas.fruiting("berry_bush", 0, 40).opaque_count();
+        const std::uint64_t d20 = atlas.fruiting("berry_bush", 20, 40).digest();
+        const std::uint64_t d40 = atlas.fruiting("berry_bush", 40, 40).digest();
+        const std::uint64_t d0 = atlas.fruiting("berry_bush", 0, 40).digest();
+        CHECK(d0 != d20 && d20 != d40);
+        CHECK(atlas.fruiting("berry_bush", 40, 40).opaque_count() >= f0);
+        CHECK(atlas.fruiting("berry_bush", 20, 40).digest() == d20);   // deterministic cache
+    }
+    // ---- engine kinds, weapons, armor, walls, scripts ------------------------
+    for (const char* k : {"inscription", "enclosure", "portal", "remains", "rubble", "deposit",
+                          "residue", "composite", "goods", "person"})
+        CHECK(atlas.kind(k) && atlas.kind(k)->opaque_count() > 20);
+    const MaterialId fl = w.materials.id_of("flint");
+    const std::uint64_t blade = atlas.weapon(900, 0, 0, false, fl).digest();
+    const std::uint64_t mace = atlas.weapon(0, 800, 0, false, fl).digest();
+    const std::uint64_t bow = atlas.weapon(0, 0, 650, false, fl).digest();
+    const std::uint64_t poison = atlas.weapon(900, 0, 0, true, fl).digest();
+    CHECK(blade != mace && mace != bow && blade != bow && blade != poison);
+    CHECK(atlas.armor_overlay(900, w.materials.id_of("metal_plate")).opaque_count() > 0);
+    {   // 47-tile autotiling: 256 neighbour masks collapse to exactly 47 shapes
+        std::set<std::uint64_t> shapes;
+        for (int m = 0; m < 256; ++m) shapes.insert(atlas.wall(static_cast<std::uint8_t>(m), 0, w.materials.id_of("stone")).digest());
+        CHECK(shapes.size() == 47);
+        CHECK(atlas.wall(0x55, 0, w.materials.id_of("stone")).digest() !=
+              atlas.wall(0x55, 3, w.materials.id_of("stone")).digest());   // cracks show
+    }
+    {   // each tribe has its own script; a carving is reproducible
+        CHECK(atlas.glyph(11 * 2654435761u, 0).digest() != atlas.glyph(22 * 2654435761u, 0).digest());
+        CHECK(atlas.glyph_stone(77, "peace|cede:5", false).digest() ==
+              atlas.glyph_stone(77, "peace|cede:5", false).digest());
+        CHECK(atlas.glyph_stone(77, "peace|cede:5", false).digest() !=
+              atlas.glyph_stone(78, "peace|cede:5", false).digest());
+        CHECK(atlas.glyph_stone(77, "peace|cede:5", false).opaque_count() > 100);
+    }
+    CHECK(atlas.bytes() < 8u * 1024u * 1024u);                     // 4GB-machine friendly
+
+    // ---- snapshot + 3-tier fog of war -----------------------------------------
+    World v(92, "data");
+    {
+        TerrainGrid& tg = v.terrain; tg.w = 64; tg.h = 64; tg.cell = 16; tg.ox = 0; tg.oy = 0;
+        const std::size_t n = 64 * 64;
+        tg.elevation.assign(n, 200); tg.moisture.assign(n, 500); tg.temperature.assign(n, 200);
+        tg.water.assign(n, 0); tg.vegetation.assign(n, 300); tg.slope.assign(n, 0);
+        tg.wind_x.assign(n, 0); tg.wind_y.assign(n, 0); tg.water_table.assign(n, 10);
+        tg.traffic_wear.assign(n, 0);
+    }
+    const EntityId scout = mk_person(v, {100, 100});
+    tseti(*v.find(scout), v, "sight_range", 120);
+    tseti(*v.find(scout), v, "language_id", 5);
+    v.mind(scout);
+    PropertyBag eb;
+    eb.set(tpid(v, "footprint_radius"), Value::integer(40));
+    eb.set(tpid(v, "integrity"), Value::integer(900));
+    const EntityId hut = v.create_entity("enclosure", v.materials.id_of("stone"), {130, 110}, eb);
+    const EntityId stranger = mk_person(v, {140, 100});            // walks inside the scouted zone
+    const EntityId far_thing = mk_person(v, {900, 900});
+    FogOfWar fog;
+    fog.set_mode(FogOfWar::Mode::Tribe, 5);
+    fog.update(v);
+    CHECK(fog.point_fog(v, {100, 100}) == Fog::Visible);
+    CHECK(fog.point_fog(v, {900, 900}) == Fog::Unexplored);
+    const ViewRect all{0, 0, 1024, 1024};
+    const std::uint64_t h0 = v.state_hash();
+    RenderSnapshot s1 = capture(v, all, fog);
+    auto has = [](const RenderSnapshot& s, EntityId id) {
+        for (const EntityView& e : s.entities) if (e.id == id) return &e;
+        return static_cast<const EntityView*>(nullptr);
+    };
+    CHECK(has(s1, hut) && has(s1, hut)->fog == Fog::Visible);
+    CHECK(has(s1, stranger) != nullptr);
+    CHECK(has(s1, far_thing) == nullptr);                            // never seen
+    {   // unexplored cells leak no terrain
+        bool leak = false;
+        for (const CellView& c : s1.cells) if (c.fog == Fog::Unexplored && c.elevation != 0) leak = true;
+        CHECK(!leak);
+    }
+    // the scout walks away (test moves it directly — the viewer never would)
+    v.find(scout)->pos = {700, 700}; v.spatial.move(scout, {700, 700});
+    fog.update(v);
+    CHECK(fog.point_fog(v, {100, 100}) == Fog::Shrouded);
+    CHECK(fog.point_fog(v, {700, 700}) == Fog::Visible);
+    RenderSnapshot s2 = capture(v, all, fog);
+    CHECK(has(s2, hut) && has(s2, hut)->fog == Fog::Shrouded);       // remembered architecture
+    CHECK(has(s2, stranger) == nullptr);                              // motion hidden
+    // God Eye sees everything
+    FogOfWar god;
+    god.update(v);
+    RenderSnapshot s3 = capture(v, all, god);
+    CHECK(has(s3, far_thing) && has(s3, stranger));
+    // viewport culling: a small window holds fewer entities
+    RenderSnapshot s4 = capture(v, ViewRect{600, 600, 800, 800}, god);
+    CHECK(s4.entities.size() < s3.entities.size());
+    CHECK(!s4.cells.empty() && s4.cells.size() < s3.cells.size());
+    const std::uint64_t h1 = v.state_hash();                       // after the test's own edits
+    // back-to-front order
+    for (std::size_t i = 1; i < s3.entities.size(); ++i)
+        CHECK(s3.entities[i - 1].pos.y <= s3.entities[i].pos.y);
+    // ---- rendering never perturbs the simulation ------------------------------
+    for (int f = 0; f < 300; ++f) {
+        fog.update(v);
+        RenderSnapshot sf = capture(v, ViewRect{f, f, 512 + f, 512 + f}, fog);
+        for (const EntityView& e : sf.entities)
+            if (!e.species.empty()) (void)atlas.species(e.species);
+    }
+    CHECK(v.state_hash() == h1);
+    (void)h0; (void)atlas.size();
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -7964,6 +9198,11 @@ int main(int argc, char** argv) {
     RUN(test_inductive_economy_currency_inflation_and_credit);
     RUN(test_political_legal_base_core_norms_authority_and_revolt);
     RUN(test_architectural_base_core_enclosures_ergonomics_and_decay);
+    RUN(test_myth_oral_literature_rituals_and_diplomacy_base_core);
+    RUN(test_warfare_logistics_siege_and_emergent_weapons_rd);
+    RUN(test_render_snapshot_and_procedural_atlas);
+    RUN(test_primordial_genesis_true_playable);
+    RUN(test_patron_journal_planet_and_beacons);
     RUN(test_infection_and_primitive_medicine);
     RUN(test_neuro_psychopathology);
     RUN(test_phase9_autonomous_civilization);

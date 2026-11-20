@@ -75,8 +75,24 @@ std::int32_t WorldGenerator::elevation_at(std::uint64_t seed, int gx, int gy) {
     if (c.ok && c.seed == seed && c.gx == gx && c.gy == gy) return c.val;
     const std::uint64_t ts = worldgen_seed(seed, "terrain");
     const std::int32_t local = fbm(gx, gy, ts);                       // hills (8..64 cells)
-    const std::int32_t cont  = vnoise(gx, gy, 192, ts ^ 0xC0171u);    // continents / basins
-    const std::int32_t v = 80 + (local * 2 + cont) / 3 * 420 / 1023;
+    std::int32_t v;
+    int PW = 0, PH = 0;
+    if (planet_dims(seed, PW, PH)) {
+        // several continents (scale ~ width/3), ridged ranges, ocean rim
+        const int cs = std::max(12, PW / 3);
+        const std::int32_t cont = vnoise(gx, gy, cs, ts ^ 0xC0171u);
+        v = 60 + (local + cont * 2) / 3 * 460 / 1023;
+        const std::int32_t rid = std::abs(vnoise(gx + 311, gy + 97, std::max(10, PW / 4),
+                                                 ts ^ 0x41D6Eu) - 512);
+        if (rid < 36) v += (36 - rid) * 7;                            // mountain spine
+        const int edge = std::min(gx, PW - 1 - gx);
+        const int margin = std::max(3, PW / 10);
+        if (edge < margin) v -= (margin - edge) * 320 / margin;       // east/west seas
+        if (gx < 0 || gx >= PW || gy < 0 || gy >= PH) v = 0;          // beyond the planet: sea
+    } else {
+        const std::int32_t cont  = vnoise(gx, gy, 192, ts ^ 0xC0171u);    // continents / basins
+        v = 80 + (local * 2 + cont) / 3 * 420 / 1023;
+    }
     c = {seed, gx, gy, v, true};
     return v;
 }
@@ -253,12 +269,45 @@ std::int32_t WorldGenerator::moisture_at(std::uint64_t seed, int gx, int gy,
             if (is_sea(seed, gx + dx, gy + dy, sea_level)) ++sea_n;
         }
     m = std::min<std::int32_t>(1000, m + sea_n * 60);
+    int PW = 0, PH = 0;
+    if (planet_dims(seed, PW, PH)) {
+        // wet equator (rainforest), dry subtropics, cold-dry poles
+        const std::int32_t lat = planet_latitude(seed, gy);
+        const std::int32_t belt = lat < 250 ? 260 - lat : (lat < 500 ? -120 : (lat < 800 ? 60 : -200));
+        m = std::clamp<std::int32_t>(m + belt, 0, 1000);
+    }
     return m;
 }
 
 std::int32_t WorldGenerator::temperature_at(std::uint64_t seed, int gx, int gy,
                                             std::int32_t /*sea_level*/) {
+    int PW = 0, PH = 0;
+    if (planet_dims(seed, PW, PH)) {
+        // belt: +34.5 C at the equator -> -20.0 C at the poles; lapse above
+        // the lowlands (deci-C per elevation unit, integer)
+        const std::int32_t lat = planet_latitude(seed, gy);
+        const std::int32_t e = elevation_at(seed, gx, gy);
+        return 345 - lat * 545 / 1000 - std::max<std::int32_t>(0, e - 220) * 7 / 10;
+    }
     return 400 - elevation_at(seed, gx, gy) + latitude_term(gy);
+}
+
+std::uint64_t WorldGenerator::planet_seed(std::uint32_t user_seed, int w, int h) {
+    const std::uint64_t W = static_cast<std::uint64_t>(std::clamp(w, 16, 32767));
+    const std::uint64_t H = static_cast<std::uint64_t>(std::clamp(h, 16, 32767));
+    return (1ull << 63) | (H << 47) | (W << 32) | user_seed;
+}
+bool WorldGenerator::planet_dims(std::uint64_t seed, int& w, int& h) {
+    if (!(seed >> 63)) return false;
+    w = static_cast<int>((seed >> 32) & 0x7FFF);
+    h = static_cast<int>((seed >> 47) & 0x7FFF);
+    return w > 0 && h > 0;
+}
+std::int32_t WorldGenerator::planet_latitude(std::uint64_t seed, int gy) {
+    int PW = 0, PH = 0;
+    if (!planet_dims(seed, PW, PH)) return 500;
+    const int half = std::max(1, PH / 2);
+    return std::clamp<std::int32_t>(std::abs(gy - half) * 1000 / half, 0, 1000);
 }
 
 std::uint8_t WorldGenerator::water_at(std::uint64_t seed, int gx, int gy,
@@ -356,8 +405,8 @@ std::vector<Stratum> WorldGenerator::column_at(const World& w, std::uint64_t see
                                                std::int32_t sea_level) {
     const std::uint64_t gseed = worldgen_seed(seed, "geology");
     const std::uint64_t sseed = worldgen_seed(seed, "subsurface");
-    const PropId lith_p = w.props.find_name("lithology") ? w.props.find_name("lithology")->id : kNoProp;
-    const PropId tex_p  = w.props.find_name("soil_texture") ? w.props.find_name("soil_texture")->id : kNoProp;
+    const PropId lith_p = SIMLAB_PID(w.props, "lithology");
+    const PropId tex_p  = SIMLAB_PID(w.props, "soil_texture");
     auto with_prop = [&](PropId pid, std::int64_t val) {
         std::vector<MaterialId> out;
         if (pid == kNoProp) return out;
@@ -593,6 +642,9 @@ void WorldGenerator::stage_ecology(GenCtx& ctx, int gx0, int gy0, int gw, int gh
             for (const SpeciesDef& sp : w.species.defs()) {
                 if (spawned >= ctx.p.max_trees) break;
                 if (!sp.fauna && flora_here) continue;
+                if (!ctx.p.skip_species.empty() &&
+                    std::find(ctx.p.skip_species.begin(), ctx.p.skip_species.end(),
+                              sp.name) != ctx.p.skip_species.end()) continue;
                 if (!conditions_hold(ctx, sp.conditions, gx, gy, 0)) continue;
                 if (hash2(gx, gy, eseed ^ (sp.id * 0x7A77u)) % 1000 >=
                     static_cast<std::uint32_t>(sp.density)) continue;

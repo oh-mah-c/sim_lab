@@ -62,6 +62,16 @@ public:
     static constexpr std::size_t kEvictBatch = 1024;
 
     EventId append(CausalEvent e);        // assigns id = next_id_++
+    // RAM budget (Phase 13, 4GB machines): besides the kMaxWindow COUNT
+    // bound, keep the retained window under `bytes` (0 = no byte bound,
+    // the default — preserves every existing replay/hash). Eviction is the
+    // same deterministic fold into archived_hash_, so state_hash stays a
+    // pure function of (history, budget). Per-tick metabolize events carry a
+    // StateChange per drifting entity, so a count-only window can grow to
+    // gigabytes on a large world.
+    void set_byte_budget(std::size_t bytes) { byte_budget_ = bytes; }
+    std::size_t byte_budget() const { return byte_budget_; }
+    std::size_t retained_bytes() const { return retained_bytes_; }
     const CausalEvent* find(EventId id) const;
     const std::vector<CausalEvent>& history() const { return history_; }
     std::size_t size() const { return history_.size(); }
@@ -78,12 +88,14 @@ public:
     std::vector<Counterfactual> counterfactuals(EventId id) const;
     // All ancestor events (parents, grandparents...), sorted, bounded by `limit`.
     std::vector<EventId> ancestors(EventId id, std::size_t limit = 4096) const;
-    void clear() { history_.clear(); next_id_ = 1; archived_hash_ = 0; }
+    void clear() { history_.clear(); next_id_ = 1; archived_hash_ = 0; retained_bytes_ = 0; }
 
 private:
     std::vector<CausalEvent> history_;    // RETAINED window only
     EventId next_id_ = 1;                 // one past the last assigned id
     std::uint64_t archived_hash_ = 0;     // FNV-1a digest of evicted events
+    std::size_t byte_budget_ = 0;         // 0 = unbounded (count window only)
+    std::size_t retained_bytes_ = 0;      // estimated heap of the retained window
 };
 
 }  // namespace simlab

@@ -278,6 +278,7 @@ struct AgentMind {
     std::map<std::string, std::int64_t> sublimation_relief;
     std::int64_t ostracism_accum = 0;             // Euclid remainder (LOD)
     std::int64_t political_accum = 0;             // defer/grievance Euclid remainder (LOD)
+    std::int64_t myth_accum = 0;                  // mythogenesis Euclid remainder (LOD)
     std::deque<Observation> observations;          // FIFO, capped
     std::map<std::string, Belief> beliefs;
     std::map<std::string, DiscoveryRecord> discoveries;  // §11.5 records
@@ -497,6 +498,47 @@ std::int64_t arch_utility_bonus(const World& w, EntityId npc,
 void arch_from_event(World& w, EntityId actor,
                      const std::vector<EntityId>& targets,
                      const CausalEvent& ev);
+
+// ---- Phase 12.5: myth, oral literature, ritual & diplomacy -------------------
+// Causal mythogenesis: unexplained shocks (tested-but-unverified discoveries
+// with emotional charge) crystallize into sacred:<key> beliefs for minds
+// with high agency_attribution_bias; the first crossing spawns a
+// semantic_concept carrying a seed-derived agent name + derived appeasement.
+void myth_from_event(World& w, EntityId actor,
+                     const std::vector<EntityId>& targets,
+                     const CausalEvent& ev);
+// Meter of an oral tradition: permille of adjacent syllable-length matches
+// plus shared onsets across the entries naming one concept. Pure function of
+// phoneme_seeds — deterministic, no stored verse.
+std::int64_t oral_cadence_of(const World& w, EntityId entry);
+// Inter-community trust ledger on `language` entities: diplo_table text
+// "peer:trust[:ft][:host];" — trust -1000..+1000 always stored as a number;
+// `ft` set only by a treaty (lapses below trust 0), `host` <=> trust <= -600.
+struct DiploEntry { std::int64_t peer = 0, trust = 0;
+                    bool free_trade = false, hostile = false; };
+std::vector<DiploEntry> diplo_parse(const std::string& table);
+std::string diplo_render(const std::vector<DiploEntry>& v);
+std::string diplo_bump(const std::string& table, std::int64_t peer,
+                       std::int64_t delta);
+std::string diplo_mark_trade(const std::string& table, std::int64_t peer);
+std::int64_t diplo_trust(const World& w, std::int64_t lang_a,
+                         std::int64_t lang_b);
+bool diplo_free_trade(const World& w, std::int64_t lang_a,
+                      std::int64_t lang_b);
+bool diplo_hostile(const World& w, std::int64_t lang_a,
+                   std::int64_t lang_b);
+
+// ---- Phase 12.6: warfare cognition ------------------------------------------------
+// Post-event hook: wounds tagged "victim=<id> mech=<m>" raise the victim's
+// (and nearby same-tongue kin's) `weapon_counter:<m>` and `armor_tech_bias`
+// beliefs (emergent arms race); war_target changes write `war:<tongue>`;
+// a "PEACE enc=.. to=.." treaty moves `owns:<enc>` and ends war beliefs.
+void war_from_event(World& w, EntityId actor, const std::vector<EntityId>& targets,
+                    const CausalEvent& ev);
+// Planner bonus from those beliefs: armor (don/assemble), antidotes (treat),
+// counter-ranged (launch, elastic assemblies). 0 for a mind never hurt.
+std::int64_t arms_race_bonus(const World& w, const AgentMind& m,
+                             const InteractionContext& c);
 
 }  // namespace simlab
 

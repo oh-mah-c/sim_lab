@@ -110,6 +110,12 @@ bool SpeciesRegistry::parse(const std::string& text, const PropertyRegistry& pro
                         ps.extra.set(pd->id, Value::integer(parse_i64(v)));
                 }
                 d.anatomy.push_back(ps);
+            } else if (key == "innate") {
+                // instinct verb (Primordial Genesis): the only actions a
+                // founder's mind knows at tick 0. Repeatable.
+                std::string v; ls >> v;
+                if (v.empty()) return bad("innate needs a verb");
+                d.innate.push_back(v);
             } else if (key == "gene") {
                 // hereditary locus (Phase 7): `gene <prop>` declares which
                 // props pass to offspring. PropId only — no trait semantics.

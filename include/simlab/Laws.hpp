@@ -307,5 +307,20 @@ public:
     std::unique_ptr<INaturalLawModel> clone() const override;
 };
 
+// ---- Warfare model (Phase 12.6) ------------------------------------------------
+// launch / coat / don / doff / mobilize — weapons, armor and armies emerge
+// from material numbers (edge_sharpness, blunt_mass, elasticity, tensile,
+// armor_penetration_resist, volatility, expansion_force) and the diplomatic
+// ledger. No weapon, armor, unit or tech names exist in the engine.
+class WarfareModel final : public INaturalLawModel {
+public:
+    LawId id() const override;
+    const char* name() const override { return "warfare"; }
+    std::vector<std::string> domains() const override { return {"physical", "social"}; }
+    bool supports(const World& w, const InteractionContext& ctx) const override;
+    PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
+    std::unique_ptr<INaturalLawModel> clone() const override;
+};
+
 }  // namespace simlab
 

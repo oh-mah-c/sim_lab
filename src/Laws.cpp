@@ -8,6 +8,388 @@ namespace simlab {
 
 using namespace lawutil;
 
+namespace lawutil {
+// ---- shared blow resolution (Physics impact + Warfare launch/blast) ------------
+// One target, one blow of energy E carried by a weapon profile `b`. Anatomical
+// bodies route it into a body part (sharp: soft tissue + bleed, stopped by
+// worn armor; blunt: impulse through armor into bone/organs); plain entities
+// lose integrity. Fully property-driven — no weapon or armor names.
+std::int64_t armor_resist(const World& w, EntityId body) {
+    const PropId apr_p = pid(w, "armor_penetration_resist");
+    const PropId sev_p = pid(w, "severed");
+    if (apr_p == kNoProp) return 0;
+    std::int64_t best = 0;
+    for (const Relation& rel : w.relations_of(body, "wearing")) {
+        if (rel.a != body) continue;
+        const Entity* a = w.find(rel.b);
+        if (!a || !a->alive) continue;
+        if (sev_p != kNoProp && w.prop_int(*a, sev_p, 0) != 0) continue;
+        best = std::max(best, w.prop_int(*a, apr_p, 0));
+    }
+    return std::clamp<std::int64_t>(best, 0, 1000);
+}
+
+Blow blow_of(const World& w, EntityId weapon, std::int64_t base_edge) {
+    Blow b;
+    b.sharp = base_edge;
+    const Entity* e = weapon != kNoEntity ? w.find(weapon) : nullptr;
+    if (!e) return b;
+    b.sharp = std::max(b.sharp, w.prop_int(*e, pid(w, "edge_sharpness"), 0));
+    b.blunt = w.prop_int(*e, pid(w, "blunt_mass"), 0);
+    b.coat_toxin = w.prop_int(*e, pid(w, "coat_toxin"), 0);
+    b.coat_strain = w.prop_int(*e, pid(w, "coat_strain"), 0);
+    return b;
+}
+
+void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
+                  std::int64_t E, const Blow& b, EntityId striker,
+                  std::int64_t& wear_total) {
+    const Entity* t = w.find(tid);
+    if (!t || !t->alive) return;
+    const PropertyDef* pd_hard = w.props.find_name("hardness");
+    const PropertyDef* pd_brit = w.props.find_name("brittleness");
+    const PropertyDef* pd_mass = w.props.find_name("mass");
+    const PropertyDef* pd_integ = w.props.find_name("integrity");
+    if (!pd_hard || !pd_brit || !pd_mass || !pd_integ) return;
+    // Phase 10: anatomical bodies route the blow into ONE body part —
+    // picked deterministically by part_size weight and a hash of the
+    // blow (same inputs -> same part, replay-safe).
+    std::vector<EntityId> parts;
+    std::vector<std::int64_t> psz;
+    std::int64_t wsum = 0;
+    const PropId sev_pid = pid(w, "severed");
+    const PropId role_chk = pid(w, "part_role");
+    for (const Relation& rel : w.relations_of(tid, "part_of")) {
+        if (rel.b != tid) continue;
+        const Entity* p = w.find(rel.a);
+        if (!p || !p->alive) continue;
+        // anatomy parts carry part_role; ordinary composite structure
+        // parts (spear head/shaft) do not -> they keep physics damage.
+        if (role_chk != kNoProp) {
+            const Value* rv = w.prop_of(*p, role_chk);
+            if (!rv || rv->type != ValType::Text || rv->s.empty()) continue;
+        }
+        const PropId sev = sev_pid;
+        if (sev != kNoProp) {
+            const Value* sv = w.prop_of(*p, sev);
+            if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+        }
+        const std::int64_t sz =
+            w.prop_int(*p, pid(w, "part_size"), 200);
+        parts.push_back(rel.a); psz.push_back(sz); wsum += sz;
+    }
+    if (!parts.empty()) {
+        // deterministic weighted pick
+        std::uint64_t h = static_cast<std::uint64_t>(tid) * 0x9E3779B97F4A7C15ull
+            ^ static_cast<std::uint64_t>(E) * 0xBF58476D1CE4E5B9ull
+            ^ static_cast<std::uint64_t>(w.clock_.tick()) * 0x94D049BB133111EBull;
+        h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+        std::int64_t pick = static_cast<std::int64_t>(h % wsum), pi = 0;
+        while (pick >= psz[pi]) { pick -= psz[pi]; ++pi; }
+        const EntityId part_id = parts[pi];
+        const Entity* part = w.find(part_id);
+        const std::int64_t hard = w.prop_int(*part, pd_hard->id, 300);
+        const std::int64_t brit = w.prop_int(*part, pd_brit->id, 400);
+        const std::int64_t mass = w.prop_int(*part, pd_mass->id, 1000);
+        const std::int64_t integ = w.prop_int(*part, pd_integ->id, 500);
+        const std::int64_t mass_factor = 1000 + mass / 50;
+        std::int64_t dmg = E * (1000 + 2 * brit) /
+            ((hard + 500) * mass_factor / 1000);
+        if (dmg < 1 && E > 0) dmg = 1;
+        // two physical channels (Phase 12.6): a keen edge concentrates
+        // pressure and is stopped by armor; mass transmits impulse through
+        // soft armor. Absent weapon/armor props both factors are exactly 1.
+        const bool sharp = b.sharp >= 350 && b.sharp >= b.blunt;
+        const std::int64_t apr = armor_resist(w, tid);
+        if (sharp) dmg = dmg * (1000 - apr) / 1000;
+        else dmg = dmg * (1000 + b.blunt) / 1000 * (1000 - apr / 3) / 1000;
+        if (dmg < 1 && E > 0 && apr < 1000) dmg = 1;
+        const PropId br_p = pid(w, "bleed_rate"),
+                     fr_p = pid(w, "fracture_level"),
+                     pv_p = pid(w, "vital_organ"),
+                     rl_p = pid(w, "part_role"),
+                     sl_p = pid(w, "body_slot"),
+                     cn_p = pid(w, "contained"),
+                     pa_p = pid(w, "pain_level"),
+                     bo_p = pid(w, "bleed_rate");
+        // layered response: blunt -> fracture + deep bruising bleed;
+        // sharp -> integ loss + heavy soft-tissue bleed; bone parts
+        // (brittleness>700) fracture under both.
+        std::int64_t n_integ = integ, n_bleed = 0, n_frac = 0;
+        if (sharp) {
+            n_integ = std::max<std::int64_t>(0, integ - dmg);
+            n_bleed = std::min<std::int64_t>(1000,
+                w.prop_int(*part, br_p, 0) + dmg * 3 / 4);
+        } else {
+            n_integ = std::max<std::int64_t>(0, integ - dmg * 3 / 5);
+            n_bleed = std::min<std::int64_t>(1000,
+                w.prop_int(*part, br_p, 0) + dmg / 20);
+        }
+        if (brit > 700 || (!sharp && b.blunt >= 500))   // bone, or impulse through it
+            n_frac = std::min<std::int64_t>(1000,
+                w.prop_int(*part, fr_p, 0) + dmg / 3);
+        const std::int64_t vital = pv_p != kNoProp
+            ? w.prop_int(*part, pv_p, 0) : 0;
+        const bool amputate = sharp && dmg >= integ && vital < 1000;
+        const bool part_destroyed = n_integ <= 0 || (sharp && dmg >= integ);
+
+        // secondary organ hit: sharp penetration damages the vital
+        // organ sharing this part's body_slot (heart/lung/brain).
+        EntityId organ_id = kNoEntity;
+        std::int64_t organ_dmg = 0;
+        if (sharp && dmg > 300 && sl_p != kNoProp) {
+            const Value* myslot = w.prop_of(*part, sl_p);
+            if (myslot && myslot->type == ValType::Text) {
+                for (const Relation& rel2 : w.relations_of(tid, "part_of")) {
+                    if (rel2.b != tid || rel2.a == part_id) continue;
+                    const Entity* q = w.find(rel2.a);
+                    if (!q || !q->alive) continue;
+                    const Value* sv = sev_pid != kNoProp ? w.prop_of(*q, sev_pid) : nullptr;
+                    if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
+                    if (role_chk != kNoProp) {
+                        const Value* qr = w.prop_of(*q, role_chk);
+                        if (!qr || qr->type != ValType::Text || qr->s.empty()) continue;
+                    }
+                    const Value* qs = w.prop_of(*q, sl_p);
+                    if (!qs || qs->type != ValType::Text || qs->s != myslot->s) continue;
+                    if (pv_p != kNoProp && w.prop_int(*q, pv_p, 0) >= 800) {
+                        organ_id = rel2.a; organ_dmg = dmg / 2; break;
+                    }
+                }
+            }
+        }
+
+        // pain on the body: sharp wounds hurt more; amputation maxes.
+        std::int64_t pain_add = amputate ? 1000 : (sharp ? dmg : dmg / 2);
+        const std::int64_t body_pain = pa_p != kNoProp
+            ? w.prop_int(*t, pa_p, 0) : 0;
+        const std::int64_t n_pain = std::min<std::int64_t>(1000, body_pain + pain_add);
+
+        auto setp = [&](EntityId id, PropId p, std::int64_t before, std::int64_t after) {
+            if (p == kNoProp || before == after) return;
+            StateChange ch; ch.entity = id; ch.prop = p; ch.had_before = true;
+            ch.before = Value::integer(before); ch.after = Value::integer(after);
+            r.changes.push_back(ch);
+        };
+        setp(part_id, pd_integ->id, integ, amputate ? 60 : n_integ);
+        if (br_p != kNoProp) setp(part_id, br_p, w.prop_int(*part, br_p, 0), amputate ? 1000 : n_bleed);
+        if (fr_p != kNoProp && n_frac) setp(part_id, fr_p, w.prop_int(*part, fr_p, 0), n_frac);
+        if (amputate) {
+            // severed part stays alive at the scene: severed=1,
+            // contained=false -> physically independent entity.
+            const PropId sv_p = pid(w, "severed");
+            const std::int64_t sv0 = sv_p != kNoProp ? w.prop_int(*part, sv_p, 0) : 0;
+            setp(part_id, sv_p, sv0, 1);
+            if (cn_p != kNoProp) {
+                // contained is a BOOLEAN prop — integer write would
+                // break is_contained's ValType::Boolean check.
+                const Value* cv = w.prop_of(*part, cn_p);
+                const bool was = cv && cv->type == ValType::Boolean && cv->b;
+                if (was) {
+                    StateChange ch; ch.entity = part_id; ch.prop = cn_p;
+                    ch.had_before = true; ch.before = Value::boolean(true);
+                    ch.after = Value::boolean(false);
+                    r.changes.push_back(ch);
+                }
+            }
+            // the edge is KEPT as anatomical record; `severed` is the
+            // detach truth (lets anatomy_function still count it).
+            // stump bleeding moves onto the body's own bleed_rate.
+            const std::int64_t bbr = bo_p != kNoProp ? w.prop_int(*t, bo_p, 0) : 0;
+            setp(tid, bo_p, bbr, std::min<std::int64_t>(1000, bbr + 700));
+            // severed arm drops whatever the body was wielding
+            if (rl_p != kNoProp) {
+                const Value* rv = w.prop_of(*part, rl_p);
+                if (rv && rv->type == ValType::Text && rv->s == "arm") {
+                    for (const Relation& wr : w.relations_of(tid, "wielding"))
+                        if (wr.a == tid)
+                            r.rel_changes.push_back({tid, "wielding", wr.b, false});
+                }
+            }
+        }
+        if (organ_id != kNoEntity) {
+            const Entity* op = w.find(organ_id);
+            if (op) {
+                const std::int64_t oi = w.prop_int(*op, pd_integ->id, 500);
+                setp(organ_id, pd_integ->id, oi, std::max<std::int64_t>(0, oi - organ_dmg));
+                if (br_p != kNoProp)
+                    setp(organ_id, br_p, w.prop_int(*op, br_p, 0),
+                         std::min<std::int64_t>(1000, w.prop_int(*op, br_p, 0) + organ_dmg / 2));
+            }
+        }
+        // Phase 10.3 lumen rupture: a blow landing on a body region
+        // bursts any distended hollow organ (lumen_capacity>0,
+        // luminal pressure>=800) sharing that region's body_slot.
+        // Fully generic — slot names, capacities and waste materials
+        // all come from data; no organ or disease names in code.
+        {
+            const PropId lc_i = pid(w, "lumen_capacity"),
+                       cl_i = pid(w, "contents_load"),
+                       ca_i = pid(w, "contents_accum"),
+                       rup_i = pid(w, "ruptured"),
+                       inf_i = pid(w, "infection_level"),
+                       em_i = pid(w, "evacuate_material"),
+                       nec_i = pid(w, "necrotic"),
+                       cnt_i = pid(w, "contamination");
+            const Value* hit_slot = sl_p != kNoProp
+                ? w.prop_of(*part, sl_p) : nullptr;
+            if (lc_i != kNoProp && cl_i != kNoProp && rup_i != kNoProp &&
+                hit_slot && hit_slot->type == ValType::Text) {
+                for (const Relation& rel3 : w.relations_of(tid, "part_of")) {
+                    if (rel3.b != tid) continue;
+                    const Entity* lp = w.find(rel3.a);
+                    if (!lp || !lp->alive) continue;
+                    if (sev_pid != kNoProp) {
+                        const Value* sv = w.prop_of(*lp, sev_pid);
+                        if (sv && sv->type == ValType::Integer && sv->i != 0)
+                            continue;
+                    }
+                    if (nec_i != kNoProp) {
+                        const Value* nv = w.prop_of(*lp, nec_i);
+                        if (nv && nv->type == ValType::Integer && nv->i != 0)
+                            continue;
+                    }
+                    const std::int64_t lcap =
+                        w.prop_int(*lp, lc_i, 0);
+                    if (lcap <= 0) continue;
+                    const std::int64_t lload =
+                        w.prop_int(*lp, cl_i, 0);
+                    if (lload * 1000 / lcap < 800) continue;
+                    if (rup_i != kNoProp &&
+                        w.prop_int(*lp, rup_i, 0) != 0) continue;
+                    const Value* ls = sl_p != kNoProp
+                        ? w.prop_of(*lp, sl_p) : nullptr;
+                    if (!ls || ls->type != ValType::Text ||
+                        ls->s != hit_slot->s) continue;
+                    // rupture: wall bursts, contents spill as contamination
+                    setp(rel3.a, rup_i, w.prop_int(*lp, rup_i, 0), 1);
+                    setp(rel3.a, pd_integ->id,
+                         w.prop_int(*lp, pd_integ->id, 500), 0);
+                    if (br_p != kNoProp)
+                        setp(rel3.a, br_p, w.prop_int(*lp, br_p, 0),
+                             std::min<std::int64_t>(1000,
+                                 w.prop_int(*lp, br_p, 0) + 300));
+                    setp(rel3.a, cl_i, lload, 0);
+                    if (ca_i != kNoProp && w.prop_of(*lp, ca_i))
+                        setp(rel3.a, ca_i,
+                             w.prop_int(*lp, ca_i, 0), 0);
+                    // spilled contents infect sibling parts (peritonitis)
+                    std::int64_t spill = 0;
+                    if (em_i != kNoProp && cnt_i != kNoProp) {
+                        const Value* ev = w.prop_of(*lp, em_i);
+                        if (ev && ev->type == ValType::Text &&
+                            !ev->s.empty())
+                            if (const MaterialDef* wm =
+                                    w.materials.find_name(ev->s)) {
+                                Entity tmp; tmp.material = wm->id;
+                                spill = w.prop_int(tmp, cnt_i, 0) / 4;
+                            }
+                    }
+                    if (spill > 0 && inf_i != kNoProp)
+                        for (const Relation& rel4 :
+                             w.relations_of(tid, "part_of")) {
+                            if (rel4.b != tid || rel4.a == rel3.a)
+                                continue;
+                            const Entity* sib = w.find(rel4.a);
+                            if (!sib || !sib->alive) continue;
+                            setp(rel4.a, inf_i,
+                                 w.prop_int(*sib, inf_i, 0),
+                                 std::min<std::int64_t>(1000,
+                                     w.prop_int(*sib, inf_i, 0) + spill));
+                        }
+                    if (pa_p != kNoProp)
+                        setp(tid, pa_p, body_pain, 1000);
+                    r.notes.push_back(
+                        "lumen rupture under impact (pressure " +
+                        std::to_string(lload * 1000 / lcap) + ")");
+                }
+            }
+        }
+        // vital organ (brain/heart, vital_organ==1000) destroyed or
+        // severed -> the body dies on the spot.
+        const bool vital_dead = vital >= 1000 &&
+            (part_destroyed || amputate || organ_dmg > 0);
+        const PropId body_integ = pid(w, "integrity");
+        if (vital_dead && body_integ != kNoProp) {
+            const std::int64_t bi = w.prop_int(*t, body_integ, 500);
+            setp(tid, body_integ, bi, 0);
+        }
+        setp(tid, pa_p, body_pain, n_pain);
+        if (striker != kNoEntity && striker != part_id)
+            wear_total += reaction_wear(w, striker, integ - (amputate ? 60 : n_integ), hard);
+        // coated edge (Phase 12.6): a blade/point that actually breaks the
+        // skin carries its coating into the blood — toxin straight into
+        // toxin_load, a pathogen strain as a fresh ActiveInfection.
+        bool injected = false;
+        if (sharp && dmg >= 50) {
+            const PropId tox_p = pid(w, "toxin_load");
+            if (b.coat_toxin > 0 && tox_p != kNoProp) {
+                const std::int64_t tv = w.prop_int(*t, tox_p, 0);
+                setp(tid, tox_p, tv, std::min<std::int64_t>(1000, tv + b.coat_toxin));
+                injected = true;
+            }
+            if (b.coat_strain > 0) {
+                const Entity* se = w.find(static_cast<EntityId>(b.coat_strain));
+                if (se && se->alive && !w.host_immune_to(tid, b.coat_strain)) {
+                    SpawnSpec s;
+                    s.kind = "infection"; s.pos = t->pos;
+                    auto sp = [&](const char* nm, std::int64_t v) {
+                        const PropId q = pid(w, nm);
+                        if (q != kNoProp) s.props.set(q, Value::integer(v));
+                    };
+                    sp("pathogen_strain", b.coat_strain);
+                    sp("pathogen_load", 300); sp("antibody_level", 0);
+                    sp("infection_elapsed", 0); sp("infection_load_accum", 0);
+                    sp("infection_ab_accum", 0); sp("shed_accum", 0);
+                    s.rel_from.push_back({"carries", tid});
+                    r.spawns.push_back(std::move(s));
+                    injected = true;
+                }
+            }
+        }
+        std::ostringstream n;
+        n << "victim=" << tid << " mech="
+          << (b.mech ? b.mech : (sharp ? "bleed" : "blunt"))
+          << (injected ? " mech=toxin" : "") << " armor=" << apr << " ";
+        n << "impact E=" << E << " on part " << part_id << " of " << tid
+          << " part=" << part_id
+          << " dmg=" << dmg << (amputate ? " AMPUTATED" : "")
+          << (sharp ? " sharp" : " blunt");
+        r.notes.push_back(n.str());
+        r.possible = true;
+        return;
+    }
+
+    const std::int64_t hard = w.prop_int(*t, pd_hard->id, 300);
+    const std::int64_t brit = w.prop_int(*t, pd_brit->id, 400);
+    const std::int64_t mass = w.prop_int(*t, pd_mass->id, 1000);
+    const std::int64_t integ = w.prop_int(*t, pd_integ->id, 500);
+
+    const std::int64_t mass_factor = 1000 + mass / 50;      // heavier absorbs more
+    std::int64_t dmg = E * (1000 + 2 * brit) / ((hard + 500) * mass_factor / 1000);
+    dmg = dmg * (1000 + b.blunt) / 1000;                     // weapon mass channel
+    if (dmg < 1 && E > 0) dmg = 1;
+    // brittle targets fracture when the hit exceeds what their surface can take
+    const bool fracture = dmg * 4 > (hard + brit) && brit > 600;
+    const std::int64_t new_integ = fracture ? 0 : std::max<std::int64_t>(0, integ - dmg);
+
+    StateChange ch;
+    ch.entity = tid; ch.prop = pd_integ->id; ch.had_before = true;
+    ch.before = Value::integer(integ);
+    ch.after = Value::integer(new_integ);
+    r.changes.push_back(ch);
+    if (striker != kNoEntity && striker != tid)
+        wear_total += reaction_wear(w, striker, integ - new_integ, hard);
+
+    std::ostringstream n;
+    n << "impact E=" << E << " on " << tid
+      << " hard=" << hard << " brit=" << brit << " mass=" << mass
+      << " -> dmg=" << dmg << (fracture ? " FRACTURE" : "");
+    r.notes.push_back(n.str());
+    r.possible = true;
+}
+}  // namespace lawutil
+
 LawId PhysicsModel::id() const { return 1; }
 
 bool PhysicsModel::supports(const World& w, const InteractionContext& ctx) const {
@@ -56,6 +438,7 @@ PredictionResult PhysicsModel::predict(const World& w, const InteractionContext&
     const PropId reach_pid = pid(w, "reach"), energy_pid = pid(w, "energy"),
                  contained_pid = pid(w, "contained");
     const EntityId striker = wielded_tool(w, ctx.actor);
+    const Blow blow = blow_of(w, striker, tedge);
     std::int64_t wear_total = 0;
 
     for (EntityId tid : ctx.targets) {
@@ -66,300 +449,7 @@ PredictionResult PhysicsModel::predict(const World& w, const InteractionContext&
             r.notes.push_back("target " + std::to_string(tid) + " out of reach");
             continue;
         }
-        // Phase 10: anatomical bodies route the blow into ONE body part —
-        // picked deterministically by part_size weight and a hash of the
-        // blow (same inputs -> same part, replay-safe).
-        std::vector<EntityId> parts;
-        std::vector<std::int64_t> psz;
-        std::int64_t wsum = 0;
-        const PropId sev_pid = pid(w, "severed");
-        const PropId role_chk = pid(w, "part_role");
-        for (const Relation& rel : w.relations_of(tid, "part_of")) {
-            if (rel.b != tid) continue;
-            const Entity* p = w.find(rel.a);
-            if (!p || !p->alive) continue;
-            // anatomy parts carry part_role; ordinary composite structure
-            // parts (spear head/shaft) do not -> they keep physics damage.
-            if (role_chk != kNoProp) {
-                const Value* rv = w.prop_of(*p, role_chk);
-                if (!rv || rv->type != ValType::Text || rv->s.empty()) continue;
-            }
-            const PropId sev = sev_pid;
-            if (sev != kNoProp) {
-                const Value* sv = w.prop_of(*p, sev);
-                if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
-            }
-            const std::int64_t sz =
-                w.prop_int(*p, pid(w, "part_size"), 200);
-            parts.push_back(rel.a); psz.push_back(sz); wsum += sz;
-        }
-        if (!parts.empty()) {
-            // deterministic weighted pick
-            std::uint64_t h = static_cast<std::uint64_t>(tid) * 0x9E3779B97F4A7C15ull
-                ^ static_cast<std::uint64_t>(E) * 0xBF58476D1CE4E5B9ull
-                ^ static_cast<std::uint64_t>(w.clock_.tick()) * 0x94D049BB133111EBull;
-            h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
-            std::int64_t pick = static_cast<std::int64_t>(h % wsum), pi = 0;
-            while (pick >= psz[pi]) { pick -= psz[pi]; ++pi; }
-            const EntityId part_id = parts[pi];
-            const Entity* part = w.find(part_id);
-            const std::int64_t hard = w.prop_int(*part, pd_hard->id, 300);
-            const std::int64_t brit = w.prop_int(*part, pd_brit->id, 400);
-            const std::int64_t mass = w.prop_int(*part, pd_mass->id, 1000);
-            const std::int64_t integ = w.prop_int(*part, pd_integ->id, 500);
-            const std::int64_t mass_factor = 1000 + mass / 50;
-            std::int64_t dmg = E * (1000 + 2 * brit) /
-                ((hard + 500) * mass_factor / 1000);
-            if (dmg < 1 && E > 0) dmg = 1;
-            const bool sharp = tedge >= 350;
-            const PropId br_p = pid(w, "bleed_rate"),
-                         fr_p = pid(w, "fracture_level"),
-                         pv_p = pid(w, "vital_organ"),
-                         rl_p = pid(w, "part_role"),
-                         sl_p = pid(w, "body_slot"),
-                         cn_p = pid(w, "contained"),
-                         pa_p = pid(w, "pain_level"),
-                         bo_p = pid(w, "bleed_rate");
-            // layered response: blunt -> fracture + deep bruising bleed;
-            // sharp -> integ loss + heavy soft-tissue bleed; bone parts
-            // (brittleness>700) fracture under both.
-            std::int64_t n_integ = integ, n_bleed = 0, n_frac = 0;
-            if (sharp) {
-                n_integ = std::max<std::int64_t>(0, integ - dmg);
-                n_bleed = std::min<std::int64_t>(1000,
-                    w.prop_int(*part, br_p, 0) + dmg * 3 / 4);
-            } else {
-                n_integ = std::max<std::int64_t>(0, integ - dmg * 3 / 5);
-                n_bleed = std::min<std::int64_t>(1000,
-                    w.prop_int(*part, br_p, 0) + dmg / 20);
-            }
-            if (brit > 700) n_frac = std::min<std::int64_t>(1000,
-                w.prop_int(*part, fr_p, 0) + dmg / 3);
-            const std::int64_t vital = pv_p != kNoProp
-                ? w.prop_int(*part, pv_p, 0) : 0;
-            const bool amputate = sharp && dmg >= integ && vital < 1000;
-            const bool part_destroyed = n_integ <= 0 || (sharp && dmg >= integ);
-
-            // secondary organ hit: sharp penetration damages the vital
-            // organ sharing this part's body_slot (heart/lung/brain).
-            EntityId organ_id = kNoEntity;
-            std::int64_t organ_dmg = 0;
-            if (sharp && dmg > 300 && sl_p != kNoProp) {
-                const Value* myslot = w.prop_of(*part, sl_p);
-                if (myslot && myslot->type == ValType::Text) {
-                    for (const Relation& rel2 : w.relations_of(tid, "part_of")) {
-                        if (rel2.b != tid || rel2.a == part_id) continue;
-                        const Entity* q = w.find(rel2.a);
-                        if (!q || !q->alive) continue;
-                        const Value* sv = sev_pid != kNoProp ? w.prop_of(*q, sev_pid) : nullptr;
-                        if (sv && sv->type == ValType::Integer && sv->i != 0) continue;
-                        if (role_chk != kNoProp) {
-                            const Value* qr = w.prop_of(*q, role_chk);
-                            if (!qr || qr->type != ValType::Text || qr->s.empty()) continue;
-                        }
-                        const Value* qs = w.prop_of(*q, sl_p);
-                        if (!qs || qs->type != ValType::Text || qs->s != myslot->s) continue;
-                        if (pv_p != kNoProp && w.prop_int(*q, pv_p, 0) >= 800) {
-                            organ_id = rel2.a; organ_dmg = dmg / 2; break;
-                        }
-                    }
-                }
-            }
-
-            // pain on the body: sharp wounds hurt more; amputation maxes.
-            std::int64_t pain_add = amputate ? 1000 : (sharp ? dmg : dmg / 2);
-            const std::int64_t body_pain = pa_p != kNoProp
-                ? w.prop_int(*t, pa_p, 0) : 0;
-            const std::int64_t n_pain = std::min<std::int64_t>(1000, body_pain + pain_add);
-
-            auto setp = [&](EntityId id, PropId p, std::int64_t before, std::int64_t after) {
-                if (p == kNoProp || before == after) return;
-                StateChange ch; ch.entity = id; ch.prop = p; ch.had_before = true;
-                ch.before = Value::integer(before); ch.after = Value::integer(after);
-                r.changes.push_back(ch);
-            };
-            setp(part_id, pd_integ->id, integ, amputate ? 60 : n_integ);
-            if (br_p != kNoProp) setp(part_id, br_p, w.prop_int(*part, br_p, 0), amputate ? 1000 : n_bleed);
-            if (fr_p != kNoProp && n_frac) setp(part_id, fr_p, w.prop_int(*part, fr_p, 0), n_frac);
-            if (amputate) {
-                // severed part stays alive at the scene: severed=1,
-                // contained=false -> physically independent entity.
-                const PropId sv_p = pid(w, "severed");
-                const std::int64_t sv0 = sv_p != kNoProp ? w.prop_int(*part, sv_p, 0) : 0;
-                setp(part_id, sv_p, sv0, 1);
-                if (cn_p != kNoProp) {
-                    // contained is a BOOLEAN prop — integer write would
-                    // break is_contained's ValType::Boolean check.
-                    const Value* cv = w.prop_of(*part, cn_p);
-                    const bool was = cv && cv->type == ValType::Boolean && cv->b;
-                    if (was) {
-                        StateChange ch; ch.entity = part_id; ch.prop = cn_p;
-                        ch.had_before = true; ch.before = Value::boolean(true);
-                        ch.after = Value::boolean(false);
-                        r.changes.push_back(ch);
-                    }
-                }
-                // the edge is KEPT as anatomical record; `severed` is the
-                // detach truth (lets anatomy_function still count it).
-                // stump bleeding moves onto the body's own bleed_rate.
-                const std::int64_t bbr = bo_p != kNoProp ? w.prop_int(*t, bo_p, 0) : 0;
-                setp(tid, bo_p, bbr, std::min<std::int64_t>(1000, bbr + 700));
-                // severed arm drops whatever the body was wielding
-                if (rl_p != kNoProp) {
-                    const Value* rv = w.prop_of(*part, rl_p);
-                    if (rv && rv->type == ValType::Text && rv->s == "arm") {
-                        for (const Relation& wr : w.relations_of(tid, "wielding"))
-                            if (wr.a == tid)
-                                r.rel_changes.push_back({tid, "wielding", wr.b, false});
-                    }
-                }
-            }
-            if (organ_id != kNoEntity) {
-                const Entity* op = w.find(organ_id);
-                if (op) {
-                    const std::int64_t oi = w.prop_int(*op, pd_integ->id, 500);
-                    setp(organ_id, pd_integ->id, oi, std::max<std::int64_t>(0, oi - organ_dmg));
-                    if (br_p != kNoProp)
-                        setp(organ_id, br_p, w.prop_int(*op, br_p, 0),
-                             std::min<std::int64_t>(1000, w.prop_int(*op, br_p, 0) + organ_dmg / 2));
-                }
-            }
-            // Phase 10.3 lumen rupture: a blow landing on a body region
-            // bursts any distended hollow organ (lumen_capacity>0,
-            // luminal pressure>=800) sharing that region's body_slot.
-            // Fully generic — slot names, capacities and waste materials
-            // all come from data; no organ or disease names in code.
-            {
-                const PropId lc_i = pid(w, "lumen_capacity"),
-                           cl_i = pid(w, "contents_load"),
-                           ca_i = pid(w, "contents_accum"),
-                           rup_i = pid(w, "ruptured"),
-                           inf_i = pid(w, "infection_level"),
-                           em_i = pid(w, "evacuate_material"),
-                           nec_i = pid(w, "necrotic"),
-                           cnt_i = pid(w, "contamination");
-                const Value* hit_slot = sl_p != kNoProp
-                    ? w.prop_of(*part, sl_p) : nullptr;
-                if (lc_i != kNoProp && cl_i != kNoProp && rup_i != kNoProp &&
-                    hit_slot && hit_slot->type == ValType::Text) {
-                    for (const Relation& rel3 : w.relations_of(tid, "part_of")) {
-                        if (rel3.b != tid) continue;
-                        const Entity* lp = w.find(rel3.a);
-                        if (!lp || !lp->alive) continue;
-                        if (sev_pid != kNoProp) {
-                            const Value* sv = w.prop_of(*lp, sev_pid);
-                            if (sv && sv->type == ValType::Integer && sv->i != 0)
-                                continue;
-                        }
-                        if (nec_i != kNoProp) {
-                            const Value* nv = w.prop_of(*lp, nec_i);
-                            if (nv && nv->type == ValType::Integer && nv->i != 0)
-                                continue;
-                        }
-                        const std::int64_t lcap =
-                            w.prop_int(*lp, lc_i, 0);
-                        if (lcap <= 0) continue;
-                        const std::int64_t lload =
-                            w.prop_int(*lp, cl_i, 0);
-                        if (lload * 1000 / lcap < 800) continue;
-                        if (rup_i != kNoProp &&
-                            w.prop_int(*lp, rup_i, 0) != 0) continue;
-                        const Value* ls = sl_p != kNoProp
-                            ? w.prop_of(*lp, sl_p) : nullptr;
-                        if (!ls || ls->type != ValType::Text ||
-                            ls->s != hit_slot->s) continue;
-                        // rupture: wall bursts, contents spill as contamination
-                        setp(rel3.a, rup_i, w.prop_int(*lp, rup_i, 0), 1);
-                        setp(rel3.a, pd_integ->id,
-                             w.prop_int(*lp, pd_integ->id, 500), 0);
-                        if (br_p != kNoProp)
-                            setp(rel3.a, br_p, w.prop_int(*lp, br_p, 0),
-                                 std::min<std::int64_t>(1000,
-                                     w.prop_int(*lp, br_p, 0) + 300));
-                        setp(rel3.a, cl_i, lload, 0);
-                        if (ca_i != kNoProp && w.prop_of(*lp, ca_i))
-                            setp(rel3.a, ca_i,
-                                 w.prop_int(*lp, ca_i, 0), 0);
-                        // spilled contents infect sibling parts (peritonitis)
-                        std::int64_t spill = 0;
-                        if (em_i != kNoProp && cnt_i != kNoProp) {
-                            const Value* ev = w.prop_of(*lp, em_i);
-                            if (ev && ev->type == ValType::Text &&
-                                !ev->s.empty())
-                                if (const MaterialDef* wm =
-                                        w.materials.find_name(ev->s)) {
-                                    Entity tmp; tmp.material = wm->id;
-                                    spill = w.prop_int(tmp, cnt_i, 0) / 4;
-                                }
-                        }
-                        if (spill > 0 && inf_i != kNoProp)
-                            for (const Relation& rel4 :
-                                 w.relations_of(tid, "part_of")) {
-                                if (rel4.b != tid || rel4.a == rel3.a)
-                                    continue;
-                                const Entity* sib = w.find(rel4.a);
-                                if (!sib || !sib->alive) continue;
-                                setp(rel4.a, inf_i,
-                                     w.prop_int(*sib, inf_i, 0),
-                                     std::min<std::int64_t>(1000,
-                                         w.prop_int(*sib, inf_i, 0) + spill));
-                            }
-                        if (pa_p != kNoProp)
-                            setp(tid, pa_p, body_pain, 1000);
-                        r.notes.push_back(
-                            "lumen rupture under impact (pressure " +
-                            std::to_string(lload * 1000 / lcap) + ")");
-                    }
-                }
-            }
-            // vital organ (brain/heart, vital_organ==1000) destroyed or
-            // severed -> the body dies on the spot.
-            const bool vital_dead = vital >= 1000 &&
-                (part_destroyed || amputate || organ_dmg > 0);
-            const PropId body_integ = pid(w, "integrity");
-            if (vital_dead && body_integ != kNoProp) {
-                const std::int64_t bi = w.prop_int(*t, body_integ, 500);
-                setp(tid, body_integ, bi, 0);
-            }
-            setp(tid, pa_p, body_pain, n_pain);
-            if (striker != kNoEntity && striker != part_id)
-                wear_total += reaction_wear(w, striker, integ - (amputate ? 60 : n_integ), hard);
-            std::ostringstream n;
-            n << "impact E=" << E << " on part " << part_id << " of " << tid
-              << " part=" << part_id
-              << " dmg=" << dmg << (amputate ? " AMPUTATED" : "")
-              << (sharp ? " sharp" : " blunt");
-            r.notes.push_back(n.str());
-            r.possible = true;
-            continue;
-        }
-
-        const std::int64_t hard = w.prop_int(*t, pd_hard->id, 300);
-        const std::int64_t brit = w.prop_int(*t, pd_brit->id, 400);
-        const std::int64_t mass = w.prop_int(*t, pd_mass->id, 1000);
-        const std::int64_t integ = w.prop_int(*t, pd_integ->id, 500);
-
-        const std::int64_t mass_factor = 1000 + mass / 50;      // heavier absorbs more
-        std::int64_t dmg = E * (1000 + 2 * brit) / ((hard + 500) * mass_factor / 1000);
-        if (dmg < 1 && E > 0) dmg = 1;
-        // brittle targets fracture when the hit exceeds what their surface can take
-        const bool fracture = dmg * 4 > (hard + brit) && brit > 600;
-        const std::int64_t new_integ = fracture ? 0 : std::max<std::int64_t>(0, integ - dmg);
-
-        StateChange ch;
-        ch.entity = tid; ch.prop = pd_integ->id; ch.had_before = true;
-        ch.before = Value::integer(integ);
-        ch.after = Value::integer(new_integ);
-        r.changes.push_back(ch);
-        if (striker != kNoEntity && striker != tid)
-            wear_total += reaction_wear(w, striker, integ - new_integ, hard);
-
-        std::ostringstream n;
-        n << "impact E=" << E << " on " << tid
-          << " hard=" << hard << " brit=" << brit << " mass=" << mass
-          << " -> dmg=" << dmg << (fracture ? " FRACTURE" : "");
-        r.notes.push_back(n.str());
-        r.possible = true;
+        deliver_blow(w, r, tid, E, blow, striker, wear_total);
     }
     // precise hands damage their own tools less (collateral wear proxy
     // for self-injury: 1000 -> 1.0x, 200 -> 1.4x, 2500 -> 0.25x)

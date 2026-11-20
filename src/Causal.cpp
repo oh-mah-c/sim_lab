@@ -37,18 +37,46 @@ std::uint64_t event_digest(const CausalEvent& ev, std::uint64_t h) {
 }
 }  // namespace
 
+namespace {
+// heap estimate of one event (exact enough to bound RAM; deterministic)
+std::size_t event_bytes(const CausalEvent& e) {
+    std::size_t b = sizeof(CausalEvent) + e.evidence.capacity() + e.action.capacity() + e.failure.capacity();
+    b += e.changes.capacity() * sizeof(StateChange);
+    for (const StateChange& c : e.changes) b += c.before.s.capacity() + c.after.s.capacity();
+    b += e.participants.capacity() * sizeof(EntityId) + e.parent_events.capacity() * sizeof(EventId);
+    b += e.applied_laws.capacity() * sizeof(LawId) + e.spawned.capacity() * sizeof(EntityId);
+    b += e.conditions.capacity() * sizeof(Condition);
+    return b;
+}
+}  // namespace
+
 EventId EventLedger::append(CausalEvent e) {
     const EventId id = next_id_++;
     e.id = id;
+    retained_bytes_ += event_bytes(e);
     history_.push_back(std::move(e));
     // Amortized window eviction: only when the buffer exceeds window+batch
-    // do we drop kEvictBatch oldest events — O(1) amortized, never per-append.
-    if (history_.size() > kMaxWindow + kEvictBatch) {
+    // (or the byte budget) do we drop the oldest events — O(1) amortized.
+    const bool over_count = history_.size() > kMaxWindow + kEvictBatch;
+    const bool over_bytes = byte_budget_ > 0 && retained_bytes_ > byte_budget_ &&
+                            history_.size() > 1;
+    if (over_count || over_bytes) {
+        std::size_t n = over_count ? kEvictBatch : 0;
+        if (over_bytes) {          // evict until 3/4 of the budget is free again
+            std::size_t freed = 0, need = retained_bytes_ - byte_budget_ * 3 / 4;
+            std::size_t k = 0;
+            while (k + 1 < history_.size() && freed < need) freed += event_bytes(history_[k++]);
+            n = std::max(n, k);
+        }
+        n = std::min(n, history_.size() - 1);
         std::uint64_t h = archived_hash_;
-        for (std::size_t i = 0; i < kEvictBatch; ++i)
+        for (std::size_t i = 0; i < n; ++i) {
             h = event_digest(history_[i], h);
+            retained_bytes_ -= std::min(retained_bytes_, event_bytes(history_[i]));
+        }
         archived_hash_ = h;
-        history_.erase(history_.begin(), history_.begin() + kEvictBatch);
+        history_.erase(history_.begin(), history_.begin() + static_cast<std::ptrdiff_t>(n));
+        if (over_bytes) history_.shrink_to_fit();
     }
     return id;
 }

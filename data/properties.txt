@@ -423,3 +423,42 @@ decay_accum            integer units                   domain=physical # enclosu
 # portal entity: a passage node on an enclosure's edge; destination is
 # resolved spatially (nearest other enclosure, else the outside).
 portal_open            integer units        range 0 1    domain=physical # portal: passage currently passable
+
+# ---- myth, oral literature, ritual & diplomacy (Phase 12.5) -------------------
+# Cognitive axes read off the agent entity (species defaults, per-individual
+# overrides) — agency attribution and rhythmic sensitivity, never labels.
+agency_attribution_bias integer permille     range 0 1000   domain=cognitive # agent: tendency to read will into unexplained causal shocks
+rhythmic_meter_bias      integer permille     range 0 1000   domain=cognitive # agent: sensitivity to syllable/meter repetition in retelling
+# lexical_entry / oral tradition state (World Truth on the word itself).
+transmission_count       integer units                   domain=social     # lexical_entry: times the word/clause crossed a speaker's lips
+poetic_cadence           integer permille     range 0 1000   domain=social     # lexical_entry: meter match of its rendered phoneme chain
+oral_genre               text     none                     domain=social     # lexical_entry: "" / proverb / epic once cadence+transmission crystallize
+# semantic_concept / inscription: the supernatural reading of an unexplained
+# causal key — agent name and appeasement are DERIVED, never a god list.
+sacred_key               text     none                     domain=social     # entity: causal key this concept mythologizes
+sacred_agent             text     none                     domain=social     # entity: deterministic will-attribution name (seed-derived)
+appeasement_action       text     none                     domain=social     # entity: derived soothing act (heat/share/...) for the rite
+sacred_valence           text     none                     domain=social     # entity: "curse" (trauma-born taboo) / "blessing" (salvation-born veneration)
+# language entity: communal diplomacy ledger — "peer_lang:trust;" pairs,
+# symmetric across both tables; treaty markers ride the same text.
+diplo_table              text     none                     domain=social     # language: inter-community trust ledger
+treaty_clause            text     none                     domain=social     # inscription: non_aggression / free_trade / tribute_pact
+
+# ---- warfare, logistics & emergent weapons R&D (Phase 12.6) -------------------
+# Weapon/armor/energetic channels are MATERIAL properties; composites take the
+# max of their parts (CompositionModel). No weapon, armor or charge names exist
+# in code — a "spear", "bow" or "bomb" is whatever these numbers add up to.
+edge_sharpness           integer permille     range 0 1000   domain=physical # pressure concentration of an edge/point: cuts soft tissue (bleed)
+blunt_mass               integer permille     range 0 1000   domain=physical # impact mass density: impulse through soft armor into bone/organs
+elasticity               integer permille     range 0 1000   domain=physical # stored strain energy of a flexing frame (launchers)
+armor_penetration_resist integer permille     range 0 1000   domain=physical # worn/held protection: blocks cutting, blunts impulse by 1/3
+volatility               integer permille     range 0 1000   domain=physical # ignition sensitivity of an energetic material
+expansion_force          integer permille     range 0 1000   domain=physical # gas expansion pressure when it ignites (blast)
+coat_toxin               integer permille     range 0 1000   domain=physical # weapon: toxin a penetrating edge injects (toxin_load)
+coat_strain              integer units                    domain=physical # weapon: pathogen strain id a penetrating edge injects
+launch_impulse           integer units        range 0 1000000 domain=physical # emergent: elastic frame x string tension (composite)
+# agent military state (World Truth on the agent entity)
+combat_morale            integer permille     range 0 1000   domain=social   # fighting spirit; < 200 = the soldier routs
+routed                   integer units        range 0 1    domain=social   # 1 = fled/broken ranks (morale collapse)
+war_target               integer units                    domain=social   # language_id of the community this soldier marches against
+supply_depot_link        integer units                    domain=social   # enclosure id whose stores feed this soldier

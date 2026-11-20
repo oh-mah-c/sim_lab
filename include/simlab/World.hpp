@@ -16,6 +16,7 @@
 #include "Properties.hpp"
 #include "Processes.hpp"
 #include "Relations.hpp"
+#include "SharedReg.hpp"
 #include "Species.hpp"
 #include "Rng.hpp"
 #include "Spatial.hpp"
@@ -70,6 +71,8 @@ public:
     EntityId create_entity(const std::string& kind_name, MaterialId material,
                            Vec2 pos, const PropertyBag& overrides = {});
     Entity* find(EntityId id);
+    // Every entity ever created with this kind, creation order (alive or not).
+    const std::vector<EntityId>& entities_of_kind(const KindName& k) const;
     const Entity* find(EntityId id) const;
     std::vector<EntityId> entities_near(Vec2 p, std::int64_t radius) const;
     void destroy_entity(EntityId id);       // marks dead; id is never reused
@@ -186,6 +189,37 @@ public:
                 gen_cells_.emplace(gx, gy);
     }
 
+    // Herd immunity: does `host` carry immune memory matching the antigen
+    // of the strain entity `strain_id`? Used by every transmission route
+    // (and by coated weapons, Phase 12.6).
+    bool host_immune_to(EntityId host, std::int64_t strain_id) const;
+
+    // ---- speculative planning copy (Bước 3 / A1) ----
+    // Set ONLY on the throw-away worlds plan_multi() thinks with. A
+    // speculative world still runs the physics and body laws that decide
+    // whether an action works and what it does to the agent (law predict/
+    // commit; the thinking agent's needs/anatomy/infection via flush_needs;
+    // heat dissipation; its own memory decay), but freezes the rest of the
+    // local world: no per-entity metabolize pass, ecology_tick,
+    // language_tick, political_drift, myth_drift, terrain_wear_decay,
+    // witness learning or *_from_event social hooks.
+    // Never saved or hashed; real worlds keep it false.
+    bool speculative = false;
+    // Concurrent-time round (Primordial game driver, DriverState::concurrent):
+    // while set, interact() does NOT advance the clock per action; it keeps
+    // the longest action duration in `deferred_dt` and the driver advances
+    // the world once per round by that amount (actions of one round happen
+    // side by side, so a large population no longer starves each member of
+    // turns). Transient: never saved, hashed or cloned; default off.
+    bool defer_time = false;
+    // Physics ruleset bits (saved v19, hashed only when non-zero so legacy
+    // worlds keep their exact state_hash). kRulePrimordial (Genesis worlds):
+    // an awake animal resists being eaten whole; a living organism is not
+    // a hand tool. Laws read it; nothing else changes it after creation.
+    static constexpr std::uint32_t kRulePrimordial = 1u;
+    std::uint32_t ruleset = 0;
+    std::int64_t deferred_dt = 0;
+
     // ---- public state ----
     std::uint64_t seed = 0;
     // Worldgen provenance (0/empty when the world was not generated).
@@ -194,12 +228,14 @@ public:
     int gen_origin_x = 0, gen_origin_y = 0;   // global cell offset of terrain
     int gen_sea_level = 200;                  // worldgen config persisted for replay/validation
     SimulationClock clock_;
-    PropertyRegistry props;
-    MaterialRegistry materials;
-    DepositRegistry deposits;
-    ProcessRegistry processes;
-    SpeciesRegistry species;           // habitat data (data/species.txt, optional)
-    InfluxRegistry influx;             // edge-migration zones (data/influx.txt, optional)
+    // Content registries: immutable after load_content, SHARED (copy-on-write)
+    // between a world and its clones — see SharedReg.hpp.
+    SharedReg<PropertyRegistry> props;
+    SharedReg<MaterialRegistry> materials;
+    SharedReg<DepositRegistry> deposits;
+    SharedReg<ProcessRegistry> processes;
+    SharedReg<SpeciesRegistry> species;   // habitat data (data/species.txt, optional)
+    SharedReg<InfluxRegistry> influx;     // edge-migration zones (data/influx.txt, optional)
     RelationshipGraph relations;
     // Weighted social ties between agents (Phase 8): key = Relation{a,type,b}
     // ("trust"/"debt"/"authority"/...), value = signed weight [-1000,1000].
@@ -233,6 +269,8 @@ private:
     void social_tithe(CausalEvent& ev, EntityId actor,
                       const std::vector<EntityId>& spawned);
     void metabolize(std::int64_t dt);
+    // Phase 12.6: combat_morale drift toward the soldier's situation target.
+    void morale_drift(Entity& e, std::uint64_t ticks, CausalEvent& ev);
     // Phase 9 LOD helpers: need-drift math factored out so interact() can
     // flush pending drift for its participants BEFORE law prediction —
     // a dormant entity must present current needs to the laws that judge it.
@@ -390,9 +428,7 @@ private:
     // every LexicalEntry rendered as raw phoneme/glyph strings (seeds ->
     // syllable stream via species acoustics) with the objective chronicle
     // of its concept and the community's deciphered_ratio (0..1000).
-    // Herd immunity: does `host` carry immune memory matching the antigen
-    // of the strain entity `strain_id`? Used by every transmission route.
-    bool host_immune_to(EntityId host, std::int64_t strain_id) const;
+
     // Queue an ActiveInfection SpawnSpec on `host` for `strain_id` —
     // deduped against infections already pending in `out` this pass.
     void queue_infection(std::vector<SpawnSpec>& out, EntityId host,
@@ -406,6 +442,9 @@ private:
     // grievance drift, revolt. Accumulator-exact like decay_minds; prop
     // consequences ride one ledgered CausalEvent per call.
     void political_drift(std::int64_t n);
+    // Phase 12.5: per-mind mythogenesis accumulator — unexplained shocks
+    // crystallize into sacred beliefs + semantic_concept entities.
+    void myth_drift(std::int64_t n);
     // Phase 12.4 architecture: per-entity structural drift inside
     // metabolize — enclosure weathering (decay_accum Euclid), collapse
     // into debris + occupant impact, orphan portal reaping. Also scans
@@ -422,6 +461,10 @@ private:
 
     std::map<std::string, std::unique_ptr<Rng>> rngs_;
     std::unordered_map<EntityId, std::size_t> index_;
+    // kind -> entity ids in CREATION order (same relative order as
+    // `entities`, dead included: callers filter alive exactly as their old
+    // full scans did). Keyed by the interned kind pointer.
+    std::unordered_map<const std::string*, std::vector<EntityId>> by_kind_;
     std::map<EntityId, EventId> touched_;
     std::vector<std::uint8_t> mat_need_flags_;        // LOD prefilter (lazy)               // entity -> last causal event that changed/created it   // id -> entities[] slot (lookup only)
     std::set<std::tuple<std::uint32_t, int, int>> gen_spawned_;
@@ -432,3 +475,8 @@ private:
 };
 
 }  // namespace simlab
+
+namespace simlab {
+// Deterministic spoken/written rendering of a language seed (display codec).
+std::string lang_render_word(std::uint32_t seed, std::int64_t syllables, std::uint64_t world_seed);
+}

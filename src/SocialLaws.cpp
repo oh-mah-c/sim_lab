@@ -1,3 +1,5 @@
+#include <string_view>
+#include <unordered_map>
 // SocialLaws.cpp — Phase 8: Social & Cultural Evolution (TODO §12.3/§12.4/§13).
 //
 // One law model, seven generic verbs. NOTHING here names a tribe, kingdom,
@@ -138,7 +140,7 @@ std::vector<CarveEntry> gather_carvings(const World& w, EntityId actor,
     std::vector<CarveEntry> same, other;
     for (const auto& ep : w.entities) {
         const Entity& e = *ep;
-        if (!e.alive || e.kind_name != "lexical_entry") continue;
+        if (!e.alive || e.kind_name != SIMLAB_KIND("lexical_entry")) continue;
         const Value* ck = p_ckey != kNoProp ? w.prop_of(e, p_ckey) : nullptr;
         if (!ck || ck->type != ValType::Text || ck->s != concept_key) continue;
         const Value* gv = p_gs != kNoProp ? w.prop_of(e, p_gs) : nullptr;
@@ -189,7 +191,7 @@ std::vector<ClauseOut> compose_clause(const World& w, const AgentMind* mind,
              std::map<std::int64_t, std::vector<EntityId>>> by_atom;
     for (const auto& ep : w.entities) {
         const Entity& e = *ep;
-        if (!e.alive || e.kind_name != "lexical_entry") continue;
+        if (!e.alive || e.kind_name != SIMLAB_KIND("lexical_entry")) continue;
         const Value* ck = w.prop_of(e, p_ckey);
         const Value* lv = p_lang != kNoProp ? w.prop_of(e, p_lang) : nullptr;
         if (!ck || ck->type != ValType::Text || !lv ||
@@ -228,6 +230,597 @@ std::vector<ClauseOut> compose_clause(const World& w, const AgentMind* mind,
         if (!best->second.entries.empty()) out.push_back(best->second);
     }
     return out;
+}
+
+// ---- Phase 12.5: ritual, consecration & diplomacy ----------------------------
+
+// `language` registry entity for a language_id (0 when the community never
+// coalesced — diplomacy may spawn it on first contact).
+EntityId diplo_lang_entity(const World& w, std::int64_t lang) {
+    const PropId p_ln = pid(w, "language_name");
+    if (p_ln == kNoProp || lang <= 0) return kNoEntity;
+    for (const EntityId kid_ : w.entities_of_kind(SIMLAB_KIND("language"))) {
+        const Entity& e = *w.find(kid_);
+        if (e.alive && e.kind_name == SIMLAB_KIND("language") &&
+            w.prop_int(e, p_ln, 0) == lang)
+            return e.id;
+    }
+    return kNoEntity;
+}
+
+// language_id of an entity (0 = speechless)
+std::int64_t sl_lang_of(const World& w, const Entity& e) {
+    const PropId p = pid(w, "language_id");
+    return p != kNoProp ? w.prop_int(e, p, 0) : 0;
+}
+
+
+// deterministic FNV-1a for seed-derived names (no std::hash portability)
+std::uint32_t sl_fnv(const std::string& s) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (char c : s) { h ^= static_cast<unsigned char>(c);
+                       h *= 1099511628211ull; }
+    return static_cast<std::uint32_t>(h & 0xFFFFFFFFull);
+}
+
+// find the strongest sacred belief key an agent holds ("" = none)
+std::string sacred_key_of(const AgentMind* m, std::int64_t min_conf) {
+    if (!m) return "";
+    std::string best;
+    for (const auto& [bk, bv] : m->beliefs) {
+        if (bk.rfind("sacred:", 0) != 0) continue;
+        if (bv.confidence < min_conf) continue;
+        if (best.empty() || bk < best) best = bk;
+    }
+    return best.empty() ? "" : best.substr(7);
+}
+
+// appeasement act for a sacred key: read the shared concept's derived
+// action; fall back to what the mind can actually do.
+std::string appeasement_for(const World& w, const AgentMind* m,
+                            const std::string& skey) {
+    const PropId p_skey = pid(w, "sacred_key");
+    const PropId p_app  = pid(w, "appeasement_action");
+    if (p_skey != kNoProp && p_app != kNoProp && !skey.empty()) {
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (!e.alive) continue;
+            const Value* v = w.prop_of(e, p_skey);
+            if (v && v->type == ValType::Text && v->s == skey) {
+                const Value* a = w.prop_of(e, p_app);
+                if (a && a->type == ValType::Text && !a->s.empty())
+                    return a->s;
+            }
+        }
+    }
+    if (m && m->known_actions.count("heat")) return "heat";
+    if (m && m->known_actions.count("share")) return "share";
+    return "heat";
+}
+
+// forward decls — defined later in this anonymous namespace
+bool econ_transfer(PredictionResult& r, const World& w,
+                   EntityId from, EntityId to, MaterialId mat,
+                   std::int64_t qty, const Vec2& to_pos);
+struct TradeTerms;
+TradeTerms parse_trade_note(const World& w, const std::string& note);
+
+PredictionResult predict_perform_ritual(const World& w,
+                                        const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId quantity = pid(w, "quantity");
+    const PropId integrity = pid(w, "integrity");
+    const PropId temp_p = pid(w, "temperature");
+    const PropId st_p = pid(w, "sterilization_temp");
+    const PropId cooked_p = pid(w, "cooked_state");
+    const PropId strain_p = pid(w, "strain_ref");
+    const PropId cont_p = pid(w, "contamination");
+    const PropId pl_p = pid(w, "pathogen_load");
+    const PropId flamm_p = pid(w, "flammability");
+    if (ctx.targets.size() > 8) {
+        r.failure = "too many offerings"; return r;
+    }
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor) return r;
+    // authority to convene: a mandate-holder or a convicted believer
+    const AgentMind* am = w.find_mind(ctx.actor);
+    const std::string skey = sacred_key_of(am, 400);
+    const bool mandate = pol_holds_mandate(w, ctx.actor);
+    if (skey.empty() && !mandate) {
+        r.failure = "no sacred conviction or mandate to call a rite";
+        return r;
+    }
+    if (!charge_energy(*actor, energy, 150, r)) return r;
+    // offerings are consumed by the rite — quantity drains, bare relics
+    // break. Their worth is the convener's own marginal valuation (Nhịp 2):
+    // a costly sacrifice convinces, a token one barely registers.
+    std::int64_t offered = 0;
+    for (EntityId oid : ctx.targets) {
+        const Entity* o = w.find(oid);
+        if (!o || !o->alive || is_contained(w, *o, contained)) continue;
+        if (quantity != kNoProp && o->props.get(quantity)) {
+            const std::int64_t q = w.prop_int(*o, quantity, 0);
+            if (q > 0 && o->material != kNoMaterial)
+                offered += econ_total_value(w, ctx.actor, o->material) * q;
+            if (q > 0)
+                set_change(r, oid, quantity, q, 0);
+        } else if (integrity != kNoProp) {
+            const std::int64_t ig = w.prop_int(*o, integrity, 500);
+            set_change(r, oid, integrity, ig, 0);
+        }
+    }
+    // fire appeasement: offerings that burn, or a mind that knows "heat",
+    // raise a real hearth — entities in the ring conduct the heat and any
+    // that cross their material's sterilization_temp are cleansed by the
+    // SAME rule ThermalModel applies (no ritual exemption).
+    const std::string appease = appeasement_for(w, am, skey);
+    bool fire = appease == "heat";
+    if (!fire && flamm_p != kNoProp) {
+        for (EntityId oid : ctx.targets) {
+            const Entity* o = w.find(oid);
+            if (o && w.prop_int(*o, flamm_p, 0) > 300) { fire = true; break; }
+        }
+    }
+    if (fire && temp_p != kNoProp) {
+        constexpr std::int64_t kRing = 200, kHeat = 1200;
+        for (const auto& ep : w.entities) {
+            const Entity& o = *ep;
+            if (!o.alive || o.id == ctx.actor) continue;
+            const Value* tv = o.props.get(temp_p);
+            if (!tv || tv->type != ValType::Integer) continue;
+            const std::int64_t dx = o.pos.x - actor->pos.x;
+            const std::int64_t dy = o.pos.y - actor->pos.y;
+            if (dx * dx + dy * dy > kRing * kRing) continue;
+            const std::int64_t nw = std::min<std::int64_t>(10000,
+                tv->i + kHeat);
+            set_change(r, o.id, temp_p, tv->i, nw);
+            const std::int64_t st = st_p != kNoProp
+                ? w.prop_int(o, st_p, 0) : 0;
+            if (st > 0 && nw >= st) {
+                if (cooked_p != kNoProp &&
+                    w.prop_int(o, cooked_p, 0) != 1000)
+                    set_change(r, o.id, cooked_p,
+                        w.prop_int(o, cooked_p, 0), 1000);
+                if (strain_p != kNoProp &&
+                    w.prop_int(o, strain_p, 0) != 0)
+                    set_change(r, o.id, strain_p,
+                        w.prop_int(o, strain_p, 0), 0);
+                if (cont_p != kNoProp &&
+                    w.prop_int(o, cont_p, 0) != 0)
+                    set_change(r, o.id, cont_p,
+                        w.prop_int(o, cont_p, 0), 0);
+                r.notes.push_back("rite-fire sterilized " +
+                    std::to_string(o.id));
+            }
+        }
+    }
+    // the rite legitimizes: shared awe lifts the convener's standing
+    const PropId p_leg = pid(w, "social_legitimacy");
+    const std::int64_t awe = std::clamp<std::int64_t>(80 + offered / 50, 80, 300);
+    if (p_leg != kNoProp)
+        set_change(r, ctx.actor, p_leg, pol_legitimacy(w, ctx.actor),
+                   std::min<std::int64_t>(2000,
+                       pol_legitimacy(w, ctx.actor) + awe));
+    r.possible = true; r.ticks = 6;
+    r.notes.push_back("rite performed appeasement=" + appease +
+                      (fire ? " fire" : "") + " offered=" +
+                      std::to_string(offered) + " awe=" + std::to_string(awe));
+    return r;
+}
+
+PredictionResult predict_consecrate(const World& w,
+                                    const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId reach = pid(w, "reach");
+    const PropId ins = pid(w, "inscription");
+    if (ctx.targets.size() != 1) {
+        r.failure = "consecrate needs one surface"; return r;
+    }
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* t = w.find(ctx.targets.front());
+    if (!t || !t->alive || is_contained(w, *t, contained)) {
+        r.failure = "no living target"; return r;
+    }
+    if (!in_reach(w, *actor, *t, reach, 0, &r)) {
+        r.failure = "surface out of reach"; return r;
+    }
+    // only inscription-capable materials hold a sacred carving
+    const PropId p_dur = pid(w, "inscription_durability");
+    const PropId p_hreq = pid(w, "carving_hardness_req");
+    if (material_has_prop(w, *t, p_dur) ||
+        material_has_prop(w, *t, p_hreq)) {
+        const std::int64_t dur = p_dur != kNoProp
+            ? w.prop_int(*t, p_dur, 0) : 0;
+        if (dur <= 0) { r.failure = "surface cannot hold a carving"; return r; }
+    }
+    const AgentMind* am = w.find_mind(ctx.actor);
+    const std::string skey = sacred_key_of(am, 600);
+    if (skey.empty()) {
+        r.failure = "no sacred conviction to carve"; return r;
+    }
+    if (!charge_energy(*actor, energy, 120, r)) return r;
+    // copy the shared concept's derived agent/appeasement onto the carving
+    const PropId p_skey = pid(w, "sacred_key");
+    const PropId p_sag = pid(w, "sacred_agent");
+    const PropId p_app = pid(w, "appeasement_action");
+    std::string agent, appease = appeasement_for(w, am, skey);
+    for (const auto& ep : w.entities) {
+        const Entity& e = *ep;
+        if (!e.alive || p_skey == kNoProp) continue;
+        const Value* v = w.prop_of(e, p_skey);
+        if (v && v->type == ValType::Text && v->s == skey) {
+            const Value* av = p_sag != kNoProp ? w.prop_of(e, p_sag)
+                                               : nullptr;
+            if (av && av->type == ValType::Text) agent = av->s;
+            const Value* ap = p_app != kNoProp ? w.prop_of(e, p_app)
+                                               : nullptr;
+            if (ap && ap->type == ValType::Text && !ap->s.empty())
+                appease = ap->s;
+            break;
+        }
+    }
+    if (agent.empty()) {
+        agent = "the-" + std::to_string(sl_fnv("agent|" + skey) % 997);
+    }
+    SpawnSpec is;
+    is.kind = "inscription";
+    is.pos = t->pos;
+    const PropId p_lang = pid(w, "language_id");
+    if (p_lang != kNoProp)
+        is.props.set(p_lang, Value::integer(sl_lang_of(w, *actor)));
+    if (p_skey != kNoProp) is.props.set(p_skey, Value::text(skey));
+    if (p_sag != kNoProp) is.props.set(p_sag, Value::text(agent));
+    if (p_app != kNoProp) is.props.set(p_app, Value::text(appease));
+    const PropId p_ck = pid(w, "concept_keys");
+    if (p_ck != kNoProp) is.props.set(p_ck, Value::text(skey));
+    const PropId p_gt = pid(w, "glyph_text");
+    if (p_gt != kNoProp)
+        is.props.set(p_gt, Value::text(skey + "->" + appease));
+    const PropId p_it = pid(w, "inscription_tick");
+    if (p_it != kNoProp)
+        is.props.set(p_it, Value::integer(
+            static_cast<std::int64_t>(w.clock_.tick())));
+    const PropId p_ia = pid(w, "inscription_author");
+    if (p_ia != kNoProp)
+        is.props.set(p_ia, Value::integer(static_cast<std::int64_t>(ctx.actor)));
+    // the sacred key IS a discovery key: carve its CausalClause the same way
+    // `engrave` does (bilingual authors add the Rosetta layer), so the
+    // shrine stone is readable — [cause atoms] beside the derived rite.
+    {
+        const PropId p_cl = pid(w, "clause_atoms");
+        const PropId p_l2 = pid(w, "language_id2");
+        const std::vector<ClauseOut> cls = compose_clause(w, am, ctx.actor, skey);
+        if (p_cl != kNoProp && !cls.empty()) {
+            std::string cs;
+            for (const ClauseOut& c : cls) {
+                if (!cs.empty()) cs.push_back(';');
+                cs += std::to_string(c.lang) + ":";
+                for (std::size_t i = 0; i < c.entries.size(); ++i) {
+                    if (i) cs.push_back(',');
+                    cs += std::to_string(c.entries[i]);
+                }
+            }
+            is.props.set(p_cl, Value::text(cs));
+            if (cls.size() > 1 && p_l2 != kNoProp)
+                is.props.set(p_l2, Value::integer(cls[1].lang));
+        }
+    }
+    is.rel_from.push_back({"inscribed_on", t->id});
+    r.spawns.push_back(is);
+    r.possible = true; r.ticks = 3;
+    r.notes.push_back("consecrated " + skey + " agent=" + agent);
+    return r;
+}
+
+PredictionResult predict_diplomatic_parley(const World& w,
+                                            const InteractionContext& ctx) {
+    PredictionResult r; r.law = 8; r.law_name = "social.interaction";
+    const PropId contained = pid(w, "contained");
+    const PropId energy = pid(w, "energy");
+    const PropId p_poss = pid(w, "possessed_by");
+    const PropId p_lang = pid(w, "language_id");
+    if (ctx.targets.size() != 1) {
+        r.failure = "parley needs one envoy counterpart"; return r;
+    }
+    if (!alive_pair(w, ctx, r, contained)) return r;
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* t = w.find(ctx.targets.front());
+    if (!t || !t->alive || is_contained(w, *t, contained)) {
+        r.failure = "no living counterpart"; return r;
+    }
+    if (!in_comm_range(w, *actor, *t, &r)) {
+        r.failure = "counterpart out of range"; return r;
+    }
+    const std::int64_t la = p_lang != kNoProp ? w.prop_int(*actor, p_lang, 0) : 0;
+    const std::int64_t lb = p_lang != kNoProp ? w.prop_int(*t, p_lang, 0) : 0;
+    if (la <= 0 || lb <= 0) { r.failure = "no speech community"; return r; }
+    if (la == lb) { r.failure = "same community — not diplomacy"; return r; }
+    if (!charge_energy(*actor, energy, 80, r)) return r;
+
+    const std::string& note = ctx.parameters.note;
+    // Phase 12.6 peace: the DEFEATED side's bilingual envoy sues for peace —
+    // note "peace:<enclosure_id|0>:<material|->:<qty>". Defeat is World
+    // Truth: two thirds of the actor's tongue marching on the other have
+    // routed or fallen, or the depot feeding them is breached. The Rosetta carving
+    // records cession + reparations; ledgers drop hostility; armies stand down.
+    if (note.rfind("peace:", 0) == 0) {
+        const PropId p_wt = pid(w, "war_target"), p_ro = pid(w, "routed"),
+                     p_sd = pid(w, "supply_depot_link"), p_bar = pid(w, "access_barrier"),
+                     p_int = pid(w, "integrity");
+        std::int64_t soldiers = 0, routed = 0; bool depot_fell = false;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (p_wt == kNoProp || w.prop_int(e, p_wt, 0) != lb) continue;
+            if (w.prop_int(e, p_lang, 0) != la) continue;
+            ++soldiers;                       // the fallen count as lost, too
+            if (!e.alive || (p_ro != kNoProp && w.prop_int(e, p_ro, 0) != 0)) ++routed;
+            const std::int64_t dp = p_sd != kNoProp ? w.prop_int(e, p_sd, 0) : 0;
+            if (const Entity* de = dp > 0 ? w.find(static_cast<EntityId>(dp)) : nullptr)
+                if (!de->alive || (w.prop_int(*de, p_bar, 0) == 0 && w.prop_int(*de, p_int, 0) < 300))
+                    depot_fell = true;
+        }
+        add_cond(r, "soldiers_routed", routed, soldiers);
+        // the host is broken when two thirds of it have fled or fallen
+        if (!((soldiers > 0 && routed * 3 >= soldiers * 2) || depot_fell)) {
+            r.failure = "not defeated — no cause to sue for peace"; return r;
+        }
+        const PropId p_bf = pid(w, "bilingual_familiarity");
+        if ((p_bf != kNoProp ? w.prop_int(*actor, p_bf, 500) : 500) < 600) {
+            r.failure = "envoy is not bilingual"; return r;
+        }
+        std::int64_t enc = 0, qty = 0; std::string mat;
+        {
+            const std::string rest = note.substr(6);
+            const std::size_t c1 = rest.find(':'), c2 = c1 == std::string::npos ? c1 : rest.find(':', c1 + 1);
+            if (c1 == std::string::npos || c2 == std::string::npos) { r.failure = "malformed peace terms"; return r; }
+            try { enc = std::stoll(rest.substr(0, c1)); qty = std::stoll(rest.substr(c2 + 1)); }
+            catch (...) { r.failure = "malformed peace terms"; return r; }
+            mat = rest.substr(c1 + 1, c2 - c1 - 1);
+        }
+        if (enc > 0) {
+            const Entity* ee = w.find(static_cast<EntityId>(enc));
+            if (!ee || !ee->alive || ee->kind_name != SIMLAB_KIND("enclosure")) {
+                r.failure = "ceded enclosure does not stand"; return r;
+            }
+        }
+        // Rosetta peace stone: both tongues, the envoy's own words
+        SpawnSpec is;
+        is.kind = "inscription"; is.pos = actor->pos;
+        is.props.set(p_lang, Value::integer(la));
+        if (const PropId p_l2 = pid(w, "language_id2"); p_l2 != kNoProp)
+            is.props.set(p_l2, Value::integer(lb));
+        if (const PropId p_tc = pid(w, "treaty_clause"); p_tc != kNoProp)
+            is.props.set(p_tc, Value::text("peace"));
+        if (const PropId p_gt = pid(w, "glyph_text"); p_gt != kNoProp)
+            is.props.set(p_gt, Value::text("peace|cede:" + std::to_string(enc) +
+                                           "|reparation:" + mat + "x" + std::to_string(qty)));
+        if (const PropId p_it = pid(w, "inscription_tick"); p_it != kNoProp)
+            is.props.set(p_it, Value::integer(static_cast<std::int64_t>(w.clock_.tick())));
+        if (const PropId p_ia = pid(w, "inscription_author"); p_ia != kNoProp)
+            is.props.set(p_ia, Value::integer(static_cast<std::int64_t>(ctx.actor)));
+        if (const PropId p_cl = pid(w, "clause_atoms"); p_cl != kNoProp) {
+            const AgentMind* em = w.find_mind(ctx.actor);
+            std::vector<EntityId> wa, wb;
+            if (em) for (const auto& [bk, bv] : em->beliefs) {
+                if (bk.rfind("lex:", 0) != 0 || bv.confidence < 500) continue;
+                EntityId eid = kNoEntity;
+                try { eid = static_cast<EntityId>(std::stoull(bk.substr(4))); } catch (...) { continue; }
+                const Entity* le = w.find(eid);
+                if (!le || !le->alive || le->kind_name != SIMLAB_KIND("lexical_entry")) continue;
+                const std::int64_t ll = w.prop_int(*le, p_lang, 0);
+                if (ll == la && wa.size() < 4) wa.push_back(eid);
+                if (ll == lb && wb.size() < 4) wb.push_back(eid);
+            }
+            if (!wa.empty() && !wb.empty()) {
+                std::string cs = std::to_string(la) + ":";
+                for (std::size_t i = 0; i < wa.size(); ++i) cs += (i ? "," : "") + std::to_string(wa[i]);
+                cs += ";" + std::to_string(lb) + ":";
+                for (std::size_t i = 0; i < wb.size(); ++i) cs += (i ? "," : "") + std::to_string(wb[i]);
+                is.props.set(p_cl, Value::text(cs));
+            }
+        }
+        r.spawns.push_back(is);
+        // reparations: a World-Truth debt the loser owes the victor
+        if (qty > 0 && mat != "-") {
+            const MaterialId gm = w.materials.id_of(mat);
+            if (gm == kNoMaterial) { r.failure = "unknown reparation material"; return r; }
+            SpawnSpec dbt;
+            dbt.kind = "debt_obligation"; dbt.pos = actor->pos;
+            dbt.props.set(pid(w, "debt_value"), Value::integer(
+                std::max<std::int64_t>(1, econ_total_value(w, t->id, gm) * qty)));
+            dbt.props.set(pid(w, "due_tick"), Value::integer(
+                static_cast<std::int64_t>(w.clock_.tick()) + 2000));
+            dbt.props.set(pid(w, "debtor_id"), Value::integer(static_cast<std::int64_t>(ctx.actor)));
+            dbt.props.set(pid(w, "creditor_id"), Value::integer(static_cast<std::int64_t>(t->id)));
+            dbt.props.set(pid(w, "debt_status"), Value::integer(0));
+            r.spawns.push_back(dbt);
+        }
+        // ledgers: hostility ends, trust restarts at 0 on both sides
+        const PropId p_dt = pid(w, "diplo_table");
+        for (std::int64_t side : {la, lb}) {
+            const std::int64_t peer = side == la ? lb : la;
+            const EntityId le = diplo_lang_entity(w, side);
+            const Entity* lee = le != kNoEntity ? w.find(le) : nullptr;
+            if (!lee || p_dt == kNoProp) continue;
+            const Value* cur = w.prop_of(*lee, p_dt);
+            const std::string before = cur && cur->type == ValType::Text ? cur->s : "";
+            std::vector<DiploEntry> v = diplo_parse(before);
+            bool found = false;
+            for (DiploEntry& d : v) if (d.peer == peer) { d.trust = 0; d.hostile = false; d.free_trade = false; found = true; }
+            if (!found) { DiploEntry d; d.peer = peer; v.push_back(d); }
+            const std::string after = diplo_render(v);
+            if (after != before) set_change_v(r, le, p_dt, Value::text(before), Value::text(after));
+        }
+        // armies stand down on both sides
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (!e.alive || p_wt == kNoProp) continue;
+            const std::int64_t wt = w.prop_int(e, p_wt, 0);
+            const std::int64_t el = w.prop_int(e, p_lang, 0);
+            if (!((el == la && wt == lb) || (el == lb && wt == la))) continue;
+            set_change(r, e.id, p_wt, wt, 0);
+            if (p_ro != kNoProp && w.prop_int(e, p_ro, 0) != 0)
+                set_change(r, e.id, p_ro, w.prop_int(e, p_ro, 0), 0);
+        }
+        r.possible = true; r.ticks = 5;
+        r.notes.push_back("PEACE enc=" + std::to_string(enc) + " to=" + std::to_string(t->id) +
+                          " la=" + std::to_string(la) + " lb=" + std::to_string(lb));
+        return r;
+    }
+    if (note == "treaty") {
+        // peace requires earned trust AND a mind that bridges the tongues
+        if (diplo_trust(w, la, lb) < 500) {
+            r.failure = "trust too shallow for a treaty"; return r;
+        }
+        const PropId p_bf = pid(w, "bilingual_familiarity");
+        const std::int64_t bf = p_bf != kNoProp
+            ? w.prop_int(*actor, p_bf, 500) : 500;
+        if (bf < 600) { r.failure = "envoy is not bilingual"; return r; }
+        const std::int64_t trust = diplo_trust(w, la, lb);
+        const std::string clause =
+            trust >= 700 ? "free_trade" : "non_aggression";
+        // bilingual Rosetta treaty: primary clause + second language layer
+        SpawnSpec is;
+        is.kind = "inscription";
+        is.pos = actor->pos;
+        is.props.set(p_lang, Value::integer(la));
+        const PropId p_l2 = pid(w, "language_id2");
+        if (p_l2 != kNoProp) is.props.set(p_l2, Value::integer(lb));
+        const PropId p_tc = pid(w, "treaty_clause");
+        if (p_tc != kNoProp)
+            is.props.set(p_tc, Value::text(clause));
+        const PropId p_ck = pid(w, "concept_keys");
+        if (p_ck != kNoProp)
+            is.props.set(p_ck, Value::text("treaty:" + clause));
+        const PropId p_it = pid(w, "inscription_tick");
+        if (p_it != kNoProp)
+            is.props.set(p_it, Value::integer(
+                static_cast<std::int64_t>(w.clock_.tick())));
+        const PropId p_ia = pid(w, "inscription_author");
+        if (p_ia != kNoProp)
+            is.props.set(p_ia, Value::integer(static_cast<std::int64_t>(ctx.actor)));
+        // Rosetta payload: the bilingual envoy's confident words of BOTH
+        // tongues side by side ("la:ids;lb:ids") — a reader of either
+        // language parses one clause and picks up the other (Nhịp 1B read).
+        {
+            const PropId p_cl = pid(w, "clause_atoms");
+            const AgentMind* em = w.find_mind(ctx.actor);
+            std::vector<EntityId> wa, wb;
+            if (em && p_cl != kNoProp) {
+                for (const auto& [bk, bv] : em->beliefs) {
+                    if (bk.rfind("lex:", 0) != 0 || bv.confidence < 500) continue;
+                    EntityId eid = kNoEntity;
+                    try { eid = static_cast<EntityId>(std::stoull(bk.substr(4))); }
+                    catch (...) { continue; }
+                    const Entity* le = w.find(eid);
+                    if (!le || !le->alive || le->kind_name != SIMLAB_KIND("lexical_entry")) continue;
+                    const std::int64_t ll = w.prop_int(*le, p_lang, 0);
+                    if (ll == la && wa.size() < 4) wa.push_back(eid);
+                    if (ll == lb && wb.size() < 4) wb.push_back(eid);
+                }
+            }
+            if (!wa.empty() && !wb.empty()) {
+                std::string cs = std::to_string(la) + ":";
+                for (std::size_t i = 0; i < wa.size(); ++i)
+                    cs += (i ? "," : "") + std::to_string(wa[i]);
+                cs += ";" + std::to_string(lb) + ":";
+                for (std::size_t i = 0; i < wb.size(); ++i)
+                    cs += (i ? "," : "") + std::to_string(wb[i]);
+                is.props.set(p_cl, Value::text(cs));
+            }
+        }
+        r.spawns.push_back(is);
+        // treaty effect: both ledgers mark free passage when the clause says so
+        if (clause == "free_trade") {
+            for (std::int64_t side : {la, lb}) {
+                const std::int64_t peer = side == la ? lb : la;
+                const EntityId le = diplo_lang_entity(w, side);
+                if (le == kNoEntity) continue;
+                const Entity* le_e = w.find(le);
+                if (!le_e) continue;
+                const PropId p_dt = pid(w, "diplo_table");
+                const Value* cur = p_dt != kNoProp
+                    ? w.prop_of(*le_e, p_dt) : nullptr;
+                const std::string before =
+                    cur && cur->type == ValType::Text ? cur->s : "";
+                const std::string after = diplo_mark_trade(before, peer);
+                if (after != before)
+                    set_change_v(r, le, p_dt, Value::text(before),
+                                 Value::text(after));
+            }
+        }
+        r.possible = true; r.ticks = 5;
+        r.notes.push_back("treaty carved: " + clause);
+        return r;
+    }
+
+    // gift parley: note "gift:<material>:<qty>" moves real goods and the
+    // ledgers move by the gift's marginal worth — economics IS diplomacy.
+    std::int64_t delta = 10;   // mere contact warms relations slightly
+    if (note.rfind("gift:", 0) == 0) {
+        const std::string rest = note.substr(5);
+        const std::size_t colon = rest.rfind(':');
+        if (colon == std::string::npos) {
+            r.failure = "malformed gift terms"; return r;
+        }
+        const std::string mname = rest.substr(0, colon);
+        std::int64_t qty = 0;
+        try { qty = std::stoll(rest.substr(colon + 1)); }
+        catch (...) { r.failure = "malformed gift qty"; return r; }
+        if (qty <= 0) { r.failure = "gift must be positive"; return r; }
+        const MaterialId gm = w.materials.id_of(mname);
+        if (gm == kNoMaterial) { r.failure = "unknown gift material"; return r; }
+        const EntityId stack = econ_held_stack(w, ctx.actor, gm, qty);
+        if (stack == kNoEntity) {
+            r.failure = "envoy lacks the gift"; return r;
+        }
+        const std::int64_t val = econ_total_value(w, ctx.actor, gm) * qty;
+        if (!econ_transfer(r, w, ctx.actor, t->id, gm, qty, t->pos)) {
+            r.failure = "gift transfer failed"; return r;
+        }
+        delta = std::clamp<std::int64_t>(val / 20, 50, 400);
+        r.notes.push_back("gift " + mname + " x" + std::to_string(qty) +
+                          " worth " + std::to_string(val));
+    }
+    // symmetric ledger write on both communities' language entities
+    {
+        const PropId p_dt = pid(w, "diplo_table");
+        for (std::int64_t side : {la, lb}) {
+            const std::int64_t peer = side == la ? lb : la;
+            EntityId le = diplo_lang_entity(w, side);
+            if (le == kNoEntity) {
+                SpawnSpec ls;
+                ls.kind = "language"; ls.pos = actor->pos;
+                const PropId p_ln = pid(w, "language_name");
+                if (p_ln != kNoProp) ls.props.set(p_ln, Value::integer(side));
+                if (p_dt != kNoProp)
+                    ls.props.set(p_dt, Value::text(std::to_string(peer) +
+                        ":" + std::to_string(std::clamp<std::int64_t>(
+                            delta, -1000, 1000)) + ";"));
+                r.spawns.push_back(ls);
+                continue;
+            }
+            const Entity* le_e = w.find(le);
+            if (!le_e) continue;
+            const Value* cur = p_dt != kNoProp
+                ? w.prop_of(*le_e, p_dt) : nullptr;
+            const std::string before =
+                cur && cur->type == ValType::Text ? cur->s : "";
+            const std::string after = diplo_bump(before, peer, delta);
+            if (after != before)
+                set_change_v(r, le, p_dt, Value::text(before),
+                             Value::text(after));
+        }
+    }
+    r.possible = true; r.ticks = 3;
+    r.notes.push_back("parley delta=" + std::to_string(delta));
+    return r;
 }
 
 std::string sanitize(std::string s) {
@@ -280,6 +873,94 @@ PredictionResult predict_communicate(const World& w, const InteractionContext& c
     if (!t) return r;
     if (!in_comm_range(w, *actor, *t, &r)) { r.failure = "out of communication range"; return r; }
     if (!charge_energy(*actor, energy, kCommCost, r)) return r;
+    // Phase 12.5 oral tradition: every word the speaker actually knows gets
+    // another transmission — World Truth on the entry, ledgered here.
+    // Past the meter threshold a well-rhymed clause crystallizes as
+    // proverb/epic: oral_genre + poetic_cadence become World Truth too.
+    {
+        const PropId p_tcount = pid(w, "transmission_count");
+        const PropId p_cad = pid(w, "poetic_cadence");
+        const PropId p_genre = pid(w, "oral_genre");
+        const PropId p_ckey = pid(w, "concept_key");
+        const PropId p_lang = pid(w, "language_id");
+        const AgentMind* am = w.find_mind(ctx.actor);
+        std::size_t bumped = 0;
+        bool recited_classic = false;
+        if (am && p_tcount != kNoProp) {
+            for (const auto& [bk, bv] : am->beliefs) {
+                if (bumped >= 8) break;
+                if (bk.rfind("lex:", 0) != 0 || bv.confidence < 500)
+                    continue;
+                EntityId eid = kNoEntity;
+                try { eid = static_cast<EntityId>(
+                    std::stoull(bk.substr(4))); } catch (...) { continue; }
+                const Entity* le = w.find(eid);
+                if (!le || !le->alive ||
+                    le->kind_name != SIMLAB_KIND("lexical_entry")) continue;
+                const std::int64_t cur = w.prop_int(*le, p_tcount, 0);
+                const std::int64_t nxt = std::min<std::int64_t>(100000,
+                    cur + 1);
+                set_change(r, eid, p_tcount, cur, nxt);
+                ++bumped;
+                if (p_genre != kNoProp) {
+                    const Value* g0 = w.prop_of(*le, p_genre);
+                    if (g0 && g0->type == ValType::Text && !g0->s.empty())
+                        recited_classic = true;
+                }
+                // crystallization: meter + repetition make it unforgetable
+                if (nxt >= 150 && p_genre != kNoProp) {
+                    const std::int64_t cad = oral_cadence_of(w, eid);
+                    if (cad >= 500) {
+                        const std::int64_t ocur =
+                            p_cad != kNoProp ? w.prop_int(*le, p_cad, 0) : 0;
+                        if (p_cad != kNoProp && ocur != cad)
+                            set_change(r, eid, p_cad, ocur, cad);
+                        const Value* gv = w.prop_of(*le, p_genre);
+                        const std::string gcur =
+                            gv && gv->type == ValType::Text ? gv->s : "";
+                        if (gcur.empty()) {
+                            // proverb = short clause, epic = long chain
+                            std::int64_t sibs = 0;
+                            if (p_ckey != kNoProp && p_lang != kNoProp) {
+                                const Value* ck = w.prop_of(*le, p_ckey);
+                                const Value* lv = w.prop_of(*le, p_lang);
+                                if (ck && ck->type == ValType::Text &&
+                                    lv && lv->type == ValType::Integer) {
+                                    for (const auto& ep2 : w.entities) {
+                                        const Entity& o = *ep2;
+                                        if (!o.alive ||
+                                            o.kind_name != SIMLAB_KIND("lexical_entry") ||
+                                            o.id == eid) continue;
+                                        const Value* ok =
+                                            w.prop_of(o, p_ckey);
+                                        const Value* ol =
+                                            w.prop_of(o, p_lang);
+                                        if (ok && ok->type == ValType::Text &&
+                                            ok->s == ck->s && ol &&
+                                            ol->type == ValType::Integer &&
+                                            ol->i == lv->i) {
+                                            ++sibs;
+                                            if (sibs > 3) break;
+                                        }
+                                    }
+                                }
+                            }
+                            set_change_v(r, eid, p_genre,
+                                Value::text(gcur),
+                                Value::text(sibs <= 3 ? "proverb" : "epic"));
+                        }
+                    }
+                }
+            }
+        }
+        (void)p_lang;
+        // reciting a crystallized proverb/epic binds the hearers: shared
+        // memory of the community's own history lifts the reciter's standing
+        const PropId p_leg = pid(w, "social_legitimacy");
+        if (recited_classic && p_leg != kNoProp)
+            set_change(r, ctx.actor, p_leg, pol_legitimacy(w, ctx.actor),
+                std::min<std::int64_t>(2000, pol_legitimacy(w, ctx.actor) + 15));
+    }
     r.possible = true; r.ticks = kCommTicks;
     r.notes.push_back("communicate: knowledge may flow (see social ties)");
     return r;
@@ -630,7 +1311,7 @@ EntityId econ_community_of(const World& w, EntityId agent) {
     if (lang <= 0) return kNoEntity;
     for (const auto& ep : w.entities) {
         const Entity& e = *ep;
-        if (e.alive && e.kind_name == "language" &&
+        if (e.alive && e.kind_name == SIMLAB_KIND("language") &&
             w.prop_int(e, p_lname, 0) == lang)
             return e.id;
     }
@@ -784,6 +1465,20 @@ PredictionResult predict_take(const World& w, const InteractionContext& ctx,
     if (!in_reach(w, *actor, *t, p_reach, 0, &r)) {
         r.failure = "out of reach"; return r;
     }
+    // Phase 12.6 siege: goods stored inside a standing, barred enclosure
+    // cannot be reached from outside its walls by anyone but its owner —
+    // until the walls are breached (access_barrier knocked to 0).
+    if (const EntityId enc = arch_enclosure_at(w, t->pos); enc != kNoEntity) {
+        const Entity* ee = w.find(enc);
+        const PropId p_bar = pid(w, "access_barrier"), p_fr = pid(w, "footprint_radius");
+        const std::int64_t bar = ee && p_bar != kNoProp ? w.prop_int(*ee, p_bar, 0) : 0;
+        const std::int64_t rad = ee && p_fr != kNoProp ? w.prop_int(*ee, p_fr, 0) : 0;
+        const bool inside = ee && dist2(ee->pos, actor->pos) <= rad * rad;
+        if (bar >= 500 && !inside && arch_owner_of(w, enc) != ctx.actor) {
+            add_cond(r, "access_barrier", 0, bar);
+            r.failure = "the walls bar the stores"; return r;
+        }
+    }
     if (!charge_energy(*actor, energy, steal ? kStealCost : kTakeCost, r))
         return r;
     // witnessed? any OTHER minded agent in sight of the actor sees the grab
@@ -836,6 +1531,35 @@ PredictionResult predict_take(const World& w, const InteractionContext& ctx,
             r.notes.push_back("theft unseen — exposure window armed");
         }
     }
+    // Phase 12.5: stealing across a speech-community border is an act of
+    // war by the ledgers' lights — both diplo_tables harden.
+    if (steal && holder != 0) {
+        const Entity* holder_e = w.find(
+            static_cast<EntityId>(holder));
+        const PropId p_lang = pid(w, "language_id");
+        const PropId p_dt = pid(w, "diplo_table");
+        const std::int64_t la = sl_lang_of(w, *actor);
+        const std::int64_t lb = holder_e && p_lang != kNoProp
+            ? w.prop_int(*holder_e, p_lang, 0) : 0;
+        if (la > 0 && lb > 0 && la != lb && p_dt != kNoProp) {
+            for (std::int64_t side : {la, lb}) {
+                const std::int64_t peer = side == la ? lb : la;
+                const EntityId le = diplo_lang_entity(w, side);
+                if (le == kNoEntity) continue;
+                const Entity* lee = w.find(le);
+                if (!lee) continue;
+                const Value* cur = w.prop_of(*lee, p_dt);
+                const std::string before =
+                    cur && cur->type == ValType::Text ? cur->s : "";
+                const std::string after =
+                    diplo_bump(before, peer, -150);
+                if (after != before)
+                    set_change_v(r, le, p_dt, Value::text(before),
+                                 Value::text(after));
+            }
+            r.notes.push_back("cross-border theft — ledgers harden");
+        }
+    }
     r.possible = true; r.ticks = 1;
     r.notes.push_back(steal ? "stole item" : "claimed item");
     return r;
@@ -858,6 +1582,18 @@ PredictionResult predict_trade(const World& w, const InteractionContext& ctx) {
     }
     if (pol_ostracism(w, ctx.actor, partner->id) >= 500) {
         r.failure = "ostracized by the community"; return r;
+    }
+    // Phase 12.5: communities whose ledgers say "hostile" do not trade —
+    // the treaty/hostility state is World Truth on the language entities.
+    {
+        const PropId p_lang = pid(w, "language_id");
+        const std::int64_t la = p_lang != kNoProp
+            ? w.prop_int(*actor, p_lang, 0) : 0;
+        const std::int64_t lb = p_lang != kNoProp
+            ? w.prop_int(*partner, p_lang, 0) : 0;
+        if (la > 0 && lb > 0 && la != lb && diplo_hostile(w, la, lb)) {
+            r.failure = "communities are hostile"; return r;
+        }
     }
     TradeTerms tt = parse_trade_note(w, ctx.parameters.note);
     if (!tt.ok) { r.failure = "malformed trade terms"; return r; }
@@ -994,7 +1730,7 @@ PredictionResult predict_repay(const World& w, const InteractionContext& ctx) {
     std::int64_t debt_val = 0;
     for (const auto& ep : w.entities) {
         const Entity& e = *ep;
-        if (!e.alive || e.kind_name != "debt_obligation") continue;
+        if (!e.alive || e.kind_name != SIMLAB_KIND("debt_obligation")) continue;
         if (w.prop_int(e, p_ds, 0) != 0) continue;
         if (w.prop_int(e, p_db, 0) != static_cast<std::int64_t>(ctx.actor))
             continue;
@@ -1096,7 +1832,7 @@ std::int64_t pol_defaulted_debts(const World& w, EntityId debtor) {
     std::int64_t n = 0;
     for (const auto& ep : w.entities) {
         const Entity& e = *ep;
-        if (!e.alive || e.kind_name != "debt_obligation") continue;
+        if (!e.alive || e.kind_name != SIMLAB_KIND("debt_obligation")) continue;
         if (w.prop_int(e, p_ds, 0) == 2 &&
             w.prop_int(e, p_db, 0) ==
                 static_cast<std::int64_t>(debtor)) ++n;
@@ -1298,13 +2034,25 @@ LawId SocialModel::id() const { return 8; }
 
 bool SocialModel::supports(const World& w, const InteractionContext& ctx) const {
     (void)w;
-    const std::string& a = ctx.parameters.action;
-    if (a == "found") return ctx.targets.empty();
-    if (a == "communicate" || a == "engrave" || a == "read" ||
-        a == "join" || a == "leave" || a == "share" || a == "withdraw" ||
-        a == "take" || a == "steal" || a == "trade" || a == "repay" ||
-        a == "adjudicate" || a == "tribute")
-        return ctx.targets.size() == 1;
+    // every law is asked about every action; one hash probe instead of a
+    // 17-way string compare chain (same verdicts, same order of laws).
+    enum class Arity : std::uint8_t { None, One, UpTo8 };
+    static const std::unordered_map<std::string_view, Arity> kVerbs = {
+        {"found", Arity::None},
+        {"communicate", Arity::One}, {"engrave", Arity::One}, {"read", Arity::One},
+        {"join", Arity::One}, {"leave", Arity::One}, {"share", Arity::One},
+        {"withdraw", Arity::One}, {"take", Arity::One}, {"steal", Arity::One},
+        {"trade", Arity::One}, {"repay", Arity::One}, {"adjudicate", Arity::One},
+        {"tribute", Arity::One}, {"consecrate", Arity::One},
+        {"diplomatic_parley", Arity::One},
+        {"perform_ritual", Arity::UpTo8}};
+    const auto it = kVerbs.find(ctx.parameters.action);
+    if (it == kVerbs.end()) return false;
+    switch (it->second) {
+        case Arity::None:  return ctx.targets.empty();
+        case Arity::One:   return ctx.targets.size() == 1;
+        case Arity::UpTo8: return ctx.targets.size() <= 8;
+    }
     return false;
 }
 
@@ -1325,6 +2073,9 @@ PredictionResult SocialModel::predict(const World& w,
     if (a == "repay")      return predict_repay(w, ctx);
     if (a == "adjudicate") return predict_adjudicate(w, ctx);
     if (a == "tribute")    return predict_tribute(w, ctx);
+    if (a == "perform_ritual") return predict_perform_ritual(w, ctx);
+    if (a == "consecrate") return predict_consecrate(w, ctx);
+    if (a == "diplomatic_parley") return predict_diplomatic_parley(w, ctx);
     PredictionResult r; r.law = id(); r.law_name = name();
     r.failure = "unsupported social action";
     return r;

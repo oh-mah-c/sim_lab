@@ -384,6 +384,12 @@ species vector_midge
 species sapient
   kind fauna
   material flesh
+  # instincts only (Primordial Genesis founders): eat, rest, walk, mate.
+  # Every other verb must be discovered (curiosity) or imitated (witness).
+  innate consume
+  innate rest
+  innate move
+  innate reproduce
   density 6
   condition temperature 50 400
   condition moisture 250 1000
@@ -429,6 +435,8 @@ species sapient
   communicate_range 500
   reach 250
   architectural_style_bias 500
+  agency_attribution_bias 500
+  rhythmic_meter_bias 500
   vocal_capability 900
   phoneme_harshness 450
   syllable_length_bias 3

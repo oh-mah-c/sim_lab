@@ -135,8 +135,7 @@ MaterialId fruit_material_prop(const World& w, const Value* fv) {
 
 std::string entity_sig(const World& w, EntityId npc, EntityId e) {
     const Entity* ent = w.find(e);
-    const PropId fmp = w.props.find_name("fruit_material")
-        ? w.props.find_name("fruit_material")->id : kNoProp;
+    const PropId fmp = SIMLAB_PID(w.props, "fruit_material");
     // Fog-of-war: a remembered-but-absent entity still has a signature —
     // fall back to the mind's last snapshot (material / observed signs),
     // never inventing identity the NPC didn't perceive.
@@ -365,12 +364,9 @@ bool goal_satisfied_now(const World& w, const Goal& g) {
 // mark becoming exposed, or a recoverable quantity dropping.
 bool sign_yielded(const World& w, EntityId subject,
                   const std::vector<EventId>& events) {
-    const PropId exposed = w.props.find_name("exposed")
-        ? w.props.find_name("exposed")->id : kNoProp;
-    const PropId dep_rem = w.props.find_name("deposit_remaining")
-        ? w.props.find_name("deposit_remaining")->id : kNoProp;
-    const PropId quantity = w.props.find_name("quantity")
-        ? w.props.find_name("quantity")->id : kNoProp;
+    const PropId exposed = SIMLAB_PID(w.props, "exposed");
+    const PropId dep_rem = SIMLAB_PID(w.props, "deposit_remaining");
+    const PropId quantity = SIMLAB_PID(w.props, "quantity");
     for (EventId id : events) {
         const CausalEvent* ev = w.ledger.find(id);
         if (!ev) continue;
@@ -405,8 +401,7 @@ bool synth_yielded(const World& w, const InteractionContext& first,
     }
     // single-target transforms: any alive change on the target counts
     if (first.targets.size() == 1) {
-        const PropId exposed = w.props.find_name("exposed")
-            ? w.props.find_name("exposed")->id : kNoProp;
+        const PropId exposed = SIMLAB_PID(w.props, "exposed");
         for (EventId id : events) {
             const CausalEvent* ev = w.ledger.find(id);
             if (!ev) continue;
@@ -516,8 +511,7 @@ void add_synthesis_hypotheses(std::map<std::string, Hypothesis>& best,
     std::vector<EntityId> pool;
     for (const auto& [id, s] : mind->memory) {
         if (id == npc) continue;
-        const PropId cont = w.props.find_name("contained")
-            ? w.props.find_name("contained")->id : kNoProp;
+        const PropId cont = SIMLAB_PID(w.props, "contained");
         // `contained` is not observable — skip the truth check entirely;
         // predict() refuses contained targets anyway.
         (void)cont;
@@ -663,8 +657,7 @@ std::vector<Problem> detect_problems(const World& w, EntityId npc,
     // unexplained observable signs: any observable prop other than `exposed`
     // (trace-mineral stains etc.) marks something worth a closer look.
     if (mind) {
-        const PropId exposed = w.props.find_name("exposed")
-            ? w.props.find_name("exposed")->id : kNoProp;
+        const PropId exposed = SIMLAB_PID(w.props, "exposed");
         for (const Observation& o : mind->observations) {
             // Fog-of-war: sign detection uses ONLY the observation's own
             // props — no live entity lookup. Whether the marked entity is
@@ -683,8 +676,7 @@ std::vector<Problem> detect_problems(const World& w, EntityId npc,
     // ---- Threat & CapabilityGap from the causal ledger (TODO §11.1/§10.6) ----
     // The NPC's own history is legitimate self-knowledge: it remembers being
     // hurt and being refused. Scan the recent tail of the ledger.
-    const PropId integ = w.props.find_name("integrity")
-        ? w.props.find_name("integrity")->id : kNoProp;
+    const PropId integ = SIMLAB_PID(w.props, "integrity");
     const std::size_t led = w.ledger.size();
     const std::size_t scan = std::min<std::size_t>(led, 32);
     bool threat = false; std::int64_t threat_urgency = 0; EntityId threat_src = kNoEntity;
@@ -732,14 +724,10 @@ std::vector<Problem> detect_problems(const World& w, EntityId npc,
     // problem competing in the same Score(H) arena as hunger.
     {
         std::int64_t sev = 0;
-        const PropId br_p = w.props.find_name("bleed_rate")
-            ? w.props.find_name("bleed_rate")->id : kNoProp;
-        const PropId iv_p = w.props.find_name("infection_level")
-            ? w.props.find_name("infection_level")->id : kNoProp;
-        const PropId sev_p = w.props.find_name("severed")
-            ? w.props.find_name("severed")->id : kNoProp;
-        const PropId nec_p = w.props.find_name("necrotic")
-            ? w.props.find_name("necrotic")->id : kNoProp;
+        const PropId br_p = SIMLAB_PID(w.props, "bleed_rate");
+        const PropId iv_p = SIMLAB_PID(w.props, "infection_level");
+        const PropId sev_p = SIMLAB_PID(w.props, "severed");
+        const PropId nec_p = SIMLAB_PID(w.props, "necrotic");
         if (br_p != kNoProp && iv_p != kNoProp) {
             for (const Relation& rel : w.relations_of(npc, "part_of")) {
                 if (rel.b != npc) continue;
@@ -768,10 +756,8 @@ std::vector<Problem> detect_problems(const World& w, EntityId npc,
     // Evacuation urge (Phase 10.3): a distended hollow organ is
     // first-person body state — luminal pressure >=700 is a problem.
     {
-        const PropId lc = w.props.find_name("lumen_capacity")
-            ? w.props.find_name("lumen_capacity")->id : kNoProp;
-        const PropId cl = w.props.find_name("contents_load")
-            ? w.props.find_name("contents_load")->id : kNoProp;
+        const PropId lc = SIMLAB_PID(w.props, "lumen_capacity");
+        const PropId cl = SIMLAB_PID(w.props, "contents_load");
         if (lc != kNoProp && cl != kNoProp)
             for (const Relation& rel : w.relations_of(npc, "part_of")) {
                 if (rel.b != npc) continue;
@@ -876,8 +862,7 @@ std::vector<Hypothesis> generate_hypotheses(const World& w, EntityId npc,
                         }
                     }
                 if (g.need == kNoProp) g.need =
-                    w.props.find_name("hunger")
-                        ? w.props.find_name("hunger")->id : kNoProp;
+                    SIMLAB_PID(w.props, "hunger");
             }
             if (p.kind == ProblemKind::BondedDistress) {
                 // care plans are scored by care_bonus inside plan_multi;
@@ -893,8 +878,7 @@ std::vector<Hypothesis> generate_hypotheses(const World& w, EntityId npc,
                         }
                     }
                 if (g.need == kNoProp) g.need =
-                    w.props.find_name("hunger")
-                        ? w.props.find_name("hunger")->id : kNoProp;
+                    SIMLAB_PID(w.props, "hunger");
             }
             std::vector<Plan> plans = plan_multi(w, npc, g,
                                                  static_cast<int>(horizon),
@@ -962,8 +946,7 @@ ExperimentOutcome run_experiment(World& w, EntityId npc, const Hypothesis& h) {
     // harm baseline: a trial that damages or kills the actor is NEVER a
     // success, no matter how well it relieved the need — poison still fills
     // the belly on the way down.
-    const PropId integ_pid = w.props.find_name("integrity")
-        ? w.props.find_name("integrity")->id : kNoProp;
+    const PropId integ_pid = SIMLAB_PID(w.props, "integrity");
     const std::int64_t integ_before = integ_pid != kNoProp
         ? w.prop_int(*me, integ_pid, -1) : -1;
 
@@ -1088,8 +1071,7 @@ bool discover_step(World& w, EntityId npc, ExploreGoal* out_explore) {
     // moves the NPC itself).
     auto try_explore = [&]() -> bool {
         if (!out_explore) return false;
-        const PropId reach = w.props.find_name("reach")
-            ? w.props.find_name("reach")->id : kNoProp;
+        const PropId reach = SIMLAB_PID(w.props, "reach");
         const Entity* me = w.find(npc);
         if (!me) return false;
         const std::int64_t rr = reach != kNoProp ? w.prop_int(*me, reach, 64) : 64;

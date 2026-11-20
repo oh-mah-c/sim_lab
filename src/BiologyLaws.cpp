@@ -53,8 +53,8 @@ constexpr std::int64_t kParentHungerCost = 300;   // permille hunger per birth
 constexpr std::int64_t kParentHungerMax = 500;    // permille — above = too hungry
 
 PropId prop_id(const World& w, const char* name) {
-    const PropertyDef* d = w.props.find_name(name);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, name);
 }
 
 bool prop_bool(const World& w, const Entity& e, PropId p) {

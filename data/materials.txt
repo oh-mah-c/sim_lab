@@ -74,6 +74,8 @@ material hardwood
   max_span 1200
   thermal_insulation 600
   weather_resistance 550
+  blunt_mass 350
+  elasticity 650
 
   absorbency 300
   contamination 250
@@ -108,6 +110,7 @@ material stone
   max_span 300
   thermal_insulation 250
   weather_resistance 950
+  blunt_mass 600
 
   contamination 300
   intrinsic_scarcity 300
@@ -141,6 +144,7 @@ material flint
   max_span 150
   thermal_insulation 200
   weather_resistance 800
+  edge_sharpness 850
 
   contamination 350
   intrinsic_scarcity 450
@@ -174,6 +178,7 @@ material obsidian
   max_span 120
   thermal_insulation 150
   weather_resistance 750
+  edge_sharpness 950
 
 # ---- raw substances (natural occurrences yield these before processing) ------
   contamination 400
@@ -281,6 +286,7 @@ material granite
   max_span 250
   thermal_insulation 300
   weather_resistance 980
+  blunt_mass 700
 
   contamination 300
   intrinsic_scarcity 250
@@ -646,6 +652,9 @@ material copper_metal
   max_span 600
   thermal_insulation 350
   weather_resistance 800
+  edge_sharpness 600
+  blunt_mass 500
+  armor_penetration_resist 600
 
   contamination 250
   intrinsic_scarcity 800
@@ -737,6 +746,7 @@ material iron_blade
   max_span 700
   thermal_insulation 300
   weather_resistance 850
+  edge_sharpness 900
 
 # ---- forageable wild food (physiology: nutrition/hydration are World Truth --
 # agents must discover edibility by consuming or by witness, never by lookup)
@@ -998,6 +1008,7 @@ material bone
   inscription_durability 500
   carving_hardness_req 400
   portable_surface 1000
+  blunt_mass 300
 
   contamination 150
   intrinsic_scarcity 500
@@ -1247,3 +1258,95 @@ material ash
   max_span 0
   thermal_insulation 500
   weather_resistance 400
+
+# ---- Phase 12.6 war materials: just numbers — engine names none of them ------
+# Sinew / fibre: high tension, some stretch — a launcher's string.
+material sinew
+  hardness 100
+  brittleness 100
+  mass 50
+  density 1100000
+  integrity 600
+  flammability 300
+  thermal_mass 500
+  conductivity 50
+  tensile 900
+  elasticity 500
+  geom_type 1
+  geom_len 900
+  geom_wid 5
+  geom_thk 5
+
+# Cured hide: soft armor (stops cuts partly, not impulse).
+material cured_hide
+  hardness 250
+  brittleness 200
+  mass 2000
+  density 950000
+  integrity 700
+  flammability 350
+  thermal_mass 1500
+  conductivity 40
+  tensile 600
+  armor_penetration_resist 450
+  geom_type 2
+  geom_len 600
+  geom_wid 400
+  geom_thk 10
+
+# Hammered metal sheet: hard armor.
+material metal_plate
+  hardness 750
+  brittleness 250
+  mass 6000
+  density 8000000
+  integrity 950
+  flammability 0
+  thermal_mass 2500
+  conductivity 400
+  tensile 800
+  armor_penetration_resist 900
+  blunt_mass 400
+  geom_type 2
+  geom_len 500
+  geom_wid 400
+  geom_thk 5
+
+# Yellow mineral and nitre crust: inert alone, energetic when mixed (processes.txt).
+material sulfur
+  hardness 200
+  brittleness 700
+  mass 500
+  density 2000000
+  integrity 300
+  flammability 700
+  thermal_mass 600
+  conductivity 20
+  volatility 300
+  expansion_force 100
+
+material saltpeter
+  hardness 200
+  brittleness 700
+  mass 500
+  density 2100000
+  integrity 300
+  flammability 100
+  thermal_mass 700
+  conductivity 30
+  volatility 200
+  expansion_force 300
+
+# The mixture (an emergent product of a recipe, not a named weapon).
+material energetic_mix
+  hardness 100
+  brittleness 900
+  mass 500
+  density 1700000
+  integrity 200
+  flammability 900
+  thermal_mass 400
+  conductivity 30
+  volatility 850
+  expansion_force 900
+

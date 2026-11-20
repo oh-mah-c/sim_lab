@@ -18,8 +18,8 @@ namespace simlab {
 namespace {
 
 PropId gprop(const World& w, const char* n) {
-    const PropertyDef* d = w.props.find_name(n);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, n);
 }
 
 std::int64_t gv(const World& w, const Entity& e, PropId p, std::int64_t fb = 0) {

@@ -10,14 +10,10 @@ Chronicle analyze_world(const World& w) {
     c.tick = w.clock_.tick();
     c.minds = static_cast<std::int64_t>(w.minded_entities().size());
 
-    const PropId hunger = w.props.find_name("hunger")
-        ? w.props.find_name("hunger")->id : kNoProp;
-    const PropId thirst = w.props.find_name("thirst")
-        ? w.props.find_name("thirst")->id : kNoProp;
-    const PropId collective_p = w.props.find_name("collective")
-        ? w.props.find_name("collective")->id : kNoProp;
-    const PropId inscription_p = w.props.find_name("inscription")
-        ? w.props.find_name("inscription")->id : kNoProp;
+    const PropId hunger = SIMLAB_PID(w.props, "hunger");
+    const PropId thirst = SIMLAB_PID(w.props, "thirst");
+    const PropId collective_p = SIMLAB_PID(w.props, "collective");
+    const PropId inscription_p = SIMLAB_PID(w.props, "inscription");
 
     std::map<std::string, CensusRow> census;
     std::set<std::string> lineages;
@@ -51,7 +47,7 @@ Chronicle analyze_world(const World& w) {
         }
         lineages.insert(sig);
 
-        if (e.kind_name == "composite") ++c.composites;
+        if (e.kind_name == SIMLAB_KIND("composite")) ++c.composites;
         if (inscription_p != kNoProp) {
             if (const Value* iv = w.prop_of(e, inscription_p))
                 if (iv->type == ValType::Text && !iv->s.empty()) ++c.inscribed;

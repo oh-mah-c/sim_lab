@@ -22,3 +22,13 @@ process smelt_copper
   ticks 24
   output copper_metal 300
   waste slag 100
+
+# Grind nitre, yellow mineral and charcoal together (no heat needed — the
+# product is dangerous BECAUSE heat sets it off; see ThermalModel blast).
+process grind_energetic
+  input saltpeter 75
+  input sulfur 10
+  input charcoal 15
+  ticks 6
+  output energetic_mix 100
+

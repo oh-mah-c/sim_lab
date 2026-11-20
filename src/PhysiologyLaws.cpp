@@ -38,8 +38,8 @@ constexpr std::int64_t kNutToEnergy = 25;      // milliJ per permille
 constexpr std::int64_t kDefaultMaxEnergy = 500000;
 
 PropId prop_id(const World& w, const char* name) {
-    const PropertyDef* d = w.props.find_name(name);
-    return d ? d->id : kNoProp;
+    static thread_local LitPidCache c_;
+    return c_.get(w.props, name);
 }
 
 bool prop_bool(const World& w, const Entity& e, PropId p) {
@@ -86,6 +86,7 @@ static PredictionResult predict_consume(const World& w,
     const PropId toxicity = prop_id(w, "toxicity");
     const PropId fruit_material = prop_id(w, "fruit_material");
     const PropId fruit_count = prop_id(w, "fruit_count");
+    const PropId consciousness = prop_id(w, "consciousness");
     (void)fatigue;
     if (hunger == kNoProp && thirst == kNoProp) {
         r.failure = "actor has no hunger/thirst need to satisfy";
@@ -121,6 +122,16 @@ static PredictionResult predict_consume(const World& w,
         // `nutrition`/`hydration` still counts World-Truth-wise. A carcass is
         // stripped as it is eaten so it cannot feed twice — see below.
         if (contained != kNoProp && prop_bool(w, *t, contained)) continue;
+        // an awake animal (consciousness >= 300, no stock to nibble) cannot
+        // be swallowed whole while it lives — it must be subdued first
+        // (struck/bled until unconscious or dead). Physics, not a taboo.
+        if ((w.ruleset & World::kRulePrimordial) && t->alive && consciousness != kNoProp &&
+            w.prop_int(*t, consciousness, 0) >= 300 &&
+            !(quantity != kNoProp && w.prop_of(*t, quantity)) &&
+            !(fruit_count != kNoProp && w.prop_of(*t, fruit_count))) {
+            r.notes.push_back("target " + std::to_string(tid) + " is awake and resists");
+            continue;
+        }
         if (!in_reach(w, *actor, *t, reach)) {
             r.notes.push_back("target " + std::to_string(tid) + " out of reach");
             continue;
@@ -384,10 +395,8 @@ static PredictionResult predict_evacuate(const World& w,
         if (rel.b == ctx.actor && rel.a == part_id) { attached = true; break; }
     if (!attached) { r.failure = "organ is not part of the actor"; return r; }
 
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = w.props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, w.props);
     const PropId lc = pid("lumen_capacity"), cl = pid("contents_load"),
                ca = pid("contents_accum"), cv = pid("content_viscosity"),
                ct = pid("contractility"), em = pid("evacuate_material"),
@@ -526,10 +535,8 @@ PredictionResult TreatModel::predict(const World& w,
     }
     if (!med || !med->alive) { r.failure = "no dressing material"; return r; }
 
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = w.props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, w.props);
     const PropId role_p = pid("part_role"), sev_p = pid("severed"),
                  br_p = pid("bleed_rate"), inf_p = pid("infection_level"),
                  nec_p = pid("necrotic"), band_p = pid("bandaged_integrity"),
