@@ -354,3 +354,26 @@ no engine code changes.
 - Viewer: player commands are queued and run on the UI thread while it holds
   the world lock (never blocks on a sim cycle). Demo screenshot:
   `SDL_VIDEO_DRIVER=dummy SIMLAB_VDEMO=80 SIMLAB_VTAB=1 sunnyworld_viewer --selftest 4 --shot f.bmp`.
+
+## Phase 14b — planetary globe & seamless zoom (viewer)
+
+- Planet scale 2:1: `PrimordialParams::planet_w/planet_h` (1024x512,
+  2048x1024 default in the menu, 4096x2048). The planet is ANALYTIC (pure
+  field functions of the planet-coded worldgen seed, continental mask at
+  planetary scales, uniform deep sea at the date line -> seamless E-W wrap);
+  only a home region (`grid` x `grid*2/3`, best lowland longitude on the warm
+  belt) is materialized + simulated. `planet_w = 0` keeps the old square
+  planet (grid x grid).
+- `simlab/render/Globe.hpp` (SDL-free): `PlanetMap` (albedo <= 2048x1024
+  sampled once), `PlanetTiles` (32x32-cell colour tiles, LRU 384),
+  `GlobeRenderer` (per-pixel inverse-projection table rebuilt only on
+  radius/tilt change; integer N.L day/night from the world clock, rim glow,
+  fog texels), `project/unproject`.
+- Viewer: M / wheel-out at min zoom / pinch -> globe; drag spins; wheel/pinch
+  toward the cursor; double click dives; crossing the radius threshold lands
+  in 2.5D at that lon/lat. Surface wraps east-west and clamps at the poles;
+  far terrain = analytic tiles under the region ground (ground texture is
+  transparent only on planets). Mini-globe replaces the minimap on planets.
+  Smoke test: `SDL_VIDEO_DRIVER=dummy SIMLAB_VPLANET=2048 SIMLAB_VGLOBE=1
+  sunnyworld_viewer --selftest 4 [--shot prefix]` (exit 0 = globe, dive,
+  wrap, wheel-out and hash checks passed).

@@ -52,10 +52,35 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
     const int tribes = std::clamp(pp.tribes, 1, 4);
     const int per = std::clamp(pp.per_tribe, 3, 12);
 
+    int ox = 0, oy = 0, gw = grid, gh = grid;
+    std::uint64_t gseed = pp.seed;
+    if (pp.planet) {
+        const bool scaled = pp.planet_w > 0 && pp.planet_h > 0;
+        const int PW = scaled ? std::clamp(pp.planet_w, 256, 8192) : grid;
+        const int PH = scaled ? std::clamp(pp.planet_h, 128, 4096) : grid;
+        gseed = WorldGenerator::planet_seed(static_cast<std::uint32_t>(pp.seed), PW, PH);
+        out.planet_w = PW; out.planet_h = PH;
+        if (scaled) {
+            // home region on the warm belt, at the longitude with the most
+            // lowland (sampled every 4 cells; deterministic scan order)
+            gh = std::max(64, grid * 2 / 3);
+            oy = PH / 2 - gh / 2;
+            long best = -1;
+            for (int cx = PW / 10; cx + gw < PW - PW / 10; cx += 32) {
+                long land = 0;
+                for (int y = oy; y < oy + gh; y += 4)
+                    for (int x = cx; x < cx + gw; x += 4)
+                        land += !WorldGenerator::is_sea(gseed, x, y, 200);
+                if (land > best) { best = land; ox = cx; }
+            }
+        }
+    }
+    out.gen_seed = gseed;
+    out.region_x = ox; out.region_y = oy; out.region_w = gw; out.region_h = gh;
     WorldGenParams g;
-    g.seed = pp.planet ? WorldGenerator::planet_seed(static_cast<std::uint32_t>(pp.seed), grid, grid)
-                       : pp.seed;
-    g.grid_w = grid; g.grid_h = grid;
+    g.seed = gseed;
+    g.grid_w = gw; g.grid_h = gh;
+    g.origin_x = ox; g.origin_y = oy;
     g.max_trees = 1 << 24;
     g.skip_species = {pp.founder_species};
     WorldGenerator().generate(w, g);
@@ -102,10 +127,10 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
     // spread east-west along the warm belt (each on its own continent if
     // the seas allow) — isolation breeds separate tongues and myths.
     for (int t = 0; t < tribes; ++t) {
-        int ax = grid / 2, ay = grid / 2;
+        int ax = ox + gw / 2, ay = oy + gh / 2;
         if (pp.planet) {
-            ax = (t + 1) * grid / (tribes + 1);
-            ay = grid / 2 + ((t % 2) ? grid / 12 : -grid / 12);
+            ax = ox + (t + 1) * gw / (tribes + 1);
+            ay = oy + gh / 2 + ((t % 2) ? gh / 12 : -gh / 12);
         } else if (tribes > 1) {
             static const int kRing[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
             static const int kRing3[3][2] = {{-1, -1}, {1, -1}, {0, 1}};

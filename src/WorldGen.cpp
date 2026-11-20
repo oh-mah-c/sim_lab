@@ -79,15 +79,20 @@ std::int32_t WorldGenerator::elevation_at(std::uint64_t seed, int gx, int gy) {
     int PW = 0, PH = 0;
     if (planet_dims(seed, PW, PH)) {
         // several continents (scale ~ width/3), ridged ranges, ocean rim
-        const int cs = std::max(12, PW / 3);
-        const std::int32_t cont = vnoise(gx, gy, cs, ts ^ 0xC0171u);
-        v = 60 + (local + cont * 2) / 3 * 460 / 1023;
+        // continental mask at planetary scales (3 octaves); local hills
+        // only roughen it, so oceans are real basins (~55% of the surface)
+        const std::int32_t c1 = vnoise(gx, gy, std::max(12, PW / 3), ts ^ 0xC0171u);
+        const std::int32_t c2 = vnoise(gx + 977, gy + 311, std::max(8, PW / 7), ts ^ 0xC0172u);
+        const std::int32_t c3 = vnoise(gx + 131, gy + 719, std::max(6, PW / 16), ts ^ 0xC0173u);
+        const std::int32_t cont = (c1 * 4 + c2 * 2 + c3) / 7;
+        v = 200 + (cont - 540) * 9 / 10 + (local - 512) / 5;
         const std::int32_t rid = std::abs(vnoise(gx + 311, gy + 97, std::max(10, PW / 4),
                                                  ts ^ 0x41D6Eu) - 512);
-        if (rid < 36) v += (36 - rid) * 7;                            // mountain spine
+        if (rid < 36 && v > 200) v += (36 - rid) * 7;                 // mountain spine (on land)
         const int edge = std::min(gx, PW - 1 - gx);
         const int margin = std::max(3, PW / 10);
         if (edge < margin) v -= (margin - edge) * 320 / margin;       // east/west seas
+        if (edge < margin / 3) v = 40;          // uniform deep sea at the date line: wrap is seamless
         if (gx < 0 || gx >= PW || gy < 0 || gy >= PH) v = 0;          // beyond the planet: sea
     } else {
         const std::int32_t cont  = vnoise(gx, gy, 192, ts ^ 0xC0171u);    // continents / basins

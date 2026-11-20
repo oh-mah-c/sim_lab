@@ -28,6 +28,7 @@
 #include "simlab/render/Atlas.hpp"
 #include "simlab/render/Snapshot.hpp"
 #include "simlab/render/Patron.hpp"
+#include "simlab/render/Globe.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -37,6 +38,7 @@
 #include <fstream>
 #include <functional>
 #include <atomic>
+#include <list>
 #include <map>
 #include <set>
 #include <mutex>
@@ -162,7 +164,7 @@ struct Viewer {
     // ---- game layer (viewer state, not World Truth) ----
     bool in_menu = true;
     char seed_buf[24] = "2026";
-    int menu_grid = 0, menu_tribes = 2, menu_per = 6;
+    int menu_grid = 2, menu_tribes = 2, menu_per = 6;
     std::string pref_dir;              // SDL_GetPrefPath("Sunnyworld","SimLab")
     std::string status_msg;
     PatronJournal journal;             // player knowledge + Resonance (saved as .journal)
@@ -199,6 +201,28 @@ struct Viewer {
     // player commands: queued by the UI, executed on the UI thread the next
     // time it holds the world lock (never waits for a running sim cycle)
     std::vector<std::function<void()>> cmds;
+    // ---- planet / globe (viewer state) ----
+    int planet_w = 0, planet_h = 0;
+    std::uint64_t gen_seed = 0;
+    PlanetMap pmap;
+    PlanetTiles ptiles;
+    GlobeRenderer grend, grend_mini;
+    GlobeView gview;
+    bool globe = false, globe_dive = false;
+    double dive_lon = 0, dive_lat = 0, gview_sun_offset = 0;
+    SDL_Texture* globe_tex = nullptr;
+    int globe_tw = 0, globe_th = 0;
+    std::vector<std::uint32_t> globe_px, stars;
+    std::vector<std::uint8_t> globe_fog;
+    std::uint64_t globe_fog_frame = 0;
+    SDL_Texture* mini_globe_tex = nullptr;
+    std::vector<std::uint32_t> mini_px;
+    std::unordered_map<std::uint64_t, SDL_Texture*> tile_tex;
+    std::list<std::uint64_t> tile_lru;
+    struct GIcon { double lon = 0, lat = 0; int type = 0; std::int64_t lang = 0; float r = 0; std::string label; };
+    std::vector<GIcon> c_gicons;
+    std::map<SDL_FingerID, ImVec2> fingers;
+    float pinch_d = 0;
     void post(std::function<void()> f) { cmds.push_back(std::move(f)); }
     std::vector<std::pair<std::int64_t, std::string>> c_stone_words;   // per stone: lang, words joined
     EntityId avatar = kNoEntity;       // possessed agent
@@ -309,7 +333,9 @@ struct Viewer {
         journal.tribe = tribe_lang();
         journal.res_tick = w.clock_.tick();
         reset_view();
-        status_msg = "New primordial world, seed " + std::to_string(p.seed);
+        planet_setup();
+        status_msg = "New primordial world, seed " + std::to_string(p.seed) +
+                     (is_planet() ? "  (planet " + std::to_string(planet_w) + "x" + std::to_string(planet_h) + ", M = globe)" : "");
     }
     // tribes of a loaded world: distinct language_id among living minds
     void derive_tribes() {
@@ -359,8 +385,278 @@ struct Viewer {
             for (std::size_t i = 0; i < pw.tribe_lang.size(); ++i) if (pw.tribe_lang[i] == journal.tribe) tribe_view = int(i);
         journal.tribe = tribe_lang();
         reset_view();
+        planet_setup();
         status_msg = "Loaded slot " + std::to_string(slot) + " (tick " + std::to_string(w.clock_.tick()) + ")";
         return true;
+    }
+
+    // ======================= planet: globe + far surface =======================
+    // The planet beyond the materialized home region is ANALYTIC (pure field
+    // functions of the worldgen seed): the globe samples it once into an
+    // albedo map; the 2.5D surface pulls 32x32-cell colour tiles on demand.
+    static constexpr double kPI = 3.14159265358979323846;
+    bool is_planet() const { return planet_w > 0; }
+    void planet_setup() {
+        planet_w = planet_h = 0; globe = false; globe_dive = false;
+        int pw_ = 0, ph_ = 0;
+        for (auto& [k, t] : tile_tex) if (t) SDL_DestroyTexture(t);
+        tile_tex.clear(); tile_lru.clear();
+        if (!WorldGenerator::planet_dims(w.world_seed, pw_, ph_) || pw_ < 2 * ph_ - 1) return;   // valley
+        planet_w = pw_; planet_h = ph_; gen_seed = w.world_seed;
+        pmap.build(gen_seed, pw_, ph_, pw_ >= 4096 ? 2048 : 1024);
+        ptiles.reset(gen_seed, pw_, ph_, 384);
+        globe_fog.assign(std::size_t(pmap.aw) * pmap.ah, 0);
+        globe_fog_frame = 0;
+    }
+    double planet_units_w() const { return double(planet_w) * w.terrain.cell; }
+    double planet_units_h() const { return double(planet_h) * w.terrain.cell; }
+    void lonlat_of(double x, double y, double& lon, double& lat) const {
+        lon = std::remainder(x / planet_units_w() * 2 * kPI, 2 * kPI);
+        lat = (0.5 - y / planet_units_h()) * kPI;
+    }
+    void pos_of(double lon, double lat, float& x, float& y) const {
+        double u = std::fmod(lon / (2 * kPI), 1.0); if (u < 0) u += 1;
+        x = float(u * planet_units_w());
+        y = float((0.5 - lat / kPI) * planet_units_h());
+    }
+    void wrap_camera() {
+        if (!is_planet()) return;
+        const double W = planet_units_w(), H = planet_units_h(), c = w.terrain.cell;
+        cam.cx = float(std::fmod(std::fmod(double(cam.cx), W) + W, W));
+        cam.cy = float(std::clamp(double(cam.cy), 6 * c, H - 6 * c));       // the ice walls of the poles
+    }
+    void enter_globe() {
+        if (!is_planet()) return;
+        lonlat_of(cam.cx, cam.cy, gview.lon, gview.lat);
+        gview.lat = std::clamp(gview.lat, -1.35, 1.35);
+        gview.radius = std::max(cam.sw, cam.sh) * 1.2;
+        globe = true; globe_dive = false; tool = kToolNone;
+        status_msg = "Planet view - drag to spin, wheel/pinch to dive";
+    }
+    void enter_surface(double lon, double lat) {
+        pos_of(lon, lat, cam.cx, cam.cy);
+        cam.zoom = 0.3f;
+        wrap_camera();
+        globe = false; globe_dive = false;
+        status_msg = "Surface - wheel out at max zoom (or M) to return to orbit";
+    }
+    void dive_to(double lon, double lat) { globe_dive = true; dive_lon = lon; dive_lat = lat; }
+    static double ang_lerp(double a, double b, double t) { return a + std::remainder(b - a, 2 * 3.14159265358979323846) * t; }
+    // wheel/pinch on the globe: zoom toward the point under (px, py) (world_rt px)
+    void globe_zoom(double factor, float px, float py) {
+        double lon = 0, lat = 0;
+        const bool hit = GlobeRenderer::unproject(gview, px - cam.sw * 0.5, py - cam.sh * 0.5, lon, lat);
+        gview.radius = std::clamp(gview.radius * factor, std::min(cam.sw, cam.sh) * 0.16, 1e5);
+        if (factor > 1 && hit) {
+            gview.lon = ang_lerp(gview.lon, lon, 0.22);
+            gview.lat = std::clamp(gview.lat + (lat - gview.lat) * 0.22, -1.35, 1.35);
+        }
+        if (gview.radius > std::max(cam.sw, cam.sh) * 1.35) enter_surface(gview.lon, gview.lat);
+    }
+    void globe_step(double dt) {
+        if (!globe_dive) return;
+        gview.lon = ang_lerp(gview.lon, dive_lon, std::min(1.0, dt * 4));
+        gview.lat += (dive_lat - gview.lat) * std::min(1.0, dt * 4);
+        gview.radius *= 1.0 + dt * 2.6;
+        if (gview.radius > std::max(cam.sw, cam.sh) * 1.35) enter_surface(dive_lon, dive_lat);
+        ui_dirty = true;
+    }
+    // fog texels (under the lock): explored -> 1, visible -> 2
+    void build_globe_fog() {
+        if (!is_planet() || fog.mode() == FogOfWar::Mode::GodEye) return;
+        std::fill(globe_fog.begin(), globe_fog.end(), 0);
+        for (const auto& c : fog.explored_cells())
+            globe_fog[std::size_t(pmap.row_of(c.second)) * pmap.aw + pmap.col_of(c.first)] = 1;
+        for (const auto& c : fog.visible_cells())
+            globe_fog[std::size_t(pmap.row_of(c.second)) * pmap.aw + pmap.col_of(c.first)] = 2;
+    }
+    double sun_lon() const {
+        const double hour = double(c_tick % 24) + 0.5;
+        return std::remainder(kPI - hour / 24.0 * 2 * kPI + gview_sun_offset, 2 * kPI);
+    }
+    void draw_globe() {
+        const int W = cam.sw, H = cam.sh;
+        if (!globe_tex || globe_tw != W || globe_th != H) {
+            if (globe_tex) SDL_DestroyTexture(globe_tex);
+            globe_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
+            SDL_SetTextureScaleMode(globe_tex, SDL_SCALEMODE_NEAREST);
+            globe_tw = W; globe_th = H;
+            stars.assign(std::size_t(W) * H, 0xFF05070Cu);
+            std::uint32_t h = 0x9E3779B9u;
+            for (int i = 0; i < W * H / 180; ++i) {          // deterministic starfield
+                h ^= h << 13; h ^= h >> 17; h ^= h << 5;
+                const std::uint32_t v = 90 + (h >> 24) % 150;
+                stars[h % stars.size()] = 0xFF000000u | (v << 16) | (v << 8) | std::min<std::uint32_t>(255, v + 20);
+            }
+        }
+        globe_px = stars;
+        grend.render(pmap, gview, sun_lon(), fog.mode() == FogOfWar::Mode::GodEye ? nullptr : globe_fog.data(),
+                     globe_px.data(), W, H, W / 2, H / 2);
+        SDL_UpdateTexture(globe_tex, nullptr, globe_px.data(), W * 4);
+        SDL_RenderTexture(ren, globe_tex, nullptr, nullptr);
+    }
+    // strategic icons on the sphere (cached under the lock, drawn in the UI layer)
+    void build_globe_icons() {
+        c_gicons.clear();
+        if (!is_planet()) return;
+        const PropertyDef* ld = w.props.find_name("language_id");
+        const PropId warp = SIMLAB_PID(w.props, "war_target");
+        std::map<std::int64_t, std::vector<Vec2>> tribe_pos;
+        std::map<std::int64_t, int> sick, war;
+        for (const auto& [id, m] : w.minds_) {
+            (void)m;
+            const Entity* e = w.find(id);
+            if (!e || !e->alive || !ld) continue;
+            const std::int64_t l = w.prop_int(*e, ld->id, 0);
+            if (l <= 0) continue;
+            tribe_pos[l].push_back(e->pos);
+            for (const Relation& r : w.relations_of(id, "carries"))
+                if (r.a == id) if (const Entity* inf = w.find(r.b); inf && inf->alive && inf->kind_name == KindName("infection")) { ++sick[l]; break; }
+            if (warp != kNoProp && w.prop_int(*e, warp, 0) > 0) ++war[l];
+        }
+        for (const auto& [l, ps] : tribe_pos) {
+            double sx = 0, sy = 0;
+            for (const Vec2& p : ps) { sx += p.x; sy += p.y; }
+            sx /= double(ps.size()); sy /= double(ps.size());
+            double rr = 0;
+            for (const Vec2& p : ps) rr = std::max(rr, std::hypot(p.x - sx, p.y - sy));
+            GIcon g; lonlat_of(sx, sy, g.lon, g.lat);
+            g.type = 0; g.lang = l; g.r = float((rr + 4 * w.terrain.cell) / planet_units_w() * 2 * kPI);
+            g.label = "tongue " + std::to_string(l) + " (" + std::to_string(ps.size()) + ")";
+            c_gicons.push_back(g);
+            if (sick[l]) { GIcon a = g; a.type = 3; a.label = std::to_string(sick[l]) + " sick"; c_gicons.push_back(a); }
+            if (war[l]) { GIcon a = g; a.type = 4; a.label = std::to_string(war[l]) + " at war"; c_gicons.push_back(a); }
+        }
+        const TerrainGrid& t = w.terrain;
+        if (t.traffic_wear.size() == t.elevation.size()) {
+            int n = 0;
+            for (int y = 0; y < t.h && n < 400; y += 2)
+                for (int x = 0; x < t.w && n < 400; x += 2)
+                    if (t.traffic_wear[std::size_t(y) * t.w + x] >= 80) {
+                        GIcon g; lonlat_of((x + t.ox + 0.5) * t.cell, (y + t.oy + 0.5) * t.cell, g.lon, g.lat);
+                        g.type = 1; c_gicons.push_back(g); ++n;
+                    }
+        }
+        const PropId l2 = SIMLAB_PID(w.props, "language_id2");
+        int ns = 0;
+        for (EntityId id : w.entities_of_kind(SIMLAB_KIND("inscription"))) {
+            const Entity* e = w.find(id);
+            if (!e || !e->alive || ns++ > 60) continue;
+            GIcon g; lonlat_of(e->pos.x, e->pos.y, g.lon, g.lat);
+            g.type = 2; g.r = (l2 != kNoProp && w.prop_int(*e, l2, 0) > 0) ? 1.f : 0.f;
+            c_gicons.push_back(g);
+        }
+    }
+    void draw_globe_icons() {
+        if (!globe) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const float cx = cam.sw * 0.5f * kPix, cy = cam.sh * 0.5f * kPix;
+        const bool blink = (frames / 20) % 2 == 0;
+        int nlabel = 0;
+        for (const GIcon& g : c_gicons) {
+            double dx, dy;
+            if (!GlobeRenderer::project(gview, g.lon, g.lat, dx, dy)) continue;   // far side
+            const ImVec2 p(cx + float(dx) * kPix, cy + float(dy) * kPix);
+            switch (g.type) {
+                case 0: {   // territory + capital
+                    ImVec2 prev; bool have = false;
+                    for (int k = 0; k <= 32; ++k) {
+                        const double a = k * 2 * kPI / 32;
+                        double ex, ey;
+                        const double lo = g.lon + g.r * std::cos(a) / std::max(0.2, std::cos(g.lat)), la = g.lat + g.r * std::sin(a);
+                        if (!GlobeRenderer::project(gview, lo, la, ex, ey)) { have = false; continue; }
+                        const ImVec2 q(cx + float(ex) * kPix, cy + float(ey) * kPix);
+                        if (have) dl->AddLine(prev, q, IM_COL32(255, 210, 120, 220), 2.0f);
+                        prev = q; have = true;
+                    }
+                    dl->AddCircleFilled(p, 6, IM_COL32(255, 215, 90, 255));
+                    dl->AddCircle(p, 9, IM_COL32(60, 30, 10, 255), 12, 2);
+                    const float ly = p.y - 8 + 15.f * float(nlabel++);   // stacked: nearby bands never overprint
+                    dl->AddLine(ImVec2(p.x + 6, p.y), ImVec2(p.x + 12, ly + 7), IM_COL32(255, 240, 200, 160));
+                    dl->AddText(ImVec2(p.x + 14, ly), IM_COL32(255, 240, 200, 255), g.label.c_str());
+                    break;
+                }
+                case 1: dl->AddCircleFilled(p, 1.6f, IM_COL32(230, 190, 110, 200)); break;          // trails
+                case 2: dl->AddRectFilled(ImVec2(p.x - 3, p.y - 5), ImVec2(p.x + 3, p.y + 5),
+                                          g.r > 0 ? IM_COL32(120, 220, 255, 255) : IM_COL32(200, 200, 210, 230), 1); break;
+                case 3: if (blink) { dl->AddCircle(p, 16, IM_COL32(120, 255, 80, 255), 16, 3); dl->AddText(ImVec2(p.x + 10, p.y + 8), IM_COL32(150, 255, 120, 255), g.label.c_str()); } break;
+                case 4: if (blink) { dl->AddCircle(p, 22, IM_COL32(255, 70, 40, 255), 16, 3); dl->AddText(ImVec2(p.x + 10, p.y + 22), IM_COL32(255, 120, 90, 255), g.label.c_str()); } break;
+            }
+        }
+    }
+    // far terrain (analytic tiles) under the materialized region, surface view
+    void draw_far_terrain() {
+        if (!is_planet()) return;
+        const int cell = w.terrain.cell;
+        const double CU = double(PlanetTiles::kChunk) * cell;
+        const double x0 = cam.cx - cam.sw * 0.5 / cam.zoom, x1 = cam.cx + cam.sw * 0.5 / cam.zoom;
+        const double y0 = cam.cy - cam.sh * 0.5 / cam.zoom / Camera::kY, y1 = cam.cy + cam.sh * 0.5 / cam.zoom / Camera::kY;
+        const bool dim = fog.mode() != FogOfWar::Mode::GodEye;
+        for (int cy = int(std::floor(y0 / CU)); cy <= int(std::floor(y1 / CU)); ++cy)
+            for (int cxi = int(std::floor(x0 / CU)); cxi <= int(std::floor(x1 / CU)); ++cxi) {
+                SDL_Texture* tx = tile_texture(cxi, cy);
+                if (!tx) continue;
+                SDL_FRect d{cam.sx(float(cxi * CU)), cam.sy(float(cy * CU)), float(CU) * cam.zoom + 1,
+                            float(CU) * Camera::kY * cam.zoom + 1};
+                if (dim) SDL_SetTextureColorMod(tx, 66, 58, 48); else SDL_SetTextureColorMod(tx, 255, 255, 255);
+                SDL_RenderTexture(ren, tx, nullptr, &d);
+            }
+    }
+    SDL_Texture* tile_texture(int cx, int cy) {
+        const int ncx = (planet_w + PlanetTiles::kChunk - 1) / PlanetTiles::kChunk;
+        const int wcx = ((cx % ncx) + ncx) % ncx;
+        const std::uint64_t k = ptiles.key(wcx, cy);
+        if (auto it = tile_tex.find(k); it != tile_tex.end()) return it->second;
+        const std::vector<std::uint32_t>* px = ptiles.tile(wcx, cy);
+        if (!px) return nullptr;
+        if (tile_tex.size() >= 384) {                   // LRU (insertion order) bound
+            const std::uint64_t old = tile_lru.front(); tile_lru.pop_front();
+            if (auto it = tile_tex.find(old); it != tile_tex.end()) { SDL_DestroyTexture(it->second); tile_tex.erase(it); }
+        }
+        SDL_Texture* t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, PlanetTiles::kChunk, PlanetTiles::kChunk);
+        SDL_UpdateTexture(t, nullptr, px->data(), PlanetTiles::kChunk * 4);
+        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+        tile_tex[k] = t; tile_lru.push_back(k);
+        return t;
+    }
+    // mini-globe in the minimap corner, following the camera
+    void update_mini_globe() {
+        if (!is_planet()) return;
+        const int S = 170;
+        if (!mini_globe_tex) {
+            mini_globe_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, S, S);
+            SDL_SetTextureBlendMode(mini_globe_tex, SDL_BLENDMODE_BLEND);
+        }
+        mini_px.assign(std::size_t(S) * S, 0x00000000u);
+        GlobeView v;
+        lonlat_of(cam.cx, cam.cy, v.lon, v.lat);
+        v.lat = std::clamp(v.lat, -1.3, 1.3);
+        v.radius = S * 0.44;
+        grend_mini.render(pmap, v, sun_lon(), fog.mode() == FogOfWar::Mode::GodEye ? nullptr : globe_fog.data(),
+                          mini_px.data(), S, S, S / 2, S / 2);
+        SDL_UpdateTexture(mini_globe_tex, nullptr, mini_px.data(), S * 4);
+    }
+    void ui_mini_globe() {
+        if (!mini_globe_tex) return;
+        const float S = 170.f;
+        ImGui::SetNextWindowPos(ImVec2(float(win_w) - S - 24, float(win_h) - S - 44), ImGuiCond_Always);
+        ImGui::Begin("Planet", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+        const ImVec2 o = ImGui::GetCursorScreenPos();
+        ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)mini_globe_tex), ImVec2(S, S));
+        // view frame at the centre (camera footprint as an angle on the sphere)
+        const float half_w = float(cam.sw * 0.5 / cam.zoom / planet_units_w() * 2 * kPI * S * 0.44);
+        const float half_h = float(cam.sh * 0.5 / cam.zoom / Camera::kY / planet_units_h() * kPI * S * 0.44);
+        const ImVec2 c(o.x + S * 0.5f, o.y + S * 0.5f);
+        ImGui::GetWindowDrawList()->AddRect(ImVec2(c.x - std::max(2.f, half_w), c.y - std::max(2.f, half_h)),
+                                           ImVec2(c.x + std::max(2.f, half_w), c.y + std::max(2.f, half_h)), IM_COL32(255, 255, 255, 230), 0, 0, 1.5f);
+        if (ImGui::IsItemClicked()) {
+            const ImVec2 m = ImGui::GetMousePos();
+            GlobeView v; lonlat_of(cam.cx, cam.cy, v.lon, v.lat); v.lat = std::clamp(v.lat, -1.3, 1.3); v.radius = S * 0.44;
+            double lo, la;
+            if (GlobeRenderer::unproject(v, m.x - c.x, m.y - c.y, lo, la)) { pos_of(lo, la, cam.cx, cam.cy); wrap_camera(); }
+        }
+        if (ImGui::SmallButton("Globe (M)")) enter_globe();
+        ImGui::End();
     }
 
     void resize_world_rt() {
@@ -445,7 +741,11 @@ struct Viewer {
             ground_w = gw; ground_h = gh;
         }
         SDL_SetRenderTarget(ren, ground);
-        SDL_SetRenderDrawColor(ren, 18, 15, 12, 255);
+        // planet: transparent margins so far tiles show around the region;
+        // valley: opaque copy (alpha blending the big blit costs ~2x in software)
+        SDL_SetTextureBlendMode(ground, is_planet() ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        if (is_planet()) SDL_SetRenderDrawColor(ren, 0, 0, 0, 0); else SDL_SetRenderDrawColor(ren, 18, 15, 12, 255);
         SDL_RenderClear(ren);
         const float ts = float(cell * kGround);
         for (int ly = 0; ly < t.h; ++ly)
@@ -493,15 +793,16 @@ struct Viewer {
         std::vector<std::uint32_t> px(std::size_t(t.w) * t.h);
         for (int y = 0; y < t.h; ++y) for (int x = 0; x < t.w; ++x) {
             const Fog f = fog.cell_fog(x + t.ox, y + t.oy);
-            px[std::size_t(y) * t.w + x] = f == Fog::Visible ? 0u : f == Fog::Shrouded ? 0x730A0A12u : 0xFF120F0Cu;
+            px[std::size_t(y) * t.w + x] = f == Fog::Visible ? 0u : f == Fog::Shrouded ? 0x730A0A12u : 0xC8120F0Cu;   // unexplored: dark haze, relief faintly readable
         }
         SDL_UpdateTexture(fog_tex, nullptr, px.data(), t.w * 4);
     }
     void draw_terrain() {
         if (!ground) return;                       // (re)built under the lock in frame()
         // visible slice of the ground texture -> whole screen (one blit)
-        SDL_FRect src{(cam.cx - cam.sw * 0.5f / cam.zoom) * kGround,
-                      (cam.cy * Camera::kY - cam.sh * 0.5f / cam.zoom) * kGround + ground_margin,
+        const float gox = float(w.terrain.ox * w.terrain.cell), goy = float(w.terrain.oy * w.terrain.cell);
+        SDL_FRect src{(cam.cx - gox - cam.sw * 0.5f / cam.zoom) * kGround,
+                      ((cam.cy - goy) * Camera::kY - cam.sh * 0.5f / cam.zoom) * kGround + ground_margin,
                       cam.sw / cam.zoom * kGround, cam.sh / cam.zoom * kGround};
         SDL_FRect dst{0, 0, float(cam.sw), float(cam.sh)};
         SDL_RenderTexture(ren, ground, &src, &dst);
@@ -790,18 +1091,21 @@ struct Viewer {
             const std::uint64_t r = SDL_GetTicksNS() ^ (std::uint64_t(SDL_GetPerformanceCounter()) << 17);
             std::snprintf(seed_buf, sizeof seed_buf, "%llu", (unsigned long long)(r % 1000000000ull));
         }
-        static const char* kSizes[] = {"Local Valley (64)", "Continent planet (128)", "Full Planet (192)"};
-        static const int kGrid[] = {64, 128, 192};
-        static const bool kPlanet[] = {false, true, true};
-        ImGui::SetNextItemWidth(220); ImGui::Combo("World", &menu_grid, kSizes, 3);
-        if (menu_grid > 0) ImGui::TextDisabled("Closed planet: frozen poles, hot wet equator, seas and mountain spines.");
+        static const char* kSizes[] = {"Local Valley (64 x 64)", "Medium planet (1024 x 512)",
+                                       "Large planet (2048 x 1024)", "Colossal planet (4096 x 2048)"};
+        static const int kGrid[] = {64, 128, 128, 128};
+        static const int kPW[] = {0, 1024, 2048, 4096};
+        ImGui::SetNextItemWidth(260); ImGui::Combo("World", &menu_grid, kSizes, 4);
+        if (menu_grid > 0) ImGui::TextDisabled("2:1 planet: ice poles, wet equator, oceans, mountain spines.\n"
+                                               "Your bands live in a simulated home region; the rest sleeps until reached.");
         ImGui::SetNextItemWidth(160); ImGui::SliderInt("Starting tribes", &menu_tribes, 1, 4);
         ImGui::SetNextItemWidth(160); ImGui::SliderInt("Humans per tribe", &menu_per, 3, 12);
         if (ImGui::Button("Create world", ImVec2(160, 0))) {
             PrimordialParams p;
             p.seed = std::strtoull(seed_buf, nullptr, 10);
-            p.grid = kGrid[std::clamp(menu_grid, 0, 2)];
-            p.planet = kPlanet[std::clamp(menu_grid, 0, 2)];
+            const int mi = std::clamp(menu_grid, 0, 3);
+            p.grid = kGrid[mi];
+            p.planet = kPW[mi] > 0; p.planet_w = kPW[mi]; p.planet_h = kPW[mi] / 2;
             p.tribes = menu_tribes; p.per_tribe = menu_per;
             { std::lock_guard<std::mutex> lk(mx); new_world(p); }
             in_menu = false; speed = 1; speed_atomic = 1;
@@ -1660,8 +1964,49 @@ struct Viewer {
         const bool ui = ImGui::GetIO().WantCaptureMouse, kb = ImGui::GetIO().WantCaptureKeyboard;
         if (e.type == SDL_EVENT_QUIT) quit = true;
         if (e.type == SDL_EVENT_WINDOW_RESIZED) { win_w = e.window.data1; win_h = e.window.data2; resize_world_rt(); }
-        if (e.type == SDL_EVENT_MOUSE_WHEEL && !ui)
-            cam.zoom = std::clamp(cam.zoom * (e.wheel.y > 0 ? 1.15f : 1 / 1.15f), 0.25f, 3.0f);
+        if (e.type == SDL_EVENT_MOUSE_WHEEL && !ui && !in_menu) {
+            if (globe) globe_zoom(e.wheel.y > 0 ? 1.15 : 1 / 1.15, e.wheel.mouse_x / kPix, e.wheel.mouse_y / kPix);
+            else if (is_planet() && e.wheel.y < 0 && cam.zoom <= 0.2501f) enter_globe();   // zoom out to orbit
+            else cam.zoom = std::clamp(cam.zoom * (e.wheel.y > 0 ? 1.15f : 1 / 1.15f), 0.25f, 3.0f);
+        }
+        // ---- touch: 1 finger pans (surface), 2 fingers pinch-zoom ----
+        if (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_FINGER_MOTION || e.type == SDL_EVENT_FINGER_UP) {
+            const ImVec2 fp(e.tfinger.x * win_w, e.tfinger.y * win_h);
+            if (e.type == SDL_EVENT_FINGER_UP) { fingers.erase(e.tfinger.fingerID); pinch_d = 0; }
+            else {
+                fingers[e.tfinger.fingerID] = fp;
+                if (fingers.size() == 2) {
+                    const ImVec2 a = fingers.begin()->second, b = std::next(fingers.begin())->second;
+                    const float d = std::hypot(a.x - b.x, a.y - b.y);
+                    if (pinch_d > 0 && d > 0 && !in_menu) {
+                        const float f = d / pinch_d;
+                        if (globe) globe_zoom(f, (a.x + b.x) * 0.5f / kPix, (a.y + b.y) * 0.5f / kPix);
+                        else if (is_planet() && f < 1 && cam.zoom <= 0.2501f) enter_globe();
+                        else cam.zoom = std::clamp(cam.zoom * f, 0.25f, 3.0f);
+                    }
+                    pinch_d = d;
+                } else if (e.type == SDL_EVENT_FINGER_MOTION && fingers.size() == 1 && !globe && !ui && !in_menu) {
+                    cam.cx -= e.tfinger.dx * win_w / kPix / cam.zoom;
+                    cam.cy -= e.tfinger.dy * win_h / kPix / cam.zoom / Camera::kY;
+                }
+            }
+        }
+        // ---- globe: drag spins, double click dives ----
+        if (globe && !ui && !in_menu) {
+            if (e.type == SDL_EVENT_MOUSE_MOTION && (e.motion.state & (SDL_BUTTON_LMASK | SDL_BUTTON_RMASK))) {
+                gview.lon -= e.motion.xrel / kPix / gview.radius;
+                gview.lat = std::clamp(gview.lat + e.motion.yrel / kPix / gview.radius, -1.35, 1.35);
+                globe_dive = false;
+                return;
+            }
+            if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                double lo, la;
+                if (e.button.clicks >= 2 &&
+                    GlobeRenderer::unproject(gview, e.button.x / kPix - cam.sw * 0.5, e.button.y / kPix - cam.sh * 0.5, lo, la))
+                    dive_to(lo, la);
+                return;
+            }
+        }
         if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !ui && !in_menu && e.button.button == SDL_BUTTON_RIGHT && tool != kToolNone) {
             tool = kToolNone; dragging = false; return;
         }
@@ -1694,6 +2039,7 @@ struct Viewer {
             }
             if (k == SDLK_F5) { save_slot(1); return; }
             if (k == SDLK_J) { show_journal = !show_journal; return; }
+            if (k == SDLK_M && is_planet()) { if (globe) enter_surface(gview.lon, gview.lat); else enter_globe(); return; }
             if (avatar != kNoEntity && k >= SDLK_1 && k <= SDLK_9) {   // avatar verbs
                 int n = 0;
                 for (const std::string& v : c_av_verbs) {
@@ -1715,6 +2061,14 @@ struct Viewer {
     void pan_keys(double dt) {
         if (ImGui::GetIO().WantCaptureKeyboard) return;
         const bool* ks = SDL_GetKeyboardState(nullptr);
+        if (globe) {                             // WASD spins the planet
+            const double r = 1.4 * dt;
+            if (ks[SDL_SCANCODE_A] || ks[SDL_SCANCODE_LEFT]) gview.lon -= r;
+            if (ks[SDL_SCANCODE_D] || ks[SDL_SCANCODE_RIGHT]) gview.lon += r;
+            if (ks[SDL_SCANCODE_W] || ks[SDL_SCANCODE_UP]) gview.lat = std::min(1.35, gview.lat + r);
+            if (ks[SDL_SCANCODE_S] || ks[SDL_SCANCODE_DOWN]) gview.lat = std::max(-1.35, gview.lat - r);
+            return;
+        }
         if (avatar != kNoEntity) {               // WASD walks the possessed body
             move_cool -= dt;
             int dx = 0, dy = 0;
@@ -1765,8 +2119,11 @@ struct Viewer {
                 ViewRect v = cam.view();
                 const std::int32_t mx_ = (v.x1 - v.x0) / 4, my_ = (v.y1 - v.y0) / 4;
                 v.x0 -= mx_; v.x1 += mx_; v.y0 -= my_; v.y1 += my_;
-                snap = capture(w, v, fog);
+                if (!globe) snap = capture(w, v, fog);      // orbit view never needs the 2.5D snapshot
                 c_tick = w.clock_.tick(); c_minds = w.minds_.size();
+                wrap_camera();
+                if (is_planet() && frames % 30 == 3) { build_globe_fog(); if (globe) build_globe_icons(); }
+                if (is_planet() && !globe && frames % 10 == 4) update_mini_globe();
                 // player commands first (they act at this exact world state)
                 if (!cmds.empty()) {
                     auto q = std::move(cmds); cmds.clear();
@@ -1813,24 +2170,31 @@ struct Viewer {
                 if (show_inspector && (frames % 10 == 1 || insp.id != selected)) build_inspector();
                 if (show_codex && (frames % 60 == 1 || c_codex.empty())) build_codex();
                 const std::uint64_t key = (c_tick / 48) * 16 + std::uint64_t(lens);
-                if (key != ground_key || !ground) { build_ground(); ground_key = key; }
+                if (!globe && (key != ground_key || !ground)) { build_ground(); ground_key = key; }
             } else {
                 ui_wants = true;
             }
         }
         t_cap = ms(t); t = clk::now();
-        if (!(skip & 1)) draw_terrain();
-        t_ter = ms(t); t = clk::now();
-        if (!(skip & 2)) draw_entities(dt);
-        draw_links();
-        if (!(skip & 4)) draw_night();
+        globe_step(dt);
+        if (globe) {
+            draw_globe();
+        } else {
+            if (!(skip & 1)) { draw_far_terrain(); draw_terrain(); }
+            t_ter = ms(t); t = clk::now();
+            if (!(skip & 2)) draw_entities(dt);
+            draw_links();
+            if (!(skip & 4)) draw_night();
+        }
         SDL_SetRenderTarget(ren, nullptr);
         if (!(skip & 32)) SDL_RenderTexture(ren, world_rt, nullptr, nullptr);     // nearest x kPix
         t_ent = ms(t); t = clk::now();
         if (in_menu) ui_menu();
         else if (!(skip & 16)) {
-            draw_overlays();
-            ui_topbar(); ui_minimap(); ui_inspector(); ui_player(); ui_journal(); ui_successor();
+            if (globe) draw_globe_icons(); else draw_overlays();
+            ui_topbar();
+            if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
+            ui_inspector(); ui_player(); ui_journal(); ui_successor();
             if (!show_journal) ui_word_editor();
         }
         if (!(skip & 8) && !in_menu) { ui_atlas(); ui_codex(); }
@@ -1900,6 +2264,9 @@ int main(int argc, char** argv) {
     std::snprintf(v.seed_buf, sizeof v.seed_buf, "%llu", (unsigned long long)seed);
     {   // backdrop world behind the title menu (also the selftest world)
         PrimordialParams p; p.seed = seed; p.grid = 64; p.tribes = 2; p.per_tribe = 6;
+        if (const char* pl = std::getenv("SIMLAB_VPLANET")) {      // e.g. 2048 -> 2048 x 1024 planet
+            p.planet = true; p.planet_w = std::atoi(pl); p.planet_h = p.planet_w / 2; p.grid = 128;
+        }
         v.pp = p;
         v.pw = build_primordial(world, p);
         if (!v.pw.homes.empty()) { v.cam.cx = float(v.pw.homes[0].x); v.cam.cy = float(v.pw.homes[0].y); }
@@ -1922,6 +2289,7 @@ int main(int argc, char** argv) {
     ImGui_ImplSDLRenderer3_Init(v.ren);
     v.atlas.build(world);
     v.init_textures();
+    v.planet_setup();
     std::printf("atlas: %zu sprites, %zu KB pixels\n", v.atlas.size(), v.atlas.bytes() / 1024);
 
     bool quit = false;
@@ -1940,6 +2308,54 @@ int main(int argc, char** argv) {
             v.frame(1.0 / 60);
             if (dbg && f < 6) std::printf("frame %ld %.1fms rss %zu tex %zu\n", f,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(), rss_kb(), v.tex.map.size());
+        }
+        if (std::getenv("SIMLAB_VGLOBE")) {
+            // globe smoke test: orbit view, spin, render cost, dive back down
+            if (!v.is_planet()) { std::printf("globe: not a planet world (set SIMLAB_VPLANET)\n"); return 3; }
+            const std::uint64_t hg = world.state_hash();
+            v.show_atlas = v.show_codex = false;
+            v.enter_globe();
+            if (std::getenv("SIMLAB_VGOD")) v.fog.set_mode(FogOfWar::Mode::GodEye);
+            v.gview.radius = std::min(v.cam.sw, v.cam.sh) * 0.42;
+            std::vector<double> ft;
+            for (int f = 0; f < 90; ++f) {
+                v.gview.lon += 0.03; if (f % 30 == 0) v.gview.lat = 0.25 * std::sin(f * 0.1);
+                const auto a = std::chrono::steady_clock::now();
+                v.frame(1.0 / 60);
+                ft.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
+            }
+            std::sort(ft.begin(), ft.end());
+            double sum = 0; for (double x : ft) sum += x;
+            if (!shot.empty()) {
+                if (!v.pw.homes.empty()) v.lonlat_of(v.pw.homes[0].x, v.pw.homes[0].y, v.gview.lon, v.gview.lat);
+                v.gview.lon -= 0.35; v.gview.lat = std::clamp(v.gview.lat + 0.25, -1.3, 1.3);
+                for (int f = 0; f < 35; ++f) v.frame(1.0 / 60);
+                v.ui_dirty = true; v.shot_path = shot + "_globe.bmp"; v.frame(1.0 / 60);
+            }
+            // double-click dive onto the first band's home
+            double lo = 0, la = 0;
+            v.lonlat_of(v.pw.homes.empty() ? 0 : v.pw.homes[0].x, v.pw.homes.empty() ? 0 : v.pw.homes[0].y, lo, la);
+            v.dive_to(lo, la);
+            int steps = 0;
+            while (v.globe && steps < 400) { v.frame(1.0 / 60); ++steps; }
+            for (int f = 0; f < 30; ++f) v.frame(1.0 / 60);
+            const bool landed = !v.globe;
+            const float dx = v.cam.cx - (v.pw.homes.empty() ? 0 : v.pw.homes[0].x), dy = v.cam.cy - (v.pw.homes.empty() ? 0 : v.pw.homes[0].y);
+            // wrap-around: walk the camera one full planet east, it must land on the same spot
+            const float x0 = v.cam.cx;
+            v.cam.cx += float(v.planet_units_w()); v.frame(1.0 / 60);
+            const bool wrapped = std::fabs(v.cam.cx - x0) < 1.0f;
+            if (!shot.empty()) { v.ui_dirty = true; v.shot_path = shot + "_surface.bmp"; v.frame(1.0 / 60); }
+            // zoom back out to orbit through the wheel path
+            v.cam.zoom = 0.25f;
+            SDL_Event we{}; we.type = SDL_EVENT_MOUSE_WHEEL; we.wheel.y = -1; we.wheel.mouse_x = 400; we.wheel.mouse_y = 300;
+            bool q2 = false; v.handle(we, q2);
+            const bool back_to_orbit = v.globe;
+            std::printf("globe: planet %dx%d albedo %dx%d frame avg %.2f ms p95 %.2f ms | dive %d frames landed=%d off=(%.0f,%.0f) "
+                        "| wrap=%d | wheel-out->globe=%d | tiles %zu | rss %zu KB | hash_unchanged=%d icons=%zu\n",
+                        v.planet_w, v.planet_h, v.pmap.aw, v.pmap.ah, sum / ft.size(), ft[ft.size() * 95 / 100], steps, int(landed),
+                        dx, dy, int(wrapped), int(back_to_orbit), v.tile_tex.size(), rss_kb(), int(world.state_hash() == hg), v.c_gicons.size());
+            return landed && wrapped && back_to_orbit && world.state_hash() == hg ? 0 : 4;
         }
         if (!shot.empty() && std::getenv("SIMLAB_VDEMO")) {
             // gameplay demo: let the world run, pin + possess a founder,

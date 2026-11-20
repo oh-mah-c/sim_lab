@@ -84,6 +84,8 @@ public:
     Fog point_fog(const World& w, Vec2 p) const;
     std::size_t explored_count() const { return explored_.size(); }
     std::size_t visible_count() const { return visible_.size(); }
+    const std::set<std::pair<int, int>>& explored_cells() const { return explored_; }
+    const std::set<std::pair<int, int>>& visible_cells() const { return visible_; }
     // last seen static structures (enclosures, inscriptions, deposits)
     std::map<EntityId, EntityView> remembered;
 private:
