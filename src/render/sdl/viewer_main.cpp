@@ -2622,17 +2622,28 @@ struct Viewer {
             a.y -= 44 * cam.zoom * kPix * 0.5f + 18;
             float x = a.x - 10;
             const float y = a.y - 30;
-            // measure
-            float wsum = 8;
-            std::vector<std::pair<std::string, std::string>> parts;
+            // measure — cap the overhead bubble at a glance: first 4 words
+            // plus a "+N" chip; the full utterance lives in Journal/Chronicle.
+            std::vector<std::pair<std::string, std::string>> all;
+            all.reserve(it->words.size());
             for (const std::string& wd : it->words) {
                 std::string tr = journal_reading(w, journal, it->lang, wd);
                 if (avatar != kNoEntity) {
                     const auto gi = c_avatar_gloss.find(wd);
                     if (gi != c_avatar_gloss.end()) tr = gi->second + " (you know)";
                 }
+                all.push_back({wd, tr});
+            }
+            std::vector<std::pair<std::string, std::string>> parts;
+            if (all.size() > 5) {
+                parts.assign(all.begin(), all.begin() + 4);
+                parts.push_back({"+" + std::to_string(all.size() - 4), "\xC2\xB7"});
+            } else {
+                parts = std::move(all);
+            }
+            float wsum = 8;
+            for (const auto& [wd, tr] : parts) {
                 const float ww = std::max(ImGui::CalcTextSize(wd.c_str()).x, ImGui::CalcTextSize(tr.c_str()).x) + 10;
-                parts.push_back({wd, tr});
                 wsum += ww;
             }
             x = a.x - wsum * 0.5f;
@@ -2828,6 +2839,55 @@ struct Viewer {
             if (const Entity* d = w.find(did); d && d->alive && w.prop_int(*d, debtor, 0) == std::int64_t(e->id))
                 insp.property.push_back("owes " + std::to_string(w.prop_int(*d, dv, 0)));
     }
+    // ---- Continuous Chronicle chapters (Biên Niên Sử) -------------------------
+    // Long-form LLM chapters in chronological order; click flies the camera
+    // to the chapter's event centroid, Export copies the .md path. Shared by
+    // the live Chronicle window and the codex "Chronicle" tab.
+    void ui_chapters() {
+        if (chron_chapters.empty()) return;
+        ImGui::TextDisabled("Biên Niên Sử — %zu chapters", chron_chapters.size());
+        if (ImGui::SmallButton("Export .md") && !chron_path.empty()) {
+            SDL_SetClipboardText(chron_path.c_str());
+            status_msg = "Chronicle path copied: " + chron_path;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", chron_path.c_str());
+        ImGui::Separator();
+        ImGuiListClipper cclip;
+        cclip.Begin(static_cast<int>(chron_chapters.size()));
+        while (cclip.Step()) {
+            for (int ci = cclip.DisplayStart; ci < cclip.DisplayEnd; ++ci) {
+                const ChronicleChapter& c = chron_chapters[ci];
+                ImGui::PushID(2000000 + ci);
+                char label[192];
+                std::snprintf(label, sizeof label, "[d%llu–d%llu] %s",
+                    (unsigned long long)(c.tick0 / 24 + 1),
+                    (unsigned long long)(c.tick1 / 24 + 1), c.title.c_str());
+                if (ImGui::Selectable(label, chron_open == ci,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    chron_open = (chron_open == ci) ? -1 : ci;
+                    cam_gx = float(c.pos.x); cam_gy = float(c.pos.y);
+                    cam_gz = 0.9f; cam_goal = true;
+                    if (globe) { globe = false; globe_dive = false; }
+                }
+                if (chron_open == ci) {
+                    ImGui::Indent(12.f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.84f, 0.9f, 1));
+                    ImGui::TextWrapped("%s", c.body.c_str());
+                    if (!c.facts.empty()) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1));
+                        ImGui::TextWrapped("Facts: %s", c.facts.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::PopStyleColor();
+                    ImGui::Unindent(12.f);
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::Separator();
+    }
+
     // ---- Phase 15: Live Chronicle Feed -----------------------------------------
     // Newest-first narrative lines from real causal events; click jumps the
     // camera to the scene and selects the actor.
@@ -2845,52 +2905,7 @@ struct Viewer {
             if (sel) ImGui::PopStyleColor();
         }
         ImGui::Separator();
-        // ---- Continuous Chronicle chapters (Biên Niên Sử) -------------------
-        // Long-form LLM chapters in chronological order; click flies the
-        // camera to the chapter's event centroid, Export copies the .md path.
-        if (!chron_chapters.empty()) {
-            ImGui::TextDisabled("Biên Niên Sử — %zu chapters", chron_chapters.size());
-            if (ImGui::SmallButton("Export .md") && !chron_path.empty()) {
-                SDL_SetClipboardText(chron_path.c_str());
-                status_msg = "Chronicle path copied: " + chron_path;
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", chron_path.c_str());
-            ImGui::Separator();
-            ImGuiListClipper cclip;
-            cclip.Begin(static_cast<int>(chron_chapters.size()));
-            while (cclip.Step()) {
-                for (int ci = cclip.DisplayStart; ci < cclip.DisplayEnd; ++ci) {
-                    const ChronicleChapter& c = chron_chapters[ci];
-                    ImGui::PushID(2000000 + ci);
-                    char label[192];
-                    std::snprintf(label, sizeof label, "[d%llu–d%llu] %s",
-                        (unsigned long long)(c.tick0 / 24 + 1),
-                        (unsigned long long)(c.tick1 / 24 + 1), c.title.c_str());
-                    if (ImGui::Selectable(label, chron_open == ci,
-                                          ImGuiSelectableFlags_AllowDoubleClick)) {
-                        chron_open = (chron_open == ci) ? -1 : ci;
-                        cam_gx = float(c.pos.x); cam_gy = float(c.pos.y);
-                        cam_gz = 0.9f; cam_goal = true;
-                        if (globe) { globe = false; globe_dive = false; }
-                    }
-                    if (chron_open == ci) {
-                        ImGui::Indent(12.f);
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.84f, 0.9f, 1));
-                        ImGui::TextWrapped("%s", c.body.c_str());
-                        if (!c.facts.empty()) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1));
-                            ImGui::TextWrapped("Facts: %s", c.facts.c_str());
-                            ImGui::PopStyleColor();
-                        }
-                        ImGui::PopStyleColor();
-                        ImGui::Unindent(12.f);
-                    }
-                    ImGui::PopID();
-                }
-            }
-            ImGui::Separator();
-        }
+        ui_chapters();   // Biên Niên Sử — LLM chapters (also in codex tab)
         // filtered view, newest first — cfeed is UI-thread only, no lock needed
         std::vector<const NarrativeLine*> rows;
         rows.reserve(cfeed.lines.size());
@@ -3172,6 +3187,8 @@ struct Viewer {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Chronicle")) {
+                ui_chapters();   // Biên Niên Sử — persistent LLM chapters
+                ImGui::TextDisabled("— codex chronicle —");
                 ImGuiListClipper clip;
                 clip.Begin(static_cast<int>(c_chron.size()));
                 while (clip.Step())
@@ -3723,6 +3740,18 @@ struct Viewer {
                     if (is_planet()) fog_mark_dirty(); else build_fog_ground();
                 }
                 if (frames % 30 == 1) update_minimap();
+                // Tribe vision tracks LIVE speech communities: language_id
+                // is not inherited (children converge on the per-kind hash
+                // lang), so genesis tribe_langs go stale as founders die —
+                // without this refresh Tribe fog ends up with ZERO observers
+                // (black map, NPCs invisible beyond the last explored ring).
+                if (frames % 600 == 5) {
+                    derive_tribes();
+                    if (!pw.tribe_lang.empty())
+                        tribe_view = std::min(tribe_view, int(pw.tribe_lang.size()) - 1);
+                    if (fog.mode() == FogOfWar::Mode::Tribe)
+                        fog.set_mode(FogOfWar::Mode::Tribe, tribe_lang());
+                }
                 // snapshot 1.5x the view: panning while the sim is busy
                 // still has content at the edges
                 ViewRect v = cam.view();
