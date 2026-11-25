@@ -183,14 +183,14 @@ std::uint64_t BrainArena::alloc(std::uint64_t bytes) {
         high_water_ += cells;
     }
     live_bytes_ += cells * kCell;
-    return slab_base_off_ + cell * kCell;
+    // offsets are cell-grid relative (cell * kCell); slab_base_off_ is added
+    // by w8()/free() so realloc-moving reserve() never invalidates them.
+    return cell * kCell;
 }
 
 void BrainArena::free(std::uint64_t offset, std::uint64_t bytes) {
-    if (offset == kInvalid || offset < slab_base_off_) return;
-    const std::uint64_t rel = offset - slab_base_off_;
-    if (rel % kCell != 0) return;                    // not cell-aligned
-    const std::uint64_t cell = rel / kCell;
+    if (offset == kInvalid || offset % kCell != 0) return;
+    const std::uint64_t cell = offset / kCell;
     const std::uint64_t cells = (bytes + kCell - 1) / kCell;
     if (cells == 0 || cell + cells > slab_cells_) return;
     if (cells >= free_.size()) free_.resize(cells + 1);
@@ -206,8 +206,7 @@ namespace {
 // Fixed-point shifts chosen so (dot >> shift) + bias lands in int8 range
 // for the init spread (|w| <= 24) and typical activations.
 constexpr std::int32_t kShEmbed = 11, kShGru = 11, kShWm1 = 11, kShWm2 = 12;
-constexpr std::int32_t kWmHidden = 96;
-constexpr std::int32_t kWmIn = 80;      // h(64) ++ action(16)
+constexpr std::int32_t kWmHidden = kBrainWmHidden;
 constexpr std::int32_t kHid = 64;
 
 struct Off {
@@ -215,34 +214,47 @@ struct Off {
     std::uint32_t b = 0;   // bias offset   (int16, rows)
 };
 
-// Build the layout once: every layer's weight block then its bias block,
-// sequentially. All column counts are multiples of 16 so stride == cols.
-const BrainLayout& layout_impl() {
-    static const BrainLayout L = [] {
-        BrainLayout l{};
-        std::uint64_t o = 0;
-        auto layer = [&](std::uint32_t rows, std::uint32_t cols,
-                         std::uint32_t& w, std::uint32_t& b) {
-            w = static_cast<std::uint32_t>(o);
-            o += static_cast<std::uint64_t>(rows) * cols;   // cols % 16 == 0
-            b = static_cast<std::uint32_t>(o);
-            o += static_cast<std::uint64_t>(rows) * 2;
-        };
-        layer(64, 96,  l.embed_w, l.embed_b);   // sensor 96 -> hidden 64
-        layer(64, 64,  l.zw,     l.zb);         // GRU update gate
-        layer(64, 64,  l.hw,     l.hb);         // GRU candidate
-        layer(32, 64,  l.m1w,    l.m1b);        // manager 64 -> 32
-        layer(8,  32,  l.m2w,    l.m2b);        // manager 32 -> 8 drives
-        layer(64, 80,  l.w1w,    l.w1b);        // worker (64+8) -> 64
-        layer(16, 64,  l.w2w,    l.w2b);        // worker 64 -> 16 verbs
-        layer(16, 64,  l.aqw,    l.aqb);        // worker attention queries
-        layer(96, 80,  l.wm1w,   l.wm1b);       // WM 80 -> 96
-        layer(25, 96,  l.wm2w,   l.wm2b);       // WM 96 -> 25 outputs
-        layer(1,  64,  l.valw,   l.valb);       // value 64 -> 1
-        l.total_bytes = o;
-        return l;
-    }();
-    return L;
+// Build the layout for hidden size H: every layer's weight block then its
+// bias block, sequentially. All column counts are padded to multiples of
+// 16 so stride == padded cols (worker input H+8 -> pad16, WM input H+16).
+static BrainLayout layout_for(std::int32_t H) {
+    BrainLayout l{};
+    std::uint64_t o = 0;
+    auto layer = [&](std::uint32_t rows, std::uint32_t cols,
+                     std::uint32_t& w, std::uint32_t& b) {
+        w = static_cast<std::uint32_t>(o);
+        o += static_cast<std::uint64_t>(rows) * cols;
+        b = static_cast<std::uint32_t>(o);
+        o += static_cast<std::uint64_t>(rows) * 2;
+    };
+    const std::uint32_t wc = static_cast<std::uint32_t>(
+        (H + 8 + 15) & ~15);    // worker input: h(H) ++ drive(8), padded
+    const std::uint32_t mc = static_cast<std::uint32_t>(
+        (H + 16 + 15) & ~15);   // WM input: h(H) ++ action(16), padded
+    const std::uint32_t Hu = static_cast<std::uint32_t>(H);
+    layer(Hu, 96,  l.embed_w, l.embed_b);   // sensor 96 -> hidden H
+    layer(Hu, Hu,  l.zw,     l.zb);         // GRU update gate
+    layer(Hu, Hu,  l.hw,     l.hb);         // GRU candidate
+    layer(32, Hu,  l.m1w,    l.m1b);        // manager H -> 32
+    layer(8,  32,  l.m2w,    l.m2b);        // manager 32 -> 8 drives
+    layer(64, wc,  l.w1w,    l.w1b);        // worker (H+8) -> 64
+    layer(16, 64,  l.w2w,    l.w2b);        // worker 64 -> 16 verbs
+    layer(16, Hu,  l.aqw,    l.aqb);        // worker attention queries
+    layer(96, mc,  l.wm1w,   l.wm1b);       // WM (H+16) -> 96
+    layer(25, 96,  l.wm2w,   l.wm2b);       // WM 96 -> 25 outputs
+    layer(1,  Hu,  l.valw,   l.valb);       // value H -> 1
+    l.total_bytes = o;
+    return l;
+}
+
+// hidden sizes are genome-quantized to {32,48,64,96}; anything else falls
+// back to the nearest supported size (deterministic).
+static std::int32_t snap_hidden(std::int32_t h) {
+    if (h <= 32) return 32;
+    if (h <= 48) return 48;
+    if (h <= 64) return 64;
+    if (h <= 96) return 96;
+    return 96;
 }
 
 // dense forward with int16 bias: y[o] = act(clamp((dot>>shift)+bias[o]))
@@ -270,40 +282,106 @@ std::int32_t huber_i32(std::int32_t e) {
 
 }  // namespace
 
-const BrainLayout& brain_layout() { return layout_impl(); }
+const BrainLayout& brain_layout() { return brain_layout_h(kHid); }
 
-BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc) {
+const BrainLayout& brain_layout_h(std::int32_t hidden) {
+    static BrainLayout cache[7];   // index = H/16 - 2  ({32..96} -> 0..4)
+    static bool init[7] = {};
+    const std::int32_t H = snap_hidden(hidden);
+    const int idx = H / 16 - 2;
+    if (!init[idx]) { cache[idx] = layout_for(H); init[idx] = true; }
+    return cache[idx];
+}
+
+// read a brain_* hyper-gene locus (integer allele) with a default
+static std::int64_t brain_locus(const World& w, const Entity* e,
+                                const char* name, std::int64_t dflt) {
+    if (!e || e->genome.loci.empty()) return dflt;
+    const PropertyDef* d = w.props.find_name(name);
+    if (!d) return dflt;
+    const std::int64_t* v = e->genome.get(d->id);
+    return v ? *v : dflt;
+}
+
+BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
+                      const BrainGenome* genome) {
     auto it = store.slots.find(npc);
     if (it != store.slots.end()) return it->second;
-    const BrainLayout& L = brain_layout();
+    // hyper-genes: explicit genome wins, else the entity's own loci
+    const Entity* ge = w.find(npc);
+    const BrainGenome* src = genome;
+    BrainGenome tmp;
+    if (!src || !src->valid) {
+        tmp.hidden   = snap_hidden(static_cast<std::int32_t>(
+            brain_locus(w, ge, "brain_hidden", kHid)));
+        tmp.lr_permille    = static_cast<std::int32_t>(
+            brain_locus(w, ge, "brain_lr", 400));
+        tmp.trace_decay    = static_cast<std::int32_t>(
+            brain_locus(w, ge, "brain_trace_decay", 900));
+        tmp.mut_scale      = static_cast<std::int32_t>(
+            brain_locus(w, ge, "brain_mut_scale", 500));
+        src = &tmp;
+    }
+    const std::int32_t H = snap_hidden(src->hidden);
+    const BrainLayout& L = brain_layout_h(H);
     BrainArena& ar = store.arena;
     if (ar.capacity_cells() == 0) ar.reserve(8192);   // ~512KB initial slab
-    const std::uint64_t off = ar.alloc(L.total_bytes);
+    const bool have_slow = src->slow.size() == L.total_bytes;
+    const std::uint64_t bytes = L.total_bytes;
+    std::uint64_t off = ar.alloc(bytes);
+    while (off == BrainArena::kInvalid) {               // grow until it fits
+        const std::uint64_t need = (bytes + BrainArena::kCell - 1) /
+                                   BrainArena::kCell;
+        ar.reserve(ar.capacity_cells() + need + 64);
+        off = ar.alloc(bytes);
+    }
     BrainSlot slot;
     slot.woff = off;
-    slot.wbytes = L.total_bytes;
-    // deterministic init: every weight from (world_seed, entity, index)
+    slot.wbytes = bytes;
+    slot.hidden = H;
+    slot.lr_permille = src->lr_permille;
+    slot.trace_decay = src->trace_decay;
+    slot.mut_scale = src->mut_scale;
+    // weights: inherited slow block verbatim (Baldwin — fast weights are
+    // NOT inherited and start at the hash-init... no: spec says fast=0;
+    // our layout has no separate fast region yet, so an inherited brain
+    // keeps its slow block and a fresh brain hash-inits (genesis noise).
     std::int8_t* base = ar.w8(off);
-    for (std::uint64_t i = 0; i < L.total_bytes; ++i) {
-        // bias region is the tail — detect by offset parity is fragile;
-        // instead fill EVERYTHING with small random int8 then zero biases
-        // via the layout below.
-        base[i] = brain_rand_weight(w.seed, static_cast<std::uint64_t>(npc),
-                                    i, 24);
+    if (have_slow) {
+        std::memcpy(base, src->slow.data(), L.total_bytes);
+        // clamp int16 bias regions to the legal range (byte-crossover can
+        // produce out-of-range halves)
+        auto clamp_bias = [&](std::uint32_t boff, std::uint32_t rows) {
+            std::int16_t* bp = reinterpret_cast<std::int16_t*>(base + boff);
+            for (std::uint32_t i = 0; i < rows; ++i)
+                bp[i] = static_cast<std::int16_t>(
+                    std::max<std::int64_t>(-4096,
+                        std::min<std::int64_t>(4095, bp[i])));
+        };
+        clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
+        clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
+        clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, 16); clamp_bias(L.aqb, 16);
+        clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
+    } else {
+        for (std::uint64_t i = 0; i < bytes; ++i)
+            base[i] = brain_rand_weight(w.seed, static_cast<std::uint64_t>(npc),
+                                        i, 24);
+        auto zero_bias = [&](std::uint32_t boff, std::uint32_t rows) {
+            std::memset(base + boff, 0, rows * 2);
+        };
+        zero_bias(L.embed_b, H); zero_bias(L.zb, H); zero_bias(L.hb, H);
+        zero_bias(L.m1b, 32);    zero_bias(L.m2b, 8);
+        zero_bias(L.w1b, 64);    zero_bias(L.w2b, 16); zero_bias(L.aqb, 16);
+        zero_bias(L.wm1b, 96);   zero_bias(L.wm2b, 25); zero_bias(L.valb, 1);
     }
-    // zero all bias regions (they live interleaved; walk the layout)
-    const BrainLayout& l = L;
-    auto zero_bias = [&](std::uint32_t boff, std::uint32_t rows) {
-        std::memset(base + boff, 0, rows * 2);
-    };
-    zero_bias(l.embed_b, 64); zero_bias(l.zb, 64); zero_bias(l.hb, 64);
-    zero_bias(l.m1b, 32);    zero_bias(l.m2b, 8);
-    zero_bias(l.w1b, 64);    zero_bias(l.w2b, 16); zero_bias(l.aqb, 16);
-    zero_bias(l.wm1b, 96);   zero_bias(l.wm2b, 25); zero_bias(l.valb, 1);
-    // int8-fill only touched weight bytes? brain_rand_weight filled biases
-    // too then memset zeroed them — weight bytes keep their draws. But the
-    // rand stream index `i` ran over total_bytes INCLUDING bias bytes, so
-    // weight draws depend on layout — deterministic regardless. Fine.
+    // Phase 3 plasticity: fast weights start at ZERO (Baldwin — never
+    // inherited); anchor snapshots the birth slow-WM2 block for the
+    // L2-SP pull during sleep consolidation.
+    constexpr std::int32_t kWm2n = kLabelChannels * kWmHidden;
+    slot.fast.assign(kWm2n, 0);
+    slot.anchor.assign(reinterpret_cast<const std::int8_t*>(base + L.wm2w),
+                       reinterpret_cast<const std::int8_t*>(base + L.wm2w) + kWm2n);
+    // h and replay start at zero — fast weights / experience never inherit
     auto [ins, ok] = store.slots.emplace(npc, std::move(slot));
     (void)ok;
     return ins->second;
@@ -327,11 +405,26 @@ void brain_gc(World& w, BrainStore& store) {
     for (EntityId id : dead) brain_free_slot(store, id);
 }
 
+// WM output layer: effective weight = clamp_i8(slow + fast_delta). Merges
+// into a stack buffer so the hot dot product stays a plain int8 matvec.
+static void wm2_forward(const std::int8_t* wm2w, const std::int8_t* fast,
+                        const std::int16_t* wm2b, const std::int8_t* x,
+                        std::int8_t* y) {
+    constexpr std::int32_t n = kLabelChannels * kWmHidden;
+    std::array<std::int8_t, n> merged;
+    for (std::int32_t i = 0; i < n; ++i)
+        merged[i] = brain_clamp_i8(static_cast<std::int64_t>(wm2w[i]) + fast[i]);
+    dense16(merged.data(), kLabelChannels, kWmHidden, x, wm2b,
+            kShWm2, BrainAct::kLinear, y);
+}
+
 // forward trunk + world model; fills pending. Caller guarantees slot exists.
 static void brain_forward(World& w, BrainStore& store, EntityId npc,
                           BrainPending& p) {
     BrainSlot& s = brain_slot(w, store, npc);
-    const BrainLayout& L = brain_layout();
+    const std::int32_t H = s.hidden;
+    const BrainLayout& L = brain_layout_h(H);
+    const std::int32_t wm_in = ((H + 16 + 15) & ~15);   // padded cols
     std::int8_t* base = store.arena.w8(s.woff);
     const std::int8_t* embed_w = base + L.embed_w;
     const std::int16_t* embed_b =
@@ -349,17 +442,18 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
     const std::int16_t* wm2b =
         reinterpret_cast<const std::int16_t*>(base + L.wm2b);
 
-    // embed: sensor(96) -> e(64), tanh
-    std::array<std::int8_t, kHid> e{};
-    dense16(embed_w, kHid, kSensorChannels, p.s.data(), embed_b,
+    // embed: sensor(96) -> e(H), tanh
+    std::array<std::int8_t, 96> e{};
+    dense16(embed_w, H, kSensorChannels, p.s.data(), embed_b,
             kShEmbed, BrainAct::kTanh, e.data());
+    for (int i = 0; i < H; ++i) p.embed[i] = e[i];
 
     // minGRU: gates read the EMBEDDED input only (no recurrence inside the
     // gates); the recurrence is one elementwise multiply — the cheap part.
-    std::array<std::int8_t, kHid> z{}, hh{};
-    dense16(zw, kHid, kHid, e.data(), zb, kShGru, BrainAct::kSigmoid, z.data());
-    dense16(hw, kHid, kHid, e.data(), hb, kShGru, BrainAct::kTanh, hh.data());
-    for (int i = 0; i < kHid; ++i) {
+    std::array<std::int8_t, 96> z{}, hh{};
+    dense16(zw, H, H, e.data(), zb, kShGru, BrainAct::kSigmoid, z.data());
+    dense16(hw, H, H, e.data(), hb, kShGru, BrainAct::kTanh, hh.data());
+    for (int i = 0; i < H; ++i) {
         const std::int64_t zq = static_cast<std::int64_t>(z[i]) + 128; // ~sigma*256
         const std::int64_t target = static_cast<std::int64_t>(hh[i]) * 256;
         std::int64_t h = s.h[i] + ((zq * (target - s.h[i])) >> 8);
@@ -368,19 +462,18 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
         p.h[i] = s.h[i];
     }
 
-    // WM input: hidden state dequantized to int8 ++ action one-hot (80)
-    std::array<std::int8_t, kWmIn> win{};
-    for (int i = 0; i < kHid; ++i)
+    // WM input: hidden state dequantized to int8 ++ action one-hot (pad16)
+    std::array<std::int8_t, 112> win{};
+    for (int i = 0; i < H; ++i)
         win[i] = static_cast<std::int8_t>(s.h[i] >> 8);
     for (int i = 0; i < kActionVerbs; ++i)
-        win[kHid + i] = p.a[i];
+        win[H + i] = p.a[i];
 
-    // WM layer 1: 80 -> 96, tanh (kept for the output-layer gradient)
-    dense16(wm1w, kWmHidden, kWmIn, win.data(), wm1b,
+    // WM layer 1: (H+16) -> 96, tanh (kept for the output-layer gradient)
+    dense16(wm1w, kWmHidden, wm_in, win.data(), wm1b,
             kShWm1, BrainAct::kTanh, p.wm_hidden.data());
-    // WM output: 96 -> 25, linear
-    dense16(wm2w, kLabelChannels, kWmHidden, p.wm_hidden.data(), wm2b,
-            kShWm2, BrainAct::kLinear, p.yhat.data());
+    // WM output: 96 -> 25, linear (slow wm2w + fast delta, clamped int8)
+    wm2_forward(wm2w, s.fast.data(), wm2b, p.wm_hidden.data(), p.yhat.data());
 }
 
 void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
@@ -428,7 +521,7 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
 
     // replay: stratified ring — replace the least (charge+sigma) sample
     Transition t;
-    t.s = p.s; t.a = p.a; t.y = y;
+    t.s = p.s; t.a = p.a; t.y = y; t.wh = p.wm_hidden;
     t.sigma = static_cast<std::uint16_t>(sigma);
     t.charge = static_cast<std::uint16_t>(charge);
     t.event_id = ev.id;
@@ -451,12 +544,12 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
 
     // ---- one integer SGD step on the WM OUTPUT layer (W2 + bias) -------------
     // err = huber(y - yhat); grad ~ err * hidden; lr modulated by surprise.
-    const BrainLayout& L = brain_layout();
+    const BrainLayout& L = brain_layout_h(s.hidden);
     std::int8_t* base = store->arena.w8(s.woff);
     std::int8_t* wm2w = base + L.wm2w;
     std::int16_t* wm2b =
         reinterpret_cast<std::int16_t*>(base + L.wm2b);
-    const std::int64_t eta = 384 + sigma / 2;      // permille-ish lr 384..884
+    const std::int64_t eta = s.lr_permille + sigma / 2;  // genome lr + surprise
     for (int o = 0; o < kLabelChannels; ++o) {
         const std::int32_t err =
             huber_i32(static_cast<std::int32_t>(y[o]) - p.yhat[o]);
@@ -481,6 +574,93 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                           std::min<std::int64_t>(4095, bv)));
         }
     }
+
+    // ---- Phase 3: FAST-weight plasticity on the same WM2 error -------------
+    // Faster, surprise-scaled, small deltas — the "working memory" of the
+    // world model. Consolidated into slow weights on `rest` (sleep).
+    if (s.fast.size() == static_cast<std::size_t>(kLabelChannels * kWmHidden)) {
+        const std::int64_t eta_f = (eta * 3) / 2;   // ~1.5x slow lr
+        for (int o = 0; o < kLabelChannels; ++o) {
+            const std::int32_t err =
+                huber_i32(static_cast<std::int32_t>(y[o]) - p.yhat[o]);
+            if (err == 0) continue;
+            for (int i = 0; i < kWmHidden; ++i) {
+                const std::int64_t dw =
+                    (eta_f * err * p.wm_hidden[i]) >> 18;
+                const std::int64_t d = std::max<std::int64_t>(-6,
+                                                   std::min<std::int64_t>(6, dw));
+                if (d == 0) continue;
+                const std::int64_t v =
+                    static_cast<std::int64_t>(s.fast[o * kWmHidden + i]) + d;
+                s.fast[o * kWmHidden + i] = static_cast<std::int8_t>(
+                    std::max<std::int64_t>(-96,
+                        std::min<std::int64_t>(96, v)));
+            }
+        }
+    }
+
+    // ---- Phase 3: sleep consolidation on `rest` ----------------------------
+    // 1) replay SGD: 4 stratified samples (highest charge+sigma) update the
+    //    SLOW wm2 via their stored WM-hidden activations.
+    // 2) fast -> slow transfer (>>2, remainder stays fast).
+    // 3) L2-SP pull toward the birth anchor (>>4) — anti-forgetting.
+    if (p.a[4] && s.replay_count > 0 &&                       // verb "rest"
+        s.fast.size() == static_cast<std::size_t>(kLabelChannels * kWmHidden)) {
+        const std::int64_t eta_c = std::max<std::int64_t>(16, s.lr_permille / 2);
+        // pick top-4 replay entries by charge+sigma (insertion order, deterministic)
+        std::array<std::int32_t, 4> top{-1, -1, -1, -1};
+        std::array<std::int64_t, 4> topsc{-1, -1, -1, -1};
+        for (int i = 0; i < 16 && i < s.replay_count; ++i) {
+            if (!s.replay[i].valid) continue;
+            const std::int64_t sc =
+                static_cast<std::int64_t>(s.replay[i].charge) + s.replay[i].sigma;
+            for (int k = 0; k < 4; ++k) {
+                if (sc > topsc[k]) {
+                    for (int j = 3; j > k; --j) { topsc[j] = topsc[j-1]; top[j] = top[j-1]; }
+                    topsc[k] = sc; top[k] = i; break;
+                }
+            }
+        }
+        for (int k = 0; k < 4; ++k) {
+            const int ri = top[k];
+            if (ri < 0) continue;
+            const Transition& rt = s.replay[ri];
+            LabelVec yh{};
+            wm2_forward(wm2w, s.fast.data(), wm2b, rt.wh.data(), yh.data());
+            for (int o = 0; o < kLabelChannels; ++o) {
+                const std::int32_t err = huber_i32(
+                    static_cast<std::int32_t>(rt.y[o]) - yh[o]);
+                if (err == 0) continue;
+                for (int i = 0; i < kWmHidden; ++i) {
+                    const std::int64_t dw = (eta_c * err * rt.wh[i]) >> 18;
+                    const std::int64_t d = std::max<std::int64_t>(-4,
+                                                       std::min<std::int64_t>(4, dw));
+                    if (d == 0) continue;
+                    const std::int64_t v =
+                        static_cast<std::int64_t>(wm2w[o * kWmHidden + i]) + d;
+                    wm2w[o * kWmHidden + i] = brain_clamp_i8(v);
+                }
+            }
+        }
+        // fast -> slow transfer + L2-SP anchor pull (one pass, in place)
+        for (int i = 0; i < kLabelChannels * kWmHidden; ++i) {
+            const std::int32_t f = s.fast[i];
+            const std::int32_t tr = f >> 2;                 // keep remainder
+            if (tr != 0) {
+                const std::int64_t v =
+                    static_cast<std::int64_t>(wm2w[i]) + tr;
+                wm2w[i] = brain_clamp_i8(v);
+                s.fast[i] = static_cast<std::int8_t>(f - (tr << 2));
+            }
+            const std::int64_t pull =
+                (static_cast<std::int64_t>(s.anchor[i]) - wm2w[i]) >> 4;
+            if (pull != 0) {
+                const std::int64_t v =
+                    static_cast<std::int64_t>(wm2w[i]) + pull;
+                wm2w[i] = brain_clamp_i8(v);
+            }
+        }
+    }
 }
 
 std::uint64_t brain_state_hash(const BrainStore& store) {
@@ -493,6 +673,10 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
         mix(static_cast<std::uint64_t>(id));
         mix(s.wbytes);   // woff is arena bookkeeping (heap-alignment
                          // dependent) — NOT brain state, never hashed
+        mix(static_cast<std::uint32_t>(s.hidden));
+        mix(static_cast<std::uint32_t>(s.lr_permille));
+        mix(static_cast<std::uint32_t>(s.trace_decay));
+        mix(static_cast<std::uint32_t>(s.mut_scale));
         for (std::int16_t v : s.h) mix(static_cast<std::uint16_t>(v));
         for (std::int8_t v : s.last_action) mix(static_cast<std::uint8_t>(v));
         // weights: hash the arena bytes of this brain's block
@@ -500,6 +684,10 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
         for (std::uint64_t i = 0; i < s.wbytes; ++i)
             mix(static_cast<std::uint8_t>(wb[i]));
         mix(s.replay_count); mix(s.replay_next);
+        mix(static_cast<std::uint64_t>(s.mac_pending));
+        mix(static_cast<std::uint64_t>(s.mac_frac));
+        for (std::int8_t v : s.fast) mix(static_cast<std::uint8_t>(v));
+        for (std::int8_t v : s.anchor) mix(static_cast<std::uint8_t>(v));
         for (const Transition& t : s.replay) {
             mix(t.valid ? 1 : 0);
             if (!t.valid) continue;
@@ -507,12 +695,351 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
             for (std::int8_t v : t.s) mix(static_cast<std::uint8_t>(v));
             for (std::int8_t v : t.a) mix(static_cast<std::uint8_t>(v));
             for (std::int8_t v : t.y) mix(static_cast<std::uint8_t>(v));
+            for (std::int8_t v : t.wh) mix(static_cast<std::uint8_t>(v));
         }
     }
     mix(store.wm_err_sum); mix(store.wm_n);
     mix(store.sigma_sum); mix(store.sigma_n);
     mix(store.surprise_events);
     return h;
+}
+
+// ================= Phase 2: genome, inheritance, CL-1 decision =================
+
+BrainGenome brain_genome_of(const World& w, const BrainStore& store,
+                            EntityId npc) {
+    (void)w;
+    BrainGenome g;
+    const auto it = store.slots.find(npc);
+    if (it == store.slots.end()) return g;
+    const BrainSlot& s = it->second;
+    const std::int8_t* wb = store.arena.w8(s.woff);
+    g.valid = true;
+    g.hidden = s.hidden;
+    g.lr_permille = s.lr_permille;
+    g.trace_decay = s.trace_decay;
+    g.mut_scale = s.mut_scale;
+    g.slow.assign(wb, wb + s.wbytes);
+    return g;
+}
+
+std::int64_t brain_genetic_distance(const BrainGenome& a,
+                                    const BrainGenome& b) {
+    if (!a.valid || !b.valid || a.hidden != b.hidden ||
+        a.slow.size() != b.slow.size() || a.slow.empty())
+        return 1000000;
+    std::int64_t sum = 0;
+    for (std::size_t i = 0; i < a.slow.size(); ++i)
+        sum += std::abs(static_cast<std::int32_t>(a.slow[i]) -
+                        static_cast<std::int32_t>(b.slow[i]));
+    // mean |dw| as permille of the 255 int8 range
+    return sum * 1000 / (static_cast<std::int64_t>(a.slow.size()) * 255);
+}
+
+BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
+                               const BrainGenome& ga, const BrainGenome& gb) {
+    BrainGenome g;
+    g.valid = true;
+    g.hidden = ga.hidden;
+    const std::uint64_t tick = w.clock_.tick();
+    auto pick = [&](std::int32_t x, std::int32_t y, std::uint64_t f) {
+        return (Rng::hash(w.world_seed ^ (a * 0x9E3779B97F4A7C15ull) ^
+                          (b * 0xBF58476D1CE4E5B9ull) ^
+                          (tick * 0x94D049BB133111EBull) ^ (f << 32)) & 1)
+                   ? y : x;
+    };
+    g.lr_permille = pick(ga.lr_permille, gb.lr_permille, 1);
+    g.trace_decay = pick(ga.trace_decay, gb.trace_decay, 2);
+    g.mut_scale = pick(ga.mut_scale, gb.mut_scale, 3);
+    // block crossover: 64-byte blocks (one arena cell) from either parent
+    const std::size_t n = std::min(ga.slow.size(), gb.slow.size());
+    g.slow.assign(n, 0);
+    for (std::size_t blk = 0; blk * 64 < n; ++blk) {
+        const BrainGenome& src =
+            (Rng::hash(w.world_seed ^ (a * 0x9E3779B97F4A7C15ull) ^
+                       (b * 0xBF58476D1CE4E5B9ull) ^
+                       (tick * 0x94D049BB133111EBull) ^
+                       ((blk + 100) << 32)) & 1) ? gb : ga;
+        const std::size_t cnt = std::min<std::size_t>(64, n - blk * 64);
+        std::memcpy(g.slow.data() + blk * 64, src.slow.data() + blk * 64, cnt);
+    }
+    // mutation at the child's own mut_scale (permille), step 3
+    brain_mutate_blocks(g.slow.data(), static_cast<std::int64_t>(n),
+                        w.world_seed, a, tick, 3, g.mut_scale);
+    // clamp int16 bias halves back into range (byte-level crossover can
+    // produce out-of-range pairs)
+    const BrainLayout& L = brain_layout_h(g.hidden);
+    auto clamp_bias = [&](std::uint32_t boff, std::uint32_t rows) {
+        std::int16_t* bp = reinterpret_cast<std::int16_t*>(g.slow.data() + boff);
+        for (std::uint32_t i = 0; i < rows; ++i)
+            bp[i] = static_cast<std::int16_t>(
+                std::max<std::int64_t>(-4096, std::min<std::int64_t>(4095, bp[i])));
+    };
+    const std::int32_t H = g.hidden;
+    clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
+    clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
+    clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, 16); clamp_bias(L.aqb, 16);
+    clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
+    return g;
+}
+
+// install an inherited brain on a freshly spawned entity (interact commit)
+void brain_install_spawn(World& w, EntityId nid, const BrainGenome& g) {
+    if (w.speculative || !g.valid) return;
+    if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+    brain_slot(w, *w.brains_, nid, &g);
+}
+
+namespace {
+
+// 8 drive logits get a deterministic tilt from the emotion axes — the
+// manager's output is modulated, never replaced, by personality.
+std::int32_t drive_bias(const NeuroState& nr, int d) {
+    static const std::int32_t kSign[8] = {3, -2, 1, -1, 2, -3, 0, 1};
+    const std::int64_t base =
+        nr.rage + nr.grief / 2 - nr.panic / 2;
+    return static_cast<std::int32_t>((base * kSign[d]) >> 6);
+}
+
+}  // namespace
+
+BrainChoice brain_decide(World& w, EntityId npc) {
+    BrainChoice out;
+    if (w.speculative) return out;
+    const Entity* me = w.find(npc);
+    const AgentMind* mind = w.find_mind(npc);
+    if (!me || !me->alive || !mind) return out;
+    if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+    BrainStore& store = *w.brains_;
+    BrainSlot& s = brain_slot(w, store, npc);
+    const std::int32_t H = s.hidden;
+    const BrainLayout& L = brain_layout_h(H);
+    const std::int32_t wc = (H + 8 + 15) & ~15;
+    const std::int32_t mc = (H + 16 + 15) & ~15;
+    const std::int8_t* base = store.arena.w8(s.woff);
+    auto W = [&](std::uint32_t o) { return base + o; };
+    auto B = [&](std::uint32_t o) {
+        return reinterpret_cast<const std::int16_t*>(base + o);
+    };
+
+    // ---- 1-2. encode -> embed -> minGRU (on a COPY of h — decide must not
+    // commit recurrent state; brain_pre does that at interact time) --------
+    const SensorVec sv = sensor_encode(w, npc, &s.last_action);
+    std::array<std::int8_t, 96> e{}, z{}, hh{};
+    dense16(W(L.embed_w), H, kSensorChannels, sv.data(), B(L.embed_b),
+            kShEmbed, BrainAct::kTanh, e.data());
+    dense16(W(L.zw), H, H, e.data(), B(L.zb), kShGru, BrainAct::kSigmoid,
+            z.data());
+    dense16(W(L.hw), H, H, e.data(), B(L.hb), kShGru, BrainAct::kTanh,
+            hh.data());
+    std::array<std::int8_t, 96> h8{};
+    for (int i = 0; i < H; ++i) {
+        const std::int64_t zq = static_cast<std::int64_t>(z[i]) + 128;
+        const std::int64_t target = static_cast<std::int64_t>(hh[i]) * 256;
+        std::int64_t h = s.h[i] + ((zq * (target - s.h[i])) >> 8);
+        h = std::max<std::int64_t>(-32512, std::min<std::int64_t>(32511, h));
+        h8[i] = static_cast<std::int8_t>(h >> 8);
+    }
+
+    // ---- 3. manager: e -> 32 -> 8 drive logits + personality bias -----------
+    std::array<std::int8_t, 32> m1{};
+    dense16(W(L.m1w), 32, H, e.data(), B(L.m1b), kShGru, BrainAct::kTanh,
+            m1.data());
+    std::array<std::int8_t, 8> m2{};
+    dense16(W(L.m2w), 8, 32, m1.data(), B(L.m2b), kShGru, BrainAct::kLinear,
+            m2.data());
+    std::int32_t drive_score[8];
+    int drive = 0;
+    for (int d = 0; d < 8; ++d) {
+        drive_score[d] = m2[d] * 8 + drive_bias(mind->neuro, d);
+        if (drive_score[d] > drive_score[drive]) drive = d;
+    }
+
+    // ---- worker: (h8 ++ drive) -> 64 -> 16 verb logits + 16 attn query -----
+    std::array<std::int8_t, 128> win{};
+    for (int i = 0; i < H; ++i) win[i] = h8[i];
+    win[H + drive] = 100;
+    std::array<std::int8_t, 64> w1{};
+    dense16(W(L.w1w), 64, wc, win.data(), B(L.w1b), kShWm1, BrainAct::kTanh,
+            w1.data());
+    std::array<std::int8_t, kActionVerbs> vlogit{};
+    dense16(W(L.w2w), kActionVerbs, 64, w1.data(), B(L.w2b), kShWm2,
+            BrainAct::kLinear, vlogit.data());
+    std::array<std::int8_t, 16> query{};
+    dense16(W(L.aqw), 16, H, h8.data(), B(L.aqb), kShGru, BrainAct::kLinear,
+            query.data());
+
+    // mask: only verbs the mind has learned (known_actions) plus the
+    // innate locomotion/rest pair — an agent cannot plan what it never saw
+    bool allowed[kActionVerbs] = {};
+    int nallowed = 0;
+    for (int i = 0; i < kActionVerbs; ++i) {
+        allowed[i] = mind->known_actions.count(sensor_verb_table()[i]) > 0;
+        if (allowed[i]) ++nallowed;
+    }
+    for (int i = 0; i < kActionVerbs; ++i) {
+        const char* v = sensor_verb_table()[i];
+        if (std::string(v) == "move" || std::string(v) == "rest") {
+            allowed[i] = true;
+        }
+    }
+    nallowed = 0;
+    for (int i = 0; i < kActionVerbs; ++i) if (allowed[i]) ++nallowed;
+    if (nallowed == 0) {
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (std::string(sensor_verb_table()[i]) == "move" ||
+                std::string(sensor_verb_table()[i]) == "rest") {
+                allowed[i] = true;
+            }
+        for (int i = 0; i < kActionVerbs; ++i) if (allowed[i]) ++nallowed;
+    }
+    if (nallowed == 0) return out;
+
+    // ---- attention targets: the same 6 nearest remembered entities the
+    // sensor encoded (channels 24..71), re-sorted identically ---------------
+    struct NearEnt { std::int64_t d2; EntityId id; Vec2 pos; };
+    std::vector<NearEnt> near;
+    {
+        const PropId p_sight = SIMLAB_PID(w.props, "sight_range");
+        const std::int64_t sight =
+            p_sight != kNoProp ? w.prop_int(*me, p_sight, 64) : 64;
+        (void)sight;
+        for (const auto& [kid, snap] : mind->memory) {
+            if (kid == npc) continue;
+            const std::int64_t dx = snap.pos.x - me->pos.x;
+            const std::int64_t dy = snap.pos.y - me->pos.y;
+            near.push_back({dx * dx + dy * dy, kid, snap.pos});
+        }
+        std::sort(near.begin(), near.end(),
+                  [](const NearEnt& a, const NearEnt& b) { return a.d2 < b.d2; });
+        if (near.size() > kEntitySlots) near.resize(kEntitySlots);
+    }
+    // attention score per remembered slot: query[0..7] . sensor-feat[0..7]
+    std::int32_t attn[kEntitySlots] = {};
+    for (int t = 0; t < static_cast<int>(near.size()); ++t) {
+        const std::int8_t* f = &sv[24 + t * kEntityFeats];
+        std::int32_t sc = 0;
+        for (int k = 0; k < 8; ++k) sc += query[k] * f[k];
+        attn[t] = sc;
+    }
+
+    // ---- candidate generation: top-C (verb, target) pairs -------------------
+    constexpr int kC = 5;
+    struct Cand { std::int32_t score; int verb; int tgt; };
+    std::array<Cand, kC> cands{};
+    int ncand = 0;
+    auto consider = [&](std::int32_t score, int verb, int tgt) {
+        if (ncand < kC) {
+            cands[ncand++] = {score, verb, tgt};
+            if (ncand == kC)
+                std::sort(cands.begin(), cands.end(),
+                          [](const Cand& a, const Cand& b) {
+                              return a.score > b.score; });
+            return;
+        }
+        if (score > cands[kC - 1].score) {
+            cands[kC - 1] = {score, verb, tgt};
+            std::sort(cands.begin(), cands.end(),
+                      [](const Cand& a, const Cand& b) {
+                          return a.score > b.score; });
+        }
+    };
+    for (int v = 0; v < kActionVerbs; ++v) {
+        if (!allowed[v]) continue;
+        consider(vlogit[v], v, -1);                    // no-entity variant
+        for (int t = 0; t < static_cast<int>(near.size()); ++t)
+            consider(vlogit[v] + attn[t] / 8, v, t);
+    }
+    if (ncand == 0) return out;                        // nothing plannable
+
+    // ---- 4. imagination: N-step WM rollout per candidate ---------------------
+    const std::int64_t N = std::clamp<std::int64_t>(
+        mind_params(w, *me).plan_horizon, 1, 6);
+    const std::int64_t gamma =
+        std::clamp<std::int64_t>(s.trace_decay, 0, 1024);   // Q10 discount
+    std::array<std::int8_t, kLabelChannels> yhat{};
+    std::array<std::int8_t, kWmHidden> wh{};
+    std::int64_t best_total = INT64_MIN;
+    int best_c = 0;
+    for (int c = 0; c < ncand; ++c) {
+        const Cand& cd = cands[c];
+        std::int64_t total = 0;
+        for (std::int64_t step = 0; step < N; ++step) {
+            // reflex continuation: step 0 = candidate verb, later steps a
+            // deterministic rotation through the allowed verbs
+            int vstep = cd.verb;
+            if (step > 0) {
+                int k = 0;
+                for (int i = 0; i < kActionVerbs; ++i) {
+                    if (!allowed[i]) continue;
+                    if (k == static_cast<int>((cd.verb + step) % nallowed)) {
+                        vstep = i; break;
+                    }
+                    ++k;
+                }
+            }
+            std::array<std::int8_t, 112> aw{};
+            for (int i = 0; i < H; ++i) aw[i] = h8[i];
+            aw[H + vstep] = 100;
+            dense16(W(L.wm1w), kWmHidden, mc, aw.data(), B(L.wm1b),
+                    kShWm1, BrainAct::kTanh, wh.data());
+            wm2_forward(W(L.wm2w), s.fast.data(), B(L.wm2b),
+                        wh.data(), yhat.data());
+            const std::int32_t r =
+                yhat[24] + (yhat[16] > 0 ? 24 : yhat[16] < 0 ? -24 : 0);
+            total = (total * gamma + r * 1024) >> 10;
+        }
+        // terminal value of the imagined state
+        std::array<std::int8_t, 1> vv{};
+        dense16(W(L.valw), 1, H, h8.data(), B(L.valb), kShGru,
+                BrainAct::kLinear, vv.data());
+        total += static_cast<std::int64_t>(vv[0]) * 256;
+        // small deterministic exploration jitter (genome-scaled)
+        const std::uint64_t jit =
+            Rng::hash(w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^
+                      (w.clock_.tick() * 0xBF58476D1CE4E5B9ull) ^
+                      (static_cast<std::uint64_t>(c) << 40));
+        total += static_cast<std::int64_t>(jit %
+            static_cast<std::uint64_t>(1 + s.mut_scale / 100)) -
+            (1 + s.mut_scale / 100) / 2;
+        if (total > best_total) { best_total = total; best_c = c; }
+    }
+
+    // ---- 5. map winner to an action ------------------------------------------
+    const Cand& chosen = cands[best_c];
+    // Phase 3 metabolism: bill the MACs this decision actually spent.
+    // embed 96*H + GRU 2*H*H + manager H*32+32*8 + worker wc*64+64*16+
+    // H*16(attn) + WM per imagined step mc*96+96*25 (x C x N) + value H.
+    {
+        const std::int64_t macs =
+            96LL * H + 2LL * H * H + H * 32 + 32 * 8 +
+            static_cast<std::int64_t>(wc) * 64 + 64 * 16 + H * 16 +
+            static_cast<std::int64_t>(ncand > 0 ? ncand : 1) * N *
+                (static_cast<std::int64_t>(mc) * 96 + 96 * 25) + H;
+        s.mac_pending += macs;
+    }
+    const char* verb = sensor_verb_table()[chosen.verb];
+    out.verb = verb;
+    out.score = best_total;
+    out.target = (chosen.tgt >= 0 && chosen.tgt < static_cast<int>(near.size()))
+                     ? near[chosen.tgt].id : kNoEntity;
+    if (std::string(verb) == "move") {
+        out.has_move = true;
+        if (out.target != kNoEntity)
+            out.move_to = near[chosen.tgt].pos;   // walk to the mark
+        else {
+            // unmarked wander: deterministic offset within sight range
+            const std::uint64_t j =
+                Rng::hash(w.world_seed ^ (npc * 0x2545F4914F6CDD1Dull) ^
+                          (w.clock_.tick() * 0xFF51AFD7ED558CCDull));
+            out.move_to = {me->pos.x + static_cast<std::int32_t>(
+                               static_cast<std::int64_t>(j % 161) - 80),
+                           me->pos.y + static_cast<std::int32_t>(
+                               ((j >> 16) % 161) - 80)};
+        }
+    }
+    out.valid = true;
+    return out;
 }
 
 }  // namespace simlab

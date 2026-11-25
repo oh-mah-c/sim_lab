@@ -26,6 +26,7 @@
 #include <vector>
 #include "Types.hpp"
 #include "World.hpp"
+#include "Brain.hpp"
 
 namespace simlab {
 
@@ -79,6 +80,16 @@ struct DriverState {
     // CL-1 Phase 1: shadow-mode brains — observe/predict/learn in a private
     // arena, never influence actions, never enter state_hash. Default OFF.
     bool brain_shadow = false;
+    // CL-1 Phase 2: brains as action selector (C=5 WM imagination rollouts).
+    // Default OFF: until the world model has a training curriculum, an
+    // untrained brain fires every cycle and starves the social reflexes
+    // (reproduce/communicate/engrave), collapsing emergent civilization.
+    // Opt in per-scenario; falls back to discover_step when it can't decide.
+    bool brain_control = false;
+    // CL-1 Phase 3: reserved for motor-persistence cache (unused while the
+    // brain is a sparse advisor — kept for the future always-on mode).
+    // Controller memory only: never saved, never hashed.
+    std::map<EntityId, BrainChoice> brain_last;
     std::set<EntityId> possessed;
 };
 

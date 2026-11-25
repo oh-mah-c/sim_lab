@@ -6,7 +6,7 @@ CXX ?= g++
 # The engine is integer-only (no floats in state), so -O3/-flto cannot
 # change simulation results: state_hash is identical across all modes.
 MODE ?= dev
-BASEFLAGS := -std=c++20 -Wall -Wextra -Iinclude
+BASEFLAGS := -std=c++20 -Wall -Wextra -Iinclude -Ithird_party/lang-host/include -Ithird_party/lang-host/ggml/include
 ifeq ($(MODE),release)
   BUILDDIR := build-release
   CXXFLAGS ?= $(BASEFLAGS) -O3 -flto=auto -DNDEBUG
@@ -42,7 +42,7 @@ $(BUILDDIR)/test_main.o: tests/test_main.cpp $(HDR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILDDIR)/tests: $(OBJ) $(BUILDDIR)/test_main.o
-	$(CXX) $(LDFLAGS) $^ -o $@
+	$(CXX) $(LDFLAGS) $^ -ldl -o $@
 
 test: $(BUILDDIR)/tests
 	./$(BUILDDIR)/tests

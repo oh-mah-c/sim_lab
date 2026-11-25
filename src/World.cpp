@@ -3,6 +3,7 @@
 #include "simlab/Geometry.hpp"
 #include "simlab/Cognition.hpp"
 #include "simlab/Discovery.hpp"
+#include "LawUtil.hpp"
 #include <algorithm>
 #include <unordered_set>
 #include <cctype>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdio>
+#include <cstring>
 
 namespace simlab {
 
@@ -798,6 +800,60 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                     e.props.set(ica, Value::integer(acc));
                     ev.changes.push_back(ch);
                     touched = true;
+                }
+            }
+        }
+    }
+    // CL-1 brain work (Phase 3): MACs spent by brain_decide() since the
+    // last pass are billed here — inside the causal metabolize event, so
+    // ledger replay sees the energy cost. `mind_brain_work` records the
+    // cumulative MAC ledger; `mind_brain_metabolic_cost` prices each MAC
+    // (permille-microJ). mac_frac keeps the sub-unit remainder so batched
+    // and per-tick evaluation agree. Speculative clones share brains_ but
+    // must not drain the real store's pending counters.
+    if (!speculative && brains_ && np.energy != kNoProp &&
+        prop_of(e, np.energy)) {
+        auto bit = brains_->slots.find(e.id);
+        if (bit != brains_->slots.end() && bit->second.mac_pending > 0) {
+            BrainSlot& bs = bit->second;
+            static thread_local SeqPidCache bw_c_;
+            SeqPid bw(bw_c_, props);
+            const PropId pwork = bw("mind_brain_work");
+            const std::int64_t macs = bs.mac_pending;
+            bs.mac_pending = 0;
+            if (pwork != kNoProp && prop_of(e, pwork)) {
+                const std::int64_t w0 = prop_int(e, pwork, 0);
+                const std::int64_t w1 = w0 + macs;
+                StateChange ch;
+                ch.entity = e.id; ch.prop = pwork; ch.had_before = true;
+                ch.before = Value::integer(w0);
+                ch.after = Value::integer(w1);
+                e.props.set(pwork, Value::integer(w1));
+                ev.changes.push_back(ch);
+                touched = true;
+            }
+            const std::int64_t bcost = np.mind_brain_cost != kNoProp
+                ? prop_int(e, np.mind_brain_cost, 15) : 15;
+            if (bcost > 0) {
+                // macs * bcost / 100000 energy units per MAC-lot, remainder
+                // carried in mac_frac (permille-of-a-unit granularity).
+                bs.mac_frac += macs * bcost;
+                const std::int64_t drop = bs.mac_frac / 100000;
+                bs.mac_frac %= 100000;
+                if (drop > 0) {
+                    const Value* en = prop_of(e, np.energy);
+                    const std::int64_t nxt =
+                        std::max<std::int64_t>(0, en->i - drop);
+                    if (nxt != en->i) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = np.energy;
+                        ch.had_before = true;
+                        ch.before = Value::integer(en->i);
+                        ch.after = Value::integer(nxt);
+                        e.props.set(np.energy, Value::integer(nxt));
+                        ev.changes.push_back(ch);
+                        touched = true;
+                    }
                 }
             }
         }
@@ -2421,6 +2477,93 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             if (mit != minds_.end())
                 mit->second.neuro.panic = std::min<std::int64_t>(1000,
                     mit->second.neuro.panic + dt * 2);
+        }
+    }
+    // ---- respiration (CL-1 Phase 3): O2 exchange, land vs water ------------
+    // Opt-in like flora drift: only entities CARRYING `oxygen` respire.
+    // Exchange rate scales with the expressed organ gain — `organ_lung_gain`
+    // on land (depth <= kWadeDepth), `organ_gill_gain` submerged — minus a
+    // flat metabolic O2 cost, so an organ-less diver slowly suffocates and
+    // a weak lung slowly tires on land. Organ upkeep is priced in `energy`
+    // proportional to (lung+gill): running BOTH is expensive, which is the
+    // trade-off that makes amphibian generalists pay for their flexibility.
+    // Organ expression is read from genome loci first (heritable), then
+    // props — the same lookup order brain_locus uses. `resp_accum` is the
+    // Euclid remainder for the upkeep drain; O2 itself is integer permille
+    // and moves linearly, so dt-batching is exact.
+    {
+        const PropId ox_p = pid("oxygen"),
+                     lg_p = pid("organ_lung_gain"),
+                     gg_p = pid("organ_gill_gain"),
+                     ra_p = pid("resp_accum"),
+                     pain_p2 = pid("pain_level");
+        if (ox_p != kNoProp && prop_of(e, ox_p)) {
+            auto expr = [&](PropId p) -> std::int64_t {
+                if (p == kNoProp) return 0;
+                if (const std::int64_t* v = e.genome.get(p)) return *v;
+                return prop_int(e, p, 0);
+            };
+            const std::int64_t lung = expr(lg_p);
+            const std::int64_t gill = expr(gg_p);
+            {
+                const std::int64_t submerged =
+                    lawutil::water_depth(*this, e.pos);
+                const bool under = submerged > lawutil::kWadeDepth;
+                // exchange permille/tick: gain*50/1000 - 4 baseline cost —
+                // applied even with NO organs (gain 0 -> -4/tick suffocation)
+                const std::int64_t gain = under ? gill : lung;
+                const std::int64_t exch = gain * 50 / 1000 - 4;
+                const std::int64_t ox0 = prop_int(e, ox_p, 1000);
+                if (exch != 0) {
+                    const std::int64_t nox =
+                        std::max<std::int64_t>(0,
+                            std::min<std::int64_t>(1000, ox0 + exch * dt));
+                    if (nox != ox0) change(ox_p, ox0, nox);
+                }
+            }
+            if (lung > 0 || gill > 0) {
+                // organ upkeep: (lung+gill)/50 energy units per tick
+                if (ra_p != kNoProp && energy_p != kNoProp &&
+                    prop_of(e, ra_p) && prop_of(e, energy_p)) {
+                    const std::int64_t upkeep = lung + gill;
+                    if (upkeep > 0) {
+                        std::int64_t acc = prop_int(e, ra_p, 0) + upkeep * dt;
+                        const std::int64_t drop = acc / 50;
+                        acc %= 50;
+                        if (drop > 0) {
+                            const std::int64_t en0 = prop_int(e, energy_p, 0);
+                            change(energy_p, en0,
+                                   std::max<std::int64_t>(0, en0 - drop));
+                        }
+                        change(ra_p, prop_int(e, ra_p, 0), acc);
+                    }
+                }
+            }
+            // hypoxia: O2 < 350 -> blood loss + consciousness decay + pain.
+            // Pain deltas already pump neuro panic/rage and forge negative
+            // engrams in learn_from_event — the CL-1 brain feels suffocation
+            // as affect, not as a labelled state.
+            const std::int64_t ox_now = prop_int(e, ox_p, 1000);
+            if (ox_now < 350) {
+                const std::int64_t deficit = 350 - ox_now;
+                if (bv_p != kNoProp && prop_of(e, bv_p)) {
+                    const std::int64_t bv0 = prop_int(e, bv_p, 500);
+                    change(bv_p, bv0,
+                           std::max<std::int64_t>(0,
+                               bv0 - deficit * dt / 200));
+                }
+                if (cs_p != kNoProp && prop_of(e, cs_p)) {
+                    const std::int64_t cs0 = prop_int(e, cs_p, 1000);
+                    change(cs_p, cs0,
+                           std::max<std::int64_t>(0,
+                               cs0 - deficit * dt / 300));
+                }
+                if (pain_p2 != kNoProp && prop_of(e, pain_p2)) {
+                    const std::int64_t pp0 = prop_int(e, pain_p2, 0);
+                    change(pain_p2, pp0,
+                           std::min<std::int64_t>(1000, pp0 + deficit * dt / 100));
+                }
+            }
         }
     }
     // hypovolemic shock: no blood -> clinical death, same reap rule.
@@ -5272,6 +5415,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         }
         if (!s.genome.loci.empty())
             if (Entity* ne = find(nid)) ne->genome = s.genome;
+        // CL-1 Phase 2: inherited brain installs with slow weights +
+        // hyper-genes; h/replay/fast state starts empty (Baldwin).
+        if (s.brain.valid) brain_install_spawn(*this, nid, s.brain);
         // Epigenetic marks (Nhịp 3): the newborn's AgentMind is born with
         // vague trauma engrams keyed by material/kind — born_memories,
         // never entity memory. Only created when marks actually transmit.
@@ -5664,6 +5810,10 @@ std::uint64_t World::state_hash() const {
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_sea_level)));
     mix(world_seed); mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(generator_version)));
     if (ruleset != 0) mix(0x52554C45ull ^ ruleset);   // legacy worlds (0) hash as before
+    // CL-1 Phase 2: live brain state (weights + h + replay) is World state —
+    // replay must reproduce it bit-identically. Skipped on speculative
+    // clones (they share brains_ but are never hashed for replay anyway).
+    if (brains_ && !speculative) mix(brain_state_hash(*brains_));
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_origin_x)));
     mix(static_cast<std::uint64_t>(static_cast<std::uint32_t>(gen_origin_y)));
     mix(kinds.counter());
@@ -5871,7 +6021,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 19;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset
+constexpr std::uint32_t kSaveFormat = 20;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore
 
 struct Writer {
     std::ofstream f;
@@ -6167,6 +6317,50 @@ bool World::save(const std::string& path, std::string* err) const {
     w.put(static_cast<std::uint32_t>(rngs_.size()));
     for (const auto& [name, rg] : rngs_) { w.str(name); w.put(rg->state()); }
     w.put(ruleset);                                   // v19
+    // v20: CL-1 brain store (arena bookkeeping + live slots)
+    w.boolean(brains_ != nullptr);
+    if (brains_) {
+        BrainStore& bs = *brains_;
+        w.put(bs.arena.capacity_cells());
+        w.put(bs.arena.used_cells());
+        w.put(bs.arena.live_bytes());
+        const auto& fl = bs.arena.free_lists();
+        w.put(static_cast<std::uint32_t>(fl.size()));
+        for (const auto& v : fl) {
+            w.put(static_cast<std::uint32_t>(v.size()));
+            for (std::uint64_t x : v) w.put(x);
+        }
+        w.put(static_cast<std::uint64_t>(bs.slots.size()));
+        for (const auto& [nid, s] : bs.slots) {
+            w.put(nid);
+            w.put(s.hidden); w.put(s.lr_permille);
+            w.put(s.trace_decay); w.put(s.mut_scale);
+            w.put(s.woff); w.put(s.wbytes);
+            w.str(std::string(reinterpret_cast<const char*>(bs.arena.w8(s.woff)),
+                              static_cast<std::size_t>(s.wbytes)));
+            w.str(std::string(reinterpret_cast<const char*>(s.h.data()),
+                              s.h.size() * sizeof(std::int16_t)));
+            w.str(std::string(reinterpret_cast<const char*>(s.last_action.data()),
+                              s.last_action.size()));
+            w.put(s.replay_next); w.put(s.replay_count);
+            w.put(s.mac_pending); w.put(s.mac_frac);
+            w.str(std::string(reinterpret_cast<const char*>(s.fast.data()),
+                              s.fast.size()));
+            w.str(std::string(reinterpret_cast<const char*>(s.anchor.data()),
+                              s.anchor.size()));
+            for (const Transition& t : s.replay) {
+                w.boolean(t.valid); w.put(t.event_id);
+                w.put(t.sigma); w.put(t.charge);
+                w.str(std::string(reinterpret_cast<const char*>(t.s.data()), t.s.size()));
+                w.str(std::string(reinterpret_cast<const char*>(t.a.data()), t.a.size()));
+                w.str(std::string(reinterpret_cast<const char*>(t.y.data()), t.y.size()));
+                w.str(std::string(reinterpret_cast<const char*>(t.wh.data()), t.wh.size()));
+            }
+        }
+        w.put(bs.wm_err_sum); w.put(bs.wm_n);
+        w.put(bs.sigma_sum); w.put(bs.sigma_n);
+        w.put(bs.surprise_events);
+    }
     w.f.close();
     if (!w.ok()) { if (err) *err = "save: write failed"; return false; }
     return true;
@@ -6189,7 +6383,7 @@ bool World::load(const std::string& path, std::string* err) {
     if (gver > kGeneratorVersion) return fail("generator_version too new for this build");
 
     // reset world truth (content registries stay — names must resolve)
-    entities.clear(); index_.clear(); by_kind_.clear(); touched_.clear(); spatial.clear(); relations.clear(); social_.clear(); ledger.clear(); minds_.clear();
+    entities.clear(); index_.clear(); by_kind_.clear(); touched_.clear(); spatial.clear(); relations.clear(); social_.clear(); ledger.clear(); minds_.clear(); brains_.reset();
     rngs_.clear();
     gen_spawned_.clear();
     kinds = EntityRegistry{};
@@ -6629,6 +6823,80 @@ bool World::load(const std::string& path, std::string* err) {
     }
     ruleset = 0;
     if (fmt >= 19 && !r.get(ruleset)) return fail("truncated ruleset");
+    // v20: CL-1 brain store
+    if (fmt >= 20) {
+        std::uint8_t has_brains = 0;
+        if (!r.get(has_brains)) return fail("truncated brain flag");
+        if (has_brains) {
+            auto bs = std::make_shared<BrainStore>();
+            std::uint64_t cells = 0, hw = 0, live = 0;
+            if (!r.get(cells) || !r.get(hw) || !r.get(live))
+                return fail("truncated brain arena");
+            std::uint32_t nfl = 0;
+            if (!r.get(nfl) || nfl > (1u << 20)) return fail("bad brain free lists");
+            std::vector<std::vector<std::uint64_t>> fl(nfl);
+            for (auto& v : fl) {
+                std::uint32_t n = 0;
+                if (!r.get(n) || n > (1u << 24)) return fail("bad brain free list");
+                v.resize(n);
+                for (auto& x : v) if (!r.get(x)) return fail("truncated brain free list");
+            }
+            bs->arena.restore_state(cells, hw, live, fl);
+            std::uint64_t nslots = 0;
+            if (!r.get(nslots) || nslots > (1u << 22)) return fail("bad brain slot count");
+            for (std::uint64_t i = 0; i < nslots; ++i) {
+                EntityId nid = 0;
+                BrainSlot s;
+                if (!r.get(nid) || !r.get(s.hidden) || !r.get(s.lr_permille) ||
+                    !r.get(s.trace_decay) || !r.get(s.mut_scale) ||
+                    !r.get(s.woff) || !r.get(s.wbytes))
+                    return fail("truncated brain slot");
+                std::string wblob, hblob, ablob;
+                if (!r.str(wblob) || wblob.size() != s.wbytes)
+                    return fail("truncated brain weights");
+                if (!r.str(hblob) || hblob.size() != s.h.size() * sizeof(std::int16_t))
+                    return fail("truncated brain hidden");
+                if (!r.str(ablob) || ablob.size() != s.last_action.size())
+                    return fail("truncated brain action");
+                std::memcpy(bs->arena.w8(s.woff), wblob.data(), s.wbytes);
+                std::memcpy(s.h.data(), hblob.data(), hblob.size());
+                std::memcpy(s.last_action.data(), ablob.data(), ablob.size());
+                if (!r.get(s.replay_next) || !r.get(s.replay_count) ||
+                    !r.get(s.mac_pending) || !r.get(s.mac_frac))
+                    return fail("truncated brain replay head");
+                s.fast.assign(kBrainFastLen, 0);
+                s.anchor.assign(kBrainFastLen, 0);
+                std::string fblob, anblob;
+                if (!r.str(fblob) || fblob.size() != s.fast.size() ||
+                    !r.str(anblob) || anblob.size() != s.anchor.size())
+                    return fail("truncated brain plasticity");
+                std::memcpy(s.fast.data(), fblob.data(), fblob.size());
+                std::memcpy(s.anchor.data(), anblob.data(), anblob.size());
+                for (Transition& t : s.replay) {
+                    std::uint8_t tv = 0;
+                    if (!r.get(tv) || !r.get(t.event_id) || !r.get(t.sigma) ||
+                        !r.get(t.charge)) return fail("truncated brain transition");
+                    t.valid = tv != 0;
+                    std::string sb, ab, yb, wb;
+                    if (!r.str(sb) || sb.size() != t.s.size() ||
+                        !r.str(ab) || ab.size() != t.a.size() ||
+                        !r.str(yb) || yb.size() != t.y.size() ||
+                        !r.str(wb) || wb.size() != t.wh.size())
+                        return fail("truncated brain transition vecs");
+                    std::memcpy(t.s.data(), sb.data(), sb.size());
+                    std::memcpy(t.a.data(), ab.data(), ab.size());
+                    std::memcpy(t.y.data(), yb.data(), yb.size());
+                    std::memcpy(t.wh.data(), wb.data(), wb.size());
+                }
+                bs->slots.emplace(nid, std::move(s));
+            }
+            if (!r.get(bs->wm_err_sum) || !r.get(bs->wm_n) ||
+                !r.get(bs->sigma_sum) || !r.get(bs->sigma_n) ||
+                !r.get(bs->surprise_events))
+                return fail("truncated brain stats");
+            brains_ = std::move(bs);
+        }
+    }
     r.f.close();
     if (!r.ok()) return fail("read failed");
     return true;

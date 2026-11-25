@@ -5,6 +5,7 @@
 #include "Causal.hpp"
 #include "Entity.hpp"
 #include "Types.hpp"
+#include "Brain.hpp"
 
 namespace simlab {
 
@@ -56,6 +57,10 @@ struct SpawnSpec {
         std::int64_t charge = 0;
     };
     std::vector<LegacyEngram> legacy;
+    // CL-1 Phase 2 (Baldwin): inherited brain — slow weights + hyper-genes
+    // only. Fast weights/h/replay always start empty on the newborn.
+    // Invalid/empty -> the spawn gets a hash-initialized brain lazily.
+    BrainGenome brain;
 };
 
 // A proposed entity relocation — first-class causal change alongside

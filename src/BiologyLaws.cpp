@@ -505,6 +505,25 @@ PredictionResult BiologyModel::predict(const World& w,
     s.pos = {(actor->pos.x + partner->pos.x) / 2,
              (actor->pos.y + partner->pos.y) / 2};
     s.genome = child;
+    // ---- CL-1 brain inheritance (Baldwin, Phase 2) ---------------------------
+    // Only SLOW weights + hyper-genes cross the generational boundary; the
+    // newborn's h/replay/fast state starts empty (installed at spawn-commit).
+    // Reproductive isolation: hidden-size mismatch OR mean weight distance
+    // beyond kMaxBrainGeneticDistance -> the pairing is refused, which is
+    // how divergent lineages become separate species without a species table.
+    if (w.brains_) {
+        const BrainGenome ga = brain_genome_of(w, *w.brains_, actor->id);
+        const BrainGenome gb = brain_genome_of(w, *w.brains_, partner->id);
+        if (ga.valid || gb.valid) {
+            if (!ga.valid || !gb.valid || ga.hidden != gb.hidden ||
+                brain_genetic_distance(ga, gb) > kMaxBrainGeneticDistance) {
+                r.failure =
+                    "brain genomes incompatible (reproductive isolation)";
+                return r;
+            }
+            s.brain = brain_child_genome(w, actor->id, partner->id, ga, gb);
+        }
+    }
     // Epigenetic transmission (Nhịp 3): a parent's EXTREME consolidated
     // trauma — |charge| >= inherit_charge AND stability >= inherit_stability
     // — becomes a vague born-mark in the child, at most 2 marks total.

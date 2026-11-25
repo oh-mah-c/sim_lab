@@ -34,6 +34,7 @@
 #include "simlab/render/Patron.hpp"
 #include "simlab/render/Narrative.hpp"
 #include "simlab/render/Globe.hpp"
+#include "simlab/NarrativeHost.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -221,6 +222,19 @@ struct Viewer {
     std::uint64_t c_carved_tick = ~0ull;                      // rebuild gate (world tick)
     bool need_successor = false;
     EntityId fallen = kNoEntity;
+    // ---- CL-1 Phase 3: async LLM chronicler (Qwen via NarrativeHost) ---------
+    // Presentation only: the worker thread never touches World state, so
+    // state_hash() is identical with the host on or off. `llm_host` is
+    // started explicitly by start_llm() (main, non-selftest runs only);
+    // llm_starter joins it so model load never blocks the UI thread.
+    NarrativeHost llm_host;
+    std::thread llm_starter;
+    EventId llm_scanned = 0;               // ledger cursor (mirrors cfeed.scanned)
+    bool llm_primed = false;
+    std::uint64_t llm_key_seq = 0;         // outbound narration keys
+    std::unordered_map<std::uint64_t, NarrativeLine> llm_pending;  // key -> line stub
+    std::deque<std::uint64_t> llm_outstanding;                     // FIFO poll order
+    std::unordered_map<std::uint64_t, std::uint64_t> llm_last_tell; // actor^class -> tick
     double move_cool = 0;
     int rounds_since_trim = 0;
     Vec2 c_av_pos{};
@@ -363,7 +377,37 @@ struct Viewer {
 
     explicit Viewer(World& world) : w(world) {
         dstate.curiosity = true; dstate.concurrent = true;
+        dstate.brain_control = true;      // CL-1 is the sapient controller
         composer.load(data_dir + "/narrative_templates.txt");
+    }
+    ~Viewer() {
+        // Wait out an in-flight model load so ~NarrativeHost never races it.
+        if (llm_starter.joinable()) llm_starter.join();
+    }
+    // Kick the Qwen chronicler off a background thread (model load takes
+    // seconds; the title menu must stay responsive). Safe no-op when the
+    // llama build or GGUF model is absent.
+    void start_llm() {
+        if (llm_starter.joinable() || llm_host.active()) return;
+        NarrativeHost::Config hc;
+        if (const char* m = std::getenv("SIMLAB_LLM_MODEL")) hc.model_path = m;
+        else hc.model_path = llm_resolve(hc.model_path);
+        if (const char* l = std::getenv("SIMLAB_LLM_LIB")) hc.lib_dir = l;
+        else hc.lib_dir = llm_resolve(hc.lib_dir);
+        llm_starter = std::thread([this, hc] { llm_host.start(hc); });
+    }
+    // Model/lib paths are relative to the repo root; when the viewer is
+    // launched from elsewhere, retry relative to the executable location.
+    static std::string llm_resolve(const std::string& rel) {
+        if (std::filesystem::exists(rel)) return rel;
+        std::error_code ec;
+        const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (ec) return rel;
+        for (const char* up : {"..", "../.."}) {
+            const std::filesystem::path p = exe.parent_path() / up / rel;
+            if (std::filesystem::exists(p)) return p.string();
+        }
+        return rel;
     }
 
     std::int64_t tribe_lang() const {
@@ -372,6 +416,7 @@ struct Viewer {
     // reset every viewer-side cache after the World was replaced
     void reset_view() {
         dstate = DriverState{}; dstate.curiosity = true; dstate.concurrent = true;
+        dstate.brain_control = true;
         fog = FogOfWar{};
         fog.set_mode(FogOfWar::Mode::Tribe, tribe_lang());
         selected = kNoEntity; avatar = kNoEntity; av_targets.clear();
@@ -387,6 +432,8 @@ struct Viewer {
         insp = InspCache{}; c_stones.clear(); c_codex.clear(); c_chron.clear();
         journal.bubbles.clear(); bubble_rects.clear(); c_signs.clear(); c_legends.clear();
         cfeed = ChronicleFeed{}; c_callouts.clear(); narr_seen = 0; c_carved.clear();
+        llm_scanned = 0; llm_primed = false; llm_key_seq = 0;
+        llm_pending.clear(); llm_outstanding.clear(); llm_last_tell.clear();
         cap_scratch = CaptureScratch{};
         snap = RenderSnapshot{}; snap_back = RenderSnapshot{}; snap_gen = 0;
         fog_tex_gen = mini_fog_gen = globe_fog_gen = ~0ull;
@@ -2604,7 +2651,8 @@ struct Viewer {
                 ImGui::TextDisabled("%s", when);
                 ImGui::SameLine(0, 4);
                 ImGui::PushStyleColor(ImGuiCol_Text,
-                    (l->cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
+                    l->llm ? ImVec4(1.f, 0.9f, 0.55f, 1)
+                    : (l->cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
                     : (l->cat & kCatDiscovery) ? ImVec4(1.f, 0.82f, 0.5f, 1)
                     : (l->cat & kCatSociety) ? ImVec4(0.6f, 0.9f, 0.95f, 1)
                     : (l->cat & kCatSurvival) ? ImVec4(0.65f, 0.95f, 0.6f, 1)
@@ -3035,6 +3083,110 @@ struct Viewer {
         if (ks[SDL_SCANCODE_D] || ks[SDL_SCANCODE_RIGHT]) cam.cx += v;
     }
 
+    // ---- CL-1 Phase 3: LLM chronicle scan/drain (UI thread, world lock held)
+    // Salient causal events are summarised and handed to NarrativeHost; the
+    // worker narrates them off-thread and llm_drain() re-injects the text as
+    // tagged NarrativeLine{llm=true} rows in the same ChronicleFeed.
+    static bool llm_skip_verb(const std::string& a) {
+        return a.empty() || a == "metabolize" || a == "cool" || a == "ecology" ||
+               a == "political_drift" || a == "myth_drift" || a == "language" ||
+               a == "anatomy_drift" || a == "decay_minds" || a == "move" ||
+               a == "perceive" || a == "witness" || a == "advance_ticks" ||
+               a == "flush_needs";
+    }
+    void llm_scan(const World& w) {
+        // While the model is still loading, fast-forward the cursor so the
+        // first active scan doesn't replay (and drop) the whole backlog.
+        if (!llm_host.active()) {
+            if (!w.ledger.history().empty()) llm_scanned = w.ledger.next_id() - 1;
+            llm_primed = true;
+            return;
+        }
+        const auto& hist = w.ledger.history();
+        if (hist.empty()) return;
+        const std::uint64_t base = w.ledger.next_id() - hist.size();
+        std::size_t i0 = hist.size();
+        if (!llm_primed) { llm_primed = true; llm_scanned = w.ledger.next_id(); }
+        else if (llm_scanned + 1 >= base)
+            i0 = std::min<std::size_t>(std::size_t(llm_scanned + 1 - base), hist.size());
+        else llm_scanned = w.ledger.next_id() - 1;   // cursor evicted: skip backlog
+
+        std::size_t made = 0;
+        const PropId pain_p = SIMLAB_PID(w.props, "pain_level");
+        const PropId integ_p = SIMLAB_PID(w.props, "integrity");
+        for (std::size_t i = i0; i < hist.size() && made < 4; ++i) {
+            const CausalEvent& ev = hist[i];
+            llm_scanned = base + i;
+            const std::string& a = ev.action;
+            if (llm_skip_verb(a)) continue;
+            const EntityId actor = ev.participants.empty() ? kNoEntity : ev.participants.front();
+            const EntityId about = ev.participants.size() > 1 ? ev.participants[1] : kNoEntity;
+            const Entity* ae = actor != kNoEntity ? w.find(actor) : nullptr;
+            const Entity* be = about != kNoEntity ? w.find(about) : nullptr;
+            // Salience proxy for |emotional_charge| >= 800 — the charge lives
+            // in mind engrams, not on the event, so we key on what the
+            // engram would encode: death, birth, rare-kind spawn, heavy trauma.
+            const bool death = (be && !be->alive) || (ae && !ae->alive);
+            const bool birth = (a == "reproduce" && !ev.failed);
+            bool rare = false;
+            for (EntityId sid : ev.spawned)
+                if (const Entity* se = w.find(sid);
+                    se && se->kind_name == SIMLAB_KIND("sapient")) { rare = true; break; }
+            std::int64_t hurt = 0;
+            for (const StateChange& ch : ev.changes) {
+                if (ch.entity == kNoEntity) continue;
+                if (ch.prop == pain_p) hurt = std::max(hurt, ch.after.i - ch.before.i);
+                else if (ch.prop == integ_p) hurt = std::max(hurt, ch.before.i - ch.after.i);
+            }
+            const bool trauma = hurt >= 400 ||
+                (be && integ_p != kNoProp && w.prop_int(*be, integ_p, 1000) <= 0);
+            if (!death && !birth && !rare && !trauma) continue;
+            // Per actor+class cooldown: one feud must not fill the queue.
+            const std::uint64_t cls = death ? 1 : birth ? 2 : rare ? 3 : 4;
+            const std::uint64_t kh = std::uint64_t(actor) * 0x9E3779B97F4A7C15ull ^ cls;
+            auto [it, ins] = llm_last_tell.try_emplace(kh, 0);
+            const std::uint64_t cd = (death || birth) ? 480 : 960;   // ~20 / ~40 days
+            if (it->second && ev.tick < it->second + cd) continue;
+            it->second = ev.tick;
+            // Structured summary for the chronicler (plain facts, no lore).
+            std::string s = "Day " + std::to_string(ev.tick / 24 + 1) + ", hour " +
+                            std::to_string(ev.tick % 24) + ". ";
+            s += NarrativeComposer::describe(w, actor);
+            s += " "; s += a;
+            if (about != kNoEntity) { s += " "; s += NarrativeComposer::describe(w, about); }
+            if (ev.failed && !ev.failure.empty()) { s += " — failed: "; s += ev.failure; }
+            NarrativeLine l;
+            l.tick = ev.tick;
+            l.pos = ae ? ae->pos : (be ? be->pos : Vec2{});
+            l.who = actor; l.about = about;
+            l.cat = death ? kCatCombat : (birth || rare) ? kCatSociety : kCatSurvival;
+            l.callout = death || birth || rare;
+            const std::uint64_t key = ++llm_key_seq;
+            llm_pending.emplace(key, l);
+            llm_outstanding.push_back(key);
+            llm_host.submit(key, s);
+            ++made;
+        }
+    }
+    void llm_drain() {
+        if (llm_outstanding.empty()) return;
+        std::deque<std::uint64_t> keep;
+        for (std::uint64_t key : llm_outstanding) {
+            std::string text;
+            if (!llm_host.poll(key, text)) { keep.push_back(key); continue; }
+            auto it = llm_pending.find(key);
+            if (it == llm_pending.end()) continue;    // stale (world was reset)
+            NarrativeLine l = std::move(it->second);
+            l.seq = cfeed.seq_next++;
+            l.text = std::move(text);
+            l.llm = true;
+            cfeed.lines.push_back(std::move(l));
+            while (cfeed.lines.size() > 400) cfeed.lines.pop_front();
+            llm_pending.erase(it);
+        }
+        llm_outstanding.swap(keep);
+    }
+
     // one frame: snapshot (const, under the world lock) -> draw -> UI
     void frame(double dt) {
         const auto t_frame = std::chrono::steady_clock::now();
@@ -3160,7 +3312,8 @@ struct Viewer {
                         narr_seen = l.seq;
                         if (!l.callout) continue;
                         ImU32 col = IM_COL32(215, 215, 225, 255);
-                        if (l.cat & kCatCombat) col = IM_COL32(255, 110, 90, 255);
+                        if (l.llm) col = IM_COL32(255, 230, 140, 255);
+                        else if (l.cat & kCatCombat) col = IM_COL32(255, 110, 90, 255);
                         else if (l.cat & kCatDiscovery) col = IM_COL32(255, 205, 90, 255);
                         else if (l.cat & kCatSociety) col = IM_COL32(120, 215, 225, 255);
                         else if (l.cat & kCatSurvival) col = IM_COL32(140, 225, 130, 255);
@@ -3168,6 +3321,9 @@ struct Viewer {
                     }
                     while (c_callouts.size() > 48) c_callouts.pop_front();
                 }
+                // LLM chronicler: same incremental ledger scan, salient events
+                // only; results re-enter cfeed tagged llm=true.
+                if (frames % 4 == 2) { llm_scan(w); llm_drain(); }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
                     c_av_verbs.clear(); c_av_line.clear();
@@ -3409,6 +3565,10 @@ int main(int argc, char** argv) {
     }
     v.speed = 0; v.speed_atomic = 0;               // paused under the title menu
     v.has_game = selftest > 0;
+    // CL-1 Phase 3: start the async Qwen chronicler on real runs only —
+    // selftests/headless runs skip it (SIMLAB_NO_LLM=1 also disables).
+    if (selftest <= 0 && !std::getenv("SIMLAB_VTITLE") && !std::getenv("SIMLAB_NO_LLM"))
+        v.start_llm();
     v.title_map.build(WorldGenerator::planet_seed(std::uint32_t(seed), 1024, 512), 1024, 512, 1024);
     v.title_view.radius = 300;
     v.win = SDL_CreateWindow("Sunnyworld - Primordial Sandbox", v.win_w, v.win_h, SDL_WINDOW_RESIZABLE);

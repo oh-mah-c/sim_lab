@@ -35,6 +35,13 @@ class World;
 enum class BrainAct : std::int32_t { kLinear = 0, kTanh = 1, kSigmoid = 2 };
 const std::int8_t* brain_act_lut(BrainAct act);   // never null, 256 entries
 
+// Phase 3: the world-model output layer is fixed at 25 x 96 regardless of
+// the genome-chosen hidden size H. fast/anchor vectors always have this
+// length (BrainSlot invariant, also used by save/load).
+constexpr std::int32_t kBrainWmHidden = 96;
+constexpr std::size_t kBrainFastLen =
+    static_cast<std::size_t>(kLabelChannels) * kBrainWmHidden;
+
 // ---- kernels ----------------------------------------------------------------
 inline std::int8_t brain_clamp_i8(std::int64_t v) {
     if (v > 127) return 127;
@@ -116,15 +123,30 @@ public:
     void free(std::uint64_t offset, std::uint64_t bytes);
 
     // Raw access. offset must have come from alloc() and not be freed.
+    // Offsets are cell-grid relative; slab_base_off_ (alignment slack)
+    // is added here so reserve() reallocs never invalidate them.
     std::int8_t* w8(std::uint64_t offset) {
-        return reinterpret_cast<std::int8_t*>(slab_.data()) + offset;
+        return reinterpret_cast<std::int8_t*>(slab_.data()) +
+               slab_base_off_ + offset;
     }
     const std::int8_t* w8(std::uint64_t offset) const {
-        return reinterpret_cast<const std::int8_t*>(slab_.data()) + offset;
+        return reinterpret_cast<const std::int8_t*>(slab_.data()) +
+               slab_base_off_ + offset;
     }
     std::uint64_t used_cells() const { return high_water_; }
     std::uint64_t capacity_cells() const { return slab_cells_; }
     std::uint64_t live_bytes() const { return live_bytes_; }
+    // Phase 2 save/load: arena bookkeeping needed to rebuild identical
+    // alloc/free behavior after a load (offsets themselves are re-derived).
+    const std::vector<std::vector<std::uint64_t>>& free_lists() const {
+        return free_;
+    }
+    void restore_state(std::uint64_t cells, std::uint64_t high_water,
+                       std::uint64_t live_bytes,
+                       const std::vector<std::vector<std::uint64_t>>& fl) {
+        reserve(cells);
+        high_water_ = high_water; live_bytes_ = live_bytes; free_ = fl;
+    }
 
 private:
     // slab_ holds slab_cells_ * kCell bytes, 64-byte aligned via vector of
@@ -161,6 +183,7 @@ struct Transition {
     SensorVec s{};
     ActionVec a{};
     LabelVec  y{};
+    std::array<std::int8_t, 96> wh{};   // WM layer-1 activation (sleep SGD)
     std::uint16_t sigma = 0;        // surprise 0..1000
     std::uint16_t charge = 0;       // |emotional_charge| 0..1000
     std::uint64_t event_id = 0;
@@ -176,19 +199,56 @@ struct BrainPending {
     ActionVec a{};
     std::array<std::int8_t, kLabelChannels> yhat{};
     std::array<std::int8_t, 96> wm_hidden{};   // WM layer-1 activations
-    std::array<std::int16_t, 64> h{};          // post-GRU hidden state Q8
+    std::array<std::int16_t, 96> h{};          // post-GRU hidden state Q8
+    std::array<std::int8_t, 96> embed{};       // embed output (manager/worker in)
 };
 
 struct BrainSlot {
     std::uint64_t woff = 0;          // arena offset of weight block
     std::uint64_t wbytes = 0;        // bytes handed to arena (for free)
-    std::array<std::int16_t, 64> h{};          // GRU state, Q8 fixed-point
+    std::int32_t hidden = 64;        // H — layer width, {32,48,64,96}
+    // Baldwin hyper-genes (inherited via BrainGenome / entity genome loci)
+    std::int32_t lr_permille = 400;      // brain_lr — lifetime SGD rate
+    std::int32_t trace_decay = 900;     // brain_trace_decay — gamma*1024
+    std::int32_t mut_scale = 500;       // brain_mut_scale — birth mutation ‰
+    std::array<std::int16_t, 96> h{};   // GRU state, Q8 (first `hidden` used)
     ActionVec last_action{};                   // feeds sensor channels 80..95
     BrainPending pending{};
     std::array<Transition, 16> replay{};
     std::int32_t replay_next = 0;
     std::int32_t replay_count = 0;
+    // Phase 3 metabolism: MACs spent by brain_decide() since the last
+    // drift_needs() metabolize pass, plus the sub-unit energy remainder
+    // (Euclid-exact like mind_brain_accum). Converted to `energy` drain
+    // inside interact()'s causal event — never written outside it.
+    std::int64_t mac_pending = 0;
+    std::int64_t mac_frac = 0;
+    // Phase 3 plasticity: FAST weights — a small int8 delta on the WM
+    // output layer (25 x 96), updated online by brain_post with a
+    // surprise-scaled rate, consolidated into slow weights during `rest`
+    // (sleep). Never inherited (Baldwin). `anchor` is the slow-WM2
+    // snapshot taken at birth — the L2-SP regularizer target that keeps
+    // sleep consolidation from catastrophic forgetting.
+    std::vector<std::int8_t> fast;      // kLabelChannels*kWmHidden deltas
+    std::vector<std::int8_t> anchor;    // same size, birth snapshot of wm2w
 };
+
+// Phase 2: the inheritable brain. `slow` is the canonical-layout int8
+// weight block (embed+GRU+manager+worker+WM+value). Fast weights are NOT
+// stored — they are always zero at birth (Baldwin: only slow weights and
+// hyper-genes cross the generational boundary).
+struct BrainGenome {
+    bool valid = false;
+    std::int32_t hidden = 64;
+    std::int32_t lr_permille = 400;
+    std::int32_t trace_decay = 900;
+    std::int32_t mut_scale = 500;
+    std::vector<std::int8_t> slow;
+};
+
+// Reproductive isolation threshold: mean |Δw| over the slow block, permille
+// of the 255 int8 range. Above this, reproduce() refuses the pairing.
+constexpr std::int64_t kMaxBrainGeneticDistance = 180;   // ~18% mean drift
 
 // Per-world brain bank. Shared via shared_ptr so speculative clones see
 // the same store but MUST NOT write it (guarded by World::speculative).
@@ -206,7 +266,9 @@ struct BrainStore {
 };
 
 // ---- Phase 1 API ----------------------------------------------------------------
-// Layer geometry (public for tests/tools).
+// Layer geometry (public for tests/tools). brain_layout() is the canonical
+// H=64 view; brain_layout_h(H) gives the per-hidden-size layout used by
+// Phase-2 genome-variable brains ({32,48,64,96}).
 struct BrainLayout {
     // offsets (bytes) inside the weight block; weights region first,
     // then the int16 bias region.
@@ -219,10 +281,14 @@ struct BrainLayout {
     std::uint64_t total_bytes = 0;
 };
 const BrainLayout& brain_layout();
+const BrainLayout& brain_layout_h(std::int32_t hidden);
 
-// Get-or-create the agent's brain slot (allocates + hash-inits weights).
-// Deterministic per (world_seed, entity): same id -> same initial brain.
-BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc);
+// Get-or-create the agent's brain slot (allocates + hash-inits weights,
+// or installs `genome`'s slow weights + hyper-genes when provided and
+// layout-compatible). Deterministic per (world_seed, entity): same id ->
+// same initial brain.
+BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
+                      const BrainGenome* genome = nullptr);
 void brain_free_slot(BrainStore& store, EntityId npc);
 // Sweep dead/missing entities out of the store (called from decay_minds).
 void brain_gc(World& w, BrainStore& store);
@@ -236,5 +302,35 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev);
 // Deterministic fingerprint of ALL brain state (weights + h + replay) —
 // the Phase-1 replay check. FNV-1a over sorted slots.
 std::uint64_t brain_state_hash(const BrainStore& store);
+
+// ---- Phase 2: genome, decision, inheritance ------------------------------------
+// Read the agent's current BrainGenome (slow weights + hyper-genes) —
+// nullptr-equivalent `valid=false` when the agent has no slot yet.
+BrainGenome brain_genome_of(const World& w, const BrainStore& store,
+                            EntityId npc);
+// Mean |Δw| over the slow block in permille of 255 (0 = identical).
+std::int64_t brain_genetic_distance(const BrainGenome& a,
+                                    const BrainGenome& b);
+// Block crossover (64-weight blocks) + brain_mutate_blocks at the child's
+// brain_mut_scale. Deterministic per (seed, parentA, parentB, tick).
+BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
+                               const BrainGenome& ga, const BrainGenome& gb);
+
+// The CL-1 decision: encode -> embed -> minGRU -> manager(drive) ->
+// worker(verb logits + attention) -> mask -> top-C (verb,target) ->
+// N-step WM imagination -> argmax. Returns the chosen (verb,target,dest).
+struct BrainChoice {
+    bool valid = false;
+    std::string verb;
+    EntityId target = kNoEntity;   // remembered entity id, kNoEntity = none
+    Vec2 move_to{0, 0};            // only when verb == "move"
+    bool has_move = false;
+    std::int64_t score = 0;        // imagined value (diagnostics/tests)
+};
+BrainChoice brain_decide(World& w, EntityId npc);
+
+// Install an inherited brain on a just-spawned entity (interact commit
+// path). No-op on speculative clones or invalid genomes.
+void brain_install_spawn(World& w, EntityId nid, const BrainGenome& g);
 
 }  // namespace simlab

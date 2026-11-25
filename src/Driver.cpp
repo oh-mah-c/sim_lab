@@ -3,6 +3,8 @@
 #include "simlab/Discovery.hpp"
 #include "simlab/Laws.hpp"
 #include "simlab/WorldGen.hpp"
+#include "simlab/Brain.hpp"
+#include "simlab/Sensor.hpp"
 #include "LawUtil.hpp"
 #include <algorithm>
 #include <chrono>
@@ -113,6 +115,103 @@ bool quantum_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
         if (w.interact(sc).completed) return true;
     }
     return false;
+}
+
+// ---- CL-1 Phase 2: brain-driven action --------------------------------------
+// The brain proposes (verb, target, destination); the Driver only maps it
+// onto an InteractionContext — all law checks still run inside interact().
+// Returns true when the brain produced a usable choice and interact()
+// committed (or at least attempted) it.
+EntityId nearest_agent(const World& w, EntityId npc, std::int64_t range2);
+
+// Phase 3 social floor: with brain_control on, CL-1 owns STRATEGIC choice
+// but the civilization-critical reflexes (reproduce, communicate) still
+// fire first — an untrained brain must not starve the species of its
+// reproductive loop. Mirrors the section-5 predicates exactly.
+bool social_floor(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
+    const Entity* me = w.find(npc);
+    if (!me || !me->alive) return false;
+    const PropId hunger = dpid(w, "hunger");
+    const PropId age = dpid(w, "age"), adult = dpid(w, "adult");
+    const PropId fert = dpid(w, "fertility"), energy = dpid(w, "energy");
+    const PropId crange = dpid(w, "communication_range"),
+               reach = dpid(w, "reach");
+    // reproduce
+    if (cooled(st, npc, kReproduce, now) && repro_ready(w, *me, now) &&
+        !me->genome.loci.empty() &&
+        dint(w, *me, age, 0) >= dint(w, *me, adult, 100) &&
+        dint(w, *me, fert, 0) > 0 &&
+        (hunger == kNoProp || dint(w, *me, hunger, 0) <= 500) &&
+        dint(w, *me, energy, 40000) >= 40000) {
+        const std::int64_t rr = dint(w, *me, reach, 64);
+        const EntityId partner = nearest_agent(w, npc, rr * rr);
+        if (partner != kNoEntity) {
+            const Entity* p = w.find(partner);
+            if (p && dint(w, *p, age, 0) >= dint(w, *p, adult, 100) &&
+                dint(w, *p, fert, 0) > 0 &&
+                (hunger == kNoProp || dint(w, *p, hunger, 0) <= 500) &&
+                dint(w, *p, energy, 0) >= 40000 &&
+                !p->genome.loci.empty()) {
+                cool(st, npc, kReproduce, now, kCooldown[kReproduce]);
+                if (w.interact(mk(npc, {partner}, "reproduce")).completed)
+                    return true;
+            }
+        }
+    }
+    // communicate
+    const std::int64_t cr2 = dint(w, *me, crange, 0);
+    if (cr2 > 0 && cooled(st, npc, kCommunicate, now)) {
+        const EntityId partner = nearest_agent(w, npc, cr2 * cr2);
+        if (partner != kNoEntity) {
+            const AgentMind* om = w.find_mind(partner);
+            const AgentMind* mm = w.find_mind(npc);
+            if (om && mm && om->known_actions != mm->known_actions) {
+                cool(st, npc, kCommunicate, now, kCooldown[kCommunicate]);
+                if (w.interact(mk(npc, {partner}, "communicate")).completed)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
+                DriverTally* tally) {
+    if (!st || !st->brain_control || w.speculative) return false;
+    if (social_floor(w, st, npc, now)) {
+        if (tally) ++tally->social;
+        return true;
+    }
+    const Entity* me = w.find(npc);
+    if (!me || !me->alive) return false;
+    // Survival gate: a desperate agent (hunger/thirst > 500, same threshold
+    // the consume reflex uses) hands control back to the legacy planner —
+    // an untrained brain must not starve its body while it learns.
+    const PropId hp = dpid(w, "hunger"), tp = dpid(w, "thirst");
+    if ((hp != kNoProp && dint(w, *me, hp, 0) > 500) ||
+        (tp != kNoProp && dint(w, *me, tp, 0) > 500))
+        return false;
+    // Sparse consultation: the brain deliberates once every 8 cycles per
+    // agent (deterministic hash of tick+id); off-cycles return false so the
+    // legacy reflex/planner path owns the body. This is the honest curriculum
+    // stage: an untrained WM is noise, but brain_pre/post still observe and
+    // learn from EVERY interact() — including reflex-driven ones — so the
+    // world model trains on real experience while survival stays reflexive.
+    // It also cuts decide cost ~8x (measured ~62us -> ~8us effective).
+    if (((now + static_cast<std::uint64_t>(npc)) & 7) != 0) return false;
+    BrainChoice ch = brain_decide(w, npc);
+    if (!ch.valid) return false;
+    InteractionContext c = mk(npc, {}, ch.verb.c_str(), 1);
+    if (ch.target != kNoEntity) c.targets.push_back(ch.target);
+    if (ch.has_move) {
+        c.parameters.destination = ch.move_to;
+        c.parameters.has_destination = true;
+        c.parameters.ticks = move_stride(st);
+    }
+    // verbs that need a remembered entity but got none still fire — the law
+    // decides (usually a cheap refusal); consume/rest/move need no target.
+    w.interact(c);
+    return true;
 }
 
 // ---- shore sense (game mode, Primordial ruleset) ---------------------------
@@ -1127,6 +1226,15 @@ void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
             if (tally) ++tally->moves;
             continue;
         }
+        // CL-1 Phase 2: the brain is the primary action selector. It runs
+        // every cycle (its own C=5 imagination budget is internal); the
+        // legacy discover/plan_multi path only fires as a bootstrap
+        // fallback while the brain has no usable policy yet.
+        if (st && st->brain_control && !walking_pending && !gated &&
+            brain_step(w, st, npc, now, tally)) {
+            if (tally) ++tally->experiments;
+            continue;
+        }
         bool may_discover = discover_budget > 0;
         if (st && st->curiosity) {
             const bool urgent = dint(w, *me, hunger, 0) > 600 ||
@@ -1309,7 +1417,9 @@ static bool cycle_step(World& w, DriverState* st, DriverTally* tally,
         const std::uint64_t now = w.clock_.tick();
         const bool concurrent = st && st->concurrent;
         if (concurrent) { w.defer_time = true; w.deferred_dt = 0; }
-        if (st) w.brain_shadow = st->brain_shadow;   // CL-1 shadow mode
+        // brain_shadow gates the WM learn hooks; brain_control implies them
+        // (a controlling brain still predicts/learns every interact).
+        if (st) w.brain_shadow = st->brain_shadow || st->brain_control;
         if (st) ++st->cycles;
         if (tally) ++tally->cycles;
 

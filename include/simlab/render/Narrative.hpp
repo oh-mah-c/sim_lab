@@ -46,6 +46,8 @@ struct NarrativeLine {
     EntityId      about = kNoEntity; // secondary participant (target/victim)
     std::uint8_t  cat   = kCatOther;
     bool          callout = false;   // also float above `pos` for a few seconds
+    bool          llm   = false;     // text came from NarrativeHost (async Qwen),
+                                     // not the deterministic template composer
 };
 
 struct ChronicleFeed {

@@ -706,3 +706,133 @@ no engine code changes.
   in the test); WM MAE windowed mean drops 7.55 -> 5.52 over 900
   rest/strike interacts; dead agents release arena slots via
   `advance_ticks` -> `decay_minds` -> `brain_gc`.
+
+## CL-1 Phase 2 — heritable brains, CL-1 decision path, save v20
+
+- `BrainGenome` (Brain.hpp): the Baldwin inheritance unit — `hidden`
+  ({32,48,64,96} via `snap_hidden`), `lr_permille`, `trace_decay`,
+  `mut_scale`, and the `slow` int8 weight block. Fast weights/h/replay
+  are NEVER inherited: `brain_install_spawn` zeroes them at birth.
+- Layout is now per-hidden-size: `brain_layout_h(H)` (cached per H);
+  `brain_slot(w,store,id,genome?)` installs `genome->slow` verbatim when
+  sizes match, else hash-inits and zeroes int16 biases. H=64 layout is
+  byte-identical to Phase 1. `BrainArena` offsets are now cell-grid
+  relative (`w8` adds `slab_base_off_`) so `reserve()` reallocs never
+  invalidate handed-out offsets; `alloc` exhaustion auto-grows.
+- `brain_decide(w,npc)` — the CL-1 controller: sensor_encode -> embed ->
+  minGRU (on a COPY of h — decide never commits recurrent state) ->
+  manager 32->8 drive logits + NeuroState personality bias -> worker
+  (h8++drive)->64->16 verb logits + 16-dim attention query -> mask to
+  `known_actions` (+move/rest) -> top-C=5 (verb,target) over the 6
+  nearest remembered entities -> N=`mind_plan_horizon` WM imagination
+  rollouts (discount `trace_decay`/1024) + terminal `Value` -> argmax
+  with a `mut_scale`-scaled deterministic jitter. Returns
+  `BrainChoice{verb,target,move_to}`.
+- Inheritance: `reproduce()` (BiologyLaws.cpp) reads
+  `brain_genome_of` for both parents when `w.brains_` exists; refuses
+  the pairing (`r.failure="brain genomes incompatible (reproductive
+  isolation)")` on hidden mismatch or
+  `brain_genetic_distance > kMaxBrainGeneticDistance` (=180 permille of
+  the int8 range, mean |dw|), else `SpawnSpec::brain =
+  brain_child_genome` — hyper-gene pick + 64-weight block crossover
+  (bit of `Rng::hash(seed,a,b,tick,block)`) + `brain_mutate_blocks` at
+  the child's `mut_scale`, int16 biases re-clamped. Spawn-commit calls
+  `brain_install_spawn`.
+- `state_hash()` now mixes `brain_state_hash(*brains_)` whenever
+  `brains_ && !speculative` — live brain weights/h/replay are World
+  Truth from Phase 2 on. Worlds that never allocate a store hash
+  exactly as before.
+- Save format v20 serializes the whole BrainStore: arena
+  capacity/high-water/live-bytes + per-size free lists, then per slot
+  (sorted EntityId) hidden/hypers/woff/wbytes/weights/h/last_action/
+  replay ring + WM stats. `BrainArena::restore_state` rebuilds
+  bookkeeping; weights memcpy back at their offsets. v19 and older
+  loads leave `brains_` null (lazy hash-init on next use).
+- Driver: `DriverState::brain_control` (DEFAULT OFF) routes the
+  cognition slot through `brain_step` -> `brain_decide` ->
+  `InteractionContext` -> `interact()` before `discover_step`; the
+  legacy plan_multi path remains the fallback when the brain cannot
+  decide. `w.brain_shadow` is set when EITHER flag is on so the WM
+  learn hooks still run under control. Default-off is deliberate:
+  an untrained brain fires every cycle and starves the social reflexes
+  (reproduce/communicate/engrave) — the capstone civilization collapses
+  (alive 29 vs ~200, repro 6). plan_multi/clone_local are NOT yet
+  removed; that is a Phase-3 decision once the WM has a training
+  curriculum. `mind_brain_work` prop exists for the future MAC->energy
+  metabolic charge (not yet wired).
+- `data/properties.txt` gained `mind_brain_work`, `brain_hidden`,
+  `brain_lr`, `brain_trace_decay`, `brain_mut_scale` — APPENDED LAST:
+  PropId order feeds `Genome::loci` sorting and `inherit_allele`'s
+  per-index draws, so mid-file insertion silently re-rolls all
+  inheritance. `data/species.txt` deliberately has NO `gene brain_*`
+  lines yet: loci count feeds `heredity_hash(...,loci.size(),...)`
+  speciation draws, and +4 loci flipped an emergent-history assertion
+  (beacon scout). Brain hyper-genes inherit through `BrainGenome`
+  regardless; species-level drift can be added with a re-baseline.
+- Test `test_brain_phase2` (69,737 checks incl. per-byte loops):
+  decide determinism + h not committed, crossover validity/range/
+  fast-state-empty/byte-exact install/double-call determinism,
+  isolation on hidden-mismatch and saturated-weight divergence,
+  state_hash sensitivity to a single weight perturbation, and a
+  save->load->continue bit-identical `state_hash` +
+  `brain_state_hash` round-trip.
+
+## CL-1 Phase 3 — metabolism, plasticity, respiration, NarrativeHost
+
+- Metabolic cost: `brain_decide` accumulates an estimated MAC count in
+  `BrainSlot::mac_pending`/`mac_frac` (hashed into `brain_state_hash`,
+  serialized). `drift_needs` (World.cpp) converts it to an `energy`
+  StateChange via `mind_brain_metabolic_cost` permille and records
+  `mind_brain_work` as a causal prop — big brains/deep rollouts eat.
+- Respiration (PhysiologyLaws `anatomy_drift`, opt-in on `oxygen`
+  prop): `organ_lung_gain`/`organ_gill_gain` read genome loci first
+  then props; exchange `(gain*50/1000 - 4)` permille/tick runs OUTSIDE
+  the organ gate so organ-less entities suffocate at -4/tick. Organ
+  upkeep `(lung+gill)` drains via `resp_accum` Euclid remainder /50.
+  `oxygen<350` decays `blood_volume`/`consciousness` and raises pain.
+  Props appended at END of properties.txt (PropId-order invariant).
+- Plasticity: `Transition` stores WM-hidden (`wh`); `BrainSlot::fast`
+  (24,00 bytes) + `anchor` (birth-WM2 slow snapshot). `wm2_forward`
+  merges slow+fast for inference; `brain_post` runs fast-weight SGD
+  (eta_f = 1.5*eta, clamped +-96). `rest` verb triggers sleep
+  consolidation: top-4 replay SGD + fast->slow transfer >>2 + L2-SP
+  anchor pull >>4 (catastrophic-forgetting guard). All integer-only.
+- Driver social floor: `brain_step` runs section-5 reproduce/
+  communicate predicates FIRST inside the brain gate, then consults
+  CL-1 only on `(now+npc)&7==0` cycles (sparse advisor ~1-in-8) and
+  only when no urgent need (hunger/thirst>500 -> legacy path). The
+  sparse design is the fix for the Phase-2 collapse: `brain_pre`/
+  `brain_post` learn on EVERY interact regardless of chooser, so
+  reflex-driven behavior still trains the WM.
+- `brain_control` remains DEFAULT OFF. Curriculum parity achieved:
+  `test_brain_curriculum` runs brain vs control worlds 600 cycles;
+  alive>=1 in each and brain social-floor acts >= control-2.
+- NarrativeHost (include/simlab/NarrativeHost.hpp + src/
+  NarrativeHost.cpp): pimpl, `dlopen`s libllama from
+  `third_party/llama-build/bin` (+ggml backends) — NO link-time dep;
+  absent libs -> `active()==false`, safe-disable. Generation uses the
+  modern `llama_batch_ext`/`llama_process` API (deprecated
+  `llama_batch_get_one`/`llama_batch_free` caused free() corruption).
+  Worker `std::jthread`, bounded deque; results keyed by EventId/
+  EntityId for UI. NEVER touches state_hash — runs fully async.
+  Makefile: -Ithird_party/lang-host includes + -ldl for tests.
+- Tests: `test_amphibian_evolution` (7), `test_brain_curriculum`
+  (determinism + control parity), `test_narrative_host` (7, real Qwen
+  output + safe-disable path), plus a 2000-agent decide benchmark in
+  curriculum (~12.5 ms/frame, under the 16.7 ms budget).
+- Viewer wiring (Phase 3 completion): `sunnyworld_viewer` auto-starts
+  the Qwen chronicler on real runs — `Viewer::start_llm()` spawns
+  `llm_starter` (model load off the UI thread; ~Viewer joins it).
+  Paths resolve CWD-first then relative to the exe (`/proc/self/exe`,
+  `../` and `../../`); env overrides `SIMLAB_LLM_MODEL`,
+  `SIMLAB_LLM_LIB`, `SIMLAB_NO_LLM=1` disables. Selftests/`--shot`
+  paths skip it. `llm_scan` (in poll_world, frames%4==2) walks new
+  ledger events and submits salience proxies for |charge|>=800 —
+  death, successful reproduce, sapient spawn, or >=400 pain/integrity
+  hit — with per actor+class cooldown (480/960 ticks) and <=4 submits
+  per scan; `llm_drain` re-injects finished text as
+  `NarrativeLine{llm=true}` (gold in Chronicle + callouts). The host
+  is presentation-only: state_hash identical on/off.
+  `DriverState.brain_control = true` is now the viewer default
+  (ctor + reset_view) — CL-1 sparse-advisor + social floor drives
+  sapients; `brain_shadow` hooks still train the WM on every interact.

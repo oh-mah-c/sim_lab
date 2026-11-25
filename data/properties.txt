@@ -533,3 +533,22 @@ ore_tag                text     tag                  domain=physical     # mater
 malleability           integer  permille range 0 1000   domain=physical   # material: how easily it work-hardens/bends
 smelt_yield            integer  permille range 0 1000   domain=physical   # material: expected metal recovery permille
 granary_seal           integer  permille range 0 1000   domain=physical   # enclosure: spoilage reduction for contained goods
+
+# ---- CL-1 brain hyper-genes (Phase 2): heritable via `gene` loci ----------
+# Appended LAST on purpose: PropId order feeds Genome::loci sorting and
+# inherit_allele's per-index draws — inserting mid-file would re-sequence
+# every later locus and silently re-roll all inheritance.
+mind_brain_work          integer milliMAC    range 0 100000000 domain=cognitive  # imagination MACs owed to metabolism (CL-1)
+brain_hidden             integer units       range 32 96     domain=cognitive  # CL-1 hidden width {32,48,64,96}
+brain_lr                 integer permille    range 0 2000    domain=cognitive  # lifetime WM learning rate
+brain_trace_decay        integer permille    range 0 1024    domain=cognitive  # imagination discount gamma*1024
+brain_mut_scale          integer permille    range 0 1000    domain=cognitive  # birth mutation amplitude
+
+# ---- CL-1 Phase 3: respiratory gas exchange & amphibian evolution ---------
+# `oxygen` is blood O2 (0..1000); `organ_lung_gain`/`organ_gill_gain` are
+# heritable expression loci (permille) that set BOTH gas-exchange rate and
+# upkeep cost — maximizing both organs is metabolically expensive.
+oxygen                integer  permille range 0 1000   domain=biological # blood oxygen saturation
+organ_lung_gain       integer  permille range 0 1000   domain=biological # lung expression locus
+organ_gill_gain       integer  permille range 0 1000   domain=biological # gill expression locus
+resp_accum             integer  milli-units range 0 1000000000 domain=biological # respiration Euclid remainder (organ upkeep + O2 exchange)
