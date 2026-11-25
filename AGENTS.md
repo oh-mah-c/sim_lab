@@ -836,3 +836,49 @@ no engine code changes.
   `DriverState.brain_control = true` is now the viewer default
   (ctor + reset_view) — CL-1 sparse-advisor + social floor drives
   sapients; `brain_shadow` hooks still train the WM on every interact.
+
+## CL-1 Phase 4 — 100% neural CL-1 + persistent GenePool
+
+- `DriverState::legacy_planner_compat` (default false) splits `brain_step`
+  in two: FALSE = 100% neural mode — `brain_decide` every cycle, undecidable
+  -> `rest` (runs sleep consolidation), NO social floor, NO urgent-need
+  gate, NO 1-in-8 sparsity, NO plan_multi fallback (natural selection is
+  the only safety net). TRUE = the Phase-3 stabilized hybrid kept for the
+  historical regression suite (social floor + urgent gate + sparse advisor).
+  `brain_control` itself still defaults OFF for headless/tests; the viewer
+  sets it true -> full neural mode in game.
+- Allocation hygiene for 1-in-1 decide frequency: `brain_decide` and
+  `Sensor::encode` use bounded stack top-k insertion arrays instead of
+  heap vectors (state_hash-neutral).
+- `GenePool` (include/simlab/GenePool.hpp + src/GenePool.cpp): hall of
+  fame, top-32 `GenePoolEntry{BrainGenome brain, Genome body, kind,
+  fitness, seen_tick}` sorted by fitness desc. `consider`/`bless`
+  (bless = forced top, fitness = best+1) reject invalid brains and
+  dedupe identical slow blocks. Binary save/load `saves/gene_pool.bin`
+  (magic SPG1 v1, size-validated, body loci by prop name — forward
+  compatible). `derive(world_seed, npc)` is a PURE function: 70% draw
+  (hash % 10 < 7) -> block crossover of two hidden-matched donors +
+  `brain_mutate_blocks` at child mut_scale + int16 bias clamp; else false
+  -> caller falls back to hash-init. NEVER consumes RNG state, NEVER in
+  state_hash — read-only world input like a beacon.
+- `World::gene_pool` (const GenePool*, default nullptr) is read in
+  `brain_slot` lazy init only: pool-derived genome wins over entity-locus
+  hyper-genes. NOT copied by clone(), NOT in state_hash.
+- Viewer wiring: `Viewer::gene_pool` member, `attach_gene_pool()` in
+  new_world/load_slot (lazy-loads saves/gene_pool.bin once), periodic
+  `save_gene_pool()` every 300 sim rounds + on slot save + autosave-on-
+  quit. Fitness = age + 500/verified discovery + 10/memory entry.
+- God-tools (inspector, has_mind block): "Bless" = `gene_pool.bless` the
+  selected mind's BrainGenome + spawn 4 clones (full prop-bag copy, age
+  reset to adult, `brain_mutate_blocks` step 4/350 permille, anatomy
+  rebuilt). "Punish" = aversive shock: 3 freshest memory engrams ->
+  charge<=-900/stability>=6000 + neuro panic/rage/grief spikes.
+- Time Warp: topbar "Time" popup queues `warp` cycles; sim_loop runs them
+  back-to-back in 40 ms slices with 1 ms gaps (UI stays responsive,
+  ~25 rounds/s). Popup also has global `mutation_rate` override
+  (permille slider, -1 = auto; applied to all genome-bearing organisms
+  each harvest sweep) and shows pool occupancy.
+- `test_gene_pool_evolution`: unit (ordering/bless/cap/derive
+  determinism/~70% draw/save-load round-trip) + end-to-end (game1 empty
+  pool -> harvest survivors -> game2 same seed inherits -> byte-exact
+  slow-block install check + alive2 >= alive1).

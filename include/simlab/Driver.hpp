@@ -86,6 +86,15 @@ struct DriverState {
     // (reproduce/communicate/engrave), collapsing emergent civilization.
     // Opt in per-scenario; falls back to discover_step when it can't decide.
     bool brain_control = false;
+    // CL-1 Phase 4: legacy-planner compatibility mode for the historical
+    // regression suite. When brain_control is on:
+    //   false (default, "100% neural"): CL-1 decides EVERY cycle — no
+    //     social floor, no urgent-need gate, no 1-in-8 sparsity, and no
+    //     plan_multi fallback (an undecidable brain idles on `rest`,
+    //     which also triggers sleep consolidation).
+    //   true: the Phase-3 stabilized hybrid — social floor first, urgent
+    //     needs and 7/8 off-cycles fall back to the legacy planner.
+    bool legacy_planner_compat = false;
     // CL-1 Phase 3: reserved for motor-persistence cache (unused while the
     // brain is a sparse advisor — kept for the future always-on mode).
     // Controller memory only: never saved, never hashed.

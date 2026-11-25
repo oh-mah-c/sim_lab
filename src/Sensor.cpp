@@ -113,22 +113,26 @@ SensorVec sensor_encode(const World& w, EntityId npc,
     const std::int64_t sight =
         p_sight != kNoProp ? w.prop_int(*me, p_sight, 64) : 64;
     struct Near { std::int64_t d2; EntityId id; };
-    std::vector<Near> near;
-    near.reserve(mind ? mind->memory.size() : 0);
+    // bounded top-6 insertion into a stack array (no heap alloc); map
+    // iteration order is sorted-by-id so ties resolve deterministically
+    Near near[kEntitySlots];
+    int nnear = 0;
     if (mind) {
         for (const auto& [kid, snap] : mind->memory) {
             if (kid == npc) continue;
             const std::int64_t dx = snap.pos.x - me->pos.x;
             const std::int64_t dy = snap.pos.y - me->pos.y;
-            near.push_back({dx * dx + dy * dy, kid});
+            const std::int64_t d2 = dx * dx + dy * dy;
+            if (nnear == kEntitySlots && d2 >= near[kEntitySlots - 1].d2)
+                continue;
+            int p = nnear < kEntitySlots ? nnear++ : kEntitySlots - 1;
+            while (p > 0 && near[p - 1].d2 > d2) { near[p] = near[p - 1]; --p; }
+            near[p] = {d2, kid};
         }
     }
-    std::sort(near.begin(), near.end(),
-              [](const Near& a, const Near& b) { return a.d2 < b.d2; });
     const PropId p_qty = SIMLAB_PID(w.props, "quantity");
     const PropId p_integ = SIMLAB_PID(w.props, "integrity");
-    for (int slot = 0; slot < kEntitySlots && slot <
-         static_cast<int>(near.size()); ++slot) {
+    for (int slot = 0; slot < kEntitySlots && slot < nnear; ++slot) {
         const EntityId kid = near[slot].id;
         const auto& snap = mind->memory.at(kid);
         const std::int64_t dx = snap.pos.x - me->pos.x;

@@ -35,6 +35,8 @@
 #include "simlab/render/Narrative.hpp"
 #include "simlab/render/Globe.hpp"
 #include "simlab/NarrativeHost.hpp"
+#include "simlab/GenePool.hpp"
+#include "simlab/Brain.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -235,6 +237,15 @@ struct Viewer {
     std::unordered_map<std::uint64_t, NarrativeLine> llm_pending;  // key -> line stub
     std::deque<std::uint64_t> llm_outstanding;                     // FIFO poll order
     std::unordered_map<std::uint64_t, std::uint64_t> llm_last_tell; // actor^class -> tick
+    // ---- CL-1 Phase 4: persistent gene pool + god-tools ----------------------
+    // Hall of Fame survives world resets/wipeouts: fresh brains derive from
+    // it deterministically (World::gene_pool is read-only world input, never
+    // in state_hash). harvest runs on the sim thread under the world lock.
+    GenePool gene_pool;
+    bool gene_pool_loaded = false;
+    int pool_rounds = 0;                 // sim_loop counter -> periodic save
+    std::atomic<int> warp{0};            // headless cycles queued by Time Warp
+    std::atomic<int> mut_permille{-1};   // -1 = keep each organism's own prop
     double move_cool = 0;
     int rounds_since_trim = 0;
     Vec2 c_av_pos{};
@@ -445,6 +456,7 @@ struct Viewer {
     // ---- New Primordial World (caller holds the lock / sim paused) ----
     void new_world(const PrimordialParams& p) {
         w = World(p.seed, data_dir);
+        attach_gene_pool();
         w.ledger.set_byte_budget(16u << 20);
         pp = p;
         pw = build_primordial(w, p);
@@ -484,6 +496,7 @@ struct Viewer {
             std::ofstream m(slot_path(slot) + ".meta");
             m << pp.seed << ' ' << pp.grid << ' ' << int(pp.planet) << ' ' << tribe_view << ' ' << w.clock_.tick() << '\n';
             journal.save(slot_path(slot) + ".journal");
+            save_gene_pool();
             status_msg = std::string("Saved ") + slot_name(slot) + " (day " + std::to_string(w.clock_.tick() / 24) + ")";
         } else status_msg = "Save failed: " + err;
         ui_dirty = true;
@@ -494,6 +507,7 @@ struct Viewer {
         World nw(1, data_dir);
         if (!nw.load(slot_path(slot), &err)) { status_msg = "Load failed: " + err; return false; }
         w = std::move(nw);
+        attach_gene_pool();
         w.ledger.set_byte_budget(16u << 20);
         derive_tribes();
         tribe_view = 0;
@@ -1171,12 +1185,38 @@ struct Viewer {
             const auto now = std::chrono::steady_clock::now();
             accum += std::chrono::duration<double>(now - last).count() * kRate[std::clamp(speed_atomic.load(), 0, 4)];
             last = now;
+            // Headless Time Warp: run queued cycles back-to-back in bigger
+            // slices, no pacing sleep — the UI still gets the lock between
+            // slices so windows stay responsive (~25 rounds/sec).
+            if (warp.load() > 0) {
+                accum = 0;
+                if (has_game) {
+                    bool done = false;
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        done = autonomous_cycle_step(w, &dstate, nullptr, 40.0);
+                        if (done && ++pool_rounds >= 300) {
+                            pool_rounds = 0;
+                            save_gene_pool();
+                            apply_mutation_override();
+                        }
+                    }
+                    if (done) warp.fetch_sub(1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                } else warp.store(0);
+                continue;
+            }
             if (accum >= 1.0) {
                 bool round_done = true;
                 if (has_game) {
                     {
                         std::lock_guard<std::mutex> lk(mx);
                         round_done = autonomous_cycle_step(w, &dstate, nullptr, 10.0);
+                        if (round_done && ++pool_rounds >= 300) {
+                            pool_rounds = 0;
+                            save_gene_pool();
+                            apply_mutation_override();
+                        }
                     }
                     // leave the lock between slices: the UI's try_to_lock
                     // capture path gets a ~4 ms window every ~14 ms — often
@@ -1680,6 +1720,31 @@ struct Viewer {
             if (ImGui::Button(kSp[i - 1], ImVec2(42, 0))) { speed = i; speed_atomic = i; last_speed = i; }
             if (on) ImGui::PopStyleColor();
         }
+        ImGui::SameLine(0, 8);
+        const int wr = warp.load();
+        if (wr > 0) ImGui::TextColored(ImVec4(1.f, 0.75f, 0.35f, 1.f), "warp %d", wr);
+        if (ImGui::Button(wr > 0 ? "Warp.." : "Time", ImVec2(48, 0))) ImGui::OpenPopup("warppop");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Headless time-warp + evolution god-tools");
+        if (ImGui::BeginPopup("warppop")) {
+            ImGui::TextDisabled("Headless warp (cycles, no render):");
+            if (ImGui::Button("+100", ImVec2(52, 0))) warp.fetch_add(100);
+            ImGui::SameLine();
+            if (ImGui::Button("+1k", ImVec2(52, 0))) warp.fetch_add(1000);
+            ImGui::SameLine();
+            if (ImGui::Button("+10k", ImVec2(56, 0))) warp.fetch_add(10000);
+            if (wr > 0 && ImGui::Button("Stop", ImVec2(52, 0))) warp.store(0);
+            ImGui::Separator();
+            int mp = mut_permille.load();
+            ImGui::Text("Global mutation rate:");
+            ImGui::SetNextItemWidth(170);
+            if (ImGui::SliderInt("##mut", &mp, -1, 1000, mp < 0 ? "auto" : "%d"))
+                mut_permille.store(mp);
+            ImGui::TextDisabled("permille per locus; -1 = each species' own rate");
+            ImGui::Separator();
+            ImGui::TextDisabled("Gene pool (hall of fame): %zu / %zu",
+                                gene_pool.size(), GenePool::kMaxEntries);
+            ImGui::EndPopup();
+        }
         ImGui::SameLine(0, 16);
         ImGui::AlignTextToFramePadding();
         ImGui::Text("Day %llu  %02d:00", (unsigned long long)(c_tick / 24), int(c_tick % 24));
@@ -1930,6 +1995,122 @@ struct Viewer {
         if (!touched) { journal.resonance += 15; status_msg = "Nobody of your people remembers that thing"; }
     }
     void instill_fear(EntityId target) { post([=, this] { do_instill_fear(target); }); }
+
+    // ---- CL-1 Phase 4: gene pool persistence + god-tools ---------------------
+    // All run under the world lock on the UI thread (via post) or the sim
+    // thread (periodic harvest). The pool itself is read-only world input —
+    // bless/spawn writes only affect FUTURE brains, never live state_hash.
+    void ensure_gene_pool() {                 // caller holds mx
+        if (gene_pool_loaded) return;
+        gene_pool_loaded = true;
+        gene_pool.load("saves/gene_pool.bin", w.props);
+    }
+    void attach_gene_pool() {                 // caller holds mx, w fresh
+        ensure_gene_pool();
+        w.gene_pool = &gene_pool;
+    }
+    void harvest_gene_pool() {                // caller holds mx
+        if (!w.brains_) return;
+        const PropId age_p = SIMLAB_PID(w.props, "age");
+        for (const auto& [mid, mind] : w.minds_) {
+            const Entity* e = w.find(mid);
+            if (!e || !e->alive || e->kind_name != SIMLAB_KIND("sapient"))
+                continue;
+            if (!w.brains_->slots.count(mid)) continue;
+            GenePoolEntry en;
+            en.brain = brain_genome_of(w, *w.brains_, mid);
+            en.body = e->genome;
+            en.kind = "sapient";
+            en.seen_tick = w.clock_.tick();
+            std::int64_t fit = w.prop_int(*e, age_p, 0);
+            for (const auto& [k, rec] : mind.discoveries)
+                if (rec.status == DiscoveryStatus::Verified) fit += 500;
+            fit += static_cast<std::int64_t>(mind.memory.size()) * 10;
+            en.fitness = fit;
+            gene_pool.consider(en);
+        }
+    }
+    void save_gene_pool() {                   // caller holds mx
+        harvest_gene_pool();
+        gene_pool.save("saves/gene_pool.bin", w.props);
+    }
+    // Global mutation pressure: rewrite `mutation_rate` on every living
+    // genome-bearing organism (influx templates keep their own until they
+    // too are swept — the slider is a god-tool, not a law).
+    void apply_mutation_override() {          // caller holds mx
+        const int mp = mut_permille.load();
+        if (mp < 0) return;
+        const PropId mr = SIMLAB_PID(w.props, "mutation_rate");
+        if (mr == kNoProp) return;
+        for (const auto& ep : w.entities) {
+            Entity* e = ep.get();
+            if (!e || !e->alive || e->genome.loci.empty()) continue;
+            e->props.set(mr, Value::integer(mp));
+        }
+    }
+    void do_bless_clone(EntityId id) {
+        const Entity* e = w.find(id);
+        if (!e || !e->alive || e->genome.loci.empty()) {
+            status_msg = "Bless: pick a living organism with a genome";
+            return;
+        }
+        if (!w.brains_) { status_msg = "Bless: no brains allocated yet"; return; }
+        const BrainGenome bg = brain_genome_of(w, *w.brains_, id);
+        if (!bg.valid) { status_msg = "Bless: that mind has no brain yet"; return; }
+        GenePoolEntry en;
+        en.brain = bg; en.body = e->genome;
+        en.kind = e->kind_name + ""; en.seen_tick = w.clock_.tick();
+        gene_pool.bless(en);
+        save_gene_pool();
+        // spawn 4 lightly-mutated copies around the blessed one
+        const PropId age_p = SIMLAB_PID(w.props, "age");
+        const PropId adult_p = SIMLAB_PID(w.props, "adult");
+        const std::int64_t adult_age =
+            adult_p != kNoProp ? w.prop_int(*e, adult_p, 250) : 250;
+        int made = 0;
+        for (int i = 0; i < 4; ++i) {
+            const Vec2 cp{e->pos.x + (i % 2 ? 28 : -28),
+                          e->pos.y + (i < 2 ? -28 : 28)};
+            PropertyBag pb = e->props;
+            if (age_p != kNoProp)
+                pb.set(age_p, Value::integer(adult_age));
+            const EntityId nid =
+                w.create_entity(e->kind_name + "", e->material, cp, pb);
+            if (nid == kNoEntity) continue;
+            if (Entity* ne = w.find(nid)) ne->genome = e->genome;
+            BrainGenome cg = bg;
+            brain_mutate_blocks(cg.slow.data(),
+                                static_cast<std::int64_t>(cg.slow.size()),
+                                w.world_seed, nid, w.clock_.tick(), 4, 350);
+            brain_install_spawn(w, nid, cg);
+            w.build_anatomy(nid);
+            ++made;
+        }
+        status_msg = "Blessed " + sid(id) + " into the gene pool - " +
+                     std::to_string(made) + " clones born";
+    }
+    void bless_clone(EntityId id) { post([=, this] { do_bless_clone(id); }); }
+    void do_punish(EntityId id) {
+        const Entity* e = w.find(id);
+        if (!e || !e->alive) { status_msg = "Punish: no living entity"; return; }
+        AgentMind& m = w.mind(id);   // get-or-create (god-tool, same as whisper)
+        // Shock the three freshest memories aversive + spike the acute axes:
+        // the WM replay and fast weights then consolidate "don't repeat".
+        int marked = 0;
+        for (auto it = m.memory.begin();
+             it != m.memory.end() && marked < 3; ++it) {
+            MemoryEngram& g = it->second.engram;
+            g.emotional_charge = std::min<std::int64_t>(g.emotional_charge, -900);
+            g.stability = std::max<std::int64_t>(g.stability, 6000);
+            ++marked;
+        }
+        m.neuro.panic = std::min<std::int64_t>(1000, m.neuro.panic + 500);
+        m.neuro.rage = std::min<std::int64_t>(1000, m.neuro.rage + 400);
+        m.neuro.grief = std::min<std::int64_t>(1000, m.neuro.grief + 200);
+        status_msg = "Punished " + sid(id) + ": " +
+                     std::to_string(marked) + " memories turned aversive";
+    }
+    void punish(EntityId id) { post([=, this] { do_punish(id); }); }
     void do_place_beacon(Vec2 p) {
         if (!journal.spend(10)) { status_msg = "Not enough Resonance (10)"; return; }
         const auto scouts = nearest_tribe(p, 2);
@@ -2063,6 +2244,12 @@ struct Viewer {
             const bool pinned = journal.pins.count(selected) != 0;
             if (ImGui::Button(pinned ? "Unpin" : "Pin", ImVec2(60, 0))) { if (pinned) journal.pins.erase(selected); else journal.pins.insert(selected); }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Follow this life in Journal > Legends");
+            ImGui::SameLine(0, 4);
+            if (ImGui::Button("Bless", ImVec2(52, 0))) bless_clone(selected);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Hall-of-fame its brain + spawn 4 mutated clones");
+            ImGui::SameLine(0, 4);
+            if (ImGui::Button("Punish", ImVec2(56, 0))) punish(selected);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Aversive shock: recent memories + acute stress axes");
             if (ImGui::BeginPopup("idea")) {
                 ImGui::TextDisabled("Make it wonder about...");
                 const auto& verbs = curiosity_verbs();

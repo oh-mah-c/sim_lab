@@ -23,6 +23,7 @@
 #include "simlab/Chronicle.hpp"
 #include "simlab/Brain.hpp"
 #include "simlab/NarrativeHost.hpp"
+#include "simlab/GenePool.hpp"
 #include <chrono>
 #include <thread>
 
@@ -10545,9 +10546,9 @@ static void test_brain_curriculum() {
     };
     World a = build(17), b = build(17);
     DriverState sta; sta.curiosity = true; sta.concurrent = true;
-    sta.brain_control = true;
+    sta.brain_control = true; sta.legacy_planner_compat = true;
     DriverState stb; stb.curiosity = true; stb.concurrent = true;
-    stb.brain_control = true;
+    stb.brain_control = true; stb.legacy_planner_compat = true;
 
     // micro-benchmark on a THROWAWAY world — decides/learn hooks mutate
     // brain + world state, so it must not touch the determinism pair.
@@ -10661,6 +10662,150 @@ static void test_narrative_host() {
     CHECK(!h.active());
 }
 
+// CL-1 Phase 4 — persistent gene pool: hall-of-fame persistence, 70/30
+// deterministic derive, byte-exact spawn install, cross-run inheritance.
+static void test_gene_pool_evolution() {
+    World rw(3, "data");   // registry source for save/load prop names
+    auto mk_entry = [&](std::int64_t fit, std::uint64_t salt) {
+        GenePoolEntry e;
+        e.kind = "sapient"; e.fitness = fit; e.seen_tick = 1;
+        e.brain.valid = true; e.brain.hidden = 64;
+        e.brain.lr_permille = 400; e.brain.trace_decay = 900;
+        e.brain.mut_scale = 10;
+        e.brain.slow.assign(brain_layout_h(64).total_bytes, 0);
+        for (std::size_t i = 0; i < e.brain.slow.size(); ++i)
+            e.brain.slow[i] = brain_rand_weight(7, salt, i, 24);
+        return e;
+    };
+
+    // ---- unit: ordering, bless priority, cap --------------------------------
+    GenePool pool;
+    CHECK(pool.empty());
+    pool.consider(mk_entry(100, 1));
+    pool.consider(mk_entry(50, 2));
+    pool.bless(mk_entry(10, 3));              // forced to top regardless
+    CHECK(pool.size() == 3);
+    CHECK(pool.entries().front().fitness == 101);   // bless = best + 1
+    CHECK(pool.entries().back().fitness == 50);
+    GenePoolEntry bad;                        // invalid brains rejected
+    pool.consider(bad);
+    CHECK(pool.size() == 3);
+    for (int i = 0; i < 40; ++i) pool.consider(mk_entry(i, 100 + i));
+    CHECK(pool.size() <= GenePool::kMaxEntries);
+    CHECK(pool.entries().front().fitness >= pool.entries().back().fitness);
+
+    // ---- derive: determinism + ~70% draw rate --------------------------------
+    EntityId did = kNoEntity;
+    for (EntityId id = 1; id < 2000; ++id) {
+        BrainGenome t;
+        if (pool.derive(424242, id, t)) { did = id; break; }
+    }
+    CHECK(did != kNoEntity);
+    BrainGenome dg1, dg2;
+    CHECK(pool.derive(424242, did, dg1));
+    CHECK(pool.derive(424242, did, dg2));
+    CHECK(dg1.valid && dg1.slow == dg2.slow);
+    CHECK(dg1.slow.size() == brain_layout_h(dg1.hidden).total_bytes);
+    int yes = 0;
+    for (EntityId id = 1; id <= 400; ++id) {
+        BrainGenome t;
+        if (pool.derive(999, id, t)) ++yes;
+    }
+    CHECK(yes > 200 && yes < 360);             // ~70% of 400
+    BrainGenome dg3;
+    CHECK(!pool.derive(424242, did, dg3) || dg3.slow == dg1.slow);  // same seed same out
+
+    // ---- save/load round-trip -------------------------------------------------
+    std::filesystem::create_directories("saves");
+    const std::string pfile = "saves/test_gene_pool_tmp.bin";
+    CHECK(pool.save(pfile, rw.props));
+    GenePool loaded;
+    CHECK(loaded.load(pfile, rw.props));
+    CHECK(loaded.size() == pool.size());
+    CHECK(loaded.size() > 0 &&
+          loaded.entries()[0].fitness == pool.entries()[0].fitness);
+    BrainGenome gl;
+    CHECK(loaded.derive(424242, did, gl));
+    CHECK(gl.slow == dg1.slow);               // identical pool -> identical derive
+    std::filesystem::remove(pfile);
+
+    // ---- end-to-end: game1 harvest -> game2 inherits ---------------------------
+    auto build = [](std::uint64_t seed) {
+        World w(seed, "data");
+        PrimordialParams pp; pp.seed = static_cast<int>(seed); pp.grid = 48;
+        pp.tribes = 1; pp.per_tribe = 3;
+        build_primordial(w, pp);
+        return w;
+    };
+    auto score_world = [&](World& w) {
+        GenePool hall;
+        if (!w.brains_) return hall;
+        const PropId age_p = SIMLAB_PID(w.props, "age");
+        for (const auto& [mid, mind] : w.minds_) {
+            const Entity* e = w.find(mid);
+            if (!e || !e->alive || e->kind_name != SIMLAB_KIND("sapient"))
+                continue;
+            if (!w.brains_->slots.count(mid)) continue;
+            GenePoolEntry en;
+            en.brain = brain_genome_of(w, *w.brains_, mid);
+            en.body = e->genome;
+            en.kind = "sapient";
+            en.seen_tick = w.clock_.tick();
+            std::int64_t fit = w.prop_int(*e, age_p, 0);
+            for (const auto& [k, rec] : mind.discoveries)
+                if (rec.status == DiscoveryStatus::Verified) fit += 500;
+            fit += static_cast<std::int64_t>(mind.memory.size()) * 10;
+            en.fitness = fit;
+            hall.consider(en);
+        }
+        return hall;
+    };
+    auto alive_sapients = [](const World& w) {
+        std::size_t n = 0;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == SIMLAB_KIND("sapient")) ++n;
+        return n;
+    };
+
+    World g1 = build(21);
+    DriverState st; st.curiosity = true; st.concurrent = true;
+    st.brain_control = true; st.legacy_planner_compat = true;
+    for (int i = 0; i < 300; ++i) autonomous_cycle(g1, &st);
+    GenePool hall = score_world(g1);
+    CHECK(!hall.empty());
+    CHECK(hall.save(pfile, g1.props));
+    GenePool hall2;
+    CHECK(hall2.load(pfile, g1.props));
+    CHECK(hall2.size() == hall.size());
+    const std::size_t alive1 = alive_sapients(g1);
+
+    World g2 = build(21);              // same seed -> same founders
+    g2.gene_pool = &hall2;             // ván 2 inherits the hall of fame
+    DriverState st2 = st;
+    // byte-exact install check BEFORE the run: a founder whose id derives
+    // from the pool must get the derived slow block verbatim.
+    EntityId founder = kNoEntity;
+    for (const auto& ep : g2.entities)
+        if (ep->alive && ep->kind_name == SIMLAB_KIND("sapient")) {
+            founder = ep->id; break;
+        }
+    CHECK(founder != kNoEntity);
+    BrainGenome expect;
+    if (hall2.derive(g2.world_seed, founder, expect)) {
+        brain_decide(g2, founder);    // forces slot alloc -> pool install
+        CHECK(g2.brains_ && g2.brains_->slots.count(founder));
+        BrainGenome got = brain_genome_of(g2, *g2.brains_, founder);
+        CHECK(got.valid && got.slow == expect.slow &&
+              got.hidden == expect.hidden);
+    }
+    for (int i = 0; i < 300; ++i) autonomous_cycle(g2, &st2);
+    const std::size_t alive2 = alive_sapients(g2);
+    std::printf("  gene_pool: hall=%zu alive g1=%zu g2=%zu\n",
+                hall2.size(), alive1, alive2);
+    CHECK(alive2 >= alive1);           // inherited brains never do worse
+    std::filesystem::remove(pfile);
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -10730,6 +10875,7 @@ int main(int argc, char** argv) {
     RUN(test_amphibian_evolution);
     RUN(test_brain_curriculum);
     RUN(test_narrative_host);
+    RUN(test_gene_pool_evolution);
     RUN(test_infection_and_primitive_medicine);
     RUN(test_neuro_psychopathology);
     RUN(test_phase9_autonomous_civilization);

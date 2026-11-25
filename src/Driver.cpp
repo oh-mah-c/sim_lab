@@ -178,38 +178,48 @@ bool social_floor(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
 bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
                 DriverTally* tally) {
     if (!st || !st->brain_control || w.speculative) return false;
-    if (social_floor(w, st, npc, now)) {
-        if (tally) ++tally->social;
-        return true;
-    }
     const Entity* me = w.find(npc);
     if (!me || !me->alive) return false;
-    // Survival gate: a desperate agent (hunger/thirst > 500, same threshold
-    // the consume reflex uses) hands control back to the legacy planner —
-    // an untrained brain must not starve its body while it learns.
-    const PropId hp = dpid(w, "hunger"), tp = dpid(w, "thirst");
-    if ((hp != kNoProp && dint(w, *me, hp, 0) > 500) ||
-        (tp != kNoProp && dint(w, *me, tp, 0) > 500))
-        return false;
-    // Sparse consultation: the brain deliberates once every 8 cycles per
-    // agent (deterministic hash of tick+id); off-cycles return false so the
-    // legacy reflex/planner path owns the body. This is the honest curriculum
-    // stage: an untrained WM is noise, but brain_pre/post still observe and
-    // learn from EVERY interact() — including reflex-driven ones — so the
-    // world model trains on real experience while survival stays reflexive.
-    // It also cuts decide cost ~8x (measured ~62us -> ~8us effective).
-    if (((now + static_cast<std::uint64_t>(npc)) & 7) != 0) return false;
+    if (st->legacy_planner_compat) {
+        // ---- Phase-3 stabilized hybrid (regression-suite mode) --------------
+        if (social_floor(w, st, npc, now)) {
+            if (tally) ++tally->social;
+            return true;
+        }
+        // Survival gate: a desperate agent (hunger/thirst > 500, same
+        // threshold the consume reflex uses) hands control back to the
+        // legacy planner — an untrained brain must not starve its body.
+        const PropId hp = dpid(w, "hunger"), tp = dpid(w, "thirst");
+        if ((hp != kNoProp && dint(w, *me, hp, 0) > 500) ||
+            (tp != kNoProp && dint(w, *me, tp, 0) > 500))
+            return false;
+        // Sparse consultation: 1-in-8 cycles per agent.
+        if (((now + static_cast<std::uint64_t>(npc)) & 7) != 0) return false;
+        BrainChoice ch = brain_decide(w, npc);
+        if (!ch.valid) return false;
+        InteractionContext c = mk(npc, {}, ch.verb.c_str(), 1);
+        if (ch.target != kNoEntity) c.targets.push_back(ch.target);
+        if (ch.has_move) {
+            c.parameters.destination = ch.move_to;
+            c.parameters.has_destination = true;
+            c.parameters.ticks = move_stride(st);
+        }
+        w.interact(c);
+        return true;
+    }
+    // ---- 100% neural mode: CL-1 owns every cycle ---------------------------
+    // No social floor, no urgent-need bailout, no sparsity, no plan_multi
+    // fallback — natural selection is the only safety net. An undecidable
+    // brain rests (which also runs sleep consolidation on its replay).
     BrainChoice ch = brain_decide(w, npc);
-    if (!ch.valid) return false;
-    InteractionContext c = mk(npc, {}, ch.verb.c_str(), 1);
+    InteractionContext c = ch.valid ? mk(npc, {}, ch.verb.c_str(), 1)
+                                    : mk(npc, {}, "rest", 1);
     if (ch.target != kNoEntity) c.targets.push_back(ch.target);
     if (ch.has_move) {
         c.parameters.destination = ch.move_to;
         c.parameters.has_destination = true;
         c.parameters.ticks = move_stride(st);
     }
-    // verbs that need a remembered entity but got none still fire — the law
-    // decides (usually a cheap refusal); consume/rest/move need no target.
     w.interact(c);
     return true;
 }

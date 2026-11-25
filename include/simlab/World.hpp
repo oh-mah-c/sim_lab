@@ -28,6 +28,8 @@
 
 namespace simlab {
 
+class GenePool;
+
 // ---- World Core -------------------------------------------------------------
 // Owns World Truth: clock, entities, registries, spatial index, causal ledger,
 // natural-law models and deterministic RNG streams. It knows nothing about
@@ -256,6 +258,13 @@ public:
     // (brain_state_hash() fingerprints it separately for replay tests).
     bool brain_shadow = false;
     std::shared_ptr<BrainStore> brains_;
+    // CL-1 Phase 4: optional read-only pointer to the persistent gene pool
+    // (viewer-owned, lives outside World). brain_slot() consults it on
+    // lazy init: 70% of fresh brains derive from pool donors, 30% stay
+    // hash-init. NOT copied by clone() (speculative worlds never inject)
+    // and NOT part of state_hash — the pool file is world INPUT, read
+    // deterministically at spawn time only.
+    const GenePool* gene_pool = nullptr;
     // Empty when content loaded cleanly; otherwise the load_content() error.
     // On failure registries are left EMPTY (all-or-nothing), never half-loaded.
     std::string content_error;

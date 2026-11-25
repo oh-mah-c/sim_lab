@@ -1,4 +1,5 @@
 #include "simlab/Brain.hpp"
+#include "simlab/GenePool.hpp"
 #include "simlab/Rng.hpp"
 #include "simlab/World.hpp"
 #include "simlab/Cognition.hpp"
@@ -310,17 +311,24 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
     // hyper-genes: explicit genome wins, else the entity's own loci
     const Entity* ge = w.find(npc);
     const BrainGenome* src = genome;
-    BrainGenome tmp;
+    BrainGenome tmp, poolg;
     if (!src || !src->valid) {
-        tmp.hidden   = snap_hidden(static_cast<std::int32_t>(
-            brain_locus(w, ge, "brain_hidden", kHid)));
-        tmp.lr_permille    = static_cast<std::int32_t>(
-            brain_locus(w, ge, "brain_lr", 400));
-        tmp.trace_decay    = static_cast<std::int32_t>(
-            brain_locus(w, ge, "brain_trace_decay", 900));
-        tmp.mut_scale      = static_cast<std::int32_t>(
-            brain_locus(w, ge, "brain_mut_scale", 500));
-        src = &tmp;
+        // Phase 4 gene pool: 70% of fresh brains derive from hall-of-fame
+        // donors (deterministic per world_seed+npc); the rest fall through
+        // to the entity's own loci -> hash-init path.
+        if (w.gene_pool && w.gene_pool->derive(w.world_seed, npc, poolg)) {
+            src = &poolg;
+        } else {
+            tmp.hidden   = snap_hidden(static_cast<std::int32_t>(
+                brain_locus(w, ge, "brain_hidden", kHid)));
+            tmp.lr_permille    = static_cast<std::int32_t>(
+                brain_locus(w, ge, "brain_lr", 400));
+            tmp.trace_decay    = static_cast<std::int32_t>(
+                brain_locus(w, ge, "brain_trace_decay", 900));
+            tmp.mut_scale      = static_cast<std::int32_t>(
+                brain_locus(w, ge, "brain_mut_scale", 500));
+            src = &tmp;
+        }
     }
     const std::int32_t H = snap_hidden(src->hidden);
     const BrainLayout& L = brain_layout_h(H);
@@ -870,53 +878,48 @@ BrainChoice brain_decide(World& w, EntityId npc) {
             query.data());
 
     // mask: only verbs the mind has learned (known_actions) plus the
-    // innate locomotion/rest pair — an agent cannot plan what it never saw
+    // innate locomotion/rest pair — an agent cannot plan what it never saw.
+    // One pass over the (small) known set: no per-verb string temporaries.
     bool allowed[kActionVerbs] = {};
-    int nallowed = 0;
-    for (int i = 0; i < kActionVerbs; ++i) {
-        allowed[i] = mind->known_actions.count(sensor_verb_table()[i]) > 0;
-        if (allowed[i]) ++nallowed;
-    }
+    for (const std::string& kv : mind->known_actions)
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (kv == sensor_verb_table()[i]) { allowed[i] = true; break; }
     for (int i = 0; i < kActionVerbs; ++i) {
         const char* v = sensor_verb_table()[i];
-        if (std::string(v) == "move" || std::string(v) == "rest") {
+        if (std::strcmp(v, "move") == 0 || std::strcmp(v, "rest") == 0)
             allowed[i] = true;
-        }
     }
-    nallowed = 0;
+    int nallowed = 0;
     for (int i = 0; i < kActionVerbs; ++i) if (allowed[i]) ++nallowed;
     if (nallowed == 0) {
         for (int i = 0; i < kActionVerbs; ++i)
-            if (std::string(sensor_verb_table()[i]) == "move" ||
-                std::string(sensor_verb_table()[i]) == "rest") {
+            if (std::strcmp(sensor_verb_table()[i], "move") == 0 ||
+                std::strcmp(sensor_verb_table()[i], "rest") == 0)
                 allowed[i] = true;
-            }
         for (int i = 0; i < kActionVerbs; ++i) if (allowed[i]) ++nallowed;
     }
     if (nallowed == 0) return out;
 
-    // ---- attention targets: the same 6 nearest remembered entities the
-    // sensor encoded (channels 24..71), re-sorted identically ---------------
+    // ---- attention targets: the 6 nearest remembered entities --------------
+    // Bounded insertion into a stack array — no heap alloc per decide.
+    // Iterates mind->memory (sorted map -> deterministic order); equal
+    // distances keep the earlier (map-order) entry.
     struct NearEnt { std::int64_t d2; EntityId id; Vec2 pos; };
-    std::vector<NearEnt> near;
-    {
-        const PropId p_sight = SIMLAB_PID(w.props, "sight_range");
-        const std::int64_t sight =
-            p_sight != kNoProp ? w.prop_int(*me, p_sight, 64) : 64;
-        (void)sight;
-        for (const auto& [kid, snap] : mind->memory) {
-            if (kid == npc) continue;
-            const std::int64_t dx = snap.pos.x - me->pos.x;
-            const std::int64_t dy = snap.pos.y - me->pos.y;
-            near.push_back({dx * dx + dy * dy, kid, snap.pos});
-        }
-        std::sort(near.begin(), near.end(),
-                  [](const NearEnt& a, const NearEnt& b) { return a.d2 < b.d2; });
-        if (near.size() > kEntitySlots) near.resize(kEntitySlots);
+    NearEnt near[kEntitySlots];
+    int nnear = 0;
+    for (const auto& [kid, snap] : mind->memory) {
+        if (kid == npc) continue;
+        const std::int64_t dx = snap.pos.x - me->pos.x;
+        const std::int64_t dy = snap.pos.y - me->pos.y;
+        const std::int64_t d2 = dx * dx + dy * dy;
+        if (nnear == kEntitySlots && d2 >= near[kEntitySlots - 1].d2) continue;
+        int p = nnear < kEntitySlots ? nnear++ : kEntitySlots - 1;
+        while (p > 0 && near[p - 1].d2 > d2) { near[p] = near[p - 1]; --p; }
+        near[p] = {d2, kid, snap.pos};
     }
     // attention score per remembered slot: query[0..7] . sensor-feat[0..7]
     std::int32_t attn[kEntitySlots] = {};
-    for (int t = 0; t < static_cast<int>(near.size()); ++t) {
+    for (int t = 0; t < nnear; ++t) {
         const std::int8_t* f = &sv[24 + t * kEntityFeats];
         std::int32_t sc = 0;
         for (int k = 0; k < 8; ++k) sc += query[k] * f[k];
@@ -947,7 +950,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     for (int v = 0; v < kActionVerbs; ++v) {
         if (!allowed[v]) continue;
         consider(vlogit[v], v, -1);                    // no-entity variant
-        for (int t = 0; t < static_cast<int>(near.size()); ++t)
+        for (int t = 0; t < nnear; ++t)
             consider(vlogit[v] + attn[t] / 8, v, t);
     }
     if (ncand == 0) return out;                        // nothing plannable
@@ -1021,9 +1024,9 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     const char* verb = sensor_verb_table()[chosen.verb];
     out.verb = verb;
     out.score = best_total;
-    out.target = (chosen.tgt >= 0 && chosen.tgt < static_cast<int>(near.size()))
+    out.target = (chosen.tgt >= 0 && chosen.tgt < nnear)
                      ? near[chosen.tgt].id : kNoEntity;
-    if (std::string(verb) == "move") {
+    if (std::strcmp(verb, "move") == 0) {
         out.has_move = true;
         if (out.target != kNoEntity)
             out.move_to = near[chosen.tgt].pos;   // walk to the mark
