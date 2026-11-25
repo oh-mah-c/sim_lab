@@ -43,14 +43,6 @@ const char* const kVerbs[kActionVerbs] = {
     "chop", "heat", "evacuate", "assemble", "disassemble", "carve",
     "perform_ritual", "consecrate", "adjudicate"};
 
-std::int64_t isqrt_i64(std::int64_t v) {
-    if (v <= 0) return 0;
-    std::int64_t r = v;
-    std::int64_t x = (r + 1) / 2;
-    while (x < r) { r = x; x = (x + v / x) / 2; }
-    return r;
-}
-
 PropId intero_pid(const World& w, int i) {
     static thread_local std::array<PropId, kInteroChannels> cache{};
     static thread_local std::uint64_t seen_uid = 0;
@@ -117,7 +109,9 @@ SensorVec sensor_encode(const World& w, EntityId npc,
         s[23] = sensor_norm(n.panic + n.rage + n.grief, 24);
     }
 
-    // ---- channels 24..71: 6 nearest remembered entities x 8 features ----------
+    // ---- channels 24..65: 6 nearest remembered entities x 7 features ----------
+    // (feat `dist` was dropped — it is fully determined by dx/dy; the freed
+    // channels became the social/temporal block at 66..69)
     const PropId p_sight = SIMLAB_PID(w.props, "sight_range");
     const std::int64_t sight =
         p_sight != kNoProp ? w.prop_int(*me, p_sight, 64) : 64;
@@ -146,23 +140,21 @@ SensorVec sensor_encode(const World& w, EntityId npc,
         const auto& snap = mind->memory.at(kid);
         const std::int64_t dx = snap.pos.x - me->pos.x;
         const std::int64_t dy = snap.pos.y - me->pos.y;
-        const std::int64_t dist = isqrt_i64(near[slot].d2);
         std::int8_t* f = &s[24 + slot * kEntityFeats];
         f[0] = sensor_norm(dx * 8, sight);          // dx/sight, x8 headroom
         f[1] = sensor_norm(dy * 8, sight);
-        f[2] = sensor_norm(dist * 8, sight);
         // integrity: observable prop if recorded, else mid-range prior
         std::int64_t integ = 500;
         const auto ip = snap.props.find(p_integ);
         if (ip != snap.props.end() && ip->second.type == ValType::Integer)
             integ = ip->second.i;
-        f[3] = sensor_norm(integ, 8);
+        f[2] = sensor_norm(integ, 8);
         // bulk: carried quantity if the snapshot saw any
         std::int64_t qty = 0;
         const auto qp = snap.props.find(p_qty);
         if (qp != snap.props.end() && qp->second.type == ValType::Integer)
             qty = qp->second.i;
-        f[4] = sensor_norm(qty, 1000);
+        f[3] = sensor_norm(qty, 1000);
         // resource potential: material declares nutrition (data-driven)
         const MaterialDef* md = w.materials.find(snap.material);
         std::int64_t nut = 0;
@@ -171,26 +163,126 @@ SensorVec sensor_encode(const World& w, EntityId npc,
             if (np != md->props.end() && np->second.type == ValType::Integer)
                 nut = np->second.i;
         }
-        f[5] = sensor_norm(nut, 1000);
+        f[4] = sensor_norm(nut, 1000);
         // emotional charge of the engram tied to this entity (friend/foe)
-        f[6] = sensor_norm(snap.engram.emotional_charge, 8);
+        f[5] = sensor_norm(snap.engram.emotional_charge, 8);
         // memory clarity as recency/strength proxy (last-action flag is not
         // observable in snapshots — clarity is the honest substitute)
-        f[7] = sensor_norm(snap.engram.clarity, 2);
+        f[6] = sensor_norm(snap.engram.clarity, 2);
     }
 
-    // ---- channels 72..79: environment -----------------------------------------
-    if (w.terrain.contains(me->pos)) {
-        s[72] = sensor_norm(w.terrain.moist_at(me->pos), 8);
-        s[73] = sensor_norm(w.terrain.temp_at(me->pos) - 300, 16);
-        s[74] = sensor_norm(w.terrain.elev_at(me->pos), 4);
-        s[75] = sensor_norm(w.terrain.slope_at(me->pos), 4);
-        s[76] = static_cast<std::int8_t>(w.terrain.is_water(me->pos) ? 100 : -100);
-        s[77] = sensor_norm(w.terrain.veg_at(me->pos), 8);
-        s[78] = sensor_norm(w.terrain.wear_at(me->pos), 8);
-        s[79] = sensor_norm(w.terrain.water_table_at(me->pos), 100);
+    // ---- channels 66..69: social & temporal cognition ------------------------
+    // The nearest remembered AGENT (an entity with a mind) inside earshot
+    // anchors the social channels. language_id is domain=social — never in
+    // snapshots — but a neighbour's tongue is literally audible at close
+    // range, so kinship reads it live, gated by distance; affect reuses the
+    // theory-of-mind `mood:` belief (the honest "read their agitation"
+    // channel); security mixes held food (possessed_by IS observable) with
+    // wielded-tool integrity (own equipment = proprioception); scarcity is
+    // the deterministic seasonal resource clock (672 ticks/season, see
+    // World.cpp eco_season) so C-step rollouts get temporal foresight.
+    const PropId p_lang = SIMLAB_PID(w.props, "language_id");
+    const PropId p_poss = SIMLAB_PID(w.props, "possessed_by");
+    const PropId p_nut  = SIMLAB_PID(w.props, "nutrition");
+    EntityId agent_near = kNoEntity;
+    std::int64_t agent_d2 = 0;
+    if (mind) {
+        const std::int64_t earshot = sight * 2;
+        const std::int64_t ear2 = earshot * earshot;
+        for (const auto& [kid, snap] : mind->memory) {
+            if (kid == npc || w.find_mind(kid) == nullptr) continue;
+            const Entity* ae = w.find(kid);
+            if (!ae || !ae->alive) continue;
+            const std::int64_t dx = snap.pos.x - me->pos.x;
+            const std::int64_t dy = snap.pos.y - me->pos.y;
+            const std::int64_t d2 = dx * dx + dy * dy;
+            if (d2 > ear2) continue;
+            if (agent_near == kNoEntity || d2 < agent_d2) {
+                agent_near = kid; agent_d2 = d2;
+            }
+        }
     }
-    // ---- channels 80..95: last action one-hot ----------------------------------
+    // 66 tribal_kinship: bitwise similarity of the two language_ids.
+    // Identical tongue -> +127; each differing bit costs ~3.4% so fully
+    // foreign ids land near -127. 0 when either side is speechless.
+    if (agent_near != kNoEntity && p_lang != kNoProp) {
+        const Entity* ae = w.find(agent_near);
+        const std::int64_t my_lang = w.prop_int(*me, p_lang, 0);
+        const std::int64_t their_lang =
+            ae ? w.prop_int(*ae, p_lang, 0) : 0;
+        if (my_lang > 0 && their_lang > 0) {
+            const std::uint64_t x =
+                static_cast<std::uint64_t>(my_lang) ^
+                static_cast<std::uint64_t>(their_lang);
+            const std::int64_t sim = std::max<std::int64_t>(
+                0, 1000 - static_cast<std::int64_t>(__builtin_popcountll(x)) * 34);
+            s[kChanKinship] = sensor_norm(sim * 2 - 1000, 1000);
+        }
+    }
+    // 67 neighbor_affect: signed read of the ToM mood belief — confidence
+    // above ~500 agitates (stampede/pack signal), below reads calm; no
+    // belief -> 0 (the observer's theory_of_mind never inferred anything).
+    if (agent_near != kNoEntity && mind) {
+        const Belief* b = mind->find_belief(
+            "mood:" + std::to_string(agent_near));
+        if (b) s[kChanNeighborAffect] = sensor_norm(b->confidence - 500, 4);
+    }
+    // 68 inventory_security: bounded composite of carried edible items
+    // (snapshots whose observable possessed_by == me, material nutrition>0)
+    // plus wielded-tool integrity. 0..127; feeds the homeostatic security
+    // bonus in brain_post (stockpiling drive, <=15% of the reward range).
+    {
+        std::int64_t food_items = 0;
+        if (mind) {
+            for (const auto& [kid, snap] : mind->memory) {
+                if (kid == npc) continue;
+                const auto pp = snap.props.find(p_poss);
+                if (pp == snap.props.end() ||
+                    pp->second.type != ValType::Integer ||
+                    pp->second.i != static_cast<std::int64_t>(npc))
+                    continue;
+                const MaterialDef* md = w.materials.find(snap.material);
+                if (!md) continue;
+                const auto np = md->props.find(p_nut);
+                if (np != md->props.end() &&
+                    np->second.type == ValType::Integer && np->second.i > 0)
+                    ++food_items;
+            }
+        }
+        std::int64_t tool_integ = 0;
+        for (const Relation& rel : w.relations_of(npc, "wielding")) {
+            if (rel.a != npc) continue;
+            const Entity* t = w.find(rel.b);
+            if (!t || !t->alive) continue;
+            tool_integ = std::max(tool_integ, w.prop_int(*t, p_integ, 0));
+        }
+        const std::int64_t sec = std::min<std::int64_t>(
+            1000, std::min<std::int64_t>(food_items, 8) * 140 +
+                  std::min<std::int64_t>(tool_integ, 1000) / 5);
+        s[kChanInvSecurity] = sensor_norm(sec, 1000);
+    }
+    // 69 cycle_scarcity_phase: triangle wave over the 672-tick season —
+    // -127 mid-season (resources abundant), +127 at the boundary (scarce).
+    {
+        const std::int64_t t =
+            static_cast<std::int64_t>(w.clock_.tick() % 672);
+        const std::int64_t tri = t < 336 ? t : 672 - t;
+        const std::int64_t scarce = 336 - tri;
+        s[kChanScarcityPhase] = sensor_norm(scarce * 2 - 336, 336);
+    }
+
+    // ---- channels 70..77: environment -----------------------------------------
+    if (w.terrain.contains(me->pos)) {
+        s[70] = sensor_norm(w.terrain.moist_at(me->pos), 8);
+        s[71] = sensor_norm(w.terrain.temp_at(me->pos) - 300, 16);
+        s[72] = sensor_norm(w.terrain.elev_at(me->pos), 4);
+        s[73] = sensor_norm(w.terrain.slope_at(me->pos), 4);
+        s[74] = static_cast<std::int8_t>(w.terrain.is_water(me->pos) ? 100 : -100);
+        s[75] = sensor_norm(w.terrain.veg_at(me->pos), 8);
+        s[76] = sensor_norm(w.terrain.wear_at(me->pos), 8);
+        s[77] = sensor_norm(w.terrain.water_table_at(me->pos), 100);
+    }
+    // ---- channels 80..111: last action one-hot ---------------------------------
     if (last_action)
         std::copy(last_action->begin(), last_action->end(), s.begin() + 80);
     return s;

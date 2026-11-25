@@ -7,11 +7,16 @@
 // PERCEIVED world into fixed-width integer vectors — never reads World
 // Truth beyond what AgentMind::memory/perceive() already recorded.
 //
-//   sensor vec : 112 x int8  (intero 16 | neuro 8 | entities 48 | env 8 | act 32)
+//   sensor vec : 112 x int8  (intero 16 | neuro 8 | entities 42 | social 4 | env 8 | spare 2 | act 32)
 //   action vec : 32 x int8   (verb one-hot over the law vocabulary)
 //   label vec  : 25 x int8   (16 intero deltas | 8 outcome classes | reward)
 //
 // All quantization is integer permille->int8; no floats anywhere.
+//
+// Phase "deep cognition": entity feats dropped the redundant `dist`
+// channel (derivable from dx/dy) 8->7, freeing 6 channels; four became
+// the social/temporal block (66..69) and two are reserved spare (78..79).
+// Env moved 72..79 -> 70..77; action one-hot stays at 80..111.
 
 namespace simlab {
 
@@ -23,10 +28,17 @@ struct Entity;
 constexpr int kSensorChannels = 112;
 constexpr int kInteroChannels = 16;    // sensor channels 0..15
 constexpr int kNeuroChannels   = 8;    // channels 16..23
-constexpr int kEntitySlots     = 6;    // channels 24..71 (6 x 8)
-constexpr int kEntityFeats     = 8;
-constexpr int kEnvChannels     = 8;    // channels 72..79
+constexpr int kEntitySlots     = 6;    // channels 24..65 (6 x 7)
+constexpr int kEntityFeats     = 7;
+constexpr int kSocialChannels  = 4;    // channels 66..69
+constexpr int kEnvChannels     = 8;    // channels 70..77
+constexpr int kSpareChannels   = 2;    // channels 78..79 (reserved)
 constexpr int kActChannels     = 32;   // channels 80..111 (last action)
+// Named social/temporal channel indices (Phase deep-cognition).
+constexpr int kChanKinship        = 66;  // tribal_kinship  -127..127
+constexpr int kChanNeighborAffect = 67;  // neighbor_affect -127..127
+constexpr int kChanInvSecurity    = 68;  // inventory_security 0..127
+constexpr int kChanScarcityPhase  = 69;  // cycle_scarcity_phase -127..127
 constexpr int kActionVerbs     = 32;
 constexpr int kLabelChannels   = 25;   // 16 deltas | 8 outcomes | reward
 

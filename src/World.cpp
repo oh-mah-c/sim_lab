@@ -6031,7 +6031,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 20;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore
+constexpr std::uint32_t kSaveFormat = 21;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay)
 
 struct Writer {
     std::ofstream f;
@@ -6365,6 +6365,7 @@ bool World::save(const std::string& path, std::string* err) const {
                 w.str(std::string(reinterpret_cast<const char*>(t.a.data()), t.a.size()));
                 w.str(std::string(reinterpret_cast<const char*>(t.y.data()), t.y.size()));
                 w.str(std::string(reinterpret_cast<const char*>(t.wh.data()), t.wh.size()));
+                w.str(std::string(reinterpret_cast<const char*>(t.w1h.data()), t.w1h.size()));
             }
         }
         w.put(bs.wm_err_sum); w.put(bs.wm_n);
@@ -6897,6 +6898,12 @@ bool World::load(const std::string& path, std::string* err) {
                     std::memcpy(t.a.data(), ab.data(), ab.size());
                     std::memcpy(t.y.data(), yb.data(), yb.size());
                     std::memcpy(t.wh.data(), wb.data(), wb.size());
+                    if (fmt >= 21) {           // v21: dream-replay worker hidden
+                        std::string h1b;
+                        if (!r.str(h1b) || h1b.size() != t.w1h.size())
+                            return fail("truncated brain transition w1h");
+                        std::memcpy(t.w1h.data(), h1b.data(), h1b.size());
+                    }
                 }
                 bs->slots.emplace(nid, std::move(s));
             }

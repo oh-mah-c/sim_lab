@@ -968,3 +968,52 @@ no engine code changes.
   agent with only move+rest never gets strike/flee, sustained-grief vs
   calm worlds produce different ledger action streams, w2w rows update
   only for executed verbs.
+
+## CL-1 Deep cognition — social sensors, dream replay, synaptic forgetting
+
+- Sensor layout re-carved (still 112 channels, dims unchanged): entity
+  feats dropped `dist` 8->7 (`kEntityFeats`), entity block is now
+  24..65; NEW social/temporal block 66..69 (`kChanKinship`,
+  `kChanNeighborAffect`, `kChanInvSecurity`, `kChanScarcityPhase`);
+  env moved 72..79 -> 70..77; spare 78..79; action one-hot still 80..111.
+  `language_id` is domain=social so it is NOT in memory snapshots —
+  kinship reads it LIVE via `w.prop_int` on the nearest remembered mind
+  inside 2x sight radius, gated on both ids > 0; similarity =
+  1000 - popcount(xor)*34 -> sensor_norm(sim*2-1000). neighbor_affect
+  reuses the ToM `mood:<eid>` belief confidence (conf-500 scaled /4).
+  inventory_security = min(1000, min(food_items,8)*140 +
+  min(tool_integ,1000)/5)/1000 where food = remembered snapshots with
+  observable `possessed_by == npc` AND material `nutrition` > 0, tool =
+  own `wielding` relations' integrity. cycle_scarcity_phase = triangle
+  wave over the 672-tick season (`tick%672`, apex mid-season).
+- `Transition` gained `w1h` (64B worker hidden, written in brain_post
+  from `BrainPending::w1hidden`) — dream replay re-drives the w2w row
+  without re-running the trunk. Save format v21 serializes it.
+- `rest` consolidation in brain_post now does THREE things on top of the
+  old replay->wm2 SGD: (1) dream rollout — top-4 replay entries by
+  charge*4+sigma re-run WM1->WM2 on stored `wh`/`y`, then a gentle w2w
+  policy SGD on the dreamed verb (adv = y[24]*8 - 64 + sigma/charge
+  terms, eta ~ lr/16, clamp +-3) so coping consolidates and charged
+  failures are suppressed; (2) fast-weight decay `f -= f/16` before the
+  fast->slow transfer (use-it-or-lose-it); (3) engram forgetting —
+  memory engrams whose |emotional_charge| is below 200 and whose age
+  since last_rehearsal exceeds the heritable `s.trace_decay` horizon
+  get charge *= 3/4 and stability *= 3/8 — the cut MUST beat
+  sleep_consolidate's x2 doubling (runs earlier in learn_from_event on
+  the same rest) or stale traces never actually decay. Dreamed top-4
+  engrams also get rehearse_engram + last_rehearsal = now.
+- Stockpiling drive: the actor-learning advantage in brain_post adds
+  `(sensor[kChanInvSecurity]*5)>>2` (bounded, ~8% of the reward swing)
+  — a smooth gradient toward food/tool hoarding, never a rule; urgent
+  hunger (y[24]) still dominates.
+- `test_brain_deep_cognition` (19 checks): kinship +127 same language /
+  negative foreign, neighbor_affect from the mood belief, lone-agent
+  zeros, scarcity phase varies over the season, inventory_security from
+  carried nutrition; dream rest shifts the w2w row vs a non-rest twin;
+  forgetting attenuates weak engrams while a -900 trauma survives;
+  fast weights decay toward zero.
+- Verified: 90364 checks, 0 failures; capstone 335c58593ea91fb4
+  unchanged (capstone runs without brain_shadow — CL-1 is inert there);
+  dev==release AND seq==t1==t8 bit-identical on brain-active tests
+  (curriculum hash 508a3f5371ff440c, parallel_think 310e9d9fe378f2aa
+  in both dev and release builds).

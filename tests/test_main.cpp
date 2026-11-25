@@ -10979,6 +10979,188 @@ static void test_brain_free_will() {
     }
 }
 
+// ---------- deep cognition: social sensors, dream replay, forgetting -------
+static void test_brain_deep_cognition() {
+    // (1) social & temporal sensor channels ----------------------------------
+    {
+        World w(97, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const EntityId b = mk_sapient(w, {70, 50});
+        Entity& ea = *w.find(a);
+        Entity& eb = *w.find(b);
+        // same tongue -> +127 kinship; no mood belief -> neutral affect
+        tseti(ea, w, "language_id", 777);
+        tseti(eb, w, "language_id", 777);
+        AgentMind& ma = w.mind(a);
+        AgentMind::MemorySnapshot snap;
+        snap.tick = w.clock_.tick();
+        snap.pos = eb.pos; snap.material = eb.material;
+        snap.kind_name = eb.kind_name;
+        upsert_memory(ma, b, snap, 0, mind_params(w, ea));
+        SensorVec s_same = sensor_encode(w, a);
+        CHECK(s_same[kChanKinship] == 127);
+        CHECK(s_same[kChanNeighborAffect] == 0);
+        // foreign tongue (bit-distant id) -> strongly negative kinship
+        tseti(eb, w, "language_id", 1000000000);
+        SensorVec s_for = sensor_encode(w, a);
+        CHECK(s_for[kChanKinship] < 0);
+        CHECK(s_for[kChanKinship] < s_same[kChanKinship] - 100);
+        // ToM mood belief: agitated vs calm neighbour
+        ma.belief("mood:" + std::to_string(b)).confidence = 950;
+        CHECK(sensor_encode(w, a)[kChanNeighborAffect] > 100);
+        ma.belief("mood:" + std::to_string(b)).confidence = 50;
+        CHECK(sensor_encode(w, a)[kChanNeighborAffect] < -50);
+        // lone agent: no conspecific in memory -> neutral social channels
+        const EntityId c = mk_sapient(w, {900, 900});
+        const SensorVec s_alone = sensor_encode(w, c);
+        CHECK(s_alone[kChanKinship] == 0);
+        CHECK(s_alone[kChanNeighborAffect] == 0);
+        CHECK(s_alone[kChanInvSecurity] == 0);
+        // scarcity phase: deterministic triangle over the 672-tick season
+        CHECK(s_alone[kChanScarcityPhase] >= -127 &&
+              s_alone[kChanScarcityPhase] <= 127);
+        w.advance_ticks_for_test(340);   // cross the mid-season apex
+        const SensorVec s_later = sensor_encode(w, c);
+        CHECK(s_later[kChanScarcityPhase] != s_alone[kChanScarcityPhase]);
+        // carried food lifts inventory_security (possessed_by is observable)
+        {
+            const MaterialId berry = w.materials.id_of("wild_berries");
+            if (berry != kNoMaterial) {
+                PropertyBag ib;
+                ib.set(pid(w, "possessed_by"), Value::integer(c));
+                const EntityId it = w.create_entity("berries", berry,
+                                                   {55, 55}, ib);
+                AgentMind& mc = w.mind(c);
+                AgentMind::MemorySnapshot is;
+                is.tick = w.clock_.tick(); is.pos = {55, 55};
+                is.material = berry; is.kind_name = "item";
+                const auto pi = w.find(it);
+                if (pi) {
+                    for (PropId op : w.observable_props())
+                        if (const Value* v = w.prop_of(*pi, op))
+                            is.props[op] = *v;
+                }
+                upsert_memory(mc, it, is, 0, mind_params(w, *w.find(c)));
+                CHECK(sensor_encode(w, c)[kChanInvSecurity] > 0);
+            }
+        }
+    }
+
+    // (2) dream consolidation: rest re-drives the traumatized verb's w2w ---
+    {
+        auto build = [](std::uint64_t seed) {
+            World w(seed, "data");
+            w.brain_shadow = true;
+            const EntityId a = mk_sapient(w, {50, 50});
+            const EntityId b = mk_sapient(w, {90, 50});
+            w.interact(mk_ctx(a, {}, "rest", 0));   // prime both slots
+            w.interact(mk_ctx(b, {}, "rest", 0));
+            return w;
+        };
+        World wA = build(101), wB = build(101);    // identical brains
+        // find the two sapients by kind in each world (same order)
+        auto sapients = [](World& w) {
+            std::vector<EntityId> v;
+            for (const auto& ep : w.entities)
+                if (ep->alive && ep->kind_name == SIMLAB_KIND("sapient"))
+                    v.push_back(ep->id);
+            std::sort(v.begin(), v.end());
+            return v;
+        };
+        const auto va = sapients(wA), vb = sapients(wB);
+        CHECK(va.size() == 2 && vb.size() == 2);
+        const EntityId a1 = va[0], a2 = va[1];
+        const EntityId b1 = vb[0], b2 = vb[1];
+        // craft an identical high-trauma "strike failed" transition in all
+        // four slots: charge 900, negative homeostatic outcome
+        auto inject = [](World& w, EntityId id) {
+            BrainSlot& s = w.brains_->slots.at(id);
+            Transition& t = s.replay[0];
+            t = Transition{};
+            t.s = sensor_encode(w, id);
+            t.a[2] = 100;                    // verb "strike"
+            t.y[16] = -100;                  // failed
+            t.y[24] = -100;                  // homeostasis worsened
+            for (int i = 0; i < 96; ++i) t.wh[i] = static_cast<std::int8_t>((i % 7) - 3);
+            for (int i = 0; i < 64; ++i) t.w1h[i] = static_cast<std::int8_t>(20 - (i % 11));
+            t.sigma = 800; t.charge = 900; t.event_id = 1; t.valid = true;
+            s.replay_count = 1; s.replay_next = 1;
+        };
+        inject(wA, a1); inject(wA, a2);
+        inject(wB, b1); inject(wB, b2);
+        auto strike_row = [](World& w, EntityId id) {
+            const BrainSlot& s = w.brains_->slots.at(id);
+            const BrainLayout& l = brain_layout_h(s.hidden);
+            return std::string(reinterpret_cast<const char*>(
+                       w.brains_->arena.w8(s.woff) + l.w2w + 2 * 64), 64);
+        };
+        const std::string preA1 = strike_row(wA, a1), preB1 = strike_row(wB, b1);
+        // a1 dreams (rest), a2 only moves; b1/b2 never rest
+        wA.interact(mk_ctx(a1, {}, "rest", 0));
+        wA.interact(mk_ctx(a2, {}, "move", 0));
+        wB.interact(mk_ctx(b1, {}, "move", 0));
+        wB.interact(mk_ctx(b2, {}, "move", 0));
+        CHECK(strike_row(wA, a1) != preA1);    // dream shifted strike logits
+        CHECK(strike_row(wB, b1) == preB1);    // never rested -> row frozen
+    }
+
+    // (3) forgetting curve: engram attenuation + fast-weight decay -----------
+    {
+        World w(103, "data");
+        w.brain_shadow = true;
+        const EntityId a = mk_sapient(w, {50, 50});
+        const EntityId x = mk_sapient(w, {60, 50});
+        w.interact(mk_ctx(a, {}, "rest", 0));   // prime slot
+        BrainSlot& s = w.brains_->slots.at(a);
+        s.trace_decay = 10;                    // tiny horizon -> stale fast
+        // salient engrams (protected from forgetting, and they push the
+        // weak trace out of the top-4 dream-rehearsal set)
+        AgentMind& m = w.mind(a);
+        const MindParams mp = mind_params(w, *w.find(a));
+        std::vector<EntityId> fillers;
+        for (int i = 0; i < 4; ++i) fillers.push_back(mk_sapient(w, {100 + i * 10, 150}));
+        for (EntityId tgt : fillers) {
+            AgentMind::MemorySnapshot snap;
+            snap.tick = w.clock_.tick();
+            snap.pos = w.find(tgt)->pos;
+            snap.material = w.find(tgt)->material;
+            snap.kind_name = w.find(tgt)->kind_name;
+            upsert_memory(m, tgt, snap, -300, mp);
+        }
+        {
+            AgentMind::MemorySnapshot snap;
+            snap.tick = w.clock_.tick();
+            snap.pos = w.find(x)->pos;
+            snap.material = w.find(x)->material;
+            snap.kind_name = w.find(x)->kind_name;
+            upsert_memory(m, x, snap, -900, mp);   // salient: survives
+        }
+        const EntityId y = mk_sapient(w, {80, 50});
+        {
+            AgentMind::MemorySnapshot snap;
+            snap.tick = w.clock_.tick();
+            snap.pos = w.find(y)->pos;
+            snap.material = w.find(y)->material;
+            snap.kind_name = w.find(y)->kind_name;
+            upsert_memory(m, y, snap, 60, mp);       // weak: |charge|<200
+        }
+        // seed fast weights so decay has something to shrink
+        for (int i = 0; i < 8; ++i) s.fast[i] = 20;
+        const std::int64_t fsum0 = [&]{ std::int64_t t=0; for (auto v : s.fast) t += v<0?-v:v; return t; }();
+        const std::int64_t stab0 = m.memory.at(y).engram.stability;
+        const std::int64_t chg0 = m.memory.at(y).engram.emotional_charge;
+        w.advance_ticks_for_test(12);            // past the horizon
+        w.interact(mk_ctx(a, {}, "rest", 0));    // dream + forget
+        const MemoryEngram& gy = w.mind(a).memory.at(y).engram;
+        CHECK(std::abs(gy.emotional_charge) < std::abs(chg0));  // -> toward 0
+        CHECK(gy.stability < stab0);                           // evict sooner
+        const MemoryEngram& gx = w.mind(a).memory.at(x).engram;
+        CHECK(gx.emotional_charge == -900);                    // salient kept
+        const std::int64_t fsum1 = [&]{ std::int64_t t=0; for (auto v : s.fast) t += v<0?-v:v; return t; }();
+        CHECK(fsum1 < fsum0);                                  // decay+transfer
+    }
+}
+
 static void test_parallel_think() {
     auto build = [](std::uint64_t seed) {
         World w(seed, "data");
@@ -11080,6 +11262,7 @@ int main(int argc, char** argv) {
     RUN(test_amphibian_evolution);
     RUN(test_brain_curriculum);
     RUN(test_narrative_host);
+    RUN(test_brain_deep_cognition);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);

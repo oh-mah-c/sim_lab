@@ -186,6 +186,7 @@ struct Transition {
     ActionVec a{};
     LabelVec  y{};
     std::array<std::int8_t, 96> wh{};   // WM layer-1 activation (sleep SGD)
+    std::array<std::int8_t, 64> w1h{};  // worker hidden (dream w2w replay)
     std::uint16_t sigma = 0;        // surprise 0..1000
     std::uint16_t charge = 0;       // |emotional_charge| 0..1000
     std::uint64_t event_id = 0;

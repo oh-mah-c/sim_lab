@@ -598,6 +598,7 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     // replay: stratified ring — replace the least (charge+sigma) sample
     Transition t;
     t.s = p.s; t.a = p.a; t.y = y; t.wh = p.wm_hidden;
+    t.w1h = p.w1hidden;             // dream replay re-drives the w2w row
     t.sigma = static_cast<std::uint16_t>(sigma);
     t.charge = static_cast<std::uint16_t>(charge);
     t.event_id = ev.id;
@@ -686,9 +687,13 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
         for (int i = 0; i < kActionVerbs; ++i)
             if (p.a[i] == 100) { verb = i; break; }
         if (verb >= 0) {
+            // stockpiling drive: a bounded bonus (<= ~15% of the reward
+            // swing) for acting while inventory_security reads high —
+            // food/tool hoarding emerges as a smooth gradient, never a rule.
             const std::int64_t adv =
                 static_cast<std::int64_t>(y[24]) * 8 +
-                (sigma >= 400 ? 96 : 0) - 64;
+                (sigma >= 400 ? 96 : 0) - 64 +
+                ((static_cast<std::int64_t>(p.s[kChanInvSecurity]) * 5) >> 2);
             if (adv != 0) {
                 const std::int64_t eta_a =
                     std::max<std::int64_t>(8, s.lr_permille / 8);
@@ -707,21 +712,25 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
         }
     }
 
-    // ---- Phase 3: sleep consolidation on `rest` ----------------------------
-    // 1) replay SGD: 4 stratified samples (highest charge+sigma) update the
-    //    SLOW wm2 via their stored WM-hidden activations.
-    // 2) fast -> slow transfer (>>2, remainder stays fast).
+    // ---- Phase 3+deep: sleep consolidation & dream replay on `rest` --------
+    // 1) dream rollout: the 4 most emotional replay samples (charge-led,
+    //    sigma breaks ties) re-run WM1->WM2 on their stored hidden state —
+    //    surprise/value delta consolidates into SLOW wm2 AND the w2w policy
+    //    row of the dreamed verb (coping reinforced, charged failures
+    //    penalized — trauma extinction without hardcoded labels).
+    // 2) fast-weight decay (use-it-or-lose-it) then fast -> slow transfer.
     // 3) L2-SP pull toward the birth anchor (>>4) — anti-forgetting.
     if (p.a[4] && s.replay_count > 0 &&                       // verb "rest"
         s.fast.size() == static_cast<std::size_t>(kLabelChannels * kWmHidden)) {
         const std::int64_t eta_c = std::max<std::int64_t>(16, s.lr_permille / 2);
-        // pick top-4 replay entries by charge+sigma (insertion order, deterministic)
+        // pick top-4 replay entries by emotional charge (sigma tiebreak)
         std::array<std::int32_t, 4> top{-1, -1, -1, -1};
         std::array<std::int64_t, 4> topsc{-1, -1, -1, -1};
         for (int i = 0; i < 16 && i < s.replay_count; ++i) {
             if (!s.replay[i].valid) continue;
             const std::int64_t sc =
-                static_cast<std::int64_t>(s.replay[i].charge) + s.replay[i].sigma;
+                static_cast<std::int64_t>(s.replay[i].charge) * 4 +
+                s.replay[i].sigma;
             for (int k = 0; k < 4; ++k) {
                 if (sc > topsc[k]) {
                     for (int j = 3; j > k; --j) { topsc[j] = topsc[j-1]; top[j] = top[j-1]; }
@@ -749,7 +758,42 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                     wm2w[o * kWmHidden + i] = brain_clamp_i8(v);
                 }
             }
+            // dream policy step: re-drive the executed verb's w2w row with
+            // the stored worker hidden. Advantage = homeostatic outcome +
+            // a charged-outcome term — actions that paid off under high
+            // emotional charge consolidate (coping), charged failures are
+            // suppressed (avoidance). Small rate: sleep is gentle.
+            int dverb = -1;
+            for (int i = 0; i < kActionVerbs; ++i)
+                if (rt.a[i] == 100) { dverb = i; break; }
+            if (dverb >= 0) {
+                std::int64_t adv =
+                    static_cast<std::int64_t>(rt.y[24]) * 8 - 64 +
+                    (rt.sigma >= 400 ? 48 : 0);
+                if (rt.charge >= 600)
+                    adv += rt.y[24] > 0 ? 96 : -192;
+                if (adv != 0) {
+                    const std::int64_t eta_d =
+                        std::max<std::int64_t>(8, s.lr_permille / 16);
+                    std::int8_t* w2w_pol = base + L.w2w;   // worker policy
+                    for (int i = 0; i < 64; ++i) {
+                        const std::int64_t dw =
+                            (eta_d * adv * rt.w1h[i]) >> 17;
+                        const std::int64_t d = std::max<std::int64_t>(-3,
+                                                   std::min<std::int64_t>(3, dw));
+                        if (d == 0) continue;
+                        const std::int64_t v =
+                            static_cast<std::int64_t>(w2w_pol[dverb * 64 + i]) + d;
+                        w2w_pol[dverb * 64 + i] = brain_clamp_i8(v);
+                    }
+                }
+            }
         }
+        // synaptic forgetting: fast weights shed ~1/16 per rest unless
+        // re-reinforced by fresh surprise — prevents saturation drift when
+        // the environment shifts (integer /16 truncates toward 0).
+        for (std::int8_t& f : s.fast)
+            f = static_cast<std::int8_t>(f - f / 16);
         // fast -> slow transfer + L2-SP anchor pull (one pass, in place)
         for (int i = 0; i < kLabelChannels * kWmHidden; ++i) {
             const std::int32_t f = s.fast[i];
@@ -766,6 +810,65 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                 const std::int64_t v =
                     static_cast<std::int64_t>(wm2w[i]) + pull;
                 wm2w[i] = brain_clamp_i8(v);
+            }
+        }
+    }
+
+    // ---- active dream replay over the engram buffer + forgetting curve ----
+    // The four most emotional memories are rehearsed while the agent rests
+    // (clarity refresh; stability doubles at the data-set interval inside
+    // rehearse_engram) and stamped as freshly recalled. Low-charge traces
+    // unrehearsed beyond the brain's heritable trace_decay horizon decay
+    // toward zero charge and shed stability — use it or lose it, freeing
+    // capacity for new experiences. Runs on `rest` even with an empty
+    // replay ring (engrams outlive transitions).
+    if (p.a[4] && mind) {                                // verb "rest"
+        const Entity* me = w.find(npc);
+        if (me) {
+            AgentMind& mm = w.mind(npc);
+            const MindParams mp = mind_params(w, *me);
+            const std::uint64_t now = w.clock_.tick();
+            // top-4 engrams by |emotional_charge| (map order breaks ties)
+            std::array<EntityId, 4> etop{kNoEntity, kNoEntity,
+                                        kNoEntity, kNoEntity};
+            std::array<std::int64_t, 4> esc{-1, -1, -1, -1};
+            for (const auto& [kid, snap] : mm.memory) {
+                const std::int64_t ch = snap.engram.emotional_charge;
+                const std::int64_t ac = ch < 0 ? -ch : ch;
+                for (int k = 0; k < 4; ++k) {
+                    if (ac > esc[k]) {
+                        for (int j = 3; j > k; --j) {
+                            esc[j] = esc[j - 1]; etop[j] = etop[j - 1];
+                        }
+                        esc[k] = ac; etop[k] = kid; break;
+                    }
+                }
+            }
+            for (EntityId kid : etop) {
+                if (kid == kNoEntity) continue;
+                auto it = mm.memory.find(kid);
+                if (it == mm.memory.end()) continue;
+                rehearse_engram(it->second.engram, mp, now);
+                it->second.engram.last_rehearsal = now;  // dream = recall
+            }
+            // forgetting curve: weak traces go quiet past the horizon
+            const std::int64_t horizon =
+                std::max<std::int64_t>(0, s.trace_decay);
+            for (auto& [kid, snap] : mm.memory) {
+                MemoryEngram& g = snap.engram;
+                const std::int64_t ch = g.emotional_charge;
+                const std::int64_t ac = ch < 0 ? -ch : ch;
+                if (ac == 0 || ac >= 200) continue;      // salient survives
+                if (now <= g.last_rehearsal ||
+                    static_cast<std::int64_t>(now - g.last_rehearsal) <=
+                        horizon)
+                    continue;
+                g.emotional_charge = ch - ch / 4;        // toward 0
+                // sleep_consolidate doubles charged engrams on the same
+                // rest, so the cut must beat x2 to actually decay: 3/8
+                // leaves a net 0.75x per rest for stale weak traces.
+                g.stability = std::max<std::int64_t>(
+                    1, (g.stability * 3) / 8);            // evict sooner
             }
         }
     }
@@ -804,6 +907,7 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
             for (std::int8_t v : t.a) mix(static_cast<std::uint8_t>(v));
             for (std::int8_t v : t.y) mix(static_cast<std::uint8_t>(v));
             for (std::int8_t v : t.wh) mix(static_cast<std::uint8_t>(v));
+            for (std::int8_t v : t.w1h) mix(static_cast<std::uint8_t>(v));
         }
     }
     mix(store.wm_err_sum); mix(store.wm_n);
@@ -1017,12 +1121,12 @@ BrainChoice brain_decide(World& w, EntityId npc) {
         while (p > 0 && near[p - 1].d2 > d2) { near[p] = near[p - 1]; --p; }
         near[p] = {d2, kid, snap.pos};
     }
-    // attention score per remembered slot: query[0..7] . sensor-feat[0..7]
+    // attention score per remembered slot: query[0..6] . sensor-feat[0..6]
     std::int32_t attn[kEntitySlots] = {};
     for (int t = 0; t < nnear; ++t) {
         const std::int8_t* f = &sv[24 + t * kEntityFeats];
         std::int32_t sc = 0;
-        for (int k = 0; k < 8; ++k) sc += query[k] * f[k];
+        for (int k = 0; k < kEntityFeats; ++k) sc += query[k] * f[k];
         attn[t] = sc;
     }
 
