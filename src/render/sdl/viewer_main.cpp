@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -262,6 +263,23 @@ struct Viewer {
     int chron_open = -1;                        // expanded chapter row (-1 none)
     static constexpr std::size_t kChronFactCap = 1024;  // facts per chapter window
     std::uint64_t chron_overflow = 0;           // facts dropped past the cap (this window)
+    // ---- Open-ended invention: LLM material cataloger -----------------------
+    // Each new World::SynthRecord gets a NAME=/DESC= prompt on the background
+    // host; completed pairs append a [DISCOVERY] block to
+    // saves/discovered_materials.txt and a line in the chronicle facts.
+    // Presentation only — the worker never touches World state.
+    struct MatPending {
+        std::uint64_t synth_id = 0, tick = 0;
+        std::string verb, pa, pb, actor;
+        std::array<std::int64_t, 7> attrs{};
+        Vec2 pos{};
+    };
+    struct MatEntry { std::string id, slug, name, desc; };
+    std::size_t mat_scanned = 0;                    // synthesized_ cursor
+    std::unordered_map<std::uint64_t, MatPending> llm_mat_pending;
+    std::deque<std::uint64_t> llm_mat_outstanding;
+    std::vector<MatEntry> mat_entries;              // catalog (file-backed)
+    std::string mat_path = "saves/discovered_materials.txt";
     // smooth camera fly-to (chapter click)
     bool cam_goal = false;
     float cam_gx = 0, cam_gy = 0, cam_gz = 1;
@@ -476,6 +494,8 @@ struct Viewer {
         cfeed = ChronicleFeed{}; c_callouts.clear(); narr_seen = 0; c_carved.clear();
         llm_scanned = 0; llm_primed = false; llm_key_seq = 0;
         llm_pending.clear(); llm_outstanding.clear(); llm_last_tell.clear();
+        mat_scanned = 0; llm_mat_pending.clear(); llm_mat_outstanding.clear();
+        mat_entries.clear(); mat_load();
         cap_scratch = CaptureScratch{};
         snap = RenderSnapshot{}; snap_back = RenderSnapshot{}; snap_gen = 0;
         fog_tex_gen = mini_fog_gen = globe_fog_gen = ~0ull;
@@ -2957,6 +2977,27 @@ struct Viewer {
             }
         }
         ImGui::Separator();
+        // ---- discovered materials catalog (Qwen-named syntheses) ------------
+        if (!mat_entries.empty()) {
+            ImGui::TextDisabled("Vật liệu do NPC khám phá — %zu", mat_entries.size());
+            ImGuiListClipper mclip;
+            mclip.Begin(static_cast<int>(mat_entries.size()));
+            while (mclip.Step()) {
+                for (int mi = mclip.DisplayStart; mi < mclip.DisplayEnd; ++mi) {
+                    const MatEntry& m = mat_entries[mi];
+                    ImGui::PushID(3000000 + mi);
+                    if (ImGui::TreeNode(m.name.c_str())) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.62f, 0.68f, 1));
+                        ImGui::TextWrapped("%s", m.desc.c_str());
+                        ImGui::TextDisabled("slug: %s   id: %s", m.slug.c_str(), m.id.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::Separator();
+        }
     }
 
 
@@ -3641,6 +3682,219 @@ struct Viewer {
         llm_ch_outstanding.swap(keep);
     }
 
+    // ================= open-ended invention: material cataloger ================
+    static std::string mat_clean(std::string s, std::size_t cap) {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) {
+            const unsigned char c = static_cast<unsigned char>(ch);
+            if (c < 32 || c == 127) {
+                if (!out.empty() && out.back() != ' ') out += ' ';
+                continue;
+            }
+            out += ch;
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        if (out.size() > cap) out = out.substr(0, cap);
+        return out;
+    }
+    static std::string mat_slug_of(const std::string& name) {
+        std::string s;
+        for (char ch : name) {
+            const unsigned char c = static_cast<unsigned char>(ch);
+            if (std::isalnum(c)) s += static_cast<char>(std::tolower(c));
+            else if (!s.empty() && s.back() != '_') s += '_';
+        }
+        while (!s.empty() && s.back() == '_') s.pop_back();
+        if (s.empty()) s = "material";
+        return s;
+    }
+    // Parse saves/discovered_materials.txt back into mat_entries (idempotent
+    // reload — the file is the catalog's source of truth across sessions).
+    void mat_load() {
+        mat_entries.clear();
+        std::ifstream f(mat_path);
+        if (!f) return;
+        MatEntry cur; bool in = false;
+        std::string line;
+        auto flush = [&]() {
+            if (in && !cur.name.empty()) mat_entries.push_back(cur);
+            cur = MatEntry{}; in = false;
+        };
+        while (std::getline(f, line)) {
+            if (line == "[DISCOVERY]") { flush(); in = true; continue; }
+            if (!in) continue;
+            auto val = [&](const char* k) -> std::string {
+                const std::string p = std::string(k) + "=";
+                if (line.rfind(p, 0) != 0) return "";
+                return line.substr(p.size());
+            };
+            if (std::string v = val("id"); !v.empty()) cur.id = v;
+            else if (std::string v = val("slug"); !v.empty()) cur.slug = v;
+            else if (std::string v = val("name"); !v.empty()) cur.name = v;
+            else if (std::string v = val("desc"); !v.empty()) cur.desc = v;
+        }
+        flush();
+    }
+    bool mat_known(std::uint64_t synth_id) const {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "0x%016llx",
+                      static_cast<unsigned long long>(synth_id));
+        for (const MatEntry& e : mat_entries)
+            if (e.id == buf) return true;
+        return llm_mat_pending.count(synth_id) != 0;
+    }
+    void mat_scan(const World& w) {
+        // cursor restart on world reset/load (synthesized_ is per-world)
+        if (mat_scanned > w.synthesized_.size()) mat_scanned = 0;
+        if (w.synthesized_.size() <= mat_scanned) {
+            mat_scanned = w.synthesized_.size();
+            return;
+        }
+        if (!llm_host.active()) return;   // backlog waits for the model (cheap: few synths)
+        // SIMLAB_PID caches one slot per call-site -> literals only, unrolled.
+        const PropId p_attr[7] = {
+            SIMLAB_PID(w.props, "hardness"),
+            SIMLAB_PID(w.props, "flammability"),
+            SIMLAB_PID(w.props, "nutrition"),
+            SIMLAB_PID(w.props, "toxicity"),
+            SIMLAB_PID(w.props, "conductivity"),
+            SIMLAB_PID(w.props, "density"),
+            SIMLAB_PID(w.props, "edge_sharpness")};
+        for (; mat_scanned < w.synthesized_.size(); ++mat_scanned) {
+            const World::SynthRecord& r = w.synthesized_[mat_scanned];
+            if (mat_known(r.synth_id)) continue;
+            MatPending mp;
+            mp.synth_id = r.synth_id; mp.tick = r.tick; mp.verb = r.verb;
+            auto mname = [&](MaterialId mid) -> std::string {
+                if (mid == kNoMaterial) return "";
+                const MaterialDef* md = w.materials.find(mid);
+                return md ? md->name : "";
+            };
+            mp.pa = mname(r.parent_a); mp.pb = mname(r.parent_b);
+            const Entity* ae = r.actor != kNoEntity ? w.find(r.actor) : nullptr;
+            mp.actor = ae ? NarrativeComposer::describe(w, r.actor)
+                          : std::string("a sapient");
+            mp.pos = ae ? ae->pos : Vec2{};
+            if (const MaterialDef* md = w.materials.find(r.material)) {
+                for (int i = 0; i < 7; ++i) {
+                    if (p_attr[i] == kNoProp) continue;
+                    const auto it = md->props.find(p_attr[i]);
+                    if (it != md->props.end() &&
+                        it->second.type == ValType::Integer)
+                        mp.attrs[i] = it->second.i;
+                }
+            }
+            // ---- prompt: strict two-line contract -------------------------
+            std::string user =
+                "A new material was invented in a living world.\n\n"
+                "Inventor: " + mp.actor + "\n"
+                "Method: " + mp.verb + " of " +
+                (mp.pa.empty() ? std::string("raw matter") : mp.pa) +
+                (mp.pb.empty() ? "" : " + " + mp.pb) + "\n"
+                "Measured attributes: hardness=" +
+                std::to_string(mp.attrs[0]) +
+                " flammability=" + std::to_string(mp.attrs[1]) +
+                " nutrition=" + std::to_string(mp.attrs[2]) +
+                " toxicity=" + std::to_string(mp.attrs[3]) +
+                " conductivity=" + std::to_string(mp.attrs[4]) +
+                " density=" + std::to_string(mp.attrs[5]) +
+                " sharpness=" + std::to_string(mp.attrs[6]) + "\n\n"
+                "Respond with EXACTLY two lines:\n"
+                "NAME=<a 2-4 word English name for this material>\n"
+                "DESC=<one sentence describing what it is like>\n";
+            const std::string sys =
+                "You are a Natural Philosopher cataloging materials "
+                "discovered in a living world. Output only the two "
+                "requested lines, nothing else.";
+            llm_mat_pending.emplace(r.synth_id, mp);
+            llm_mat_outstanding.push_back(r.synth_id);
+            llm_host.submit_prompt(r.synth_id, sys, user);
+        }
+    }
+    void llm_mat_drain() {
+        if (llm_mat_outstanding.empty()) return;
+        std::deque<std::uint64_t> keep;
+        for (std::uint64_t key : llm_mat_outstanding) {
+            std::string text;
+            if (!llm_host.poll(key, text)) { keep.push_back(key); continue; }
+            auto it = llm_mat_pending.find(key);
+            if (it == llm_mat_pending.end()) continue;    // stale
+            MatPending mp = std::move(it->second);
+            llm_mat_pending.erase(it);
+            // ---- parse NAME=/DESC= (tolerate "Name:" / bare first line) -----
+            std::string name, desc;
+            std::istringstream ls(text);
+            std::string line;
+            while (std::getline(ls, line)) {
+                std::string t = mat_clean(line, 400);
+                if (t.empty()) continue;
+                std::string up = t;
+                for (char& ch : up) ch = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(ch)));
+                auto strip_key = [&](const char* k) -> bool {
+                    std::string p = k; p += "=";
+                    if (t.rfind(p, 0) == 0) { t = t.substr(p.size()); return true; }
+                    p = k; p += ":";
+                    if (t.rfind(p, 0) == 0) { t = t.substr(p.size()); return true; }
+                    return false;
+                };
+                if (up.rfind("NAME", 0) == 0 && strip_key("NAME")) {
+                    name = mat_clean(t, 80); continue;
+                }
+                if (up.rfind("DESC", 0) == 0 && strip_key("DESC")) {
+                    if (!desc.empty()) desc += " ";
+                    desc += mat_clean(t, 300); continue;
+                }
+                if (name.empty()) name = mat_clean(t, 80);
+                else { if (!desc.empty()) desc += " "; desc += mat_clean(t, 300); }
+            }
+            name = mat_clean(name, 80); desc = mat_clean(desc, 300);
+            if (name.empty()) continue;                      // unparsable -> drop
+            // ---- catalog entry + .txt block ----------------------------------
+            MatEntry e;
+            char buf[24];
+            std::snprintf(buf, sizeof buf, "0x%016llx",
+                          static_cast<unsigned long long>(mp.synth_id));
+            e.id = buf;
+            e.slug = mat_slug_of(name);
+            // slug collision -> numeric suffix keeps the file parseable
+            bool dup = false;
+            for (const MatEntry& x : mat_entries)
+                if (x.slug == e.slug) { dup = true; break; }
+            if (dup) e.slug += "_" + std::to_string(mat_entries.size() + 1);
+            e.name = name; e.desc = desc;
+            mat_entries.push_back(e);
+            {
+                std::error_code ec;
+                std::filesystem::create_directories("saves", ec);
+                std::ofstream f(mat_path, std::ios::app);
+                if (f) {
+                    f << "[DISCOVERY]\n";
+                    f << "id=" << e.id << "\n";
+                    f << "slug=" << e.slug << "\n";
+                    f << "name=" << e.name << "\n";
+                    f << "parents=" << mp.pa << "+" << mp.pb << "\n";
+                    f << "verb=" << mp.verb << "\n";
+                    f << "hardness=" << mp.attrs[0] << "\n";
+                    f << "flammability=" << mp.attrs[1] << "\n";
+                    f << "nutrition=" << mp.attrs[2] << "\n";
+                    f << "toxicity=" << mp.attrs[3] << "\n";
+                    f << "conductivity=" << mp.attrs[4] << "\n";
+                    f << "density=" << mp.attrs[5] << "\n";
+                    f << "sharpness=" << mp.attrs[6] << "\n";
+                    f << "desc=" << e.desc << "\n\n";
+                }
+            }
+            // surface the naming in the next chronicle window
+            if (chron_facts.size() < kChronFactCap)
+                chron_facts.push_back({mp.tick,
+                    mp.actor + " named the invented material '" + e.name + "'",
+                    mp.pos});
+        }
+        llm_mat_outstanding.swap(keep);
+    }
+
     void llm_scan(const World& w) {
         // Chapter facts are collected whether or not the model is loaded —
         // chron_tick() persists them as raw "Records" chapters, so the
@@ -3915,7 +4169,7 @@ struct Viewer {
                 }
                 // LLM chronicler: same incremental ledger scan, salient events
                 // only; results re-enter cfeed tagged llm=true.
-                if (frames % 4 == 2) { llm_scan(w); llm_drain(); chron_tick(w); llm_ch_drain(); }
+                if (frames % 4 == 2) { llm_scan(w); llm_drain(); mat_scan(w); llm_mat_drain(); chron_tick(w); llm_ch_drain(); }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
                     c_av_verbs.clear(); c_av_line.clear();

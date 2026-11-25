@@ -11161,6 +11161,153 @@ static void test_brain_deep_cognition() {
     }
 }
 
+static void test_open_ended_invention() {
+    // (1) sensor material-attribute focus channels ---------------------------
+    {
+        World w(201, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId ore = w.materials.id_of("copper_ore");
+        CHECK(ore != kNoMaterial);
+        PropertyBag pb;
+        pb.set(pid(w, "quantity"), Value::integer(10));
+        const EntityId o = w.create_entity("ore_chunk", ore, {52, 50}, pb);
+        CHECK(o != kNoEntity);
+        // remember the ore so focus-B picks it up
+        AgentMind& m = w.mind(a);
+        AgentMind::MemorySnapshot snap;
+        snap.tick = w.clock_.tick(); snap.pos = {52, 50};
+        snap.material = ore; snap.kind_name = "ore_chunk";
+        const Entity* oe = w.find(o);
+        for (PropId op : w.observable_props())
+            if (const Value* v = w.prop_of(*oe, op)) snap.props[op] = *v;
+        upsert_memory(m, o, snap, 0, mind_params(w, *w.find(a)));
+        const SensorVec s = sensor_encode(w, a);
+        // copper_ore: hardness 600->76, density 4e6->127, conductivity 60->3
+        CHECK(s[kMatFocusB + 0] == 76);
+        CHECK(s[kMatFocusB + 4] == 3);
+        CHECK(s[kMatFocusB + 5] == 127);
+        // untouched channels stay zero (no held item, cool ore)
+        CHECK(s[kMatFocusA] == 0);
+        CHECK(s[kMatFocusB + 6] == 0);
+    }
+
+    // (2) combine -> synthesized material; idempotent re-discovery ----------
+    {
+        World w(202, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId berry = w.materials.id_of("wild_berries");
+        const MaterialId night = w.materials.id_of("nightshade");
+        CHECK(berry != kNoMaterial && night != kNoMaterial);
+        PropertyBag q;
+        q.set(pid(w, "quantity"), Value::integer(10));
+        const EntityId i1 = w.create_entity("item", berry, {51, 50}, q);
+        const EntityId i2 = w.create_entity("item", night, {51, 51}, q);
+        CHECK(i1 != kNoEntity && i2 != kNoEntity);
+        InteractionResult r = w.interact(mk_ctx(a, {i1, i2}, "combine", 0));
+        CHECK(r.completed);
+        CHECK(w.synthesized_.size() == 1);
+        const MaterialId syn = w.synthesized_[0].material;
+        CHECK(syn != kNoMaterial);
+        CHECK(w.materials.find(syn)->name.rfind("syn_", 0) == 0);
+        CHECK(w.synthesized_[0].verb == "combine");
+        bool found = false;
+        for (EntityId sid : r.spawned) {
+            const Entity* s = w.find(sid);
+            if (s && s->material == syn) found = true;
+        }
+        CHECK(found);                                   // product exists
+        // fresh pair of the same materials -> same recipe, same material
+        const EntityId j1 = w.create_entity("item", berry, {52, 50}, q);
+        const EntityId j2 = w.create_entity("item", night, {52, 51}, q);
+        InteractionResult r2 = w.interact(mk_ctx(a, {j1, j2}, "combine", 0));
+        CHECK(r2.completed);
+        CHECK(w.synthesized_.size() == 1);             // no duplicate recipe
+        bool found2 = false;
+        for (EntityId sid : r2.spawned) {
+            const Entity* s = w.find(sid);
+            if (s && s->material == syn) found2 = true;
+        }
+        CHECK(found2);                                  // reused material id
+    }
+
+    // (3) process refine + smelt-hot-ore paths --------------------------------
+    {
+        World w(203, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId berry = w.materials.id_of("wild_berries");
+        const MaterialId ore = w.materials.id_of("copper_ore");
+        CHECK(berry != kNoMaterial && ore != kNoMaterial);
+        // bare "process" (no authored recipe) refines a single input
+        PropertyBag q;
+        q.set(pid(w, "quantity"), Value::integer(10));
+        const EntityId i1 = w.create_entity("item", berry, {51, 50}, q);
+        InteractionResult rp = w.interact(mk_ctx(a, {i1}, "process", 0));
+        CHECK(rp.completed);
+        CHECK(w.synthesized_.size() == 1);
+        CHECK(w.synthesized_[0].verb == "process");
+        CHECK(w.synthesized_[0].parent_b == kNoMaterial);
+        // heat on ore already at smelt_temp -> SmeltModel (before Thermal)
+        PropertyBag po;
+        po.set(pid(w, "quantity"), Value::integer(10));
+        po.set(pid(w, "temperature"), Value::integer(12000));
+        const EntityId o = w.create_entity("ore", ore, {52, 50}, po);
+        InteractionResult rh = w.interact(mk_ctx(a, {o}, "heat", 0));
+        CHECK(rh.completed);
+        CHECK(w.synthesized_.size() == 2);
+        CHECK(w.synthesized_[1].verb == "heat");
+        CHECK(w.synthesized_[1].temp_band == 6);       // 12000/2000
+        CHECK(w.synthesized_[1].parent_a == ore);
+        // ordinary cool heat still falls through to ThermalModel (no synth)
+        const std::size_t nsyn = w.synthesized_.size();
+        PropertyBag pc;
+        pc.set(pid(w, "quantity"), Value::integer(10));
+        pc.set(pid(w, "temperature"), Value::integer(200));
+        const EntityId cool = w.create_entity("ore", ore, {53, 50}, pc);
+        InteractionResult rc = w.interact(mk_ctx(a, {cool}, "heat", 0));
+        CHECK(rc.completed);
+        CHECK(w.synthesized_.size() == nsyn);          // plain heating
+
+        // (4) save/load: synth recipes survive the roundtrip ---------------
+        const std::string path = "/tmp/simlab_invent_save.bin";
+        const std::uint64_t h = w.state_hash();
+        CHECK(w.save(path));
+        World w2(203, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+        CHECK(w2.synthesized_.size() == w.synthesized_.size());
+        for (std::size_t i = 0; i < w.synthesized_.size(); ++i) {
+            CHECK(w2.synthesized_[i].synth_id == w.synthesized_[i].synth_id);
+            CHECK(w2.synthesized_[i].verb == w.synthesized_[i].verb);
+            CHECK(w2.materials.find(w2.synthesized_[i].material)->name ==
+                  w.materials.find(w.synthesized_[i].material)->name);
+        }
+    }
+
+    // (5) brain tried-combo set: process marks (verb, material) once --------
+    {
+        World w(204, "data");
+        w.brain_shadow = true;
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId berry = w.materials.id_of("wild_berries");
+        CHECK(berry != kNoMaterial);
+        PropertyBag pb;
+        pb.set(pid(w, "quantity"), Value::integer(10));
+        const EntityId i1 = w.create_entity("item", berry, {51, 50}, pb);
+        const EntityId i2 = w.create_entity("item", berry, {51, 51}, pb);
+        w.interact(mk_ctx(a, {}, "rest", 0));          // prime brain slot
+        w.interact(mk_ctx(a, {i1}, "process", 0));
+        const BrainSlot& s1 = w.brains_->slots.at(a);
+        int n1 = 0;
+        for (std::uint64_t k : s1.tried) if (k) ++n1;
+        CHECK(n1 == 1);                                 // combo marked tried
+        w.interact(mk_ctx(a, {i2}, "process", 0));     // same material again
+        const BrainSlot& s2 = w.brains_->slots.at(a);
+        int n2 = 0;
+        for (std::uint64_t k : s2.tried) if (k) ++n2;
+        CHECK(n2 == 1);                                 // no duplicate entry
+    }
+}
+
 static void test_parallel_think() {
     auto build = [](std::uint64_t seed) {
         World w(seed, "data");
@@ -11263,6 +11410,7 @@ int main(int argc, char** argv) {
     RUN(test_brain_curriculum);
     RUN(test_narrative_host);
     RUN(test_brain_deep_cognition);
+    RUN(test_open_ended_invention);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);

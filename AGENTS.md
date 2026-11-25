@@ -1017,3 +1017,42 @@ no engine code changes.
   dev==release AND seq==t1==t8 bit-identical on brain-active tests
   (curriculum hash 508a3f5371ff440c, parallel_think 310e9d9fe378f2aa
   in both dev and release builds).
+
+## Open-ended invention (runtime material synthesis)
+
+- Sensor layout is now 112 channels: entity feats 4 slots x 7 (24..51),
+  a 16-channel material-attribute focus block (52..67: 8 attrs x
+  focus-A/focus-B, order hardness/flammability/nutrition/toxicity/
+  conductivity/density/temperature/edge_sharpness after scarcity),
+  social 68..71, env 72..79, action one-hot 80..111.
+- `World::synthesized_` (vector<SynthRecord>) + `SpawnSpec::has_synth`/
+  `SynthSpec` (8 attrs) let laws PROPOSE new materials; World commits
+  them via `materialize_synth` (idempotent on synth_id, names
+  `syn_%016llx`, provenance "synthesized"). synth_id =
+  hash(sorted parent material ids, verb, temp_band) so A+B == B+A.
+- ResourceLaws: `SmeltModel` (id 24, before ThermalModel — claims `heat`
+  only when a target is already >= its material `smelt_temp`) and
+  `SynthesisModel` (id 25, LAST law — fallback for `combine` >=2 targets
+  and `process` with no authored process note). synth_attrs/clamp_attrs/
+  blend_attrs (mass-weighted + interaction terms)/refine_attrs/
+  smelt_attrs live in ResourceLaws.cpp.
+- HARD RULE: synthesis/smelting reagents must never be living organisms
+  — both models skip `w.species.find_name(kind_name) || w.find_mind(id)`
+  (same gate as Driver's target scan), and only the parent reagents are
+  consumed (extra in-reach targets survive). Without this, `process`/
+  `combine` on sapients/bushes set integrity=0 and collapsed the
+  capstone civ (dead=137, genome_carriers=0).
+- Brain: `BrainSlot::tried` (uint64 keys of verb|material combos) feeds
+  an epistemic bonus in brain_decide gated by a safety factor
+  (hunger/thirst/panic); `brain_post` pays a bounded novelty reward on
+  high-surprise safe outcomes. Driver pushes a second target for
+  `combine` so brains can actually fire it. Save format v22 (synth
+  records) + v23 (brain tried set).
+- Viewer: Qwen cataloger polls `World::synthesized_` (mat_scan /
+  llm_mat_drain in viewer_main.cpp), prompts NAME=/DESC=, sanitizes and
+  appends [DISCOVERY] blocks to saves/discovered_materials.txt; the
+  Field Journal "Chronicle" tab lists the catalog. Presentation only —
+  never touches World state.
+- Verified: 90408 checks, 0 failures; test_open_ended_invention 43
+  checks (sensor attrs, combine->syn material + idempotent rediscovery,
+  smelt vs thermal fallthrough, save/load state_hash, tried-set marks).

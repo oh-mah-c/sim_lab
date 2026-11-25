@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,6 +62,20 @@ struct SpawnSpec {
     // only. Fast weights/h/replay always start empty on the newborn.
     // Invalid/empty -> the spawn gets a hash-initialized brain lazily.
     BrainGenome brain;
+    // Open-ended invention: when has_synth is set the spawn's material does
+    // not exist yet — World::interact materializes it from this descriptor
+    // at commit time (synth_id -> MaterialDef in the registry + a
+    // SynthRecord for the catalog). `material` stays kNoMaterial meanwhile.
+    struct SynthSpec {
+        std::uint64_t synth_id = 0;
+        std::string verb;
+        MaterialId parent_a = kNoMaterial;
+        MaterialId parent_b = kNoMaterial;
+        std::int64_t temp_band = 0;
+        std::array<std::int64_t, 8> attrs{};
+    };
+    SynthSpec synth;
+    bool has_synth = false;
 };
 
 // A proposed entity relocation — first-class causal change alongside
@@ -307,6 +322,32 @@ public:
     LawId id() const override;
     const char* name() const override { return "physical.combine"; }
     std::vector<std::string> domains() const override { return {"physical", "biological"}; }
+    bool supports(const World& w, const InteractionContext& ctx) const override;
+    PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
+    std::unique_ptr<INaturalLawModel> clone() const override;
+};
+
+// ---- Open-ended invention ------------------------------------------------------
+// SmeltModel (id 24) sits BEFORE ThermalModel: bare "heat" on a target already
+// at/above its material's smelt_temp synthesizes a smelted product instead of
+// just warming it. SynthesisModel (id 25) is LAST: "combine" with >=2 material
+// targets and "process" naming no authored recipe blend inputs' physical
+// attribute vectors into a brand-new MaterialDef (registered at commit).
+class SmeltModel final : public INaturalLawModel {
+public:
+    LawId id() const override;
+    const char* name() const override { return "physical.smelt"; }
+    std::vector<std::string> domains() const override { return {"physical"}; }
+    bool supports(const World& w, const InteractionContext& ctx) const override;
+    PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
+    std::unique_ptr<INaturalLawModel> clone() const override;
+};
+
+class SynthesisModel final : public INaturalLawModel {
+public:
+    LawId id() const override;
+    const char* name() const override { return "physical.synthesize"; }
+    std::vector<std::string> domains() const override { return {"physical"}; }
     bool supports(const World& w, const InteractionContext& ctx) const override;
     PredictionResult predict(const World& w, const InteractionContext& ctx) const override;
     std::unique_ptr<INaturalLawModel> clone() const override;

@@ -552,6 +552,33 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
     wm2_forward(wm2w, s.fast.data(), wm2b, p.wm_hidden.data(), p.yhat.data());
 }
 
+// ================= open-ended invention ======================================
+// Transform verbs whose un-authored executions synthesize new materials
+// (indices into kVerbs): process=9, combine=10, heat=24, carve=28.
+inline bool invent_verb(int v) {
+    return v == 9 || v == 10 || v == 24 || v == 28;
+}
+// Combo key: (verb, sorted parent material ids) — commutative like the
+// law-side synth_id so A+B and B+A share one tried entry. |1 keeps 0 free
+// as the empty-slot sentinel.
+std::uint64_t invent_key(int verb, MaterialId a, MaterialId b) {
+    std::uint64_t x = a, y = b;
+    if (x > y) std::swap(x, y);
+    std::uint64_t h = Rng::hash(static_cast<std::uint64_t>(verb));
+    h = Rng::hash(h ^ x);
+    h = Rng::hash(h ^ (y << 1));
+    return h | 1;
+}
+bool invent_tried(const BrainSlot& s, std::uint64_t key) {
+    for (std::uint64_t k : s.tried) if (k == key) return true;
+    return false;
+}
+void invent_mark(BrainSlot& s, std::uint64_t key) {
+    if (invent_tried(s, key)) return;
+    s.tried[s.tried_next & 63] = key;
+    s.tried_next = (s.tried_next + 1) & 63;
+}
+
 void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
     if (!w.brain_shadow || w.speculative) return;
     if (!w.find_mind(npc)) return;                    // only perceived agents
@@ -561,6 +588,16 @@ void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
     BrainPending& p = s.pending;
     p.s = sensor_encode(w, npc, &s.last_action);
     p.a = sensor_action(ctx);
+    // invention key inputs: first two material-bearing targets in ctx
+    // order (mirrors what SynthesisModel/SmeltModel will blend).
+    p.pm_a = kNoMaterial; p.pm_b = kNoMaterial;
+    for (EntityId tid : ctx.targets) {
+        if (tid == ctx.actor) continue;
+        const Entity* t = w.find(tid);
+        if (!t || !t->alive || t->material == kNoMaterial) continue;
+        if (p.pm_a == kNoMaterial) p.pm_a = t->material;
+        else { p.pm_b = t->material; break; }
+    }
     brain_forward(w, *store, npc, p);
     p.valid = true;
 }
@@ -687,13 +724,66 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
         for (int i = 0; i < kActionVerbs; ++i)
             if (p.a[i] == 100) { verb = i; break; }
         if (verb >= 0) {
+            // ---- open-ended invention: novelty gate -------------------------
+            // A transform on a material combo this agent never tried, while
+            // safe (well-fed, calm, unhurt) and genuinely surprising, earns
+            // a bounded curiosity bonus (~12% of the reward swing — under
+            // the 25% cap so survival always dominates). The combo is marked
+            // tried on ANY outcome: dead ends stop paying curiosity.
+            std::uint64_t ikey = 0;
+            bool ik_payoff = false;
+            if (invent_verb(verb) && p.pm_a != kNoMaterial) {
+                ikey = invent_key(verb, p.pm_a, p.pm_b);
+                const bool fresh = !invent_tried(s, ikey);
+                invent_mark(s, ikey);
+                const Entity* me = w.find(npc);
+                std::int64_t safety = 0;
+                if (me) {
+                    const PropId hp = SIMLAB_PID(w.props, "hunger"),
+                                   tp = SIMLAB_PID(w.props, "thirst");
+                    const std::int64_t hunger =
+                        hp != kNoProp ? w.prop_int(*me, hp, 0) : 0;
+                    const std::int64_t thirst =
+                        tp != kNoProp ? w.prop_int(*me, tp, 0) : 0;
+                    const std::int64_t panic =
+                        mind ? mind->neuro.panic : 0;
+                    safety = std::max<std::int64_t>(
+                        0, 1000 - std::max(hunger, thirst) - panic);
+                }
+                // "no HP loss" gate: any integrity drop on the actor
+                // disqualifies the curiosity payout.
+                bool hurt = false;
+                const PropId ip = SIMLAB_PID(w.props, "integrity");
+                if (ip != kNoProp)
+                    for (const StateChange& ch : ev.changes)
+                        if (ch.entity == npc && ch.prop == ip &&
+                            ch.before.type == ValType::Integer &&
+                            ch.after.type == ValType::Integer &&
+                            ch.after.i < ch.before.i) { hurt = true; break; }
+                ik_payoff = fresh && safety > 500 && sigma >= 400 && !hurt;
+                if (ik_payoff) {
+                    // curiosity dopamine into fast weights: nudge the
+                    // WM reward channel (o=24) toward this state.
+                    for (int i = 0; i < kWmHidden; ++i) {
+                        const std::int64_t dw =
+                            (static_cast<std::int64_t>(p.wm_hidden[i]) * 160) >> 13;
+                        if (dw == 0) continue;
+                        const std::int64_t v =
+                            static_cast<std::int64_t>(s.fast[24 * kWmHidden + i]) + dw;
+                        s.fast[24 * kWmHidden + i] = static_cast<std::int8_t>(
+                            std::max<std::int64_t>(-96,
+                                std::min<std::int64_t>(96, v)));
+                    }
+                }
+            }
             // stockpiling drive: a bounded bonus (<= ~15% of the reward
             // swing) for acting while inventory_security reads high —
             // food/tool hoarding emerges as a smooth gradient, never a rule.
-            const std::int64_t adv =
+            std::int64_t adv =
                 static_cast<std::int64_t>(y[24]) * 8 +
                 (sigma >= 400 ? 96 : 0) - 64 +
                 ((static_cast<std::int64_t>(p.s[kChanInvSecurity]) * 5) >> 2);
+            if (ik_payoff) adv += 128;   // novelty dopamine (~12% cap)
             if (adv != 0) {
                 const std::int64_t eta_a =
                     std::max<std::int64_t>(8, s.lr_permille / 8);
@@ -899,6 +989,8 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
         mix(static_cast<std::uint64_t>(s.mac_frac));
         for (std::int8_t v : s.fast) mix(static_cast<std::uint8_t>(v));
         for (std::int8_t v : s.anchor) mix(static_cast<std::uint8_t>(v));
+        mix(static_cast<std::uint32_t>(s.tried_next));
+        for (std::uint64_t k : s.tried) mix(k);
         for (const Transition& t : s.replay) {
             mix(t.valid ? 1 : 0);
             if (!t.valid) continue;
@@ -1170,6 +1262,43 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     // trauma-tagged targets; rage rewards approaching hated ones. All
     // integer arithmetic over NeuroState — no disease labels anywhere.
     const NeuroState& ns = mind->neuro;
+    // ---- open-ended invention: safety-gated epistemic bonus ---------------
+    // safety_factor = 1000 - worst(homeostatic need) - panic, clamped
+    // 0..1000. Below ~500 the drive switches off entirely — a starving or
+    // panicking agent only imagines survival. Above it, transform verbs
+    // (process/combine/heat/carve) aimed at material combos absent from
+    // the tried-set get a bounded curiosity bonus inside the C rollouts.
+    const PropId hp_p = SIMLAB_PID(w.props, "hunger"),
+                   tp_p = SIMLAB_PID(w.props, "thirst");
+    const std::int64_t hunger_v =
+        hp_p != kNoProp ? w.prop_int(*me, hp_p, 0) : 0;
+    const std::int64_t thirst_v =
+        tp_p != kNoProp ? w.prop_int(*me, tp_p, 0) : 0;
+    const std::int64_t safety = std::max<std::int64_t>(0, std::min<std::int64_t>(
+        1000, 1000 - std::max(hunger_v, thirst_v) - ns.panic));
+    const bool curious = safety > 500;
+    // two nearest remembered material-bearing entities — Driver's combine
+    // pairing appends the nearest material entity != the chosen target,
+    // so the imagined second reagent is predictable per candidate.
+    EntityId mat_ids[2] = {kNoEntity, kNoEntity};
+    MaterialId mat_m[2] = {kNoMaterial, kNoMaterial};
+    {
+        std::int64_t md2[2] = {0, 0};
+        int nm = 0;
+        for (const auto& [kid, snap] : mind->memory) {
+            if (kid == npc || snap.material == kNoMaterial) continue;
+            const std::int64_t dx = snap.pos.x - me->pos.x;
+            const std::int64_t dy = snap.pos.y - me->pos.y;
+            const std::int64_t d2 = dx * dx + dy * dy;
+            if (nm == 2 && d2 >= md2[1]) continue;
+            int p = nm < 2 ? nm++ : 1;
+            while (p > 0 && md2[p - 1] > d2) {
+                md2[p] = md2[p - 1]; mat_ids[p] = mat_ids[p - 1];
+                mat_m[p] = mat_m[p - 1]; --p;
+            }
+            md2[p] = d2; mat_ids[p] = kid; mat_m[p] = snap.material;
+        }
+    }
     const std::int64_t homeo_q =
         1024 - std::min<std::int64_t>(768, ns.grief * 3 / 4);
     const std::int64_t panic_q = ns.panic;
@@ -1223,6 +1352,21 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                 mit->second.engram.emotional_charge < 0) {
                 const std::int64_t chg = -mit->second.engram.emotional_charge;
                 total += rage_q * chg / 3072 - panic_q * chg / 4096;
+            }
+        }
+        // epistemic bonus: untried material transform while safe
+        if (curious && invent_verb(cd.verb) &&
+            cd.tgt >= 0 && cd.tgt < nnear) {
+            const auto mit = mind->memory.find(near[cd.tgt].id);
+            if (mit != mind->memory.end() &&
+                mit->second.material != kNoMaterial) {
+                const MaterialId ma = mit->second.material;
+                const MaterialId mb =
+                    (cd.verb == 10)   // combine pairs with 2nd-nearest material
+                        ? (near[cd.tgt].id == mat_ids[0] ? mat_m[1] : mat_m[0])
+                        : kNoMaterial;
+                if (!invent_tried(s, invent_key(cd.verb, ma, mb)))
+                    total += 192;
             }
         }
         // small deterministic exploration jitter (genome-scaled)

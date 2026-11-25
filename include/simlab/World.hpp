@@ -272,6 +272,21 @@ public:
     // and NOT part of state_hash — the pool file is world INPUT, read
     // deterministically at spawn time only.
     const GenePool* gene_pool = nullptr;
+    // Open-ended invention: every material the laws synthesized at runtime,
+    // in creation order. `material` is the registry id assigned at commit;
+    // the rest is the deterministic recipe (parents/verb/temp band) the
+    // auto-cataloger narrates. Part of state_hash and save v22.
+    struct SynthRecord {
+        std::uint64_t synth_id = 0;
+        MaterialId material = kNoMaterial;
+        std::string verb;
+        MaterialId parent_a = kNoMaterial;
+        MaterialId parent_b = kNoMaterial;
+        std::int64_t temp_band = 0;
+        EntityId actor = kNoEntity;
+        std::uint64_t tick = 0;
+    };
+    std::vector<SynthRecord> synthesized_;
     // Empty when content loaded cleanly; otherwise the load_content() error.
     // On failure registries are left EMPTY (all-or-nothing), never half-loaded.
     std::string content_error;
@@ -292,6 +307,11 @@ private:
     void social_tithe(CausalEvent& ev, EntityId actor,
                       const std::vector<EntityId>& spawned);
     void metabolize(std::int64_t dt);
+    // Open-ended invention: register a synthesized material (idempotent on
+    // synth_id) and append its SynthRecord. Called from the spawn-commit
+    // path inside interact() — never from const predict().
+    MaterialId materialize_synth(const SpawnSpec::SynthSpec& spec,
+                                 EntityId actor);
     // Phase 12.6: combat_morale drift toward the soldier's situation target.
     void morale_drift(Entity& e, std::uint64_t ticks, CausalEvent& ev);
     // Phase 9 LOD helpers: need-drift math factored out so interact() can

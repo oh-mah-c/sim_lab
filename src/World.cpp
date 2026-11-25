@@ -95,6 +95,7 @@ World::World(std::uint64_t s, const std::string& data_dir) : seed(s) {
     laws.push_back(std::make_unique<PhysicsModel>());
     laws.push_back(std::make_unique<ExtractionModel>());
     laws.push_back(std::make_unique<ProcessingModel>());
+    laws.push_back(std::make_unique<SmeltModel>());   // before Thermal: hot-enough ore smelts
     laws.push_back(std::make_unique<ThermalModel>());
     laws.push_back(std::make_unique<CompositionModel>());
     laws.push_back(std::make_unique<PhysiologyModel>());
@@ -104,6 +105,7 @@ World::World(std::uint64_t s, const std::string& data_dir) : seed(s) {
     laws.push_back(std::make_unique<SocialModel>());
     laws.push_back(std::make_unique<LocomotionModel>());
     laws.push_back(std::make_unique<WarfareModel>());
+    laws.push_back(std::make_unique<SynthesisModel>());  // last: open-ended fallback
     load_content(data_dir, &content_error);
 }
 
@@ -293,6 +295,55 @@ void World::add_law_model(std::unique_ptr<INaturalLawModel> m) {
     laws.push_back(std::move(m));
 }
 
+MaterialId World::materialize_synth(const SpawnSpec::SynthSpec& spec,
+                                    EntityId actor) {
+    // Idempotent on synth_id: the same recipe always resolves to the same
+    // material — re-discovery spawns more of the known stuff, never a
+    // duplicate registry entry.
+    for (const SynthRecord& r : synthesized_)
+        if (r.synth_id == spec.synth_id) return r.material;
+    MaterialDef def;
+    char buf[24];
+    std::snprintf(buf, sizeof buf, "syn_%016llx",
+                  static_cast<unsigned long long>(spec.synth_id));
+    def.name = buf;
+    def.provenance = "synthesized";
+    // attr order shared with the sensor material-focus channels:
+    // 0 hardness 1 flammability 2 nutrition 3 toxicity 4 conductivity
+    // 5 density 6 temperature 7 edge_sharpness. Temperature is instance
+    // state (entities carry it), not a material default — skipped here.
+    static const char* kAttrNames[8] = {
+        "hardness", "flammability", "nutrition", "toxicity",
+        "conductivity", "density", "temperature", "edge_sharpness"};
+    for (int i = 0; i < 8; ++i) {
+        if (i == 6) continue;
+        const PropertyDef* pd = props.find_name(kAttrNames[i]);
+        if (!pd) continue;
+        const std::int64_t v = spec.attrs[i];
+        def.props[pd->id] =
+            (pd->type == ValType::Fixed) ? Value::fixed(v)
+                                         : Value::integer(v);
+    }
+    // every material needs integrity+mass to function in the world
+    if (const PropertyDef* pi = props.find_name("integrity"))
+        def.props[pi->id] = Value::integer(500);
+    if (const PropertyDef* pm = props.find_name("mass"))
+        def.props[pm->id] = Value::integer(500);
+    const MaterialId mid = materials.add(std::move(def));
+    if (mid == kNoMaterial) return kNoMaterial;
+    SynthRecord rec;
+    rec.synth_id = spec.synth_id;
+    rec.material = mid;
+    rec.verb = spec.verb;
+    rec.parent_a = spec.parent_a;
+    rec.parent_b = spec.parent_b;
+    rec.temp_band = spec.temp_band;
+    rec.actor = actor;
+    rec.tick = clock_.tick();
+    synthesized_.push_back(rec);
+    return mid;
+}
+
 World World::clone() const {
     World out;
     out.entities.reserve(entities.size());   // reuse-friendly bulk copy
@@ -328,6 +379,7 @@ World World::clone() const {
     out.index_ = index_;
     out.by_kind_ = by_kind_;
     out.touched_ = touched_;
+    out.synthesized_ = synthesized_;
     out.content_error = content_error;
     out.speculative = speculative;
     return out;
@@ -366,6 +418,7 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
     out.laws = laws;   // law models are stateless: share, don't re-allocate
     for (const auto& [name, r] : rngs_)
         out.rngs_[name] = std::make_unique<Rng>(*r);
+    out.synthesized_ = synthesized_;   // synth dedup must see prior art
     out.content_error = content_error;
 
     // ---- entity selection: radius + structural closure ----------------------
@@ -5418,7 +5471,12 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // Law-proposed spawns commit after state changes (TODO §9 extraction/
     // processing produce NEW entities — World Truth grows causally).
     for (const SpawnSpec& s : pred.spawns) {
-        const EntityId nid = create_entity(s.kind, s.material, s.pos, s.props);
+        // Open-ended invention: a has_synth spawn materializes its
+        // MaterialDef here (idempotent on synth_id) so the entity gets a
+        // real registry material before create_entity resolves it.
+        const MaterialId smat =
+            s.has_synth ? materialize_synth(s.synth, ctx.actor) : s.material;
+        const EntityId nid = create_entity(s.kind, smat, s.pos, s.props);
         if (nid == kNoEntity) {
             ev.evidence += "spawn failed: " + s.kind + "; ";
             continue;
@@ -5790,6 +5848,13 @@ std::uint64_t World::state_hash() const {
             mix(pid); mix(static_cast<std::uint64_t>(v.i)); mix(v.b ? 1 : 0); mixs(v.s); mix(v.target);
         }
     }
+    // open-ended invention: synth recipes are world state (catalog + dedup)
+    mix(synthesized_.size());
+    for (const SynthRecord& r : synthesized_) {
+        mix(r.synth_id); mix(r.material); mixs(r.verb);
+        mix(r.parent_a); mix(r.parent_b); mix(r.temp_band);
+        mix(r.actor); mix(r.tick);
+    }
     mix(deposits.defs().size());
     for (const DepositDef& d : deposits.defs()) mixs(d.name);
     // influx zones steer spawning — part of the world's effective content
@@ -6031,7 +6096,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 21;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay)
+constexpr std::uint32_t kSaveFormat = 23;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set
 
 struct Writer {
     std::ofstream f;
@@ -6117,6 +6182,23 @@ bool World::save(const std::string& path, std::string* err) const {
     w.put(kSaveMagic); w.put(kSaveFormat);
     w.put(world_seed); w.put(generator_version); w.put(gen_origin_x); w.put(gen_origin_y);
     w.put(clock_.tick());
+    // synthesized materials (v22): must precede entities so material names
+    // resolve during load. One record per invented recipe, carrying the
+    // full MaterialDef props so the registry rebuilds identically.
+    w.put(static_cast<std::uint64_t>(synthesized_.size()));
+    for (const SynthRecord& r : synthesized_) {
+        w.put(r.synth_id); w.str(r.verb);
+        w.put(r.parent_a); w.put(r.parent_b); w.put(r.temp_band);
+        w.put(r.actor); w.put(r.tick);
+        const MaterialDef* md = materials.find(r.material);
+        w.str(md ? md->name : "");
+        w.put(static_cast<std::uint32_t>(md ? md->props.size() : 0));
+        if (md) for (const auto& [pid, v] : md->props) {
+            const PropertyDef* pd = props.find(pid);
+            w.str(pd ? pd->name : "");
+            w.value(v);
+        }
+    }
     // entities (creation order preserved -> kind ids and entity ids replay)
     w.put(static_cast<std::uint64_t>(entities.size()));
     for (const auto& e : entities) {
@@ -6367,6 +6449,8 @@ bool World::save(const std::string& path, std::string* err) const {
                 w.str(std::string(reinterpret_cast<const char*>(t.wh.data()), t.wh.size()));
                 w.str(std::string(reinterpret_cast<const char*>(t.w1h.data()), t.w1h.size()));
             }
+            w.put(s.tried_next);                          // v23
+            for (std::uint64_t k : s.tried) w.put(k);
         }
         w.put(bs.wm_err_sum); w.put(bs.wm_n);
         w.put(bs.sigma_sum); w.put(bs.sigma_n);
@@ -6397,10 +6481,44 @@ bool World::load(const std::string& path, std::string* err) {
     entities.clear(); index_.clear(); by_kind_.clear(); touched_.clear(); spatial.clear(); relations.clear(); social_.clear(); ledger.clear(); minds_.clear(); brains_.reset();
     rngs_.clear();
     gen_spawned_.clear();
+    synthesized_.clear();
     kinds = EntityRegistry{};
     clock_.tick_ = etick;
     world_seed = wseed; generator_version = gver;
     gen_origin_x = ox; gen_origin_y = oy;
+
+    // synthesized materials (v22): rebuild registry defs BEFORE entities so
+    // their material names resolve below. Order is preserved -> MaterialIds
+    // match the saving world exactly.
+    if (fmt >= 22) {
+        std::uint64_t sc = 0;
+        if (!r.get(sc) || sc > (1u << 20)) return fail("bad synth count");
+        for (std::uint64_t i = 0; i < sc; ++i) {
+            SynthRecord rec;
+            std::string mname, pname;
+            std::uint32_t pc = 0;
+            if (!r.get(rec.synth_id) || !r.str(rec.verb) ||
+                !r.get(rec.parent_a) || !r.get(rec.parent_b) ||
+                !r.get(rec.temp_band) || !r.get(rec.actor) ||
+                !r.get(rec.tick) || !r.str(mname) || !r.get(pc) ||
+                pc > (1u << 20)) return fail("truncated synth record");
+            MaterialDef def;
+            def.name = mname;
+            def.provenance = "synthesized";
+            for (std::uint32_t j = 0; j < pc; ++j) {
+                Value v;
+                if (!r.str(pname) || !r.value(v))
+                    return fail("truncated synth prop");
+                const PropertyDef* pd = props.find_name(pname);
+                if (!pd) return fail("unknown synth prop: " + pname);
+                def.props[pd->id] = v;
+            }
+            rec.material = materials.add(std::move(def));
+            if (rec.material == kNoMaterial)
+                return fail("synth material rejected: " + mname);
+            synthesized_.push_back(rec);
+        }
+    }
 
     std::uint64_t ec = 0;
     if (!r.get(ec) || ec > (1ull << 32)) return fail("bad entity count");
@@ -6904,6 +7022,12 @@ bool World::load(const std::string& path, std::string* err) {
                             return fail("truncated brain transition w1h");
                         std::memcpy(t.w1h.data(), h1b.data(), h1b.size());
                     }
+                }
+                if (fmt >= 23) {               // v23: invention tried-set
+                    if (!r.get(s.tried_next))
+                        return fail("truncated brain tried");
+                    for (std::uint64_t& k : s.tried)
+                        if (!r.get(k)) return fail("truncated brain tried");
                 }
                 bs->slots.emplace(nid, std::move(s));
             }

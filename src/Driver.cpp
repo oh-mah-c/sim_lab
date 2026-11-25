@@ -176,6 +176,29 @@ bool social_floor(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
     return false;
 }
 
+// Open-ended invention: a brain-chosen "combine" carries only ONE target,
+// but synthesis needs two reagents. Pair it with the nearest OTHER
+// remembered material-bearing entity — the same pick brain_decide uses
+// when pricing the epistemic bonus, so imagined and executed combos key
+// identically in the tried-set.
+static EntityId second_material_target(const World& w, EntityId npc,
+                                       EntityId exclude) {
+    const Entity* me = w.find(npc);
+    const AgentMind* mind = w.find_mind(npc);
+    if (!me || !mind) return kNoEntity;
+    EntityId best = kNoEntity;
+    std::int64_t bd2 = 0;
+    for (const auto& [kid, snap] : mind->memory) {
+        if (kid == npc || kid == exclude || snap.material == kNoMaterial)
+            continue;
+        const std::int64_t dx = snap.pos.x - me->pos.x;
+        const std::int64_t dy = snap.pos.y - me->pos.y;
+        const std::int64_t d2 = dx * dx + dy * dy;
+        if (best == kNoEntity || d2 < bd2) { best = kid; bd2 = d2; }
+    }
+    return best;
+}
+
 bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
                 DriverTally* tally) {
     if (!st || !st->brain_control || w.speculative) return false;
@@ -200,6 +223,10 @@ bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
         if (!ch.valid) return false;
         InteractionContext c = mk(npc, {}, ch.verb.c_str(), 1);
         if (ch.target != kNoEntity) c.targets.push_back(ch.target);
+        if (ch.verb == "combine" && ch.target != kNoEntity) {
+            const EntityId t2 = second_material_target(w, npc, ch.target);
+            if (t2 != kNoEntity) c.targets.push_back(t2);
+        }
         if (ch.has_move) {
             c.parameters.destination = ch.move_to;
             c.parameters.has_destination = true;
@@ -226,6 +253,10 @@ bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
     InteractionContext c = ch.valid ? mk(npc, {}, ch.verb.c_str(), 1)
                                     : mk(npc, {}, "rest", 1);
     if (ch.target != kNoEntity) c.targets.push_back(ch.target);
+    if (ch.verb == "combine" && ch.target != kNoEntity) {
+        const EntityId t2 = second_material_target(w, npc, ch.target);
+        if (t2 != kNoEntity) c.targets.push_back(t2);
+    }
     if (ch.has_move) {
         c.parameters.destination = ch.move_to;
         c.parameters.has_destination = true;

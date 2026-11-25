@@ -205,6 +205,11 @@ struct BrainPending {
     std::array<std::int8_t, 64> w1hidden{};    // worker hidden (actor SGD)
     std::array<std::int16_t, 96> h{};          // post-GRU hidden state Q8
     std::array<std::int8_t, 96> embed{};       // embed output (manager/worker in)
+    // open-ended invention: materials of the first two material-bearing
+    // targets, resolved pre-commit so brain_post can key the tried-combo
+    // set on exactly what the laws will see.
+    MaterialId pm_a = kNoMaterial;
+    MaterialId pm_b = kNoMaterial;
 };
 
 struct BrainSlot {
@@ -235,6 +240,11 @@ struct BrainSlot {
     // sleep consolidation from catastrophic forgetting.
     std::vector<std::int8_t> fast;      // kLabelChannels*kWmHidden deltas
     std::vector<std::int8_t> anchor;    // same size, birth snapshot of wm2w
+    // Open-ended invention: ring of material-combo keys (verb + parent
+    // material ids) this agent has already transformed. Lifetime-only —
+    // never inherited (Baldwin), like fast weights. 0 = empty slot.
+    std::array<std::uint64_t, 64> tried{};
+    std::int32_t tried_next = 0;
 };
 
 // Phase 2: the inheritable brain. `slow` is the canonical-layout int8

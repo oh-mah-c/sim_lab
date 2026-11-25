@@ -1,6 +1,7 @@
 #include "simlab/Laws.hpp"
 #include "simlab/World.hpp"
 #include "simlab/Processes.hpp"
+#include "simlab/Rng.hpp"
 #include "LawUtil.hpp"
 #include <algorithm>
 #include <set>
@@ -833,6 +834,337 @@ PredictionResult CombineModel::predict(const World& w,
 
 std::unique_ptr<INaturalLawModel> CombineModel::clone() const {
     return std::make_unique<CombineModel>();
+}
+
+// ==================== Open-ended invention ====================================
+// When no authored recipe claims a combine/process — or a "heat" hot enough
+// to smelt — the world synthesizes a NEW material by blending the inputs'
+// physical attribute vector. synth_id = hash(sorted parent material ids,
+// verb, temp_band): A+B and B+A collide onto the same material, so
+// invention is idempotent and save/replay-safe. Laws only PROPOSE: the
+// SpawnSpec carries the recipe and World::interact registers the
+// MaterialDef at commit (materialize_synth).
+
+namespace {
+
+// Attribute order shared by SynthSpec.attrs, the sensor material-focus
+// channels and the synthesis math: hardness, flammability, nutrition,
+// toxicity, conductivity, density, temperature(deciC), edge_sharpness.
+std::array<std::int64_t, 8> synth_attrs(const World& w, const Entity& e) {
+    std::array<std::int64_t, 8> a{};
+    a[0] = w.prop_int(e, SIMLAB_PID(w.props, "hardness"), 0);
+    a[1] = w.prop_int(e, SIMLAB_PID(w.props, "flammability"), 0);
+    a[2] = w.prop_int(e, SIMLAB_PID(w.props, "nutrition"), 0);
+    a[3] = w.prop_int(e, SIMLAB_PID(w.props, "toxicity"), 0);
+    a[4] = w.prop_int(e, SIMLAB_PID(w.props, "conductivity"), 0);
+    a[5] = w.prop_int(e, SIMLAB_PID(w.props, "density"), 0);
+    a[6] = w.prop_int(e, SIMLAB_PID(w.props, "temperature"), 200);
+    a[7] = w.prop_int(e, SIMLAB_PID(w.props, "edge_sharpness"), 0);
+    return a;
+}
+
+void clamp_attrs(std::array<std::int64_t, 8>& a) {
+    const std::int64_t hi[8] = {1000, 1000, 1000, 1000, 10000, 10000000,
+                                20000, 1000};
+    const std::int64_t lo[8] = {0, 0, 0, 0, 0, 0, -5000, 0};
+    for (int i = 0; i < 8; ++i)
+        a[i] = std::max(lo[i], std::min(hi[i], a[i]));
+}
+
+// combine/process blend: mass-weighted mean of every attr plus two
+// deterministic interaction terms (conductive+toxic brews a stronger
+// toxin; hard+ dense stock alloys into something tougher and sharper).
+std::array<std::int64_t, 8> blend_attrs(const World& w, const Entity& ea,
+                                        std::int64_t wa, const Entity& eb,
+                                        std::int64_t wb) {
+    const auto A = synth_attrs(w, ea), B = synth_attrs(w, eb);
+    std::array<std::int64_t, 8> o{};
+    const std::int64_t tot = std::max<std::int64_t>(1, wa + wb);
+    for (int i = 0; i < 8; ++i)
+        o[i] = (A[i] * wa + B[i] * wb) / tot;
+    o[6] = 200;                                    // product forms at ambient
+    if ((A[4] > 400 && B[3] > 200) || (B[4] > 400 && A[3] > 200))
+        o[3] += 250;                               // toxic conductor brew
+    if ((A[0] > 500 && B[5] > 3000000) ||
+        (B[0] > 500 && A[5] > 3000000)) {
+        o[0] += 150; o[7] += 100;                  // alloy hardening
+    }
+    if (A[2] > 200 && B[2] > 200) o[2] += 50;      // food synergy
+    clamp_attrs(o);
+    return o;
+}
+
+// single-input process refine: gentle attr shift, some mass/nutrition loss.
+std::array<std::int64_t, 8> refine_attrs(const World& w, const Entity& e) {
+    auto o = synth_attrs(w, e);
+    o[0] = o[0] * 15 / 16 + 20;
+    o[7] = o[7] * 15 / 16 + 20;
+    o[1] = o[1] * 7 / 8;
+    o[2] = o[2] * 7 / 8;
+    o[3] = o[3] * 7 / 8;
+    o[6] = 200;
+    clamp_attrs(o);
+    return o;
+}
+
+// heat/smelt: hotter, harder, sharper with density; toxins and fuel burn
+// off; metals conduct. band>=2 (well past smelt_temp) chars the product.
+std::array<std::int64_t, 8> smelt_attrs(const World& w, const Entity& e,
+                                        std::int64_t band) {
+    const auto A = synth_attrs(w, e);
+    std::array<std::int64_t, 8> o = A;
+    o[0] = A[0] * 5 / 4 + 100;
+    o[7] = A[7] + A[5] / 40000 + 100;
+    o[3] = A[3] * 3 / 4;
+    o[1] = A[1] / 4;
+    o[2] = A[2] / 4;
+    o[4] = std::max<std::int64_t>(A[4], 3000);
+    o[5] = A[5] * 11 / 10;
+    o[6] = 200;
+    if (band >= 2) { o[0] = o[0] * 2 / 3; o[7] = o[7] / 2; o[1] = 0; o[2] = 0; }
+    clamp_attrs(o);
+    return o;
+}
+
+std::uint64_t synth_id_of(std::uint64_t ma, std::uint64_t mb,
+                          const std::string& verb, std::int64_t band) {
+    if (ma > mb) std::swap(ma, mb);               // A+B == B+A
+    std::uint64_t h = Rng::hash(Rng::hash(verb));
+    h = Rng::hash(h ^ ma);
+    h = Rng::hash(h ^ (mb << 1));
+    h = Rng::hash(h ^ static_cast<std::uint64_t>(band));
+    return h;
+}
+
+const World::SynthRecord* find_synth(const World& w, std::uint64_t id) {
+    for (const World::SynthRecord& r : w.synthesized_)
+        if (r.synth_id == id) return &r;
+    return nullptr;
+}
+
+// shared tail for the synthesis laws: dedup-or-flag the spawn, charge the
+// actor, note the recipe in evidence.
+bool finish_synth(const World& w, PredictionResult& r, EntityId actor,
+                  const Entity* actor_e, const std::string& verb,
+                  MaterialId pa, MaterialId pb, std::int64_t band,
+                  const std::array<std::int64_t, 8>& attrs,
+                  std::int64_t product_qty, std::int64_t energy,
+                  const PropId quantity_p) {
+    const std::uint64_t sid =
+        synth_id_of(static_cast<std::uint64_t>(pa),
+                    static_cast<std::uint64_t>(pb), verb, band);
+    const World::SynthRecord* old = find_synth(w, sid);
+    SpawnSpec s;
+    s.kind = "processed_material";
+    s.pos = actor_e->pos;
+    if (old) {
+        s.material = old->material;               // idempotent re-discovery
+    } else {
+        s.has_synth = true;
+        s.synth.synth_id = sid;
+        s.synth.verb = verb;
+        s.synth.parent_a = pa;
+        s.synth.parent_b = pb;
+        s.synth.temp_band = band;
+        s.synth.attrs = attrs;
+    }
+    if (quantity_p != kNoProp && product_qty > 0)
+        s.props.set(quantity_p, Value::integer(product_qty));
+    r.spawns.push_back(s);
+    if (!charge_energy(*actor_e, SIMLAB_PID(w.props, "energy"), energy, r))
+        return false;
+    std::ostringstream n;
+    n << verb << " synthesize sid=" << std::hex << sid << std::dec
+      << " pa=" << pa << " pb=" << pb << " band=" << band
+      << (old ? " (known)" : " (new)");
+    r.notes.push_back(n.str());
+    return true;
+}
+
+}  // namespace
+
+// ============================ SmeltModel ======================================
+// Bare "heat" once a target is already at/above its declared smelt_temp
+// smelts it WITHOUT a process recipe — brute-force metallurgy. Sits before
+// ThermalModel in the law list so it claims only the transform-ready case;
+// ordinary heating falls through untouched.
+
+LawId SmeltModel::id() const { return 24; }
+
+namespace {
+
+const Entity* first_smeltable(const World& w, const InteractionContext& ctx,
+                              std::int64_t& band_out) {
+    const PropId p_temp = SIMLAB_PID(w.props, "temperature");
+    const PropId p_smt = SIMLAB_PID(w.props, "smelt_temp");
+    if (p_temp == kNoProp || p_smt == kNoProp) return nullptr;
+    for (EntityId tid : ctx.targets) {
+        const Entity* t = w.find(tid);
+        if (!t || !t->alive || t->material == kNoMaterial) continue;
+        // never smelt a living organism (same gate as Driver's target scan)
+        if (w.species.find_name(t->kind_name) || w.find_mind(tid)) continue;
+        const MaterialDef* md = w.materials.find(t->material);
+        if (!md) continue;
+        const auto it = md->props.find(p_smt);
+        if (it == md->props.end() || it->second.type != ValType::Integer ||
+            it->second.i <= 0) continue;
+        const std::int64_t cur = w.prop_int(*t, p_temp, 200);
+        if (cur >= it->second.i) {
+            band_out = std::min<std::int64_t>(7, cur / 2000);
+            return t;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+bool SmeltModel::supports(const World& w, const InteractionContext& ctx) const {
+    if (ctx.parameters.action != "heat" || ctx.targets.empty()) return false;
+    std::int64_t band = 0;
+    return first_smeltable(w, ctx, band) != nullptr;
+}
+
+PredictionResult SmeltModel::predict(const World& w,
+                                     const InteractionContext& ctx) const {
+    PredictionResult r;
+    r.law = id(); r.law_name = name();
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    const PropId reach_pid = pid(w, "reach"),
+                 integ_pid = pid(w, "integrity");
+    std::int64_t band = 0;
+    const Entity* t = first_smeltable(w, ctx, band);
+    if (!t) { r.failure = "no target at smelt temperature"; return r; }
+    const auto [treach, tedge] = w.tool_bonus(ctx.actor);
+    (void)tedge;
+    if (!in_reach(w, *actor, *t, reach_pid, treach, &r)) {
+        r.failure = "smelt target out of reach";
+        return r;
+    }
+    // smelt_yield (permille) decides how much of the charge survives.
+    std::int64_t yld = 1000;
+    if (const MaterialDef* md = w.materials.find(t->material)) {
+        const PropId p_y = SIMLAB_PID(w.props, "smelt_yield");
+        const auto it = md->props.find(p_y);
+        if (it != md->props.end() && it->second.type == ValType::Integer &&
+            it->second.i > 0)
+            yld = std::min<std::int64_t>(1000, it->second.i);
+    }
+    const std::int64_t tin = entity_qty(w, *t, pid(w, "quantity"));
+    const std::int64_t tout = std::max<std::int64_t>(1, tin * yld / 1000);
+    const MaterialId pa = t->material;
+    const auto attrs = smelt_attrs(w, *t, band);
+    if (!finish_synth(w, r, ctx.actor, actor, "heat", pa, kNoMaterial,
+                      band, attrs, tout, 1500, pid(w, "quantity")))
+        return r;
+    // the charge is consumed entirely
+    set_change(r, t->id, integ_pid, w.prop_int(*t, integ_pid, 500), 0);
+    r.possible = true;
+    r.ticks = ctx.parameters.ticks;
+    return r;
+}
+
+std::unique_ptr<INaturalLawModel> SmeltModel::clone() const {
+    return std::make_unique<SmeltModel>();
+}
+
+// ============================ SynthesisModel =================================
+// Open-ended fallback for "combine" (>=2 material targets) and "process"
+// (any targets, only when the note names NO authored process). Last in the
+// law list — every authored model gets first refusal.
+
+LawId SynthesisModel::id() const { return 25; }
+
+bool SynthesisModel::supports(const World& w,
+                              const InteractionContext& ctx) const {
+    if (ctx.parameters.action == "combine")
+        return ctx.targets.size() >= 2;
+    if (ctx.parameters.action == "process" && !ctx.targets.empty())
+        return ctx.parameters.note.empty() ||
+               w.processes.find(ctx.parameters.note) == nullptr;
+    return false;
+}
+
+PredictionResult SynthesisModel::predict(const World& w,
+                                         const InteractionContext& ctx) const {
+    PredictionResult r;
+    r.law = id(); r.law_name = name();
+    const Entity* actor = w.find(ctx.actor);
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+
+    const PropId reach_pid = pid(w, "reach"),
+                 contained_pid = pid(w, "contained"),
+                 integ_pid = pid(w, "integrity"),
+                 qty_pid = pid(w, "quantity"),
+                 temp_pid = pid(w, "temperature");
+    const auto [treach, tedge] = w.tool_bonus(ctx.actor);
+    (void)tedge;
+
+    // eligible reagents: alive, uncontained, in reach, actually material.
+    struct Reagent { EntityId id; const Entity* e; std::int64_t qty; };
+    std::vector<Reagent> rs;
+    std::int64_t best_temp = 0;
+    for (EntityId tid : ctx.targets) {
+        if (tid == ctx.actor) continue;
+        const Entity* t = w.find(tid);
+        if (!t || !t->alive || t->material == kNoMaterial) continue;
+        // living organisms are never reagents (sapients, fauna, flora)
+        if (w.species.find_name(t->kind_name) || w.find_mind(tid)) continue;
+        if (is_contained(w, *t, contained_pid)) continue;
+        if (!in_reach(w, *actor, *t, reach_pid, treach, &r)) {
+            r.notes.push_back("target " + std::to_string(tid) +
+                              " out of reach");
+            continue;
+        }
+        rs.push_back({tid, t, entity_qty(w, *t, qty_pid)});
+        best_temp = std::max(best_temp, w.prop_int(*t, temp_pid, 200));
+    }
+    const bool is_combine = ctx.parameters.action == "combine";
+    if (is_combine ? rs.size() < 2 : rs.empty()) {
+        r.failure = is_combine ? "combine needs two material targets"
+                               : "process needs a material target";
+        return r;
+    }
+    const std::int64_t band = std::min<std::int64_t>(7, best_temp / 1000);
+
+    MaterialId pa = kNoMaterial, pb = kNoMaterial;
+    std::array<std::int64_t, 8> attrs{};
+    std::int64_t tout = 1;
+    std::int64_t energy = 400;
+    std::size_t n_used = 1;                    // reagents actually consumed
+    if (is_combine || rs.size() >= 2) {
+        // blend the first two reagents (parents sorted inside synth_id_of)
+        pa = rs[0].e->material;
+        pb = rs[1].e->material;
+        attrs = blend_attrs(w, *rs[0].e, rs[0].qty, *rs[1].e, rs[1].qty);
+        tout = std::max<std::int64_t>(1, (rs[0].qty + rs[1].qty) / 2);
+        energy = is_combine ? 400 : 800;
+        n_used = 2;
+    } else {
+        // single-input process: refine in place
+        pa = rs[0].e->material;
+        pb = kNoMaterial;
+        attrs = refine_attrs(w, *rs[0].e);
+        tout = std::max<std::int64_t>(1, rs[0].qty / 2);
+        energy = 800;
+    }
+    if (!finish_synth(w, r, ctx.actor, actor, ctx.parameters.action,
+                      pa, pb, band, attrs, tout, energy, qty_pid))
+        return r;
+    // only the parent reagents are consumed — extra targets in reach are
+    // untouched (a stray third item must not be destroyed by the recipe)
+    for (std::size_t i = 0; i < n_used; ++i) {
+        const Reagent& g = rs[i];
+        set_change(r, g.id, integ_pid, w.prop_int(*g.e, integ_pid, 500), 0);
+    }
+    r.possible = true;
+    r.ticks = ctx.parameters.ticks;
+    return r;
+}
+
+std::unique_ptr<INaturalLawModel> SynthesisModel::clone() const {
+    return std::make_unique<SynthesisModel>();
 }
 
 }  // namespace simlab

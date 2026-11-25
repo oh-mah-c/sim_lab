@@ -171,7 +171,7 @@ SensorVec sensor_encode(const World& w, EntityId npc,
         f[6] = sensor_norm(snap.engram.clarity, 2);
     }
 
-    // ---- channels 66..69: social & temporal cognition ------------------------
+    // ---- channels 68..71: social & temporal cognition ------------------------
     // The nearest remembered AGENT (an entity with a mind) inside earshot
     // anchors the social channels. language_id is domain=social — never in
     // snapshots — but a neighbour's tongue is literally audible at close
@@ -271,16 +271,95 @@ SensorVec sensor_encode(const World& w, EntityId npc,
         s[kChanScarcityPhase] = sensor_norm(scarce * 2 - 336, 336);
     }
 
-    // ---- channels 70..77: environment -----------------------------------------
+    // ---- channels 52..67: material attribute focus --------------------------
+    // The 8 physical props (hardness, flammability, nutrition, toxicity,
+    // conductivity, density, temperature, edge_sharpness) of the wielded
+    // item (proprioception — always visible) and of the nearest remembered
+    // material-bearing entity inside sight range. prop_int resolves
+    // instance overrides over material defaults, so synthesized materials
+    // encode exactly like authored ones — the world model can extrapolate
+    // onto compositions it has never seen.
+    {
+        const PropId p_hard = SIMLAB_PID(w.props, "hardness");
+        const PropId p_flamm = SIMLAB_PID(w.props, "flammability");
+        const PropId p_tox = SIMLAB_PID(w.props, "toxicity");
+        const PropId p_cond = SIMLAB_PID(w.props, "conductivity");
+        const PropId p_dens = SIMLAB_PID(w.props, "density");
+        const PropId p_temp = SIMLAB_PID(w.props, "temperature");
+        const PropId p_sharp = SIMLAB_PID(w.props, "edge_sharpness");
+        auto fill8 = [&](const Entity& e, std::int8_t* f) {
+            f[0] = sensor_norm(w.prop_int(e, p_hard, 0), 1000);
+            f[1] = sensor_norm(w.prop_int(e, p_flamm, 0), 1000);
+            f[2] = sensor_norm(w.prop_int(e, p_nut, 0), 1000);
+            f[3] = sensor_norm(w.prop_int(e, p_tox, 0), 1000);
+            f[4] = sensor_norm(w.prop_int(e, p_cond, 0), 2000);
+            f[5] = sensor_norm(w.prop_int(e, p_dens, 0), 4000000);
+            f[6] = sensor_norm(w.prop_int(e, p_temp, 200) - 200, 4000);
+            f[7] = sensor_norm(w.prop_int(e, p_sharp, 0), 1000);
+        };
+        // focus A (52..59): wielded item — own equipment is proprioception;
+        // fall back to the nearest remembered item marked possessed_by=me.
+        EntityId held = kNoEntity;
+        for (const Relation& rel : w.relations_of(npc, "wielding")) {
+            if (rel.a != npc) continue;
+            const Entity* t = w.find(rel.b);
+            if (t && t->alive) { held = rel.b; break; }
+        }
+        if (held == kNoEntity && mind) {
+            std::int64_t bd2 = -1;
+            for (const auto& [kid, snap] : mind->memory) {
+                if (kid == npc) continue;
+                const auto pp = snap.props.find(p_poss);
+                if (pp == snap.props.end() ||
+                    pp->second.type != ValType::Integer ||
+                    pp->second.i != static_cast<std::int64_t>(npc))
+                    continue;
+                const Entity* t = w.find(kid);
+                if (!t || !t->alive) continue;
+                const std::int64_t dx = snap.pos.x - me->pos.x;
+                const std::int64_t dy = snap.pos.y - me->pos.y;
+                const std::int64_t d2 = dx * dx + dy * dy;
+                if (bd2 < 0 || d2 < bd2) { bd2 = d2; held = kid; }
+            }
+        }
+        if (held != kNoEntity) {
+            if (const Entity* he = w.find(held)) fill8(*he, &s[kMatFocusA]);
+        }
+        // focus B (60..67): nearest remembered entity that actually has a
+        // material, inside the same sight radius the entity slots use.
+        EntityId focus = kNoEntity;
+        std::int64_t fd2 = 0;
+        if (mind) {
+            const std::int64_t sight2 = sight * sight;
+            for (const auto& [kid, snap] : mind->memory) {
+                if (kid == npc || kid == held) continue;
+                if (snap.material == kNoMaterial) continue;
+                const std::int64_t dx = snap.pos.x - me->pos.x;
+                const std::int64_t dy = snap.pos.y - me->pos.y;
+                const std::int64_t d2 = dx * dx + dy * dy;
+                if (d2 > sight2) continue;
+                const Entity* t = w.find(kid);
+                if (!t || !t->alive) continue;
+                if (focus == kNoEntity || d2 < fd2) {
+                    focus = kid; fd2 = d2;
+                }
+            }
+        }
+        if (focus != kNoEntity) {
+            if (const Entity* fe = w.find(focus)) fill8(*fe, &s[kMatFocusB]);
+        }
+    }
+
+    // ---- channels 72..79: environment -----------------------------------------
     if (w.terrain.contains(me->pos)) {
-        s[70] = sensor_norm(w.terrain.moist_at(me->pos), 8);
-        s[71] = sensor_norm(w.terrain.temp_at(me->pos) - 300, 16);
-        s[72] = sensor_norm(w.terrain.elev_at(me->pos), 4);
-        s[73] = sensor_norm(w.terrain.slope_at(me->pos), 4);
-        s[74] = static_cast<std::int8_t>(w.terrain.is_water(me->pos) ? 100 : -100);
-        s[75] = sensor_norm(w.terrain.veg_at(me->pos), 8);
-        s[76] = sensor_norm(w.terrain.wear_at(me->pos), 8);
-        s[77] = sensor_norm(w.terrain.water_table_at(me->pos), 100);
+        s[72] = sensor_norm(w.terrain.moist_at(me->pos), 8);
+        s[73] = sensor_norm(w.terrain.temp_at(me->pos) - 300, 16);
+        s[74] = sensor_norm(w.terrain.elev_at(me->pos), 4);
+        s[75] = sensor_norm(w.terrain.slope_at(me->pos), 4);
+        s[76] = static_cast<std::int8_t>(w.terrain.is_water(me->pos) ? 100 : -100);
+        s[77] = sensor_norm(w.terrain.veg_at(me->pos), 8);
+        s[78] = sensor_norm(w.terrain.wear_at(me->pos), 8);
+        s[79] = sensor_norm(w.terrain.water_table_at(me->pos), 100);
     }
     // ---- channels 80..111: last action one-hot ---------------------------------
     if (last_action)
