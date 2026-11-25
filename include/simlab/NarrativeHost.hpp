@@ -26,11 +26,11 @@ public:
         std::string lib_dir = "third_party/llama-build/bin";
         std::uint32_t max_queue = 64;      // pending prompts (drop-oldest)
         std::uint32_t max_results = 256;   // completed texts kept for poll
-        int max_new_tokens = 48;
+        int max_new_tokens = 192;
         float temperature = 0.2f;          // low-temp, near-greedy
         std::uint32_t top_k = 40;
         std::uint32_t seed = 0xC0FFEE;
-        std::uint32_t n_ctx = 1024;
+        std::uint32_t n_ctx = 2048;
     };
 
     NarrativeHost();
@@ -48,6 +48,11 @@ public:
     // Enqueue a structured event summary for narration. `key` is the
     // lookup id (CausalEvent::id or EntityId) used by poll().
     void submit(std::uint64_t key, const std::string& summary);
+
+    // Enqueue a full system+user prompt (chronicle chapters, batched
+    // narration). Same queue/poll contract as submit().
+    void submit_prompt(std::uint64_t key, const std::string& sys,
+                       const std::string& user);
 
     // Fetch a completed narration for `key` (non-blocking). Returns false
     // until the worker finishes it; each key is delivered once.

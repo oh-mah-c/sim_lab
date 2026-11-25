@@ -122,7 +122,7 @@ struct LlamaApi {
     ~LlamaApi() { if (h) dlclose(h); }
 };
 
-struct Job { std::uint64_t key; std::string summary; };
+struct Job { std::uint64_t key; std::string sys; std::string user; };
 
 } // namespace
 
@@ -185,19 +185,25 @@ struct NarrativeHost::Impl {
         if (backend_up) { api.backend_free(); backend_up = false; }
     }
 
+    // Qwen-instruct one-liner chronicler (live feed callouts).
+    static const char* kOnelinerSys() {
+        return "You are the chronicler of an artificial ecosystem. Write "
+               "one vivid two-sentence account of the event. Plain prose "
+               "only, no preamble.";
+    }
+
     // Build the Qwen-instruct chat prompt (chat template, no jinja dep).
-    static std::string prompt_for(const std::string& summary) {
-        return std::string(
-            "<|im_start|>system\nYou are the chronicler of an artificial "
-            "ecosystem. Write one vivid two-sentence account of the event. "
-            "Plain prose only, no preamble.<|im_end|>\n"
-            "<|im_start|>user\n") + summary +
-            "<|im_end|>\n<|im_start|>assistant\n";
+    static std::string prompt_for(const std::string& sys,
+                                  const std::string& user) {
+        return std::string("<|im_start|>system\n") + sys +
+               "<|im_end|>\n<|im_start|>user\n" + user +
+               "<|im_end|>\n<|im_start|>assistant\n";
     }
 
     // Generate one narration; returns false on any llama error.
-    bool generate(const std::string& summary, std::string& out) {
-        const std::string prompt = prompt_for(summary);
+    bool generate(const std::string& sys, const std::string& user,
+                  std::string& out) {
+        const std::string prompt = prompt_for(sys, user);
         std::vector<llama_token> toks(static_cast<std::size_t>(prompt.size()) + 64);
         const int nt = api.tokenize(vocab, prompt.data(),
                                     static_cast<int32_t>(prompt.size()),
@@ -273,7 +279,8 @@ struct NarrativeHost::Impl {
             }
             if (!ready.load()) continue;
             std::string text;
-            if (generate(job.summary, text)) {
+            const std::string sys = job.sys.empty() ? kOnelinerSys() : job.sys;
+            if (generate(sys, job.user, text)) {
                 std::lock_guard<std::mutex> lk(mu);
                 if (done.size() < cfg.max_results) done[job.key] = std::move(text);
             }
@@ -301,10 +308,15 @@ void NarrativeHost::stop() {
 bool NarrativeHost::active() const { return impl_->ready.load(); }
 
 void NarrativeHost::submit(std::uint64_t key, const std::string& summary) {
+    submit_prompt(key, "", summary);
+}
+
+void NarrativeHost::submit_prompt(std::uint64_t key, const std::string& sys,
+                                  const std::string& user) {
     if (!active()) return;
     std::lock_guard<std::mutex> lk(impl_->mu);
     if (impl_->queue.size() >= impl_->cfg.max_queue) impl_->queue.pop_front();
-    impl_->queue.push_back({key, summary});
+    impl_->queue.push_back({key, sys, user});
     impl_->cv.notify_one();
 }
 

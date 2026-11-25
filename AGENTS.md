@@ -860,6 +860,23 @@ no engine code changes.
   `DriverState.brain_control = true` is now the viewer default
   (ctor + reset_view) — CL-1 sparse-advisor + social floor drives
   sapients; `brain_shadow` hooks still train the WM on every interact.
+- Continuous Chronicle (Biên Niên Sử, viewer-side): salient ledger facts
+  collected inside `llm_scan` accumulate in `chron_facts`; `chron_tick`
+  flushes a chapter every ~300 ticks (>=2 facts) or immediately on a
+  catastrophic trigger (first-seen entity kind, last sapient dying).
+  `NarrativeHost::submit_prompt(key, sys, user)` (new API; `submit`
+  unchanged) sends the chapter prompt — system prompt enforces
+  truth-to-facts + title-line/prose format; user prompt carries
+  `[Previous passage]` = `chron_tail` (last ~3 sentences of the prior
+  chapter) + world context + the fact list. Finished chapters parse
+  title/body, append to `saves/chronicle_<world_seed>.md`
+  (`### [t0 – t1] title` + `*(Dữ kiện gốc: ...)*` footer) and reload on
+  world attach via `chron_load` (called from `planet_setup`, before the
+  valley early-return). UI: chapters listed chronologically in the
+  Chronicle window — click flies the camera (smooth `cam_goal` lerp in
+  frame()), "Export .md" copies the path. Config defaults bumped:
+  `max_new_tokens` 48->192, `n_ctx` 1024->2048 (one-liners still stop at
+  EOG). All presentation-only — state_hash untouched.
 
 ## CL-1 Phase 4 — 100% neural CL-1 + persistent GenePool
 

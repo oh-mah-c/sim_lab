@@ -41,6 +41,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -237,6 +238,32 @@ struct Viewer {
     std::unordered_map<std::uint64_t, NarrativeLine> llm_pending;  // key -> line stub
     std::deque<std::uint64_t> llm_outstanding;                     // FIFO poll order
     std::unordered_map<std::uint64_t, std::uint64_t> llm_last_tell; // actor^class -> tick
+    // ---- Continuous Chronicle (Biên Niên Sử): batched LLM chapters --------
+    // Salient ledger events accumulate as facts; every ~300 ticks (or on a
+    // catastrophic trigger) they are composed into ONE chapter prompt that
+    // carries the previous chapter's tail for narrative continuity. Finished
+    // chapters append to saves/chronicle_<world_seed>.md — presentation
+    // only, never touches World state or state_hash().
+    struct ChapterFact { std::uint64_t tick; std::string text; Vec2 pos; };
+    struct ChronicleChapter {
+        std::uint64_t tick0 = 0, tick1 = 0;
+        std::string title, body, facts;
+        Vec2 pos{};
+    };
+    struct ChapterStub { std::uint64_t tick0 = 0, tick1 = 0; Vec2 pos{}; std::string facts; };
+    std::vector<ChapterFact> chron_facts;
+    std::set<std::string> chron_kinds;          // every kind ever seen (new-species trigger)
+    std::uint64_t chron_win_start = 0;
+    bool chron_catastrophic = false;
+    std::vector<ChronicleChapter> chron_chapters;   // oldest -> newest (memory cap)
+    std::unordered_map<std::uint64_t, ChapterStub> llm_ch_pending;
+    std::deque<std::uint64_t> llm_ch_outstanding;
+    std::string chron_tail;                     // last ~3 sentences of prev chapter
+    std::string chron_path;                     // saves/chronicle_<seed>.md
+    int chron_open = -1;                        // expanded chapter row (-1 none)
+    // smooth camera fly-to (chapter click)
+    bool cam_goal = false;
+    float cam_gx = 0, cam_gy = 0, cam_gz = 1;
     // ---- CL-1 Phase 4: persistent gene pool + god-tools ----------------------
     // Hall of Fame survives world resets/wipeouts: fresh brains derive from
     // it deterministically (World::gene_pool is read-only world input, never
@@ -537,6 +564,7 @@ struct Viewer {
     static constexpr double kPI = 3.14159265358979323846;
     bool is_planet() const { return planet_w > 0; }
     void planet_setup() {
+        chron_load(w);   // reload this world's Biên Niên Sử + narrative tail
         planet_w = planet_h = 0; globe = false; globe_dive = false;
         clear_gchunks();
         int pw_ = 0, ph_ = 0;
@@ -2817,6 +2845,52 @@ struct Viewer {
             if (sel) ImGui::PopStyleColor();
         }
         ImGui::Separator();
+        // ---- Continuous Chronicle chapters (Biên Niên Sử) -------------------
+        // Long-form LLM chapters in chronological order; click flies the
+        // camera to the chapter's event centroid, Export copies the .md path.
+        if (!chron_chapters.empty()) {
+            ImGui::TextDisabled("Biên Niên Sử — %zu chapters", chron_chapters.size());
+            if (ImGui::SmallButton("Export .md") && !chron_path.empty()) {
+                SDL_SetClipboardText(chron_path.c_str());
+                status_msg = "Chronicle path copied: " + chron_path;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", chron_path.c_str());
+            ImGui::Separator();
+            ImGuiListClipper cclip;
+            cclip.Begin(static_cast<int>(chron_chapters.size()));
+            while (cclip.Step()) {
+                for (int ci = cclip.DisplayStart; ci < cclip.DisplayEnd; ++ci) {
+                    const ChronicleChapter& c = chron_chapters[ci];
+                    ImGui::PushID(2000000 + ci);
+                    char label[192];
+                    std::snprintf(label, sizeof label, "[d%llu–d%llu] %s",
+                        (unsigned long long)(c.tick0 / 24 + 1),
+                        (unsigned long long)(c.tick1 / 24 + 1), c.title.c_str());
+                    if (ImGui::Selectable(label, chron_open == ci,
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                        chron_open = (chron_open == ci) ? -1 : ci;
+                        cam_gx = float(c.pos.x); cam_gy = float(c.pos.y);
+                        cam_gz = 0.9f; cam_goal = true;
+                        if (globe) { globe = false; globe_dive = false; }
+                    }
+                    if (chron_open == ci) {
+                        ImGui::Indent(12.f);
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.84f, 0.9f, 1));
+                        ImGui::TextWrapped("%s", c.body.c_str());
+                        if (!c.facts.empty()) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1));
+                            ImGui::TextWrapped("Facts: %s", c.facts.c_str());
+                            ImGui::PopStyleColor();
+                        }
+                        ImGui::PopStyleColor();
+                        ImGui::Unindent(12.f);
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::Separator();
+        }
         // filtered view, newest first — cfeed is UI-thread only, no lock needed
         std::vector<const NarrativeLine*> rows;
         rows.reserve(cfeed.lines.size());
@@ -3286,6 +3360,222 @@ struct Viewer {
                a == "perceive" || a == "witness" || a == "advance_ticks" ||
                a == "flush_needs";
     }
+    // ---- Continuous Chronicle: chapter batching ------------------------------
+    // System prompt tuned for a small instruct model: strict truthfulness to
+    // the supplied facts, epic continuity with the previous passage, and a
+    // rigid "title line + prose" output format.
+    static const char* kChapterSys() {
+        return "You are the Historian of Sunnyworld — a silent observer "
+               "recording the evolution, survival and extinction of its "
+               "creatures.\n"
+               "ABSOLUTE RULES:\n"
+               "1. TRUTHFUL TO THE RECORD: narrate ONLY from the facts "
+               "provided (names, species, deaths, births, disasters). NEVER "
+               "invent characters, magic, or events absent from the data.\n"
+               "2. EPIC CONTINUITY: continue naturally from the Previous "
+               "passage so the chronicle reads as one unbroken history. Use "
+               "solemn, vivid prose.\n"
+               "3. REQUIRED FORMAT:\n"
+               "Line 1: a short chapter title (at most 8 words, no quotes).\n"
+               "Following lines: one chronicle paragraph of 3 to 5 sentences "
+               "(no bullet lists, no meta commentary).";
+    }
+    static std::string chron_trim(const std::string& s) {
+        std::size_t a = s.find_first_not_of(" \t\r\n");
+        std::size_t b = s.find_last_not_of(" \t\r\n");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    }
+    // Last ~3 sentences of a chapter body, for prompt continuity.
+    static std::string chron_tail_of(const std::string& body) {
+        if (body.size() <= 340) return body;
+        std::string t = body.substr(body.size() - 340);
+        const std::size_t dot = t.find(". ");
+        if (dot != std::string::npos) t = t.substr(dot + 2);
+        return chron_trim(t);
+    }
+    void chron_load(const World& w) {
+        chron_facts.clear(); chron_chapters.clear();
+        llm_ch_pending.clear(); llm_ch_outstanding.clear();
+        chron_tail.clear(); chron_catastrophic = false; chron_open = -1;
+        chron_kinds.clear();
+        for (const auto& ep : w.entities)
+            if (ep->alive) chron_kinds.insert(std::string(ep->kind_name));
+        chron_win_start = w.clock_.tick();
+        chron_path = "saves/chronicle_" + std::to_string(w.world_seed) + ".md";
+        std::ifstream f(chron_path);
+        if (!f) return;
+        // Parse "### [t0 – t1] title" sections; the trailing
+        // "*(Dữ kiện gốc: ...)" line is stored separately as raw facts.
+        std::string line, title, body, facts;
+        std::uint64_t t0 = 0, t1 = 0;
+        bool have = false;
+        auto flush_sec = [&]() {
+            if (!have) return;
+            ChronicleChapter c;
+            c.tick0 = t0; c.tick1 = t1; c.title = chron_trim(title);
+            std::string b = chron_trim(body);
+            const std::string mark = "*(Dữ kiện gốc:";
+            const std::size_t fp = b.rfind(mark);
+            if (fp != std::string::npos && b.find('\n', fp) == std::string::npos) {
+                c.facts = chron_trim(b.substr(fp + mark.size(),
+                    b.size() - fp - mark.size() - (b.back() == ')' ? 2 : 1)));
+                b = chron_trim(b.substr(0, fp));
+            }
+            c.body = b;
+            if (!c.body.empty()) chron_chapters.push_back(std::move(c));
+        };
+        while (std::getline(f, line)) {
+            if (line.rfind("### [", 0) == 0) {
+                flush_sec();
+                have = true; body.clear(); facts.clear(); title.clear();
+                const std::size_t rb = line.find(']');
+                const std::size_t sep = line.find('\xE2');   // en-dash in "t0 – t1"
+                std::uint64_t a = 0, b2 = 0;
+                if (sep != std::string::npos) {
+                    a = std::strtoull(line.c_str() + 5, nullptr, 10);
+                    b2 = std::strtoull(line.c_str() + sep + 3, nullptr, 10);
+                } else {
+                    const std::size_t dash = line.find('-');
+                    if (dash != std::string::npos) {
+                        a = std::strtoull(line.c_str() + 5, nullptr, 10);
+                        b2 = std::strtoull(line.c_str() + dash + 1, nullptr, 10);
+                    }
+                }
+                t0 = a; t1 = b2;
+                if (rb != std::string::npos) title = line.substr(rb + 1);
+            } else if (have) {
+                body += line; body += '\n';
+            }
+        }
+        flush_sec();
+        if (chron_chapters.size() > 500) {          // memory cap; file keeps all
+            chron_chapters.erase(chron_chapters.begin(),
+                chron_chapters.end() - 500);
+        }
+        if (!chron_chapters.empty())
+            chron_tail = chron_tail_of(chron_chapters.back().body);
+    }
+    void chron_append(const ChronicleChapter& c) {
+        std::error_code ec;
+        std::filesystem::create_directories("saves", ec);
+        std::ofstream f(chron_path, std::ios::app);
+        if (!f) return;
+        f << "### [" << c.tick0 << " \xE2\x80\x93 " << c.tick1 << "] "
+          << c.title << "\n" << c.body << "\n";
+        if (!c.facts.empty()) f << "*(Dữ kiện gốc: " << c.facts << ")*\n";
+        f << "\n";
+    }
+    // Window check + catastrophic flush; called under the world lock.
+    void chron_tick(const World& w) {
+        const std::uint64_t now = w.clock_.tick();
+        if (chron_facts.empty()) {
+            if (!chron_catastrophic) chron_win_start = now;
+            return;
+        }
+        const bool due = now - chron_win_start >= 300 && chron_facts.size() >= 2;
+        if (!due && !chron_catastrophic) return;
+        chron_catastrophic = false;
+        // ---- compose the chapter prompt -------------------------------------
+        std::uint64_t alive = 0, minds = 0;
+        std::set<std::string> species;
+        for (const auto& ep : w.entities) {
+            if (!ep->alive) continue;
+            ++alive;
+            species.insert(std::string(ep->kind_name));
+        }
+        minds = w.minds_.size();
+        std::string facts;
+        std::string facts_short;
+        std::int64_t sx = 0, sy = 0;
+        std::size_t used = 0;
+        const std::size_t n = chron_facts.size();
+        for (std::size_t i = 0; i < n && used < 2000; ++i) {
+            std::string t = chron_facts[i].text;
+            if (t.size() > 150) t = t.substr(0, 147) + "...";
+            const std::string line = "- " + t + "\n";
+            if (used + line.size() > 2000 && i > 0) break;   // keep chronological head
+            facts += line; used += line.size();
+            if (facts_short.size() < 280) {
+                if (!facts_short.empty()) facts_short += "; ";
+                facts_short += t;
+            }
+            sx += chron_facts[i].pos.x; sy += chron_facts[i].pos.y;
+        }
+        const std::uint64_t t0 = chron_facts.front().tick;
+        const std::uint64_t t1 = chron_facts.back().tick;
+        std::string user = std::string("[Previous passage]:\n") +
+            (chron_tail.empty() ? std::string("(The chronicle begins here.)")
+                                : chron_tail) + "\n\n";
+        user += "[World context — cycles " + std::to_string(t0) + " -> " +
+                std::to_string(t1) + "]:\n";
+        user += "Survivors: " + std::to_string(alive) + " | Species: " +
+                std::to_string(species.size()) + " | Minds: " +
+                std::to_string(minds) + "\n\n";
+        user += "[Events of this chapter]:\n" + facts + "\n";
+        user += "Write the next chronicle chapter:\n";
+        ChapterStub stub;
+        stub.tick0 = t0; stub.tick1 = t1;
+        stub.pos = n ? Vec2{std::int32_t(sx / std::int64_t(n)),
+                            std::int32_t(sy / std::int64_t(n))} : Vec2{};
+        stub.facts = facts_short;
+        const std::uint64_t key = ++llm_key_seq;
+        llm_ch_pending.emplace(key, std::move(stub));
+        llm_ch_outstanding.push_back(key);
+        llm_host.submit_prompt(key, kChapterSys(), user);
+        chron_facts.clear();
+        chron_win_start = now;
+    }
+    void llm_ch_drain() {
+        if (llm_ch_outstanding.empty()) return;
+        std::deque<std::uint64_t> keep;
+        for (std::uint64_t key : llm_ch_outstanding) {
+            std::string text;
+            if (!llm_host.poll(key, text)) { keep.push_back(key); continue; }
+            auto it = llm_ch_pending.find(key);
+            if (it == llm_ch_pending.end()) continue;    // stale (world reset)
+            // Format: line 1 = title, rest = prose.
+            ChronicleChapter c;
+            const ChapterStub stub = it->second;
+            c.tick0 = stub.tick0; c.tick1 = stub.tick1;
+            c.pos = stub.pos; c.facts = stub.facts;
+            const std::size_t nl = text.find('\n');
+            if (nl == std::string::npos) {
+                c.body = chron_trim(text);
+                c.title = "Chronicle " + std::to_string(c.tick0) +
+                          "-" + std::to_string(c.tick1);
+            } else {
+                c.title = chron_trim(text.substr(0, nl));
+                c.body = chron_trim(text.substr(nl + 1));
+                // strip a leading "Title:"/"#"/markdown echo if the model added one
+                if (c.title.rfind("Title:", 0) == 0 ||
+                    c.title.rfind("title:", 0) == 0)
+                    c.title = chron_trim(c.title.substr(6));
+                while (!c.title.empty() &&
+                       (c.title.front() == '#' || c.title.front() == '*' ||
+                        c.title.front() == '"' || c.title.front() == '\''))
+                    c.title.erase(c.title.begin());
+                while (!c.title.empty() &&
+                       (c.title.back() == '*' || c.title.back() == '"' ||
+                        c.title.back() == '\''))
+                    c.title.pop_back();
+                c.title = chron_trim(c.title);
+                if (c.title.size() > 80) c.title = c.title.substr(0, 77) + "...";
+                if (c.title.empty()) c.title = "Chapter " +
+                    std::to_string(c.tick0) + "-" + std::to_string(c.tick1);
+            }
+            if (c.body.empty()) { llm_ch_pending.erase(it); continue; }
+            chron_append(c);
+            chron_tail = chron_tail_of(c.body);
+            chron_chapters.push_back(std::move(c));
+            if (chron_chapters.size() > 500)
+                chron_chapters.erase(chron_chapters.begin(),
+                                      chron_chapters.begin() +
+                                      (chron_chapters.size() - 500));
+            llm_ch_pending.erase(it);
+        }
+        llm_ch_outstanding.swap(keep);
+    }
+
     void llm_scan(const World& w) {
         // While the model is still loading, fast-forward the cursor so the
         // first active scan doesn't replay (and drop) the whole backlog.
@@ -3357,6 +3647,27 @@ struct Viewer {
             llm_pending.emplace(key, l);
             llm_outstanding.push_back(key);
             llm_host.submit(key, s);
+            // Continuous chronicle: batch this fact into the next chapter.
+            // Catastrophic triggers flush the window immediately: a kind
+            // seen for the first time, or the last sapient dying out.
+            if (chron_facts.size() < 64) {
+                chron_facts.push_back({ev.tick, s, l.pos});
+                for (EntityId sid : ev.spawned)
+                    if (const Entity* se = w.find(sid))
+                        if (chron_kinds.insert(std::string(se->kind_name)).second)
+                            chron_catastrophic = true;
+                if (death) {
+                    const Entity* dead = (ae && !ae->alive) ? ae : be;
+                    if (dead && dead->kind_name == SIMLAB_KIND("sapient")) {
+                        bool any_sapient = false;
+                        for (EntityId sid : w.entities_of_kind(SIMLAB_KIND("sapient")))
+                            if (const Entity* se = w.find(sid); se && se->alive) {
+                                any_sapient = true; break;
+                            }
+                        if (!any_sapient) chron_catastrophic = true;
+                    }
+                }
+            }
             ++made;
         }
     }
@@ -3515,7 +3826,7 @@ struct Viewer {
                 }
                 // LLM chronicler: same incremental ledger scan, salient events
                 // only; results re-enter cfeed tagged llm=true.
-                if (frames % 4 == 2) { llm_scan(w); llm_drain(); }
+                if (frames % 4 == 2) { llm_scan(w); llm_drain(); chron_tick(w); llm_ch_drain(); }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
                     c_av_verbs.clear(); c_av_line.clear();
@@ -3558,6 +3869,15 @@ struct Viewer {
         poll_world();
         t_cap = ms(t); t = clk::now();
         globe_step(dt);
+        // smooth camera fly-to (chronicle chapter click): ease cx/cy/zoom
+        if (cam_goal) {
+            const float k = std::min(1.f, float(dt) * 3.5f);
+            cam.cx += (cam_gx - cam.cx) * k;
+            cam.cy += (cam_gy - cam.cy) * k;
+            cam.zoom += (cam_gz - cam.zoom) * k;
+            if (std::abs(cam_gx - cam.cx) < 0.6f && std::abs(cam_gy - cam.cy) < 0.6f &&
+                std::abs(cam_gz - cam.zoom) < 0.01f) cam_goal = false;
+        }
         if (!has_game) {
             draw_title_globe(dt);
         } else if (globe) {
