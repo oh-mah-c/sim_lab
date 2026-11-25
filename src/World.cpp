@@ -500,7 +500,13 @@ void World::advance_ticks(std::int64_t n) {
         // plus heat physics and its own memory decay. The rest of the local
         // world stays frozen for the few ticks a plan spans.
         flush_needs(minded_entities());
-        dissipate_heat(n); decay_minds(n);
+        dissipate_heat(n);
+        // Primordial worlds: an imagined future does not forget. Decaying the
+        // thinker's engrams here forced a copy-on-write of its WHOLE memory
+        // map in every speculative clone (thousands of snapshots each), which
+        // spiked RSS by hundreds of MB on planet-sized maps. Legacy worlds keep
+        // the original behaviour (and their exact state_hash).
+        if (!(ruleset & kRulePrimordial)) decay_minds(n);
         return;
     }
     metabolize(n); dissipate_heat(n); ecology_tick(n);
@@ -534,7 +540,59 @@ World::NeedProps World::need_props() const {
     np.brain_accum = pid("mind_brain_accum");
     np.yield_penalty = pid("yield_penalty");
     np.soil_nutrient = pid("soil_nutrient");
+    np.growth = pid("growth");           np.growth_ticks = pid("growth_ticks");
+    np.irrigation_credit = pid("irrigation_credit");
     return np;
+}
+
+// ---- Phase 17: seasons, trophic ranges & flora seasonality -----------------
+// Clock contract: 1 tick = 1 hour, 24 ticks/day, 28 days/season -> a season
+// is exactly 672 ticks and the year 2688, so season index = (tick/672)%4.
+static std::int64_t eco_season(std::uint64_t tick) {
+    return static_cast<std::int64_t>((tick / 672) % 4);
+}
+// Seasonal climate wave applied to RANGE decisions only: winter bites the
+// growing bands, summer pushes warmth poleward. deci-°C offset added to
+// static terrain temperature — physiology/vector dormancy keep raw fields.
+static std::int64_t eco_season_temp(std::int64_t s) {
+    switch (s) { case 0: return 0; case 1: return 40; case 2: return -20;
+                 default: return -90; }
+}
+// Ticks spent in each season over [from,now] — at most ~n/672+1 segments,
+// so even a huge dormant catch-up stays cheap and exact.
+static void eco_season_counts(std::uint64_t from, std::uint64_t now,
+                              std::int64_t c[4]) {
+    c[0] = c[1] = c[2] = c[3] = 0;
+    for (std::uint64_t p = from; p <= now;) {
+        const std::int64_t s = eco_season(p);
+        std::uint64_t end = ((p / 672) + 1) * 672 - 1;
+        if (end > now) end = now;
+        c[s] += static_cast<std::int64_t>(end - p + 1);
+        p = end + 1;
+    }
+}
+// Diurnal/nocturnal/crepuscular activity gate on the tick's hour.
+static bool eco_phase_active(std::int64_t phase, std::int64_t hour) {
+    switch (phase) {
+        case 1: return hour >= 6 && hour < 18;                 // diurnal
+        case 2: return hour >= 18 || hour < 6;                 // nocturnal
+        case 3: return (hour >= 5 && hour < 8) ||
+                       (hour >= 17 && hour < 20);             // crepuscular
+        default: return true;
+    }
+}
+// Season-weighted regrowth permille for a declared growing_mask
+// (bit s = season s); dormant seasons scale by `dormant`. Linear in the
+// window, so batched dormant catch-up is bit-identical to per-tick.
+static std::int64_t eco_growth_permille(std::int64_t mask, std::int64_t dormant,
+                                        std::uint64_t from, std::uint64_t now) {
+    if (from > now) return 1000;
+    std::int64_t c[4];
+    eco_season_counts(from, now, c);
+    std::int64_t total = 0;
+    for (int s = 0; s < 4; ++s)
+        total += c[s] * (((mask >> s) & 1) ? 1000 : dormant);
+    return total / static_cast<std::int64_t>(now - from + 1);
 }
 
 // Per-entity need drift for dt ticks — the SAME math whether the entity is
@@ -543,9 +601,22 @@ World::NeedProps World::need_props() const {
 // window so a mid-window threshold crossing damages exactly the starving
 // ticks. integrity 0 reaps immediately inside the same causal event.
 bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
-                        CausalEvent& ev) {
+                        CausalEvent& ev, std::uint64_t now) {
     if (dt_u == 0 || !e.alive) return false;
     const std::int64_t dt = static_cast<std::int64_t>(dt_u);
+    // Phase 17: a declared growing_mask (species data, bits = seasons)
+    // scales flora regrowth; off-seasons run at dormant_growth_permille.
+    // The window is season-weighted so batched catch-up stays exact.
+    std::int64_t grow_eff = 1000;
+    {
+        const PropId p_gmask = SIMLAB_PID(props, "growing_mask");
+        if (p_gmask != kNoProp && prop_of(e, p_gmask)) {
+            const PropId p_dorm = SIMLAB_PID(props, "dormant_growth_permille");
+            const std::uint64_t from = dt_u <= now ? now - dt_u + 1 : 0;
+            grow_eff = eco_growth_permille(prop_int(e, p_gmask, 15),
+                p_dorm != kNoProp ? prop_int(e, p_dorm, 400) : 400, from, now);
+        }
+    }
     constexpr std::int64_t kDefaultMetabolism = 2000;
     bool touched = false;
     auto bump = [&](PropId p, std::int64_t rate) {
@@ -766,7 +837,10 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                         std::clamp<std::int64_t>(1000 - dev * 4, 0, 1000);
                     env = moist * tf / 1000;
                 }
-                net += prop_int(e, np.regrow_rate, 0) * env / 1000;
+                std::int64_t grow =
+                    prop_int(e, np.regrow_rate, 0) * env / 1000;
+                grow = grow * grow_eff / 1000;
+                net += grow;
             }
             if (has_frot && cur > 0)      // nothing left to rot at 0
                 net -= prop_int(e, np.fruit_decay_rate, 0);
@@ -799,6 +873,41 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             }
         }
     }
+    // Cultivation (Phase 18): `growth` accrues toward `growth_ticks` — a
+    // sown crop is barren until mature. `irrigation_credit` is watered-soil
+    // time left; it burns down linearly and lifts the effective moisture
+    // the fruit drift reads below. Both are plain integer props advanced
+    // by dt, so batched dormant catch-up is bit-identical to per-tick.
+    if (np.growth != kNoProp && np.growth_ticks != kNoProp &&
+        prop_of(e, np.growth) && prop_of(e, np.growth_ticks)) {
+        const std::int64_t gt = prop_int(e, np.growth_ticks, 0);
+        const std::int64_t g0 = prop_int(e, np.growth, 0);
+        if (gt > 0 && g0 < gt) {
+            const std::int64_t g1 = std::min(gt, g0 + dt);
+            StateChange ch;
+            ch.entity = e.id; ch.prop = np.growth;
+            ch.had_before = true;
+            ch.before = Value::integer(g0);
+            ch.after = Value::integer(g1);
+            e.props.set(np.growth, ch.after);
+            ev.changes.push_back(ch);
+            touched = true;
+        }
+        if (np.irrigation_credit != kNoProp && prop_of(e, np.irrigation_credit)) {
+            const std::int64_t ic0 = prop_int(e, np.irrigation_credit, 0);
+            if (ic0 > 0) {
+                const std::int64_t ic1 = std::max<std::int64_t>(0, ic0 - dt);
+                StateChange ch;
+                ch.entity = e.id; ch.prop = np.irrigation_credit;
+                ch.had_before = true;
+                ch.before = Value::integer(ic0);
+                ch.after = Value::integer(ic1);
+                e.props.set(np.irrigation_credit, ch.after);
+                ev.changes.push_back(ch);
+                touched = true;
+            }
+        }
+    }
     // Fruiting flora — two-layer food drift. `fruit_count` on the branch
     // regrows toward `max_fruit` at `fruit_regrow_rate` (env-scaled like
     // quantity regrowth) and spoils at `fruit_spoil_rate` — floored at 0,
@@ -819,8 +928,14 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             if (has_freg && cur < mx) {
                 std::int64_t env = 500;
                 if (!terrain.empty() && terrain.contains(e.pos)) {
-                    const std::int64_t moist =
+                    std::int64_t moist =
                         std::clamp<std::int64_t>(terrain.moist_at(e.pos), 0, 1000);
+                    // watered soil (Phase 18): `irrigation_credit` ticks of
+                    // irrigation lift the moisture this plant's fruit drift
+                    // sees — a channelled field fruits where rain will not.
+                    if (np.irrigation_credit != kNoProp)
+                        moist = std::max(moist,
+                            prop_int(e, np.irrigation_credit, 0) > 0 ? 950 : moist);
                     const std::int64_t temp = terrain.temp_at(e.pos);
                     const std::int64_t dev = temp > 200 ? temp - 200 : 200 - temp;
                     const std::int64_t tf =
@@ -829,6 +944,15 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                 }
                 std::int64_t regen =
                     prop_int(e, np.fruit_regrow_rate, 0) * env / 1000;
+                regen = regen * grow_eff / 1000;
+                // juvenile plants (Phase 18): `growth` below `growth_ticks`
+                // means the crop has not fruited yet — sowing is an
+                // investment, not an instant harvest.
+                if (np.growth_ticks != kNoProp &&
+                    prop_of(e, np.growth_ticks)) {
+                    const std::int64_t gt = prop_int(e, np.growth_ticks, 0);
+                    if (gt > 0 && prop_int(e, np.growth, 0) < gt) regen = 0;
+                }
                 // Phase 11.2: blight yield penalty and ash-fertilized soil
                 // modulate the same rate — both World-Truth props, both
                 // constant across a drift window (LOD-safe).
@@ -895,9 +1019,30 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     if (np.decay_rate != kNoProp && np.decay_credit != kNoProp &&
         np.integrity != kNoProp && prop_of(e, np.integrity)) {
         const Value* dv = prop_of(e, np.decay_rate);
-        const std::int64_t rate = dv && (dv->type == ValType::Integer ||
-                                         dv->type == ValType::Fixed)
+        std::int64_t rate = dv && (dv->type == ValType::Integer ||
+                                   dv->type == ValType::Fixed)
             ? dv->i : 0;
+        // Granary seal (Phase 18): a contained good inside a sealed store
+        // (`part_of` an enclosure carrying `granary_seal`) rots slower —
+        // dry, dark storage is what makes a surplus survive to winter.
+        if (rate > 0) {
+            const PropId p_cont = SIMLAB_PID(props, "contained");
+            const PropId p_seal = SIMLAB_PID(props, "granary_seal");
+            if (p_cont != kNoProp && p_seal != kNoProp) {
+                const Value* cv = prop_of(e, p_cont);
+                if (cv && cv->type == ValType::Boolean && cv->b) {
+                    for (const Relation& rel : relations_of(e.id, "part_of")) {
+                        const EntityId hid = rel.a == e.id ? rel.b : rel.a;
+                        const Entity* host = find(hid);
+                        if (!host || !host->alive) continue;
+                        const std::int64_t seal = prop_int(*host, p_seal, 0);
+                        if (seal > 0)
+                            rate = rate * (1000 - std::min<std::int64_t>(seal, 900)) / 1000;
+                        break;
+                    }
+                }
+            }
+        }
         if (rate > 0) {
             const std::int64_t cur = prop_int(e, np.integrity, 0);
             const std::int64_t c0 = prop_int(e, np.decay_credit, 0);
@@ -1000,13 +1145,13 @@ void World::flush_needs(const std::vector<EntityId>& ids) {
         if (pending > 1 && physiology_coupled(e)) {
             for (std::uint64_t k = 0; k < pending && e.alive; ++k) {
                 const std::uint64_t sub_now = now - pending + k + 1;
-                if (drift_needs(e, 1, np, ev)) drifted = true;
+                if (drift_needs(e, 1, np, ev, sub_now)) drifted = true;
                 anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
                 morale_drift(e, 1, ev);
             }
         } else {
-            drifted = drift_needs(e, pending, np, ev);
+            drifted = drift_needs(e, pending, np, ev, now);
             // Phase 10: circulation runs for every living entity that carries
             // blood_volume — independent of the need-prop prefilter above.
             anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
@@ -1741,7 +1886,33 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
                     (env_t - normal - 10));
             if (env_m > 700) pull += 60;
             if (!terrain.empty() && terrain.contains(e.pos) &&
-                terrain.is_water(e.pos)) pull += 80;
+                terrain.is_water(e.pos)) {
+                pull += 80;
+                // Primordial immersion: a ford wets ankles, a swim floods
+                // the chest — deeper water exposes more of the body, so the
+                // core is pulled toward the water's temperature harder.
+                // Wade-depth keeps the flat bonus; anyone aboard a craft
+                // is not immersed (same depth rule as lawutil::water_depth).
+                if ((ruleset & kRulePrimordial) != 0) {
+                    const std::size_t wi = terrain.index(e.pos);
+                    const std::uint8_t wt = terrain.water[wi];
+                    std::int64_t dep = 0;
+                    if (wt == 2) dep = 12;                       // river
+                    else if (wt == 1) {                          // sea / lake
+                        const std::int64_t below =
+                            static_cast<std::int64_t>(gen_sea_level) -
+                            terrain.elevation[wi];
+                        dep = below <= 0 ? 40
+                                         : std::max<std::int64_t>(20, below);
+                    }
+                    bool immersed = dep > 25;
+                    if (immersed)
+                        for (const Relation& ar : relations_of(e.id, "aboard"))
+                            if (ar.a == e.id) { immersed = false; break; }
+                    if (immersed)
+                        pull += std::min<std::int64_t>(140, (dep - 25) * 2);
+                }
+            }
             if (energy_r < 20000) pull += 120;
             pull = std::min<std::int64_t>(1000, pull);
             std::int64_t target = normal +
@@ -2840,7 +3011,7 @@ void World::metabolize(std::int64_t dt) {
             // batched catch-up stays bit-identical to advance(1) x N.
             for (std::uint64_t k = 0; k < pending && e.alive; ++k) {
                 const std::uint64_t sub_now = now - pending + k + 1;
-                if (drift_needs(e, 1, np, ev)) drifted = true;
+                if (drift_needs(e, 1, np, ev, sub_now)) drifted = true;
                 anatomy_drift(e, 1, sub_now, ev, shed_pools, &drift_spawns);
                 epidemiology_drift(e, 1, sub_now, ev, drift_spawns);
                 morale_drift(e, 1, ev);
@@ -2853,7 +3024,7 @@ void World::metabolize(std::int64_t dt) {
                 }
             }
         } else {
-            drifted = drift_needs(e, pending, np, ev);
+            drifted = drift_needs(e, pending, np, ev, now);
             // Phase 10: circulation for blood_volume carriers.
             anatomy_drift(e, pending, now, ev, shed_pools, &drift_spawns);
             epidemiology_drift(e, static_cast<std::int64_t>(pending), now, ev,
@@ -4106,7 +4277,36 @@ void World::ecology_tick(std::int64_t n) {
     const bool do_drops = p_drops != kNoProp && p_drops_done != kNoProp;
     const bool do_sprout = p_sprout_target != kNoProp && p_sprout_since != kNoProp &&
                           p_sprout_rate != kNoProp;
-    if (!do_drops && !do_sprout && influx.defs().empty()) return;
+    // Trophic range drift must also keep this pass alive: a world with no
+    // seed bank and no influx zones still owes its migrants their fires.
+    // The entity scan only runs in that rare all-empty case.
+    bool range_maybe = false;
+    bool husb_maybe = false;
+    if (!do_drops && !do_sprout && influx.defs().empty()) {
+        const PropId p_mig0 = pid("migration_drive");
+        const PropId p_terr0 = pid("territorial_radius");
+        const PropId p_hy0 = pid("milk_yield");
+        const PropId p_wy0 = pid("wool_yield");
+        const PropId p_sa0 = pid("scent_alert_radius");
+        if (p_mig0 != kNoProp || p_terr0 != kNoProp || p_hy0 != kNoProp ||
+            p_wy0 != kNoProp || p_sa0 != kNoProp) {
+            for (const auto& ep : entities) {
+                const Entity& e = *ep;
+                if (!e.alive) continue;
+                if (!terrain.empty() &&
+                    ((p_mig0 != kNoProp && prop_int(e, p_mig0, 0) > 0) ||
+                     (p_terr0 != kNoProp && prop_int(e, p_terr0, 0) > 0)))
+                    range_maybe = true;
+                if ((p_hy0 != kNoProp && prop_int(e, p_hy0, 0) > 0) ||
+                    (p_wy0 != kNoProp && prop_int(e, p_wy0, 0) > 0) ||
+                    (p_sa0 != kNoProp && prop_int(e, p_sa0, 0) > 0))
+                    husb_maybe = true;
+                if (range_maybe && husb_maybe) break;
+            }
+        }
+    }
+    if (!do_drops && !do_sprout && influx.defs().empty() && !range_maybe &&
+        !husb_maybe) return;
 
     const std::uint64_t now = clock_.tick();
     const std::uint64_t from = now - static_cast<std::uint64_t>(n) + 1;
@@ -4230,6 +4430,417 @@ void World::ecology_tick(std::int64_t n) {
         }
     }
 
+    // ---- trophic ranges: seasonal migration & territorial drift -------------
+    // Species carrying migration_drive / territorial_radius (pure data
+    // props — no species names in code) sense the seasonal habitat
+    // gradient: their own declared condition bands evaluated against
+    // terrain fields plus the seasonal temperature offset. A fire moves
+    // the animal one step toward the best nearby cell, home when beyond
+    // its territory, or toward its herd when cohesion pulls. Fires run
+    // on a stateless per-entity hash schedule over [from,now] — identical
+    // to the influx contract, so dormant-LOD batching stays exact.
+    {
+        const PropId p_mig = pid("migration_drive");
+        const PropId p_terr = pid("territorial_radius");
+        const PropId p_cohes = pid("herd_cohesion");
+        const PropId p_ax = pid("anchor_x");
+        const PropId p_ay = pid("anchor_y");
+        const PropId p_phase = pid("activity_phase");
+        const bool do_range = (p_mig != kNoProp || p_terr != kNoProp) &&
+                              !terrain.empty();
+        if (do_range) {
+            struct Drifter { Entity* e; const SpeciesDef* sp; std::int64_t drive; };
+            std::vector<Drifter> drifters;
+            std::map<std::string, const SpeciesDef*> spcache;
+            for (auto& ep : entities) {
+                Entity& e = *ep;
+                if (!e.alive) continue;
+                const std::int64_t mig =
+                    p_mig != kNoProp ? prop_int(e, p_mig, 0) : 0;
+                const std::int64_t terr =
+                    p_terr != kNoProp ? prop_int(e, p_terr, 0) : 0;
+                const std::string kn = e.kind_name.str();
+                auto ci = spcache.find(kn);
+                if (ci == spcache.end())
+                    ci = spcache.emplace(kn, species.find_name(kn)).first;
+                if (!ci->second) continue;
+                if (mig <= 0 && terr <= 0) {
+                    // Phase 18: a tameable animal with no wild range still
+                    // follows its bonded partner — the bond check is gated
+                    // by tameability so plain wildlife never pays for it.
+                    const PropId p_tame0 = pid("tameability");
+                    if (p_tame0 == kNoProp ||
+                        prop_int(e, p_tame0, 0) <= 0) continue;
+                    bool has_bond = false;
+                    for (const Relation& rel : relations_of(e.id, "bonded")) {
+                        const EntityId o = rel.a == e.id ? rel.b : rel.a;
+                        const Entity* oe = find(o);
+                        if (oe && oe->alive) { has_bond = true; break; }
+                    }
+                    if (!has_bond) continue;
+                    drifters.push_back({&e, ci->second, 40});
+                    continue;
+                }
+                // territorial animals drift home slowly even with no
+                // migration drive; migrants use their declared rate.
+                drifters.push_back({&e, ci->second,
+                    std::max<std::int64_t>(mig, terr > 0 ? 25 : 0)});
+            }
+            // per-condition fit: 1000 inside the band, decaying with the
+            // overshoot (units differ per field — the multiplier is data
+            // tuning, the band itself comes from the species file).
+            auto field_fit = [](const std::string& f, std::int64_t v,
+                                std::int64_t lo, std::int64_t hi) -> std::int64_t {
+                if (v >= lo && v <= hi) return 1000;
+                const std::int64_t over = v < lo ? lo - v : v - hi;
+                std::int64_t k = 10;
+                if (f == "temperature") k = 4;
+                else if (f == "moisture" || f == "vegetation") k = 5;
+                else if (f == "elevation" || f == "water_table") k = 2;
+                else if (f == "near_water") return 0;
+                return std::max<std::int64_t>(0, 1000 - over * k);
+            };
+            auto suitability = [&](const Drifter& d, Vec2 p,
+                                   std::int64_t sdt) -> std::int64_t {
+                if (!terrain.contains(p) || terrain.is_water(p)) return -1;
+                std::int64_t sum = 0;
+                int n = 0;
+                for (const FormationCondition& c : d.sp->conditions) {
+                    std::int64_t v = 0;
+                    if (c.field == "temperature")
+                        v = terrain.temp_at(p) + sdt;
+                    else if (c.field == "moisture") v = terrain.moist_at(p);
+                    else if (c.field == "vegetation") v = terrain.veg_at(p);
+                    else if (c.field == "slope") v = terrain.slope_at(p);
+                    else if (c.field == "elevation") v = terrain.elev_at(p);
+                    else if (c.field == "water_table")
+                        v = terrain.water_table_at(p);
+                    else if (c.field == "near_water") {
+                        v = 0;
+                        for (int dy = -1; dy <= 1 && !v; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (!dx && !dy) continue;
+                                const Vec2 q{p.x + dx, p.y + dy};
+                                if (terrain.contains(q) && terrain.is_water(q)) {
+                                    v = 1; break;
+                                }
+                            }
+                    } else continue;    // fault/lithology/placer: not cues
+                    sum += field_fit(c.field, v, c.lo, c.hi);
+                    ++n;
+                }
+                return n ? sum / n : 500;   // no evaluable band: neutral
+            };
+            // two rings: a fine step for local polish and a coarse step
+            // that can actually cross a habitat gradient in one bound
+            // (terrain fields are per-cell, so skipping cells is safe —
+            // suitability is evaluated at the destination, not the path).
+            static const std::int32_t kDir[16][2] = {
+                {24,0},{-24,0},{0,24},{0,-24},
+                {17,17},{17,-17},{-17,17},{-17,-17},
+                {96,0},{-96,0},{0,96},{0,-96},
+                {68,68},{68,-68},{-68,68},{-68,-68}};
+            for (std::uint64_t t = from; t <= now && !drifters.empty(); ++t) {
+                const std::int64_t sdt = eco_season_temp(eco_season(t));
+                const std::int64_t hour = static_cast<std::int64_t>(t % 24);
+                for (Drifter& d : drifters) {
+                    Entity& e = *d.e;
+                    if (!e.alive) continue;
+                    const std::int64_t phase =
+                        p_phase != kNoProp ? prop_int(e, p_phase, 0) : 0;
+                    if (!eco_phase_active(phase, hour)) continue;
+                    const std::uint64_t h = Rng::stream_seed(seed,
+                        "range_drift",
+                        static_cast<std::uint64_t>(e.id) * 0x9E3779B97F4A7C15ull
+                            + t);
+                    if (h % 1000 >= static_cast<std::uint64_t>(d.drive)) continue;
+                    const std::int64_t terr =
+                        p_terr != kNoProp ? prop_int(e, p_terr, 0) : 0;
+                    // home anchor: first drift pins territorial_radius
+                    // around wherever the animal currently stands.
+                    if (terr > 0 && p_ax != kNoProp && p_ay != kNoProp &&
+                        (!prop_of(e, p_ax) || !prop_of(e, p_ay))) {
+                        for (int k = 0; k < 2; ++k) {
+                            const PropId ap = k ? p_ay : p_ax;
+                            if (prop_of(e, ap)) continue;
+                            const std::int64_t av =
+                                k ? static_cast<std::int64_t>(e.pos.y)
+                                  : static_cast<std::int64_t>(e.pos.x);
+                            StateChange ch;
+                            ch.entity = e.id; ch.prop = ap;
+                            ch.had_before = false;
+                            ch.before = Value::integer(0);
+                            ch.after = Value::integer(av);
+                            e.props.set(ap, ch.after);
+                            ev.changes.push_back(ch);
+                        }
+                    }
+                    Vec2 np = e.pos;
+                    bool moved = false;
+                    // bonded partner pull (Phase 18): a tamed animal follows
+                    // its bonded partner instead of ranging — husbandry
+                    // overrides wild territorial drift until the bond ends.
+                    EntityId bond_partner = kNoEntity;
+                    for (const Relation& rel : relations_of(e.id, "bonded")) {
+                        const EntityId o = rel.a == e.id ? rel.b : rel.a;
+                        const Entity* oe = find(o);
+                        if (oe && oe->alive) { bond_partner = o; break; }
+                    }
+                    const std::int64_t ax = p_ax != kNoProp
+                        ? prop_int(e, p_ax, e.pos.x) : e.pos.x;
+                    const std::int64_t ay = p_ay != kNoProp
+                        ? prop_int(e, p_ay, e.pos.y) : e.pos.y;
+                    const std::int64_t adx = ax - e.pos.x;
+                    const std::int64_t ady = ay - e.pos.y;
+                    if (bond_partner != kNoEntity) {
+                        const Entity* be = find(bond_partner);
+                        const std::int64_t bdx = be->pos.x - e.pos.x;
+                        const std::int64_t bdy = be->pos.y - e.pos.y;
+                        if (bdx * bdx + bdy * bdy > 24 * 24) {
+                            Vec2 c{static_cast<std::int32_t>(
+                                       e.pos.x + std::clamp<std::int64_t>(bdx, -24, 24)),
+                                   static_cast<std::int32_t>(
+                                       e.pos.y + std::clamp<std::int64_t>(bdy, -24, 24))};
+                            if (terrain.contains(c) && !terrain.is_water(c)) {
+                                np = c; moved = true;
+                            }
+                        }
+                    } else if (terr > 0 && adx * adx + ady * ady > terr * terr) {
+                        // outside home range: walk back toward the anchor
+                        const std::int64_t step = 24;
+                        Vec2 c{static_cast<std::int32_t>(
+                                   e.pos.x + std::clamp<std::int64_t>(adx, -step, step)),
+                               static_cast<std::int32_t>(
+                                   e.pos.y + std::clamp<std::int64_t>(ady, -step, step))};
+                        if (terrain.contains(c) && !terrain.is_water(c)) {
+                            np = c; moved = true;
+                        }
+                    } else {
+                        const std::int64_t cur_s = suitability(d, e.pos, sdt);
+                        Vec2 best = e.pos;
+                        std::int64_t best_s = cur_s;
+                        auto consider = [&](Vec2 c) {
+                            const std::int64_t s = suitability(d, c, sdt);
+                            if (s >= 0 && s > best_s) { best_s = s; best = c; }
+                        };
+                        for (const auto& dd : kDir)
+                            consider({e.pos.x + dd[0], e.pos.y + dd[1]});
+                        // herd cohesion: pull toward the same-kind centroid
+                        const std::int64_t cohes =
+                            p_cohes != kNoProp ? prop_int(e, p_cohes, 0) : 0;
+                        if (cohes > 0) {
+                            std::int64_t sx = 0, sy = 0, cnt = 0;
+                            for (EntityId oid : spatial.within(e.pos, 320)) {
+                                if (oid == e.id) continue;
+                                const Entity* o = find(oid);
+                                if (!o || !o->alive ||
+                                    o->kind_name != e.kind_name) continue;
+                                sx += o->pos.x; sy += o->pos.y; ++cnt;
+                            }
+                            if (cnt > 0) {
+                                const std::int64_t cx = sx / cnt;
+                                const std::int64_t cy = sy / cnt;
+                                Vec2 c{static_cast<std::int32_t>(
+                                           e.pos.x + std::clamp<std::int64_t>(
+                                               (cx - e.pos.x) * cohes / 1000,
+                                               -24, 24)),
+                                       static_cast<std::int32_t>(
+                                           e.pos.y + std::clamp<std::int64_t>(
+                                               (cy - e.pos.y) * cohes / 1000,
+                                               -24, 24))};
+                                consider(c);
+                            }
+                        }
+                        // hysteresis: drift only on a clearly better cell
+                        if (best_s > cur_s + 30 && best != e.pos) {
+                            np = best; moved = true;
+                        }
+                    }
+                    if (moved && np != e.pos) {
+                        const Vec2 from_p = e.pos;
+                        e.pos = np;
+                        spatial.move(e.id, np);
+                        // footfall compaction, same rule as locomotion
+                        if (!terrain.traffic_wear.empty() && terrain.cell > 0) {
+                            const std::int64_t dx =
+                                static_cast<std::int64_t>(np.x) - from_p.x;
+                            const std::int64_t dy =
+                                static_cast<std::int64_t>(np.y) - from_p.y;
+                            const std::int64_t d2 = dx * dx + dy * dy;
+                            if (d2 > 0) {
+                                std::int64_t dist = 1;
+                                while (dist * dist < d2) ++dist;
+                                const std::int64_t step = terrain.cell / 2;
+                                std::int64_t samples = dist / step;
+                                if (samples < 1) samples = 1;
+                                for (std::int64_t i = 0; i <= samples; ++i) {
+                                    const Vec2 cp{
+                                        from_p.x + static_cast<std::int32_t>(
+                                            dx * i / samples),
+                                        from_p.y + static_cast<std::int32_t>(
+                                            dy * i / samples)};
+                                    if (!terrain.contains(cp)) continue;
+                                    terrain.add_wear(cp, terrain.cell);
+                                    wear_cells_.insert(
+                                        (static_cast<std::uint64_t>(
+                                             static_cast<std::uint32_t>(
+                                                 TerrainGrid::cell_of(
+                                                     cp.x, terrain.cell)))
+                                         << 32) |
+                                        static_cast<std::uint32_t>(
+                                            TerrainGrid::cell_of(
+                                                cp.y, terrain.cell)));
+                                }
+                            }
+                        }
+                        ev.participants.push_back(e.id);
+                        ev.evidence += "range " + std::to_string(e.id) + " ->(" +
+                            std::to_string(np.x) + "," + std::to_string(np.y) +
+                            "); ";
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- husbandry: bonded yields & watchdog alerts (Phase 18) ---------------
+    // A bonded animal (a `bonded` relation edge to a living partner) with
+    // milk_yield/wool_yield produces those materials on a stateless credit
+    // schedule — yield units per 1000 ticks accumulate in *_credit and each
+    // whole unit spawns one item entity, so batched catch-up is exact. A
+    // bonded watchdog (scent_alert_radius > 0) smells a higher-tier
+    // predator inside its radius and warns its partner's mind with a
+    // `peril:predator_scent` belief — fog-of-war early warning, learned
+    // from the animal's nose, not from a script.
+    {
+        const PropId p_milk_y = pid("milk_yield");
+        const PropId p_wool_y = pid("wool_yield");
+        const PropId p_milk_c = pid("milk_credit");
+        const PropId p_wool_c = pid("wool_credit");
+        const PropId p_alert = pid("scent_alert_radius");
+        const PropId p_alert_cd = pid("alert_cooldown");
+        const PropId p_tier = pid("trophic_tier");
+        const PropId p_hun = pid("hunger");
+        const PropId p_qty = pid("quantity");
+        const bool do_husb = (p_milk_y != kNoProp || p_wool_y != kNoProp ||
+                              p_alert != kNoProp);
+        if (do_husb) {
+            for (auto& ep : entities) {
+                Entity& e = *ep;
+                if (!e.alive) continue;
+                EntityId partner = kNoEntity;
+                for (const Relation& rel : relations_of(e.id, "bonded")) {
+                    const EntityId o = rel.a == e.id ? rel.b : rel.a;
+                    const Entity* oe = find(o);
+                    if (oe && oe->alive) { partner = o; break; }
+                }
+                if (partner == kNoEntity) continue;
+                // periodic yields — hungry bonded stock gives less
+                const std::int64_t hunger_pen =
+                    p_hun != kNoProp && prop_int(e, p_hun, 0) > 600 ? 500 : 1000;
+                auto yield = [&](PropId yp, PropId cp, const char* matname) {
+                    if (yp == kNoProp || cp == kNoProp) return;
+                    const std::int64_t y = prop_int(e, yp, 0);
+                    if (y <= 0) return;
+                    const std::int64_t c0 = prop_int(e, cp, 0);
+                    std::int64_t c1 = c0 +
+                        y * static_cast<std::int64_t>(n) * hunger_pen / 1000;
+                    while (c1 >= 1000) {
+                        c1 -= 1000;
+                        SpawnSpec s;
+                        s.kind = matname;
+                        const MaterialDef* md = materials.find_name(matname);
+                        s.material = md ? md->id : kNoMaterial;
+                        const std::uint64_t h = Rng::hash(
+                            static_cast<std::uint64_t>(e.id) * 0xD1B54A32D192ED03ull
+                                + c1);
+                        s.pos = {e.pos.x + static_cast<std::int32_t>(h % 21) - 10,
+                                 e.pos.y + static_cast<std::int32_t>((h >> 21) % 21) - 10};
+                        if (p_qty != kNoProp)
+                            s.props.set(p_qty, Value::integer(1));
+                        spawns.push_back(std::move(s));
+                        ev.evidence += std::string(matname) + " x1 from " +
+                                       std::to_string(e.id) + "; ";
+                    }
+                    if (c1 != c0) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = cp;
+                        ch.had_before = prop_of(e, cp) != nullptr;
+                        ch.before = Value::integer(c0);
+                        ch.after = Value::integer(c1);
+                        e.props.set(cp, ch.after);
+                        ev.changes.push_back(ch);
+                    }
+                };
+                yield(p_milk_y, p_milk_c, "milk");
+                yield(p_wool_y, p_wool_c, "wool");
+                // watchdog scent alert
+                if (p_alert != kNoProp) {
+                    const std::int64_t ar = prop_int(e, p_alert, 0);
+                    if (ar <= 0) continue;
+                    std::int64_t cd = p_alert_cd != kNoProp
+                        ? prop_int(e, p_alert_cd, 0) : 0;
+                    if (cd > 0) {
+                        const std::int64_t cd1 =
+                            std::max<std::int64_t>(0, cd - static_cast<std::int64_t>(n));
+                        if (p_alert_cd != kNoProp && cd1 != cd) {
+                            StateChange ch;
+                            ch.entity = e.id; ch.prop = p_alert_cd;
+                            ch.had_before = prop_of(e, p_alert_cd) != nullptr;
+                            ch.before = Value::integer(cd);
+                            ch.after = Value::integer(cd1);
+                            e.props.set(p_alert_cd, ch.after);
+                            ev.changes.push_back(ch);
+                        }
+                        cd = cd1;
+                    }
+                    if (cd > 0) continue;
+                    const std::int64_t own_tier = p_tier != kNoProp
+                        ? prop_int(e, p_tier, 0) : 0;
+                    std::vector<EntityId> near = spatial.within(e.pos, ar);
+                    std::sort(near.begin(), near.end());
+                    EntityId threat = kNoEntity;
+                    for (EntityId oid : near) {
+                        if (oid == e.id || oid == partner) continue;
+                        const Entity* o = find(oid);
+                        if (!o || !o->alive) continue;
+                        const std::int64_t ot = p_tier != kNoProp
+                            ? prop_int(*o, p_tier, 0) : 0;
+                        if (ot > own_tier && ot >= 2) { threat = oid; break; }
+                    }
+                    if (threat != kNoEntity) {
+                        auto mit = minds_.find(partner);
+                        if (mit != minds_.end()) {
+                            AgentMind& pm = mit->second;
+                            Belief& b = pm.belief("peril:predator_scent");
+                            b.confidence = std::min<std::int64_t>(1000, b.confidence + 300);
+                            b.evidence_for += 300;
+                            b.last_tick = now;
+                            if (b.status == BeliefStatus::Unknown ||
+                                b.status == BeliefStatus::Hypothesized)
+                                b.status = BeliefStatus::Observed;
+                        }
+                        if (p_alert_cd != kNoProp) {
+                            StateChange ch;
+                            ch.entity = e.id; ch.prop = p_alert_cd;
+                            ch.had_before = prop_of(e, p_alert_cd) != nullptr;
+                            ch.before = Value::integer(0);
+                            ch.after = Value::integer(500);
+                            e.props.set(p_alert_cd, ch.after);
+                            ev.changes.push_back(ch);
+                        }
+                        ev.participants.push_back(e.id);
+                        ev.participants.push_back(partner);
+                        ev.participants.push_back(threat);
+                        ev.evidence += "watchdog " + std::to_string(e.id) +
+                            " scent-alerts " + std::to_string(partner) +
+                            " to " + std::to_string(threat) + "; ";
+                    }
+                }
+            }
+        }
+    }
+
     // ---- edge influx ------------------------------------------------------------
     // Stateless schedule: zone fires on ticks where stream_seed(seed, zone,
     // tick) % interval == 0 — irregular but deterministic spacing, no mutable
@@ -4283,7 +4894,9 @@ void World::ecology_tick(std::int64_t n) {
         }
     }
 
-    if (spawns.empty() && ev.changes.empty()) return;
+    // range drift moves entities without prop changes — participants alone
+    // must also keep the event alive or those steps go unledgered.
+    if (spawns.empty() && ev.changes.empty() && ev.participants.empty()) return;
     std::vector<EntityId> spawn_ids(spawns.size(), kNoEntity);
     for (std::size_t i = 0; i < spawns.size(); ++i) {
         const SpawnSpec& s = spawns[i];
@@ -4470,6 +5083,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     const INaturalLawModel* used = nullptr;
     LawId refused_by = 0;
     std::vector<Condition> refused_conditions;
+    // CL-1 shadow brain: encode + predict BEFORE any law commits — the
+    // sensor sees pre-action World Truth through the mind's own memory.
+    if (ctx.actor != kNoEntity) brain_pre(*this, ctx.actor, ctx);
     for (const auto& m : laws) {
         if (!m->supports(*this, ctx)) continue;
         PredictionResult p = m->predict(*this, ctx);
@@ -4497,6 +5113,8 @@ InteractionResult World::interact(const InteractionContext& ctx) {
             fe.failed = true; fe.failure = res.failure; fe.evidence = res.failure;
             fe.conditions = std::move(refused_conditions);
             res.failed_event = ledger.append(std::move(fe));
+            if (const CausalEvent* fev = ledger.find(res.failed_event))
+                brain_post(*this, ctx.actor, *fev);
         }
         return res;
     }
@@ -4705,6 +5323,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // actor learns from its own action (World Truth -> agent knowledge,
     // one direction only: the mind never writes back into entities)
     if (ctx.actor != kNoEntity) learn_from_event(ctx.actor, res.event);
+    if (ctx.actor != kNoEntity && brains_)
+        if (const CausalEvent* cev = ledger.find(res.event))
+            brain_post(*this, ctx.actor, *cev);
     // witness learning (TODO §10.1): other living agents whose sight_range
     // covers the actor observe the event and learn the verb + WEAK evidence.
     // Only entities that already have a mind count — an entity becomes an
@@ -6937,6 +7558,19 @@ std::string World::export_lexicon_codex() const {
               << " deciphered=" << r.deciphered
               << " chronicle=" << chron << "\n";
         }
+    }
+    // Phase 19 indigenous mathematics: each tongue's numeral base, glyph
+    // style and a worked sample so the player can decode carved M/P/Q lines.
+    for (std::int64_t lg : langs) {
+        const std::int64_t base = math_base_of(lg, world_seed);
+        static const char* kStyle[] = {"tally", "dot-bar", "bar", "script"};
+        std::uint64_t h = static_cast<std::uint64_t>(lg) * 0xC2B2AE3D27D4EB4Full
+                       ^ world_seed * 0x165667B19E3779F9ull;
+        h ^= h >> 29; h *= 0x94D049BB133111EBull; h ^= h >> 32;
+        o << "MATH lang " << lg << " base " << base
+          << " style " << kStyle[h % 4]
+          << " sample8=" << math_render(lg, 8, world_seed)
+          << " sample13=" << math_render(lg, 13, world_seed) << "\n";
     }
     // semantic atoms: the atomic meanings words name (compositional layer)
     for (const auto& ep : entities) {

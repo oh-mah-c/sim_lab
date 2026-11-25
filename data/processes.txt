@@ -32,3 +32,33 @@ process grind_energetic
   ticks 6
   output energetic_mix 100
 
+
+# Bronze — copper + tin alloyed in one charge. Hotter than copper alone;
+# the alloy is tougher and keeps an edge (malleability 600 on `bronze`).
+process smelt_bronze
+  input copper_ore 200
+  input tin_ore 120
+  fuel charcoal 60
+  min_temperature 12000
+  ticks 30
+  output bronze 240
+  waste slag 180
+
+# Wrought iron — the deep-mine metal. Needs a much hotter charge than
+# copper/bronze and sacrifices more to slag; the payoff is tensile 900
+# edge_sharpness 850 — tools and blades that out-cut stone and bone.
+process smelt_iron
+  input iron_ore 500
+  fuel charcoal 80
+  min_temperature 15500
+  ticks 40
+  output iron_ingot 320
+  waste slag 180
+
+# Weave fleece into cloth — no heat, just labor ticks. The product is a
+# high-insulation textile: the cold-climate route from fiber_beast to
+# survivable winters.
+process weave_wool
+  input wool 60
+  ticks 20
+  output wool_cloth 45

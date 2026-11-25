@@ -24,6 +24,7 @@
 #include "Terrain.hpp"
 #include "Types.hpp"
 #include "Cognition.hpp"
+#include "Brain.hpp"
 
 namespace simlab {
 
@@ -249,6 +250,12 @@ public:
     std::vector<std::unique_ptr<Entity>> entities;
     std::vector<std::shared_ptr<INaturalLawModel>> laws;   // stateless -> shared by clones
     std::map<EntityId, AgentMind> minds_;             // agent knowledge (not world truth)
+    // CL-1 shadow brains (Phase 1): shared_ptr so speculative clones alias
+    // the same store; ALL brain writes are guarded by `speculative` —
+    // planning copies observe but never learn. NOT part of state_hash
+    // (brain_state_hash() fingerprints it separately for replay tests).
+    bool brain_shadow = false;
+    std::shared_ptr<BrainStore> brains_;
     // Empty when content loaded cleanly; otherwise the load_content() error.
     // On failure registries are left EMPTY (all-or-nothing), never half-loaded.
     std::string content_error;
@@ -308,6 +315,12 @@ private:
         // on blighted plants; soil_nutrient on nearby patches is the ash
         // fertilization credit that speeds regrowth.
         PropId yield_penalty = kNoProp, soil_nutrient = kNoProp;
+        // Phase 18 cultivation: `growth` accrues toward `growth_ticks`
+        // before fruiting is allowed; `irrigation_credit` ticks of watered
+        // soil lift the effective moisture the fruit drift sees, then burn
+        // down. Plain integer props — batch-exact under dormant LOD.
+        PropId growth = kNoProp, growth_ticks = kNoProp,
+               irrigation_credit = kNoProp;
     };
     NeedProps need_props() const;
     // Apply dt ticks of need/age drift to one entity; appends StateChanges
@@ -346,7 +359,7 @@ private:
     // the metabolize entity loop — create_entity + relations + ledger.
     void commit_drift_spawns(CausalEvent& ev, std::vector<SpawnSpec>& spawns);
     bool drift_needs(Entity& e, std::uint64_t dt, const NeedProps& np,
-                     CausalEvent& ev);
+                     CausalEvent& ev, std::uint64_t now);
     // Catch dormant participants up to the current tick (ledgered as a
     // "metabolize" event) so predictions see real needs, not stale ones.
     void flush_needs(const std::vector<EntityId>& ids);

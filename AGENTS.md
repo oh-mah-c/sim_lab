@@ -249,9 +249,22 @@ no engine code changes.
   per-entity metabolize pass, ecology/language/political/myth/terrain
   drift, witness learning or `*_from_event` hooks. Never true on a real world.
 - The capstone test prints `capstone fingerprint: ... state_hash=...`;
-  baseline hashes for SIMLAB_CYCLES 100/300/500/800 are b01e7e33ed7962ff /
-  fb3ddce7393e6e5e / 82715b8f27ec0cfc / d47683031ca69ffc. A pure
+  baseline hashes for SIMLAB_CYCLES 100/300/500/800 are d43a7c624c9084ec /
+  fe23ce3faf80853c / 1270c51471227658 / d978b3ec11b5982d (re-baselined
+  for Phase 19: quantum_observe writes math:/phenomenon:/qlaw: beliefs
+  into agent minds and Driver's quantum_step/hunt-force read them, so
+  the ledger diverges; content_hash is unchanged at ecdfe1d6288bf455 /
+  acb20ad3a9575888 / 31e4d11aebf23ed6 /
+  6f62e05292f578fb — only event ordering/counts moved). A pure
   optimization must reproduce them exactly.
+- Locomotion stride is balance-critical: `move` actions use
+  `ctx.parameters.ticks = 1` (~8 world units/step at speed 6000-8000).
+  Raising the stride to even 2x collapses the capstone civilization
+  (agents disperse to remote food clusters before reaching
+  `adult_age`, then starve: dead≈39, zero lineages). `PredictionResult.
+  ticks` is pinned to 1 inside `LocomotionModel::predict` so stride and
+  world-time stay decoupled — do NOT raise it without redesigning the
+  survival/metabolism balance and re-verifying emergence.
 
 ## Phase 12.6 — warfare, logistics & emergent weapons R&D
 
@@ -377,3 +390,319 @@ no engine code changes.
   Smoke test: `SDL_VIDEO_DRIVER=dummy SIMLAB_VPLANET=2048 SIMLAB_VGLOBE=1
   sunnyworld_viewer --selftest 4 [--shot prefix]` (exit 0 = globe, dive,
   wrap, wheel-out and hash checks passed).
+- Planet ground (14b+): one chunked renderer (`draw_ground_chunks`, 32x32
+  cells, 1 px/unit, LRU 96, 3 builds/frame, flat tile placeholder) for BOTH
+  the simulated region (terrain grid: wear, lenses) and the dormant planet
+  (analytic fields) -> no seam; unexplored = one dark haze everywhere.
+  Valley worlds keep the single pre-composited ground texture.
+- Menus: Title (Continue = newest of autosave/slots, New Game, Load, Quit;
+  disabled entries when no save) and in-game Pause (Resume, Save, Load, New,
+  Save & Quit to Title). Closing the window autosaves (`autosave.sav`).
+  No world is built until New/Continue/Load; a decorative planet turns
+  behind the title. Tests: `SIMLAB_PREF=<dir>/` redirects saves;
+  `SIMLAB_VTITLE=1 sunnyworld_viewer [--shot p]` smoke-tests the flow.
+- HUD (viewer): one slim top bar (play/pause + 1x/5x/20x/100x, day/hour,
+  tribe, Resonance, Journal, View, Menu). Map overlays (former lenses 1-6),
+  vision mode, panels and perf stats live in the View popup; status text is
+  a fading toast; the Inspector opens only on selection; powers / possessed
+  verbs sit in a bottom-left action bar; minimap / mini-globe bottom-right.
+
+## Phase 16 — maritime physics, drowning & emergent watercraft
+
+- All of it is gated by `World::kRulePrimordial` (legacy worlds keep water
+  as a hard edge). Helpers in `lawutil` (LocomotionLaws.cpp):
+  `water_depth` (sea = sea_level - elevation >= 20, basin lake 40, river
+  12), `wave_at` (depth*3 + |wind|/4, 0..1000), `craft_of` (relation
+  `aboard`), `sinking_load` (own excess over neutral buoyancy + 1000 g +
+  gear), `swim_stroke_cost`, `craft_capacity_left`.
+- Locomotion: depth <= `kWadeDepth` (25) = wade; deeper needs
+  `note == "swim"`: fatigue += stroke cost, `swim_skill` +1, fatigue at 1000
+  in deep water = -250 integrity per stroke ("drowning"/"drowned" in the
+  evidence). `swim_stroke_cost` = (15 + depth/10 + wave/50 +
+  |water_temp - normal_body_temp|/20 capped 600) x load x /(500+skill) —
+  carried gear (wielding/wearing) sinks you via `sinking_load`; only
+  entities with `normal_body_temp` pay the temperature term. Immersion
+  heat loss is depth-scaled in thermoregulation: wade keeps the flat
+  +80 ambient pull, swimming (>25 deep, not aboard) adds up to +140 —
+  cold seas genuinely kill over a long crossing. Aboard a craft: on land
+  the craft is hauled; in water the craft
+  and every passenger move together, swell above `wave_rating` batters it
+  ((wave-rating)/4+1 integrity), 0 = capsized (all thrown in); stepping
+  from water onto land disembarks. `board` / `disembark` verbs (law 9):
+  board needs reach, water within 2x reach, and craft lift >= the
+  newcomer's sinking load on top of those aboard.
+- Assembly (CompositionLaws): `float_capacity` = sum mass x (water - d)/d
+  over the parts (material `density`), `wave_rating` = (150 + 25 x min(6,
+  parts) + 0.6 x best part `waterproofing`) x motor precision. Raft of
+  dry_wood ~250 (calm water); sealed with cured_hide ~640 (open sea). No
+  craft names in code.
+- Driver (game mode): `shore_sense` marches the heading stroke by stroke
+  to the far shore and compares the cost (x (1000 + peril)/1000 x threat
+  gain) with fatigue headroom; swim only if it fits (panic overrides),
+  else board a remembered floating craft, else stay ashore and grow
+  `want_cross` + remember `far_shore:x:y`. Beacons blocked by water don't
+  fade. `want_cross >= 300` biases curiosity to bind lighter-than-water
+  things (up to 4 parts) and to `board` them, never to disassemble a
+  floating thing; `sail_step` paddles to the far shore first.
+- Cognition: `maritime_lesson` — drowning/capsizing in an event's
+  evidence raises `peril:deep_water` for the actor and every witness.
+- Test: `test_maritime_swimming_drowning_and_watercraft` (legacy edge,
+  depth/swell, swim + skill, drowning + witness fear, shore sense, raft vs
+  sealed hull, sailing + landing, swell damage, the full emergent
+  shore -> raft -> crossing chain, determinism).
+
+## Phase 17 — trophic web, seasonal ranges & apex predators
+
+- Data schema (data/properties.txt, domain tags matter): `trophic_tier`
+  (0 flora .. 5 deep apex, observable so minds can read it off snapshots),
+  `prey_tier_max` (highest tier a hunter may take; 0 = none), `scent_radius`,
+  `herd_cohesion`, `territorial_radius`, `activity_phase` (0 any, 1
+  diurnal, 2 nocturnal, 3 crepuscular — tick % 24 IS the hour),
+  `fire_fear` (panic above fire_fear/2 suppresses hunting),
+  `migration_drive` (permille per-tick fire chance), `anchor_x/y`
+  (territory home, pinned on first drift), `growing_mask` +
+  `dormant_growth_permille` (flora seasonality). NO species names in code.
+- Seasons: `eco_season` (672 ticks/season, 2688/year) inside World.cpp;
+  flora regrowth in `drift_needs` is scaled by `eco_growth_permille`, a
+  weighted sum over the exact season counts of the dormant window —
+  batched advance stays tick-equivalent. `growing_mask` is a bitmask over
+  the four seasons (spring|summer|autumn = 7).
+- Range drift lives inside `World::ecology_tick` (one "ecology" causal
+  event per advance, same contract as influx): per-entity stateless hash
+  schedule `stream_seed(seed,"range_drift",id*tick) % 1000 < drive`,
+  gated by `eco_phase_active`. Suitability = the species' OWN declared
+  `condition` bands evaluated on terrain fields plus the seasonal
+  temperature offset (`eco_season_temp`) — migrants climb food/moisture
+  gradients, territorial animals walk back inside `territorial_radius`
+  of their anchor, `herd_cohesion` pulls toward same-kind neighbours.
+  Two candidate rings (24 and 96 units) cross cell-scale gradients;
+  hysteresis (+30) prevents jitter. Moves update pos + spatial index +
+  traffic wear and are ledgered via event participants/evidence — the
+  commit gate also accepts participants-only events so pure moves are
+  never unledgered. The early-return guard scans for range-capable
+  entities so a world with no seed bank/influx still migrates.
+- Hunting is a Driver reflex (`hunt_step`, before the consume reflex):
+  eligibility is `prey_tier_max > 0` + hunger/thirst > 400 +
+  `activity_phase` + fire_fear/panic below threshold; prey is chosen
+  from AgentMind MEMORY snapshots only (observable `trophic_tier` must
+  be >= 1 and <= prey_tier_max, inside `hunt_range`/`scent_radius`).
+  In reach: `consume` on dead/unconscious, `strike` on awake resisters;
+  beyond: `move` toward the remembered position. World Truth is never
+  queried for the decision — only for action legality inside interact.
+- New species (all data): `migrant_herd` (tier 1 grazer, migration_drive
+  600, herd_cohesion 700), `pack_stalker` (tier 3, ptm 1, nocturnal),
+  `ridge_apex` (tier 4, ptm 3, nocturnal, territorial 800),
+  `shore_reaver` (tier 5 deep apex, ptm 4 — reaches sapients and weak
+  watercraft crews near_water), `commensal_rat` (tier 1 pest, fertility
+  900 — booms without predators, raid stored food via the generic
+  forage/consume path, zoonosis via the existing spillover system).
+- Cascades are emergent, not scripted: overhunting releases flora
+  (consume x regrow), predator loss releases pests (fertility vs
+  hunt_step), pest pressure on provisions + vectors activate Phase 11
+  spillover. The "ecology" batch event stays skipped by NarrativeComposer
+  (physics noise); the meaningful beats — strikes, kills, starvation,
+  disease — already narrate through their own verbs.
+- Viewer: 7th map lens "Ecosystem" (CellView.fauna/flora census is
+  fog-filtered at capture; apex tier>=4 gets a red ring, migrants a
+  chevron), atlas creature sprites shift hue/saturation/value by
+  `trophic_tier` so predators read darker. Atlas/body plans remain fully
+  data-driven — no per-species render code.
+- Test: `test_trophic_ecology_seasons_and_apex` (schema parse, seasonal
+  migration across a temperature/moisture gradient, growing_mask
+  spring-vs-winter fruit, tier-gated hunt killing grazer while the
+  mid-tier predator never touches a tier-3 sapient, apex reaching
+  sapients, batched-vs-stepped determinism).
+
+## Phase 18 — domestication, agriculture, metallurgy & specialization
+
+- Domestication is a `share`-verb side path in `predict_share`
+  (SocialLaws.cpp), gated purely on data: target needs `tameability > 0`
+  and `wildness` above `bond_threshold`. Feeding consumes up to 20 units
+  of the shared `quantity`, cuts the animal's `hunger`, and drops
+  `wildness` by `tameability * eaten / 100`; at/below threshold a
+  `bonded` relation edge is committed through `rel_changes`. Bonded
+  animals take the normal storage path for `share` — `pack_load_bonus`
+  widens the target `quantity` cap, which is how pack cargo loads.
+  `wildness` is a `gene` locus on the domesticable species, so lowered
+  wildness is heritable through the existing recombination system.
+- Husbandry runs inside `World::ecology_tick` (one "ecology" ledger event
+  per advance, LOD-batched): bonded animals accrue `milk_credit` /
+  `wool_credit` (spawn `milk`/`wool` material entities at thresholds,
+  reduced when the partner is hungry), and a bonded watchdog
+  (`scent_alert_radius > 0`) smells higher-tier predators inside its
+  radius on `alert_cooldown` and writes a `peril:` belief into the
+  bonded partner's AgentMind — belief only, never World Truth.
+- Bonded-follow lives in `range_drift`: a bonded animal with no range
+  props still drifts, steering toward its bonded partner's position
+  (hysteresis +30 like migration); range-capable bonded animals prefer
+  the bond pull over territory when the partner is outside
+  `territorial_radius`.
+- Agriculture verbs in BiologyLaws.cpp: `sow` consumes a propagule-like
+  target and spawns the species its material/kind declares, stamping
+  `cultivated=1`, `growth=0`, declared `growth_ticks`; `irrigate`
+  requires a real water cell within `kIrrigateWaterScan` TERRAIN CELLS
+  of the plant (cell-scaled, not world units) and grants
+  `irrigation_credit`. `drift_needs` accrues `growth` toward
+  `growth_ticks` (clamped) and decays `irrigation_credit`; fruit regrow
+  is gated to `growth >= growth_ticks` and treats
+  `irrigation_credit > 0` as moisture 950 for that plant's env calc —
+  all integer, all ledgered StateChanges, batch-exact.
+- Granaries are emergent: `CompositionLaws` derives `granary_seal =
+  ins_fac / 2` on spawned enclosures from insulation/coverage (no
+  building names). `drift_needs` perishability slows `decay_rate` for
+  contained items `part_of`-related to an enclosure carrying
+  `granary_seal` — physical storage, not a storage verb.
+- Metallurgy stays on the generic `process` law: new materials
+  (`tin_ore`, `bronze`, `iron_ingot`, `wool`, `wool_cloth`, `grain`,
+  `pulse`, `milk`) carry `smelt_temp`/`ore_tag`/`malleability`/
+  `smelt_yield` descriptors; new processes (`smelt_bronze`,
+  `smelt_iron`, `weave_wool`) are pure data. Output quantity scales
+  with process efficiency, which rises with temperature margin over
+  `min_temperature` — tests must heat well past the threshold for full
+  yield.
+- Specialization substrate: `learn_from_event` reinforces a
+  `craft:<verb>` belief for craft-family actions, alongside the
+  existing `yield:<action>:<material>` beliefs — surplus-driven craft
+  focus emerges from reinforcement, no profession assignment anywhere.
+- New species (all data): `trail_hound`, `dairy_beast`, `fiber_beast`,
+  `draft_beast` (domesticable: tameability/wildness/bond_threshold +
+  milk_yield/wool_yield/pack_load_bonus/mount_capable/scent_alert_radius
+  as declared), `cultivated_grain`, `cultivated_pulse` (sowable crops:
+  cultivated/growth/growth_ticks/irrigation_credit). No engine branch
+  on any species or material name.
+- Narrative: `sow`/`irrigate`/`share`/`process` template lines cover the
+  new verbs; the ecology batch event remains intentionally un-narrated.
+- Test: `test_domestication_agriculture_metallurgy` (62 checks) —
+  feed-to-bond chain, bonded follow + milk/wool yields, watchdog
+  alert belief, sow/growth/irrigation/fruit gating, granary seal vs
+  open spoilage, bronze/iron/weave process quantities.
+
+## Phase 19 — quantitative cognition, emergent mathematics & treatises
+
+- Two-tier physics cognition in `Cognition.cpp` (`quantum_observe`,
+  called from `learn_from_event` for every self-witnessed causal event):
+  Tier 1 `phenomenon:<domain>` beliefs (buoyancy/smelt/trajectory)
+  accumulate qualitatively from successful craft-family events — no
+  math required. Tier 2 needs `mathneed:<tier>` (count/ratio/geometry)
+  to cross 550 with `mind_abstraction_gain >= 1100`, which "spends" the
+  need and forges a `math:<tier>` belief; sustained craft events then
+  prove `qlaw:<domain>:p<param>` (status Verified) once phenomenon >=
+  650, the matching math tier >= 550 and abstraction >= 1200.
+- Parameters are MEASURED, never declared: buoyancy = (best remembered
+  composite's live `float_capacity` minus actor `mass`) / 1000 clamped
+  [1,950] — physical props aren't in memory snapshots, so the scholar
+  reads the remembered entity's live props (the shore_sense precedent);
+  trajectory = hardest `hardness` among remembered materials clamped
+  [100,950]; smelt = fuel share permille of the richest known process
+  recipe. Repeated proofs reinforce the standing `qlaw:*:p*` belief
+  (+20 conf) instead of re-deriving.
+- Event->domain map is verb-only, no content names: process/combine ->
+  smelt+ratio, impact/strike -> trajectory+geometry, sow/plant/dig/
+  irrigate -> geometry, share/consume -> count; any event touching an
+  entity with `float_capacity > 0` adds buoyancy and upgrades a `count`
+  need to `ratio` (loading a hull IS a ratio problem).
+- Indigenous mathematics (`math_base_of`/`math_render`, Cognition.hpp):
+  each `language_id` hashes (with world seed) to a base in {8,10,12,20}
+  and a glyph style {tally,dot-bar,bar,script}; values render
+  positionally with a base-marker letter and a 'o' zero — never an
+  Arabic digit. Deterministic per (lang, seed).
+- Treatises: `quantum_tables` appends `M|tier|conf`, `P|domain|conf`,
+  `Q|domain|param|conf` lines to the `inscription` text payload at
+  `engrave` (confidence >= 100 only). The `read` parser imports them at
+  half confidence (cap 500) as Observed claims — a transmitted law is
+  usable via `qlaw_param` (needs >= 300) but stays unproven until the
+  reader re-earns it.
+- Planner use (Driver.cpp only — laws never read beliefs):
+  `quantum_step` (cooldown kQuantum=48) loads remembered in-reach
+  composites to exactly `qlaw_param("buoyancy")` via
+  `parameters.force`, gated on surplus (hunger/thirst <= 300);
+  `predict_share` honors `parameters.force` as the requested transfer
+  amount (capped by the normal rules); the hunt kill-blow scales
+  `natural_force` by `qlaw_param("trajectory")/100` when proven.
+- Rosetta: `export_lexicon_codex` emits a `MATH lang <id> base <b>
+  style <s> sample8=… sample13=…` line per language so players can
+  decode each tongue's numeral system.
+- Test: `test_quantitative_cognition_and_notation` (32 checks) —
+  notation determinism, share->phenomenon->mathneed->math->qlaw chain
+  for buoyancy, trajectory-via-anvil-replacement and smelt-with-restocked
+  furnace, parameters.force law+driver paths, M/P/Q carve + halved
+  import, determinism hash.
+
+## CL-1 Phase 0 — brain substrate (no behavior change)
+
+- `include/simlab/Brain.hpp` + `src/Brain.cpp`: the integer-only neural
+  substrate for the CL-1 blueprint (`ai_architecture_blueprint.html`).
+  Nothing is wired into World/Driver yet — Phase 0 is arena + kernels +
+  LUTs + hash RNG only, so `state_hash` is untouched.
+- `BrainArena`: deterministic bump + per-size-class LIFO free-list over
+  one slab carved into 64-byte cells; `alloc`/`free` return slab-relative
+  offsets (data pointers are 64B-aligned via a computed base offset).
+  Allocation order is a pure function of the call sequence.
+- Kernels: `brain_dot_i8` (sequential int32 accumulation — the ONLY
+  accumulation order, so results are SIMD-width independent),
+  `brain_dense_i8` (`y = act(clamp_i8((dot >> shift) + bias))`).
+  Weights int8 [-127,127], activations int8 [-128,127].
+- Activations: 256-entry LUTs indexed by the raw int8 bit pattern,
+  built lazily once in fixed-point (tanh via Padé u(27+u²)/(27+9u²) in
+  Q20; sigmoid = tanh(u/2) composed by index arithmetic; linear =
+  identity). Bit-identical on every platform/build.
+- Hash RNG: `brain_rand_weight`/`brain_mutation_step`/
+  `brain_mutate_blocks` derive every draw from (seed, salt/entity,
+  index/tick, block) via `Rng::hash` — replay-identical, no wall-clock.
+- Layout helpers: `brain_padded_cols` (rows padded to 16 cols, zero
+  pad), `brain_dense_weight_bytes`/`brain_dense_bias_bytes`.
+- Test `test_brain_phase0` (322 checks total incl. suite): LUT sanity,
+  kernel determinism + hand-checked row, hash-RNG replay, arena
+  alloc/free/alignment/live-bytes, sparse block mutation bounds,
+  and a GMAC/s micro-benchmark. Measured ~1.2-1.5 GMAC/s scalar int8
+  GEMV (64x96) on the dev box — replaces the blueprint's assumed 3.
+
+## CL-1 Phase 1 — sensor, replay buffer & world model (shadow mode)
+
+- `include/simlab/Sensor.hpp` + `src/Sensor.cpp`: the 96-channel int8
+  encoder. Channels 0-15 intero (hunger/thirst/fatigue/energy/
+  blood_volume/pain/consciousness/integrity/temperature/toxin/age...,
+  per-channel scale+sign+offset tables), 16-23 NeuroState, 24-71 the
+  6 nearest REMEMBERED entities x 8 features (dx/dy/dist normalized by
+  sight_range, integrity, quantity-as-bulk, edibility, engram charge,
+  clarity — all from `AgentMind::memory` snapshots, never World Truth),
+  72-79 terrain under the agent, 80-95 last-action one-hot over the
+  fixed 16-verb table (`sensor_verb_table`). `sensor_label` turns a
+  committed CausalEvent into 25 channels: 16 intero deltas, 8 outcome
+  classes (success/met/unmet/spawned/changes/parents/evidence), reward
+  = homeostatic cost improvement.
+- `Brain.hpp` Phase-1 structs: `BrainSlot` (h[64] int16 Q8 GRU state,
+  last_action, BrainPending pre-commit snapshot, 16-transition replay
+  ring), `BrainStore` (arena + `std::map<EntityId,BrainSlot>` + WM
+  error/surprise observability sums), `BrainLayout`/`brain_layout()`
+  (embed 96->64, minGRU z/h 64->64, manager 64->32->8, worker
+  (64+8)->64->16+attn, WM 80->96->25, value 64->1 — all int8 weights,
+  int16 biases in one arena block per brain).
+- `brain_pre` (before the law loop in `World::interact`) encodes s_t,
+  runs embed->minGRU->WM forward, stashes `BrainPending` (yhat, WM
+  hidden, post-GRU h). `brain_post` (on BOTH the failed-event and the
+  committed-event paths) builds the label, sigma = min(1000, L1/8),
+  charge from neuro panic/rage/grief, stratified-replaces the
+  min(charge+sigma) replay slot, then takes ONE integer SGD step on
+  the WM output layer only (Huber-lite err, eta = 384 + sigma/2,
+  dw clamp +-8, bias clamp +-4095). Manager/Worker/Value weights are
+  allocated+hash-initialized but not yet forwarded (Phase 2 heads).
+- Gating: `World::brain_shadow` (default false) + `DriverState.
+  brain_shadow` propagated per cycle. Both hooks and `brain_gc`
+  (called at the end of `decay_minds`) early-return on
+  `w.speculative` — speculative clones share `brains_` via shared_ptr
+  but must never allocate slots or write weights. With the flag off,
+  `brains_` stays null and NOTHING runs: capstone state_hash is
+  bit-identical (verified d978b3ec11b5982d @ 800).
+- `brain_state_hash(store)`: FNV-1a over sorted slots — weights, h,
+  replay, stats. NOTE: `BrainSlot::woff` is deliberately NOT hashed —
+  it embeds the arena's heap-alignment slack (`slab_base_off_`), which
+  is pointer-dependent; woff is allocator bookkeeping, not brain state.
+- Snapshot observability: `RenderSnapshot` gains `brain_slots`,
+  `brain_wm_mae`, `brain_avg_surprise` (-1 when shadow off).
+- Test `test_brain_phase1` (143 checks): flag-off creates no store;
+  flag-on state_hash == flag-off; two same-seed shadow worlds produce
+  identical `brain_state_hash` (component-level diff diagnostics kept
+  in the test); WM MAE windowed mean drops 7.55 -> 5.52 over 900
+  rest/strike interacts; dead agents release arena slots via
+  `advance_ticks` -> `decay_minds` -> `brain_gc`.

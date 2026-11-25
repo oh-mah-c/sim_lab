@@ -329,11 +329,17 @@ static Sprite flora_sprite(const BodyPlan& p, const MaterialLook& wood, const Ma
     return s;
 }
 
-static Sprite creature_sprite(const BodyPlan& p, const MaterialLook& L, std::uint64_t seed) {
+static Sprite creature_sprite(const BodyPlan& p, const MaterialLook& L, std::uint64_t seed,
+                              int trophic_tier = 0) {
     const int S = ProceduralAtlas::kStandee;
     Sprite s = blank(S, S);
-    const int hue = static_cast<int>(seed % 360);
-    const std::uint32_t body = mix(L.base, hsv(hue, 450, 600), 450);
+    // ecology reads in the palette: higher trophic tiers run darker and more
+    // saturated — prey animals stay bright, predators read as predators.
+    // Purely cosmetic, driven by the declared tier prop (0 = unset/herbivore).
+    const int hue = static_cast<int>((seed + static_cast<std::uint64_t>(trophic_tier) * 53) % 360);
+    const int sat = std::clamp(450 + trophic_tier * 55, 0, 1000);
+    const int val = std::clamp(600 - trophic_tier * 45, 250, 1000);
+    const std::uint32_t body = mix(L.base, hsv(hue, sat, val), 450);
     const std::uint32_t dark = shade(body, 650), light = shade(body, 1250);
     const int foot = S - 1, h = p.height;
     if (p.arms >= 2 && p.legs == 2) {
@@ -422,7 +428,10 @@ void ProceduralAtlas::build(const World& w) {
             }
             sp_[sp.name] = flora_sprite(p, body, leaf, fnv(sp.name));
         } else {
-            sp_[sp.name] = creature_sprite(p, body, fnv(sp.name));
+            const PropertyDef* ttp = w.props.find_name("trophic_tier");
+            const Value* tv = ttp ? sp.props.get(ttp->id) : nullptr;
+            sp_[sp.name] = creature_sprite(p, body, fnv(sp.name),
+                                           tv ? static_cast<int>(tv->i) : 0);
         }
     }
     for (const char* k : {"inscription", "enclosure", "portal", "remains", "rubble", "fragment",

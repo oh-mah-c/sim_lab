@@ -162,4 +162,26 @@ inline bool conscious_enough(const World& w, const Entity& actor,
     return false;
 }
 
+// ---- maritime physics (Primordial ruleset; LocomotionLaws.cpp) -------------
+// Water depth of the terrain cell under `p` in metres (0 = land): sea =
+// sea_level - elevation (>= 20), a basin lake 40, a river 12 (wadeable).
+std::int64_t water_depth(const World& w, Vec2 p);
+// Wave energy 0..1000 at `p`: deeper water + stronger wind = bigger swell.
+std::int64_t wave_at(const World& w, Vec2 p);
+// Depth a body can wade through on foot (no swimming).
+constexpr std::int64_t kWadeDepth = 25;
+// Craft the actor is aboard (relation "aboard" actor -> craft), or kNoEntity.
+EntityId craft_of(const World& w, EntityId actor);
+// Mass (grams) the water must hold up to keep `e` afloat: its own excess
+// over neutral buoyancy + 1000 g of head-above-water + what it wields/wears
+// (denser-than-water gear sinks you: armour and stone drown swimmers).
+std::int64_t sinking_load(const World& w, const Entity& e);
+// Fatigue (permille) one swimming stroke costs `e` in the water at `p`:
+// depth, swell, |water temp - normal_body_temp| and load make it dearer,
+// practice (swim_skill) cheaper. Entities without a thermal phenotype pay
+// no temperature term.
+std::int64_t swim_stroke_cost(const World& w, const Entity& e, Vec2 p);
+// Lift (grams) a floating craft still has after everyone aboard.
+std::int64_t craft_capacity_left(const World& w, EntityId craft);
+
 }  // namespace simlab::lawutil

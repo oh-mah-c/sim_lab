@@ -1103,13 +1103,21 @@ bool discover_step(World& w, EntityId npc, ExploreGoal* out_explore) {
     std::sort(cands.begin(), cands.end(),
               [](const Hypothesis& a, const Hypothesis& b) { return a.score > b.score; });
 
+    // Bound real-world trials per discovery pass: every run_experiment
+    // replays the whole plan through interact() (real advance_ticks), so
+    // trying all candidates made a single agent turn cost hundreds of ms
+    // on dense maps. Two attempts keep the best-scoring candidates honest
+    // while the rest wait for the next planning slot.
+    int attempts = 0;
     for (const Hypothesis& h : cands) {
+        if (attempts >= 2) break;
         const AgentMind* m = w.find_mind(npc);
         if (!m) break;
         const auto it = m->discoveries.find(h.key);
         if (it != m->discoveries.end() &&
             it->second.status == DiscoveryStatus::Verified) continue;  // proven
         ExperimentOutcome oc = run_experiment(w, npc, h);
+        ++attempts;
         if (oc.ran) return true;
     }
     if (try_explore()) return false;

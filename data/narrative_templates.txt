@@ -1,0 +1,124 @@
+# narrative_templates.txt — Emergent Narrative Chronicle (Phase 15)
+# Every sentence the Live Feed / floating callouts / inspector life-story
+# shows is composed from REAL causal-ledger events through these patterns.
+# No script, no trigger: change the data, the storytelling changes.
+#
+# Format (fields separated by '|', '#' starts a comment):
+#   key | category | callout | template
+#
+#   key      verb ("strike"), qualified verb ("strike:wound" — picked first
+#            when the event carries that qualifier), "spawn:<kind>" for an
+#            entity born from the event, or "*" as the fallback for any
+#            narratable verb without its own rule.
+#   category combat | survival | discovery | society | other  (OR-able:
+#            "combat|society") — drives the feed's quick filters.
+#   callout  1 = also float the line above the actor on the map for ~4 s.
+#   template free text with {slots} resolved against World Truth:
+#
+#     {actor}   "#42 human" — short id + what it is
+#     {about}   "#7 wolf" — second participant (target/victim/guest)
+#     {item}    wielded tool/weapon in the actor's hands, or "bare hands"
+#     {part}    anatomy role that took the blow ("left arm", "skull"...)
+#     {qty}     amount involved (goods moved, fruit eaten, ammo spent)
+#     {mat}     material name of the target/spawned thing
+#     {pct}     integrity percent after the change ("37%")
+#     {word}    spoken/carved words, each followed by your Rosetta reading
+#     {tongue}  the speaker's tongue id
+#     {claim}   the hypothesis a verified discovery proved
+#     {charge}  emotional colour of a memory ("in fear", "in love"...)
+#     {when}    "d12 07h" — world day + hour of the event
+#     {failure} why an attempt failed, in plain words
+#     {site}    name/kind of the enclosure or place involved, if any
+#
+# Multiple lines per key = variants; one is picked deterministically by
+# (tick, key) so replays tell the same story.
+
+# ---------------------------------------------------------------- combat --
+strike:wound|combat|1|{actor} brought {item} down on {about}'s {part} — the {mat} {result}
+strike:wound|combat|1|{about} took {item} to the {part}; {actor} stood over the result
+strike|combat|1|{actor} swung at {about} with {item}
+strike|combat|0|{actor} struck {about} — {when}
+strike:kill|combat|1|{actor} killed {about} with {item}; the {mat} {result}
+launch|combat|1|{actor} loosed {item} at {about} — it struck {part}
+launch|combat|0|{actor} launched {item} toward {about}
+impact|combat|0|{actor}'s {item} came down on {about}
+coat|combat|1|{actor} smeared {mat} across {item} — a poisoned edge
+coat|combat|0|{actor} treated {item} with {mat}
+don|combat|0|{actor} strapped {item} on — {mat} against the blows
+doff|combat|0|{actor} shed {item}
+steal|combat|1|{actor} snatched {qty} {mat} from {about} in the night
+steal|society|1|{actor} stole from {about} — {when}
+
+# ------------------------------------------------------------- survival --
+consume|survival|0|{actor} ate {qty} {mat}
+consume:toxic|survival|1|{actor} bit into {mat} — poison flooded {part}; {result}
+consume|survival|1|{actor} nursed on {mat} — hunger eased
+heat|survival|1|{actor} fed {mat} to the fire and warmed {part}
+heat|survival|0|{actor} kept the {mat} burning
+rest|survival|0|{actor} lay down to rest
+rest|survival|1|{actor} slept — the world held its breath
+dig|survival|0|{actor} dug into the earth and found {mat}
+extract|survival|0|{actor} broke {mat} free from the ground
+quarry|survival|0|{actor} quarried {mat}
+chop|survival|0|{actor} felled {about} for its {mat}
+process|survival|0|{actor} worked {mat} into something new
+gather|survival|0|{actor} gathered {qty} {mat}
+harvest|survival|0|{actor} harvested {qty} {mat} from {about}
+plant|survival|0|{actor} put {mat} into the soil
+sow|survival|0|{actor} sowed {mat}
+irrigate|survival|0|{actor} led water to {about}'s parched rows
+combine|survival|0|{actor} mixed {mat} into {item}
+
+# ---------------------------------------------------------- discovery ----
+assemble|discovery|1|{actor} fitted {item} together — a {mat} takes shape
+assemble|discovery|1|{actor} crafted {item} from {mat}
+craft|discovery|1|{actor} shaped {mat} into {item}
+wield|discovery|1|{actor} took up {item} — {mat} in hand
+discover|discovery|1|{actor} proved a truth: {claim}
+read|discovery|0|{actor} studied the {mat} inscription
+impact|discovery|0|{actor} struck {mat} with {item} — a test
+combine|discovery|0|{actor} blended {mat} — watching what {result}
+
+# ------------------------------------------------------------ society ----
+found|society|1|{actor} raised a new community around the fire
+found|society|0|{actor} gathered kin about the {mat} fire
+enclose|society|1|{actor} raised walls of {mat} — a shelter
+enclose_repair|society|0|{actor} mended the {mat} walls
+communicate|society|1|{actor} spoke: "{word}" {tongue}
+communicate|society|0|{actor} traded words with {about} — "{word}"
+engrave|society|1|{actor} carved words into {mat}: "{word}"
+inscribe|society|1|{actor} set down the law on {mat}: "{word}"
+compose_clause|society|0|{actor} framed a clause of {mat}
+adjudicate|society|1|{actor} judged between {about} — {word}
+adjudicate|society|0|{actor} settled a quarrel among the people
+perform_ritual|society|1|{actor} led the rite — {mat} offered to the fire
+consecrate|society|1|{actor} consecrated {mat} — {word}
+reproduce|society|1|{about} was born to {actor}
+reproduce|society|1|{actor} and {about} welcomed a child
+share|society|0|{actor} gave {qty} {mat} to {about}
+gift|society|0|{actor} gave {qty} {mat} to {about}
+trade|society|0|{actor} traded {qty} {mat} with {about}
+treaty|society|1|{actor} and {about} swore {word}
+parley|society|1|{actor} parleyed with {about} — {word}
+diplomatic_parley|society|1|{actor} treated with {about} under truce
+tribute|society|0|{actor} paid tribute to {about}: {qty} {mat}
+repay|society|0|{actor} repaid {about} — the debt is settled
+mobilize|society|1|{actor} called the war-band of {about}
+join|society|0|{about} joined {actor}'s community
+leave|society|0|{about} left {actor}'s community
+withdraw|society|0|{actor} stepped back from the common store
+take|society|0|{actor} took {qty} {mat} from the store
+
+# ---------------------------------------------------- things born ------
+spawn:lexical_entry|discovery|1|{actor} coined the word "{word}" — {mat}
+spawn:semantic_concept|discovery|1|{actor} gave a name to an idea: {mat}
+spawn:language|society|1|a new tongue was born among {actor}'s people
+spawn:inscription|society|1|{actor} raised a stone that reads: "{word}"
+spawn:composite|discovery|1|{actor} assembled {item} — {mat}
+spawn:enclosure|society|1|{actor} built a {mat} shelter
+spawn:debt_obligation|society|0|a debt was carved into the ledger: {qty} {mat}
+spawn:semantic_concept|discovery|0|{actor} named a thing: {word}
+spawn:collective|society|1|{actor} founded a people — they will remember this
+
+# ------------------------------------------------------------- fallback --
+*|other|0|{actor} {when} — {mat}

@@ -43,12 +43,25 @@ struct PendingExplore {
     std::int64_t last_integrity = -1; // Threat check: integrity drop cancels
 };
 
+// Resume state for a sliced autonomous round (autonomous_cycle_step).
+// Controller memory only: never saved, never hashed, rebuilt each round.
+struct DriverCycleSlice {
+    std::vector<EntityId> agents;   // snapshot of minded_entities() at round start
+    std::size_t pos = 0;            // next agent index to process
+    int budget = 0;                 // remaining discover_step grants this round
+    std::size_t stride = 1;         // curiosity round-robin stride
+    std::uint64_t now = 0;          // round tick (frozen while defer_time holds)
+    bool open = false;              // a round is in progress
+    bool concurrent = false;        // round clock mode captured at open
+};
+
 struct DriverState {
     std::map<std::pair<EntityId, int>, std::uint64_t> next_try;
     std::map<EntityId, PendingExplore> pending;
     std::map<EntityId, std::uint64_t> next_discover;  // per-agent interval gate
     std::map<EntityId, int> discover_fails;           // consecutive empty discover_steps (backoff)
     std::uint64_t cycles = 0;
+    DriverCycleSlice slice;                           // sliced-round resume state
     // Primordial Genesis (viewer game mode). Both default OFF so every
     // pre-existing scenario keeps its exact trajectory/state_hash.
     //  * curiosity: idle agents "babble" — try a verb they do not know yet on
@@ -63,6 +76,9 @@ struct DriverState {
     //    the world advances once per round by the longest action.
     bool curiosity = false;
     bool concurrent = false;
+    // CL-1 Phase 1: shadow-mode brains — observe/predict/learn in a private
+    // arena, never influence actions, never enter state_hash. Default OFF.
+    bool brain_shadow = false;
     std::set<EntityId> possessed;
 };
 
@@ -82,6 +98,16 @@ const std::vector<const char*>& curiosity_verbs();
 // at most one social/move action, then the world drifts one tick.
 void autonomous_cycle(World& w, DriverState* st = nullptr,
                       DriverTally* tally = nullptr);
+
+// One wall-clock-sliced batch of an autonomous round. Processes agents in
+// the same sorted order with the same budgets as autonomous_cycle — the
+// sequence of interact() calls is IDENTICAL, only the lock-hold pattern
+// differs. Returns true when the round (including the closing
+// advance_ticks) completed; false means more agents remain — call again.
+// `max_ms` bounds wall-clock inside the call (checked between agents).
+// `st` must be non-null: slice resume state lives in st->slice.
+bool autonomous_cycle_step(World& w, DriverState* st,
+                           DriverTally* tally = nullptr, double max_ms = 6.0);
 
 // Run `cycles` autonomous rounds. Deterministic: same world state + same
 // cycle count -> identical state_hash (driver state evolves purely from

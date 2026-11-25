@@ -17,7 +17,11 @@
 // Space pause, +/- speed, left click inspect (possessed: click ground = walk,
 // click thing = target), right drag pan, F5 quick-save.
 #include <SDL3/SDL.h>
+#if defined(__GLIBC__) || defined(__linux__)
+#include <malloc.h>
+#endif
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
 #include "simlab/World.hpp"
@@ -28,16 +32,19 @@
 #include "simlab/render/Atlas.hpp"
 #include "simlab/render/Snapshot.hpp"
 #include "simlab/render/Patron.hpp"
+#include "simlab/render/Narrative.hpp"
 #include "simlab/render/Globe.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <atomic>
+#include <iterator>
 #include <list>
 #include <map>
 #include <set>
@@ -46,6 +53,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace simlab;
@@ -107,10 +115,10 @@ struct Camera {
     }
 };
 
-struct Particle { float x, y, vx, vy, life; std::uint32_t c; };
+struct Particle { float x, y, vx, vy, life; std::uint32_t c; float grav = 90.f; };
 
-enum Lens { kNatural = 0, kEpidemic, kEconomy, kPolitics, kSacred, kMilitary };
-const char* kLensName[] = {"1 Natural", "2 Epidemiology", "3 Economy", "4 Politics", "5 Sacred", "6 Military"};
+enum Lens { kNatural = 0, kEpidemic, kEconomy, kPolitics, kSacred, kMilitary, kEcology };
+const char* kLensName[] = {"1 Natural", "2 Epidemiology", "3 Economy", "4 Politics", "5 Sacred", "6 Military", "7 Ecology"};
 
 std::size_t rss_kb() {
     std::ifstream f("/proc/self/status"); std::string l;
@@ -163,6 +171,10 @@ struct Viewer {
     int tribe_view = 0;                // index into pw.tribe_lang for Tribe vision
     // ---- game layer (viewer state, not World Truth) ----
     bool in_menu = true;
+    int screen = 0;                    // Screen (menu page)
+    std::atomic<bool> has_game{false}; // a world is loaded/created (sim thread checks it)
+    PlanetMap title_map;               // decorative planet behind the title menu
+    GlobeView title_view;
     char seed_buf[24] = "2026";
     int menu_grid = 2, menu_tribes = 2, menu_per = 6;
     std::string pref_dir;              // SDL_GetPrefPath("Sunnyworld","SimLab")
@@ -194,9 +206,23 @@ struct Viewer {
     };
     std::vector<Legend> c_legends;
     std::vector<EntityId> c_successors;
+    // ---- Phase 15: Emergent Narrative Chronicle ------------------------------
+    // UI-thread only: cfeed/c_callouts are written inside poll_world (which
+    // already holds the world lock) and read by the HUD windows — no extra
+    // synchronisation needed.
+    NarrativeComposer composer;
+    ChronicleFeed cfeed;
+    struct Callout { Vec2 pos; float oy = 0; std::string text; std::uint64_t until; ImU32 col; };
+    std::deque<Callout> c_callouts;
+    std::uint64_t narr_seen = 0;             // last NarrativeLine.seq drained
+    bool show_chronicle = true;
+    int chron_filter = 0;                    // 0 all 1 combat 2 survival 3 discovery 4 society 5 pinned
+    std::map<EntityId, std::vector<std::string>> c_carved;   // legend -> translated stone words
+    std::uint64_t c_carved_tick = ~0ull;                      // rebuild gate (world tick)
     bool need_successor = false;
     EntityId fallen = kNoEntity;
     double move_cool = 0;
+    int rounds_since_trim = 0;
     Vec2 c_av_pos{};
     // player commands: queued by the UI, executed on the UI thread the next
     // time it holds the world lock (never waits for a running sim cycle)
@@ -237,9 +263,16 @@ struct Viewer {
     TexCache tex;
     Camera cam;
     FogOfWar fog;
-    RenderSnapshot snap;
+    // Double-buffered snapshot: capture() writes snap_back under the world
+    // lock, then the pair is swapped under the tiny snap_mx (<0.1 ms). The
+    // draw code always reads `snap` (front) — it never waits on the sim.
+    RenderSnapshot snap, snap_back;
+    std::mutex snap_mx;
+    std::uint64_t snap_gen = 0;         // bumped on every front-buffer swap
+    CaptureScratch cap_scratch;      // wealth-scan cache shared across frames
     int lens = kNatural;
     int speed = 1;                 // 0 pause, else cycles per second index
+    int last_speed = 1;
     double sim_accum = 0;
     DriverState dstate;
     EntityId selected = kNoEntity;
@@ -247,6 +280,18 @@ struct Viewer {
     std::unordered_map<EntityId, Vec2> last_pos;
     std::unordered_map<EntityId, float> facing, bob_until;
     std::unordered_map<EntityId, std::int64_t> last_integ, last_pain;
+    // ---- Visual Interpolation & Ambient Animation (viewer-side ONLY) ----
+    // vis_pos/vis_prev: float render positions that exponentially chase the
+    // integer sim positions each frame; vis_prev is last frame's position,
+    // giving a velocity estimate for facing flips and gait detection.
+    std::unordered_map<EntityId, ImVec2> vis_pos, vis_prev;
+    std::unordered_map<EntityId, float> dust_at;        // last dust puff (time_s)
+    // Action telegraph: last causal verb per actor, scanned incrementally
+    // from the ledger — display-only, expires after ~2 s of render time.
+    std::unordered_map<EntityId, std::string> c_act;
+    std::unordered_map<EntityId, ImU32> c_act_col;
+    std::unordered_map<EntityId, std::uint64_t> c_act_until;
+    std::uint64_t act_last = 0;                          // last scanned EventId
     bool show_atlas = false, show_codex = false, show_inspector = true;
     std::map<std::string, std::string> rosetta;     // player guesses: glyph token -> meaning
     SDL_Texture* glow = nullptr;
@@ -273,6 +318,21 @@ struct Viewer {
     // 4th frame; other frames just composite the cached layer.
     SDL_Texture* ui_rt = nullptr;
     bool ui_dirty = true;
+    // ui_rt is re-rasterized only when the UI could have changed: input
+    // events, a new snapshot generation, a new world tick (clock text),
+    // toast fade, or every 8th frame as a safety net for animations.
+    std::uint64_t ui_last_tick = ~0ull, ui_last_snap_gen = ~0ull;
+    // aux_rt caches the software-expensive reference windows (Atlas gallery,
+    // Chronicle codex): they rasterize at ~7.5 Hz into aux_rt and are blitted
+    // back at the window rects captured at rasterize time, so dragging a
+    // window never smears stale pixels.
+    SDL_Texture* aux_rt = nullptr;
+    float aux_rect[2][4] = {};        // x, y, w, h in window px (framebuffer space)
+    bool aux_ok[2] = {};
+    // fog rebuild gates: bulk fog textures regenerate only when the flat
+    // fog grid's generation counter actually moved.
+    std::uint64_t fog_tex_gen = ~0ull, mini_fog_gen = ~0ull, globe_fog_gen = ~0ull;
+    double fog_update_t = -1;
     int win_w = 1280, win_h = 800;
     float ux(float x) const { return x * kPix; }      // world-target px -> window px
     // simulation runs on its own thread; the UI thread takes the lock only
@@ -292,14 +352,18 @@ struct Viewer {
         std::vector<std::pair<std::string, std::string>> props;
         std::vector<std::string> body, discoveries, property;
         std::vector<std::pair<std::string, long long>> beliefs;
+        std::string intent;                  // Phase 15: what it's doing now
+        std::vector<std::string> life;       // Phase 15: scars/fears/loves/proofs
     } insp;
     struct Stone { EntityId id; std::int64_t lang; std::string text, treaty; };
     std::vector<Stone> c_stones;
     std::string c_codex;
+    std::vector<std::string> c_codex_lines;   // c_codex split for clipped display
     std::vector<std::string> c_chron;
 
     explicit Viewer(World& world) : w(world) {
         dstate.curiosity = true; dstate.concurrent = true;
+        composer.load(data_dir + "/narrative_templates.txt");
     }
 
     std::int64_t tribe_lang() const {
@@ -312,12 +376,21 @@ struct Viewer {
         fog.set_mode(FogOfWar::Mode::Tribe, tribe_lang());
         selected = kNoEntity; avatar = kNoEntity; av_targets.clear();
         parts.clear(); last_pos.clear(); facing.clear(); bob_until.clear(); last_integ.clear(); last_pain.clear();
+        vis_pos.clear(); vis_prev.clear(); dust_at.clear();
+        c_act.clear(); c_act_col.clear(); c_act_until.clear(); act_last = 0;
         ground_key = ~0ull;
         if (ground) { SDL_DestroyTexture(ground); ground = nullptr; }
         if (fog_tex) { SDL_DestroyTexture(fog_tex); fog_tex = nullptr; }
+        if (fog_ground) { SDL_DestroyTexture(fog_ground); fog_ground = nullptr; }
+        clear_fchunks(); fchunk_mode = -1; fog_update_t = -1;
         if (mini_tex) { SDL_DestroyTexture(mini_tex); mini_tex = nullptr; }
         insp = InspCache{}; c_stones.clear(); c_codex.clear(); c_chron.clear();
         journal.bubbles.clear(); bubble_rects.clear(); c_signs.clear(); c_legends.clear();
+        cfeed = ChronicleFeed{}; c_callouts.clear(); narr_seen = 0; c_carved.clear();
+        cap_scratch = CaptureScratch{};
+        snap = RenderSnapshot{}; snap_back = RenderSnapshot{}; snap_gen = 0;
+        fog_tex_gen = mini_fog_gen = globe_fog_gen = ~0ull;
+        ui_last_tick = ui_last_snap_gen = ~0ull;
         need_successor = false; tool = kToolNone; dragging = false;
         if (!pw.homes.empty()) { cam.cx = float(pw.homes[0].x); cam.cy = float(pw.homes[0].y); }
         ui_dirty = true;
@@ -354,15 +427,17 @@ struct Viewer {
             pw.founders.push_back(id);
         }
     }
-    std::string slot_path(int slot) const { return pref_dir + "slot" + std::to_string(slot) + ".sav"; }
+    std::string slot_path(int slot) const {
+        return pref_dir + (slot <= 0 ? std::string("autosave") : "slot" + std::to_string(slot)) + ".sav";
+    }
     void save_slot(int slot) {
         std::string err;
         std::lock_guard<std::mutex> lk(mx);
         if (w.save(slot_path(slot), &err)) {
             std::ofstream m(slot_path(slot) + ".meta");
-            m << pp.seed << ' ' << pp.grid << ' ' << int(pp.planet) << ' ' << tribe_view << '\n';
+            m << pp.seed << ' ' << pp.grid << ' ' << int(pp.planet) << ' ' << tribe_view << ' ' << w.clock_.tick() << '\n';
             journal.save(slot_path(slot) + ".journal");
-            status_msg = "Saved slot " + std::to_string(slot) + " (tick " + std::to_string(w.clock_.tick()) + ")";
+            status_msg = std::string("Saved ") + slot_name(slot) + " (day " + std::to_string(w.clock_.tick() / 24) + ")";
         } else status_msg = "Save failed: " + err;
         ui_dirty = true;
     }
@@ -386,7 +461,8 @@ struct Viewer {
         journal.tribe = tribe_lang();
         reset_view();
         planet_setup();
-        status_msg = "Loaded slot " + std::to_string(slot) + " (tick " + std::to_string(w.clock_.tick()) + ")";
+        has_game = true;
+        status_msg = std::string("Loaded ") + slot_name(slot) + " (day " + std::to_string(w.clock_.tick() / 24) + ")";
         return true;
     }
 
@@ -398,6 +474,7 @@ struct Viewer {
     bool is_planet() const { return planet_w > 0; }
     void planet_setup() {
         planet_w = planet_h = 0; globe = false; globe_dive = false;
+        clear_gchunks();
         int pw_ = 0, ph_ = 0;
         for (auto& [k, t] : tile_tex) if (t) SDL_DestroyTexture(t);
         tile_tex.clear(); tile_lru.clear();
@@ -407,6 +484,10 @@ struct Viewer {
         ptiles.reset(gen_seed, pw_, ph_, 384);
         globe_fog.assign(std::size_t(pmap.aw) * pmap.ah, 0);
         globe_fog_frame = 0;
+        // flat fog grid covers the whole planet (~8 MB worst case); gx wraps
+        // at the antimeridian like planet_cell() does for terrain sampling.
+        fog.set_bounds(0, 0, pw_, ph_);
+        fog.set_wrap_x(pw_);
     }
     double planet_units_w() const { return double(planet_w) * w.terrain.cell; }
     double planet_units_h() const { return double(planet_h) * w.terrain.cell; }
@@ -464,36 +545,62 @@ struct Viewer {
     // fog texels (under the lock): explored -> 1, visible -> 2
     void build_globe_fog() {
         if (!is_planet() || fog.mode() == FogOfWar::Mode::GodEye) return;
+        if (fog.generation() == globe_fog_gen) return;   // nothing moved
+        globe_fog_gen = fog.generation();
         std::fill(globe_fog.begin(), globe_fog.end(), 0);
-        for (const auto& c : fog.explored_cells())
-            globe_fog[std::size_t(pmap.row_of(c.second)) * pmap.aw + pmap.col_of(c.first)] = 1;
-        for (const auto& c : fog.visible_cells())
-            globe_fog[std::size_t(pmap.row_of(c.second)) * pmap.aw + pmap.col_of(c.first)] = 2;
+        auto mark = [&](std::uint64_t k, std::uint8_t v) {
+            const int gx = static_cast<int>(k >> 32), gy = static_cast<int>(std::uint32_t(k));
+            globe_fog[std::size_t(pmap.row_of(gy)) * pmap.aw + pmap.col_of(gx)] = v;
+        };
+        for (const std::uint64_t k : fog.explored_indices()) mark(k, 1);
+        for (const std::uint64_t k : fog.visible_indices()) mark(k, 2);
     }
     double sun_lon() const {
         const double hour = double(c_tick % 24) + 0.5;
         return std::remainder(kPI - hour / 24.0 * 2 * kPI + gview_sun_offset, 2 * kPI);
     }
+    // title screen: a slowly turning decorative planet behind the menu
+    void draw_title_globe(double dt) {
+        if (!title_map.valid()) return;
+        title_view.lon += dt * 0.06;
+        title_view.lat = 0.35;
+        title_view.radius = std::min(cam.sw, cam.sh) * 0.55;
+        draw_globe();
+    }
     void draw_globe() {
         const int W = cam.sw, H = cam.sh;
-        if (!globe_tex || globe_tw != W || globe_th != H) {
+        // The sphere's pixel loop costs ~pi * radius^2 per frame (20 ms at
+        // radius 768). When zoomed far out we render into a proportionally
+        // smaller buffer — same image, GPU-upscaled with LINEAR — capping the
+        // effective radius so a frame stays ~2-3 ms. px_ is rebuilt once per
+        // (scaled) radius; lon/light changes reuse the cached projection.
+        GlobeView gv = has_game ? gview : title_view;
+        const double rr = std::max(1.0, double(gv.radius));
+        const double gs = rr > 256.0 ? 256.0 / rr : 1.0;
+        const int bw = std::max(96, int(W * gs)), bh = std::max(64, int(H * gs));
+        if (!globe_tex || globe_tw != bw || globe_th != bh) {
             if (globe_tex) SDL_DestroyTexture(globe_tex);
-            globe_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, W, H);
-            SDL_SetTextureScaleMode(globe_tex, SDL_SCALEMODE_NEAREST);
-            globe_tw = W; globe_th = H;
-            stars.assign(std::size_t(W) * H, 0xFF05070Cu);
+            globe_tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, bw, bh);
+            SDL_SetTextureScaleMode(globe_tex, SDL_SCALEMODE_LINEAR);   // smooth upscale of the low-res sphere
+            globe_tw = bw; globe_th = bh;
+            stars.assign(std::size_t(bw) * bh, 0xFF05070Cu);
             std::uint32_t h = 0x9E3779B9u;
-            for (int i = 0; i < W * H / 180; ++i) {          // deterministic starfield
+            for (int i = 0; i < bw * bh / 180; ++i) {          // deterministic starfield
                 h ^= h << 13; h ^= h >> 17; h ^= h << 5;
                 const std::uint32_t v = 90 + (h >> 24) % 150;
                 stars[h % stars.size()] = 0xFF000000u | (v << 16) | (v << 8) | std::min<std::uint32_t>(255, v + 20);
             }
         }
         globe_px = stars;
-        grend.render(pmap, gview, sun_lon(), fog.mode() == FogOfWar::Mode::GodEye ? nullptr : globe_fog.data(),
-                     globe_px.data(), W, H, W / 2, H / 2);
-        SDL_UpdateTexture(globe_tex, nullptr, globe_px.data(), W * 4);
-        SDL_RenderTexture(ren, globe_tex, nullptr, nullptr);
+        gv.radius *= gs;                                     // scale view with the buffer
+        if (has_game)
+            grend.render(pmap, gv, sun_lon(), fog.mode() == FogOfWar::Mode::GodEye ? nullptr : globe_fog.data(),
+                         globe_px.data(), bw, bh, bw / 2, has_game ? bh / 2 : bh * 5 / 8);
+        else
+            grend.render(title_map, gv, time_s * 0.15, nullptr, globe_px.data(), bw, bh, bw / 2, bh * 5 / 8);
+        SDL_UpdateTexture(globe_tex, nullptr, globe_px.data(), bw * 4);
+        const SDL_FRect dst{0, 0, float(W), float(H)};
+        SDL_RenderTexture(ren, globe_tex, nullptr, &dst);
     }
     // strategic icons on the sphere (cached under the lock, drawn in the UI layer)
     void build_globe_icons() {
@@ -619,6 +726,321 @@ struct Viewer {
         tile_tex[k] = t; tile_lru.push_back(k);
         return t;
     }
+    // ---- planet ground: one chunked renderer for home region AND far planet ----
+    // 32x32-cell chunks drawn with the same material sprites, tint, cliffs and
+    // elevation lift everywhere, so the simulated region and the dormant
+    // planet join without a seam. Region cells read the terrain grid (wear,
+    // lenses); far cells read the analytic fields. LRU-bounded, a few chunk
+    // builds per frame (a flat colour tile stands in until a chunk is ready).
+    static constexpr int kCC = 32;          // cells per chunk side
+    static constexpr float kCS = 1.0f;      // chunk texture px per map unit
+    struct GChunk { SDL_Texture* t = nullptr; std::uint64_t used = 0, epoch = 0; int lens = -1; };
+    std::unordered_map<std::uint64_t, GChunk> gchunks;
+    void clear_gchunks() {
+        for (auto& [k, g] : gchunks) if (g.t) SDL_DestroyTexture(g.t);
+        gchunks.clear();
+    }
+    int gchunk_margin() const { return int(600 * Camera::kElev * kCS) + 6; }
+    bool chunk_in_region(int wcx, int cy) const {
+        const TerrainGrid& t = w.terrain;
+        const int x0 = wcx * kCC, y0 = cy * kCC;
+        return x0 < t.ox + t.w && x0 + kCC > t.ox && y0 < t.oy + t.h && y0 + kCC > t.oy;
+    }
+    CellView planet_cell(int gx, int gy) const {
+        CellView c; c.gx = gx; c.gy = gy;
+        int lx, ly;
+        const TerrainGrid& t = w.terrain;
+        if (t.local_cell(gx, gy, lx, ly)) {
+            const std::size_t i = std::size_t(ly) * t.w + lx;
+            c.elevation = t.elevation[i]; c.moisture = t.moisture[i]; c.vegetation = t.vegetation[i];
+            c.temperature = t.temperature[i]; c.slope = t.slope[i]; c.water = t.water[i];
+            c.wear = t.traffic_wear.size() == t.elevation.size() ? t.traffic_wear[i] : 0;
+            return c;
+        }
+        const std::int32_t sl = w.gen_sea_level;
+        const int gxw = ((gx % planet_w) + planet_w) % planet_w;
+        c.elevation = WorldGenerator::elevation_at(gen_seed, gxw, gy);
+        c.temperature = WorldGenerator::temperature_at(gen_seed, gxw, gy, sl);
+        c.water = WorldGenerator::water_at(gen_seed, gxw, gy, sl);
+        c.moisture = c.water ? 1000 : WorldGenerator::moisture_at(gen_seed, gxw, gy, sl);
+        c.vegetation = c.water ? 0 : (c.temperature >= -50 && c.temperature <= 350 ? c.moisture * 9 / 10 : c.moisture / 5);
+        c.slope = WorldGenerator::slope_at(gen_seed, gxw, gy);
+        return c;
+    }
+    void build_gchunk(GChunk& g, int wcx, int cy) {
+        const int cell = w.terrain.cell;
+        const int margin = gchunk_margin();
+        const int TW = int(kCC * cell * kCS), TH = int(kCC * cell * Camera::kY * kCS) + margin + 8;
+        if (!g.t) {
+            g.t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, TW, TH);
+            SDL_SetTextureBlendMode(g.t, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(g.t, SDL_SCALEMODE_NEAREST);
+        }
+        SDL_SetRenderTarget(ren, g.t);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
+        SDL_RenderClear(ren);
+        const float ts = float(cell) * kCS;
+        const bool region = chunk_in_region(wcx, cy);
+        for (int ly = 0; ly < kCC; ++ly) {
+            const int gy = cy * kCC + ly;
+            if (gy < 0 || gy >= planet_h) continue;
+            for (int lx = 0; lx < kCC; ++lx) {
+                const CellView c = planet_cell(wcx * kCC + lx, gy);
+                const float x = float(lx) * ts;
+                const float y = (float(ly * cell) * Camera::kY - c.elevation * Camera::kElev) * kCS + margin;
+                SDL_FRect dst{x, y, ts, ts * Camera::kY + 1};
+                if (const Sprite* sp = atlas.material(terrain_material(c))) {
+                    SDL_Texture* tx = tex.get(*sp);
+                    int r = 255, gg = 255, b = 255;
+                    if (!c.water) {
+                        r = 255 - c.vegetation / 6; b = 255 - c.vegetation / 5;
+                        const int wear = std::min(1000, c.wear);
+                        r -= (r - 170) * wear / 1000; gg -= (gg - 140) * wear / 1000; b -= (b - 100) * wear / 1000;
+                    }
+                    SDL_SetTextureColorMod(tx, Uint8(std::clamp(r, 0, 255)), Uint8(std::clamp(gg, 0, 255)), Uint8(std::clamp(b, 0, 255)));
+                    SDL_RenderTexture(ren, tx, nullptr, &dst);
+                    SDL_SetTextureColorMod(tx, 255, 255, 255);
+                }
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+                if (c.temperature < 20) {                               // frost -> snow -> ice
+                    const int a = std::clamp((20 - c.temperature) * 2, 30, 230);
+                    SDL_SetRenderDrawColor(ren, 236, 242, 250, Uint8(c.water ? a / 2 : a));
+                    SDL_RenderFillRect(ren, &dst);
+                }
+                if (c.slope > 12 && !c.water) {
+                    SDL_FRect face{x, y + ts * Camera::kY, ts, std::min(ts, c.slope * Camera::kElev * kCS)};
+                    SDL_SetRenderDrawColor(ren, 40, 30, 22, 170);
+                    SDL_RenderFillRect(ren, &face);
+                }
+                if (region) draw_cell_lens(c, dst);
+                SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+            }
+        }
+        g.epoch = region ? c_tick / 240 : 0;
+        g.lens = region ? lens : -1;
+        SDL_SetRenderTarget(ren, world_rt);
+    }
+    void draw_ground_chunks() {
+        const int cell = w.terrain.cell;
+        const double CU = double(kCC) * cell;
+        const float margin_u = float(gchunk_margin()) / kCS;
+        const int TW = int(kCC * cell * kCS), TH = int(kCC * cell * Camera::kY * kCS) + gchunk_margin() + 8;
+        const double x0 = cam.cx - cam.sw * 0.5 / cam.zoom, x1 = cam.cx + cam.sw * 0.5 / cam.zoom;
+        const double y0 = cam.cy - cam.sh * 0.5 / cam.zoom / Camera::kY, y1 = cam.cy + cam.sh * 0.5 / cam.zoom / Camera::kY;
+        const int ncx = (planet_w + kCC - 1) / kCC;
+        int budget = 3;                                   // chunk builds per frame
+        const std::uint64_t ep = c_tick / 240;
+        for (int cy = int(std::floor(y0 / CU)); cy <= int(std::floor(y1 / CU)) + 1; ++cy) {
+            if (cy < 0 || cy * kCC >= planet_h) continue;
+            for (int cxi = int(std::floor(x0 / CU)); cxi <= int(std::floor(x1 / CU)); ++cxi) {
+                const int wcx = ((cxi % ncx) + ncx) % ncx;
+                const std::uint64_t key = (std::uint64_t(std::uint32_t(cy)) << 32) | std::uint32_t(wcx);
+                GChunk& g = gchunks[key];
+                const bool stale = g.t && chunk_in_region(wcx, cy) && (g.epoch != ep || g.lens != lens);
+                if ((!g.t || stale) && budget > 0) { build_gchunk(g, wcx, cy); --budget; }
+                g.used = frames;
+                const float sx = cam.sx(float(cxi * CU));
+                if (g.t) {
+                    SDL_FRect d{sx, cam.sy(float(cy * CU)) - margin_u * cam.zoom, float(TW) / kCS * cam.zoom + 0.5f,
+                                float(TH) / kCS * cam.zoom};
+                    SDL_RenderTexture(ren, g.t, nullptr, &d);
+                } else if (SDL_Texture* ph = tile_texture(wcx, cy)) {     // placeholder until built
+                    SDL_FRect d{sx, cam.sy(float(cy * CU)), float(CU) * cam.zoom + 1, float(CU) * Camera::kY * cam.zoom + 1};
+                    SDL_SetTextureColorMod(ph, 255, 255, 255);
+                    SDL_RenderTexture(ren, ph, nullptr, &d);
+                }
+            }
+        }
+        // LRU bound: ~0.9 MB per chunk, keep <= 96
+        while (gchunks.size() > 96) {
+            auto old = gchunks.end();
+            for (auto it = gchunks.begin(); it != gchunks.end(); ++it)
+                if (old == gchunks.end() || it->second.used < old->second.used) old = it;
+            if (old->second.t) SDL_DestroyTexture(old->second.t);
+            gchunks.erase(old);
+        }
+    }
+    // fog on planets: region keeps its per-cell soft fog; the dormant planet
+    // outside it is unexplored by definition -> the same dark haze
+    // ---- fog layer lifted with the terrain --------------------------------------
+    // Fog is painted per cell at the SAME elevation lift (and cliff face) as
+    // the ground, so the lit disk sits exactly where the people stand. Low
+    // resolution (kFS px per map unit) + linear filtering = soft edges, cheap
+    // rebuilds. Painter order top -> bottom with BLENDMODE_NONE: like the
+    // ground, the frontmost cell owns every pixel it covers.
+    static constexpr float kFS = 0.25f;
+    static std::uint32_t fog_rgba(Fog f) { return f == Fog::Visible ? 0u : f == Fog::Shrouded ? 0x780A0A12u : 0xD8120F0Cu; }
+    template <class ElevFn>
+    void paint_fog_cells(int gx0, int gy0, int gx1, int gy1, float org_x, float org_y, int margin_px, ElevFn elev_slope) {
+        const int cell = w.terrain.cell;
+        const float cw = float(cell) * kFS;
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        for (int gy = gy0; gy < gy1; ++gy)
+            for (int gx = gx0; gx < gx1; ++gx) {
+                std::int32_t e = 0, sl = 0;
+                elev_slope(gx, gy, e, sl);
+                const std::uint32_t c = fog_rgba(fog.cell_fog(gx, gy));
+                const float x = (float(gx * cell) - org_x) * kFS;
+                const float y = (float(gy * cell) * Camera::kY - float(e) * Camera::kElev - org_y) * kFS + float(margin_px);
+                const float face = sl > 12 ? std::min(float(cell), float(sl) * Camera::kElev) * kFS : 0.f;
+                SDL_SetRenderDrawColor(ren, Uint8(c >> 16), Uint8(c >> 8), Uint8(c), Uint8(c >> 24));
+                SDL_FRect r{x, y, cw + 0.5f, cw * Camera::kY + face + 1.f};
+                SDL_RenderFillRect(ren, &r);
+            }
+    }
+    // valley: one fog texture over the single ground texture
+    SDL_Texture* fog_ground = nullptr;
+    int fog_ground_margin = 0;
+    void build_fog_ground() {
+        const TerrainGrid& t = w.terrain;
+        if (t.empty()) return;
+        const int cell = t.cell;
+        fog_ground_margin = int(600 * Camera::kElev * kFS) + 2;
+        const int W = int(t.w * cell * kFS) + 1, H = int(t.h * cell * Camera::kY * kFS) + fog_ground_margin + 4;
+        if (!fog_ground) {
+            fog_ground = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, W, H);
+            SDL_SetTextureBlendMode(fog_ground, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(fog_ground, SDL_SCALEMODE_LINEAR);
+        }
+        SDL_Texture* prev = SDL_GetRenderTarget(ren);
+        SDL_SetRenderTarget(ren, fog_ground);
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
+        SDL_RenderClear(ren);
+        paint_fog_cells(t.ox, t.oy, t.ox + t.w, t.oy + t.h, float(t.ox * cell), float(t.oy * cell) * Camera::kY,
+                        fog_ground_margin, [&](int gx, int gy, std::int32_t& e, std::int32_t& sl) {
+                            const std::size_t i = std::size_t(gy - t.oy) * t.w + (gx - t.ox);
+                            e = t.elevation[i]; sl = t.water[i] ? 0 : t.slope[i];
+                        });
+        SDL_SetRenderTarget(ren, prev);
+    }
+    void draw_fog_ground() {
+        if (!fog_ground || fog.mode() == FogOfWar::Mode::GodEye) return;
+        const TerrainGrid& t = w.terrain;
+        const float gox = float(t.ox * t.cell), goy = float(t.oy * t.cell);
+        SDL_FRect src{(cam.cx - gox - cam.sw * 0.5f / cam.zoom) * kFS,
+                      ((cam.cy - goy) * Camera::kY - cam.sh * 0.5f / cam.zoom) * kFS + fog_ground_margin,
+                      cam.sw / cam.zoom * kFS, cam.sh / cam.zoom * kFS};
+        SDL_FRect dst{0, 0, float(cam.sw), float(cam.sh)};
+        SDL_RenderTexture(ren, fog_ground, &src, &dst);
+    }
+    // planet: one small fog texture per ground chunk, rebuilt only when a
+    // cell inside it changed tier (dirty set from the fog's visible lists)
+    struct FChunk { SDL_Texture* t = nullptr; bool dirty = true; std::uint64_t used = 0; };
+    std::unordered_map<std::uint64_t, FChunk> fchunks;
+    std::vector<std::uint64_t> fog_prev_visible;
+    std::size_t fog_explored_seen = 0;
+    int fchunk_mode = -1; std::int64_t fchunk_tribe = 0;
+    void clear_fchunks() {
+        for (auto& [k, f] : fchunks) if (f.t) SDL_DestroyTexture(f.t);
+        fchunks.clear(); fog_prev_visible.clear(); fog_explored_seen = 0;
+    }
+    std::uint64_t fchunk_key_of_cell(int gx, int gy) const {
+        const int ncx = std::max(1, (planet_w + kCC - 1) / kCC);
+        const int cx = ((gx / kCC) % ncx + ncx) % ncx, cy = gy / kCC;
+        return (std::uint64_t(std::uint32_t(cy)) << 32) | std::uint32_t(cx);
+    }
+    // called under the lock after fog.update(): mark touched chunks dirty
+    void fog_mark_dirty() {
+        if (int(fog.mode()) != fchunk_mode || fog.tribe() != fchunk_tribe) {
+            clear_fchunks(); fchunk_mode = int(fog.mode()); fchunk_tribe = fog.tribe();
+        }
+        auto mark = [&](std::uint64_t packed) {
+            const int gx = int(packed >> 32), gy = int(std::uint32_t(packed));
+            if (auto it = fchunks.find(fchunk_key_of_cell(gx, gy)); it != fchunks.end()) it->second.dirty = true;
+        };
+        // only cells whose tier CHANGED: (old visible) xor (new visible);
+        // newly explored cells are in the new visible set by definition
+        std::vector<std::uint64_t> cur = fog.visible_indices();
+        std::sort(cur.begin(), cur.end());
+        std::vector<std::uint64_t> diff;
+        std::set_symmetric_difference(fog_prev_visible.begin(), fog_prev_visible.end(),
+                                      cur.begin(), cur.end(), std::back_inserter(diff));
+        for (std::uint64_t k : diff) mark(k);
+        fog_explored_seen = fog.explored_indices().size();
+        fog_prev_visible.swap(cur);
+    }
+    void draw_fog_chunks() {
+        if (fog.mode() == FogOfWar::Mode::GodEye) return;
+        const int cell = w.terrain.cell;
+        const double CU = double(kCC) * cell;
+        const int mpx = int(600 * Camera::kElev * kFS) + 2;
+        const int TW = int(kCC * cell * kFS) + 1, TH = int(kCC * cell * Camera::kY * kFS) + mpx + 4;
+        const double x0 = cam.cx - cam.sw * 0.5 / cam.zoom, x1 = cam.cx + cam.sw * 0.5 / cam.zoom;
+        const double y0 = cam.cy - cam.sh * 0.5 / cam.zoom / Camera::kY, y1 = cam.cy + cam.sh * 0.5 / cam.zoom / Camera::kY;
+        const int ncx = (planet_w + kCC - 1) / kCC;
+        int budget = 8;
+        for (int cy = int(std::floor(y0 / CU)); cy <= int(std::floor(y1 / CU)) + 1; ++cy) {
+            if (cy < 0 || cy * kCC >= planet_h) continue;
+            for (int cxi = int(std::floor(x0 / CU)); cxi <= int(std::floor(x1 / CU)); ++cxi) {
+                const int wcx = ((cxi % ncx) + ncx) % ncx;
+                const std::uint64_t key = (std::uint64_t(std::uint32_t(cy)) << 32) | std::uint32_t(wcx);
+                FChunk& fc = fchunks[key];
+                fc.used = frames;
+                if (fc.dirty && budget > 0) {
+                    --budget;
+                    if (!fc.t) {
+                        fc.t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, TW, TH);
+                        SDL_SetTextureBlendMode(fc.t, SDL_BLENDMODE_BLEND);
+                        SDL_SetTextureScaleMode(fc.t, SDL_SCALEMODE_LINEAR);
+                    }
+                    SDL_Texture* prev = SDL_GetRenderTarget(ren);
+                    SDL_SetRenderTarget(ren, fc.t);
+                    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+                    SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
+                    SDL_RenderClear(ren);
+                    const int gx0 = wcx * kCC, gy0 = cy * kCC;
+                    paint_fog_cells(gx0, gy0, gx0 + kCC, std::min(gy0 + kCC, planet_h), float(gx0 * cell),
+                                    float(gy0 * cell) * Camera::kY, mpx,
+                                    [&](int gx, int gy, std::int32_t& e, std::int32_t& sl) {
+                                        const CellView c = planet_cell(gx, gy);
+                                        e = c.elevation; sl = c.water ? 0 : c.slope;
+                                    });
+                    SDL_SetRenderTarget(ren, prev);
+                    fc.dirty = false;
+                }
+                const float sx = cam.sx(float(cxi * CU));
+                if (fc.t) {                                 // stale-but-close until repainted
+                    SDL_FRect d{sx, cam.sy(float(cy * CU)) - float(mpx) / kFS * cam.zoom, float(TW) / kFS * cam.zoom,
+                                float(TH) / kFS * cam.zoom};
+                    SDL_RenderTexture(ren, fc.t, nullptr, &d);
+                } else {                                   // not painted yet: plain haze
+                    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+                    SDL_SetRenderDrawColor(ren, 18, 15, 12, 0xD8);
+                    SDL_FRect d{sx, cam.sy(float(cy * CU)), float(CU) * cam.zoom + 1, float(CU) * Camera::kY * cam.zoom + 1};
+                    SDL_RenderFillRect(ren, &d);
+                }
+            }
+        }
+        while (fchunks.size() > 160) {                     // ~60 KB each
+            auto old = fchunks.end();
+            for (auto it = fchunks.begin(); it != fchunks.end(); ++it)
+                if (old == fchunks.end() || it->second.used < old->second.used) old = it;
+            if (old->second.t) SDL_DestroyTexture(old->second.t);
+            fchunks.erase(old);
+        }
+    }
+
+    void draw_planet_fog() {
+        if (fog.mode() == FogOfWar::Mode::GodEye) return;
+        const TerrainGrid& t = w.terrain;
+        if (fog_tex) {
+            const float rx0 = cam.sx(float(t.ox * t.cell)), ry0 = cam.sy(float(t.oy * t.cell));
+            SDL_FRect fd{rx0, ry0, float(t.w * t.cell) * cam.zoom, float(t.h * t.cell) * Camera::kY * cam.zoom};
+            SDL_RenderTexture(ren, fog_tex, nullptr, &fd);
+            SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(ren, 18, 15, 12, 0xC8);
+            const float W = float(cam.sw), H = float(cam.sh);
+            const float rx1 = rx0 + fd.w, ry1 = ry0 + fd.h;
+            SDL_FRect bands[4] = {{0, 0, W, std::max(0.f, ry0)},
+                                  {0, std::max(0.f, ry1), W, std::max(0.f, H - ry1)},
+                                  {0, std::max(0.f, ry0), std::max(0.f, rx0), std::max(0.f, std::min(H, ry1) - std::max(0.f, ry0))},
+                                  {std::max(0.f, rx1), std::max(0.f, ry0), std::max(0.f, W - rx1), std::max(0.f, std::min(H, ry1) - std::max(0.f, ry0))}};
+            for (const SDL_FRect& b : bands) if (b.w > 0 && b.h > 0) SDL_RenderFillRect(ren, &b);
+        }
+    }
+
     // mini-globe in the minimap corner, following the camera
     void update_mini_globe() {
         if (!is_planet()) return;
@@ -639,8 +1061,9 @@ struct Viewer {
     void ui_mini_globe() {
         if (!mini_globe_tex) return;
         const float S = 170.f;
-        ImGui::SetNextWindowPos(ImVec2(float(win_w) - S - 24, float(win_h) - S - 44), ImGuiCond_Always);
-        ImGui::Begin("Planet", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+        ImGui::SetNextWindowPos(ImVec2(float(win_w) - 10, float(win_h) - 10), ImGuiCond_Always, ImVec2(1, 1));
+        ImGui::Begin("##planet", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
         const ImVec2 o = ImGui::GetCursorScreenPos();
         ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)mini_globe_tex), ImVec2(S, S));
         // view frame at the centre (camera footprint as an angle on the sphere)
@@ -655,7 +1078,7 @@ struct Viewer {
             double lo, la;
             if (GlobeRenderer::unproject(v, m.x - c.x, m.y - c.y, lo, la)) { pos_of(lo, la, cam.cx, cam.cy); wrap_camera(); }
         }
-        if (ImGui::SmallButton("Globe (M)")) enter_globe();
+        if (ImGui::Button("Planet view (M)", ImVec2(S, 0))) enter_globe();
         ImGui::End();
     }
 
@@ -669,6 +1092,10 @@ struct Viewer {
         // ImGui rasterized INTO this target with normal blending leaves
         // premultiplied colour; compositing it must not multiply alpha again
         SDL_SetTextureBlendMode(ui_rt, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+        if (aux_rt) SDL_DestroyTexture(aux_rt);
+        aux_rt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, win_w, win_h);
+        SDL_SetTextureBlendMode(aux_rt, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+        aux_ok[0] = aux_ok[1] = false;
         ui_dirty = true;
     }
     void init_textures() {
@@ -686,8 +1113,9 @@ struct Viewer {
     }
 
     // ---- simulation pacing (the ONLY thing that advances the World) --------
-    // Runs on sim_thread. Each cycle holds the world lock; the UI thread
-    // only reads under the same lock, so it never sees a half-applied cycle.
+    // Runs on sim_thread. A round is processed in ~6 ms wall-clock slices
+    // (autonomous_cycle_step) so the UI thread can grab the world lock for
+    // captures between slices instead of starving for a whole ~350 ms cycle.
     void sim_loop() {
         static const double kRate[] = {0, 2, 10, 40, 200};   // cycles / second
         auto last = std::chrono::steady_clock::now();
@@ -697,12 +1125,31 @@ struct Viewer {
             accum += std::chrono::duration<double>(now - last).count() * kRate[std::clamp(speed_atomic.load(), 0, 4)];
             last = now;
             if (accum >= 1.0) {
-                { std::lock_guard<std::mutex> lk(mx); autonomous_cycle(w, &dstate); }
-                accum = std::min(accum - 1.0, 4.0);       // never queue a backlog
-                if (ui_wants.exchange(false))              // let the UI take one fresh look
-                    std::this_thread::sleep_for(std::chrono::milliseconds(6));
+                bool round_done = true;
+                if (has_game) {
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        round_done = autonomous_cycle_step(w, &dstate, nullptr, 10.0);
+                    }
+                    // leave the lock between slices: the UI's try_to_lock
+                    // capture path gets a ~4 ms window every ~14 ms — often
+                    // enough for ~15 fresh snapshots/sec while the round
+                    // still completes in ~0.5 s (~2 rounds/sec at speed 1,
+                    // matching the pre-slice throughput).
+                    const bool wants = ui_wants.exchange(false);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(wants ? 8 : 4));
+                }
+                if (round_done) {
+                    accum = std::min(accum - 1.0, 4.0);   // never queue a backlog
+#if defined(__GLIBC__)
+                    // hand freed planner clones back to the OS: RSS tracks the
+                    // live world, not the high-water mark of one heavy round
+                    if (++rounds_since_trim >= 4) { malloc_trim(0); rounds_since_trim = 0; }
+#endif
+                }
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
     }
@@ -806,11 +1253,27 @@ struct Viewer {
                       cam.sw / cam.zoom * kGround, cam.sh / cam.zoom * kGround};
         SDL_FRect dst{0, 0, float(cam.sw), float(cam.sh)};
         SDL_RenderTexture(ren, ground, &src, &dst);
-        if (fog.mode() == FogOfWar::Mode::Tribe && fog_tex) {
-            const TerrainGrid& t = w.terrain;
-            const float x0 = cam.sx(float(t.ox * t.cell)), y0 = cam.sy(float(t.oy * t.cell));
-            SDL_FRect fd{x0, y0, float(t.w * t.cell) * cam.zoom, float(t.h * t.cell) * Camera::kY * cam.zoom};
-            SDL_RenderTexture(ren, fog_tex, nullptr, &fd);
+        draw_fog_ground();                         // lifted with the terrain (Tribe & Avatar)
+    }
+
+    // ambient water: sparse glints drifting inside visible water cells,
+    // phased by cell hash so the pattern is stable but shimmer moves.
+    void draw_water_glints() {
+        if (snap.cells.empty()) return;
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        for (const CellView& c : snap.cells) {
+            if (!c.water || c.fog == Fog::Unexplored) continue;
+            if (((c.gx * 31 + c.gy * 17) & 3) != 0) continue;         // ~1/4 of cells
+            const float ph = std::sin(float(time_s) * 1.7f + float((c.gx * 73 + c.gy * 41) % 628) / 100.f);
+            if (ph < 0.25f) continue;
+            const float a = (ph - 0.25f) * 0.9f;
+            const float cx = cam.sx(float(c.gx * snap.cell)) +
+                (0.5f + 0.3f * std::sin(float(time_s) * 0.6f + c.gx)) * snap.cell * cam.zoom;
+            const float cy = cam.sy(float(c.gy * snap.cell)) +
+                (0.5f + 0.3f * std::cos(float(time_s) * 0.5f + c.gy)) * snap.cell * Camera::kY * cam.zoom;
+            SDL_SetRenderDrawColor(ren, 205, 232, 255, Uint8(80 * a));
+            SDL_FRect g{cx, cy, 2.6f * cam.zoom, 1.3f * cam.zoom};
+            SDL_RenderFillRect(ren, &g);
         }
     }
 
@@ -827,6 +1290,20 @@ struct Viewer {
         if (lens == kMilitary && c.fog != Fog::Visible) {
             SDL_SetRenderDrawColor(ren, 60, 0, 0, 70);
             SDL_RenderFillRect(ren, &dst);
+        }
+        if (lens == kEcology) {
+            // flora base (green) with a fauna accent (amber) — the census is
+            // fog-filtered at capture, so shrouded land stays blank.
+            if (c.flora > 0) {
+                SDL_SetRenderDrawColor(ren, 40, 140, 50,
+                                       Uint8(std::min(120, 30 + c.flora * 22)));
+                SDL_RenderFillRect(ren, &dst);
+            }
+            if (c.fauna > 0) {
+                SDL_SetRenderDrawColor(ren, 225, 140, 40,
+                                       Uint8(std::min(150, 40 + c.fauna * 30)));
+                SDL_RenderFillRect(ren, &dst);
+            }
         }
     }
 
@@ -890,12 +1367,33 @@ struct Viewer {
     void draw_entities(double dt) {
         for (const EntityView& e : snap.entities) {
             if (e.kind == "enclosure") { draw_enclosure(e); continue; }
-            const float elev = elev_at(e.pos);
-            const float fx = cam.sx(float(e.pos.x)), fy = cam.sy(float(e.pos.y), elev);
+            // ---- smooth visual position: exponential chase of sim pos ----
+            // (viewer-side only; sim positions stay integer World Truth)
+            const float tx = float(e.pos.x), ty = float(e.pos.y);
+            auto vit = vis_pos.find(e.id);
+            if (vit == vis_pos.end())
+                vit = vis_pos.emplace(e.id, ImVec2(tx, ty)).first;
+            else {
+                const float ddx = tx - vit->second.x, ddy = ty - vit->second.y;
+                if (ddx * ddx + ddy * ddy > 400.f * 400.f)      // spawn/teleport: snap
+                    vit->second = ImVec2(tx, ty);
+                else {
+                    const float k = 1.f - std::exp(-float(dt) * 12.f);
+                    vit->second.x += ddx * k; vit->second.y += ddy * k;
+                }
+            }
+            const auto pit = vis_prev.find(e.id);
+            const ImVec2 pp = pit == vis_prev.end() ? vit->second : pit->second;
+            const float mvx = vit->second.x - pp.x, mvy = vit->second.y - pp.y;
+            vis_prev[e.id] = vit->second;
+            if (std::fabs(mvx) > 0.02f) facing[e.id] = mvx < 0 ? -1.f : 1.f;   // face travel dir
+            const float spd = std::sqrt(mvx * mvx + mvy * mvy) / std::max(1e-3f, float(dt));
+            const bool gliding = spd > 12.f;                     // world units / sec
+            const float elev = elev_at(Vec2{std::int32_t(vit->second.x), std::int32_t(vit->second.y)});
+            const float fx = cam.sx(vit->second.x), fy = cam.sy(vit->second.y, elev);
             // motion memory -> bob / flip (viewer-side, never World state)
             auto lp = last_pos.find(e.id);
             if (lp != last_pos.end() && (lp->second.x != e.pos.x || lp->second.y != e.pos.y)) {
-                facing[e.id] = e.pos.x < lp->second.x ? -1.f : 1.f;
                 bob_until[e.id] = float(time_s) + 0.8f;
             }
             last_pos[e.id] = e.pos;
@@ -920,15 +1418,19 @@ struct Viewer {
             if (!sp || sp->empty()) continue;
             const bool creature = e.fauna || e.minded;
             float sw = sp->w * cam.zoom, sh = sp->h * cam.zoom;
-            float squash = 1.f, ox = 0;
-            const bool moving = bob_until.count(e.id) && bob_until[e.id] > time_s;
+            float squash = 1.f, ox = 0, sox = 0;
+            const bool moving = gliding || (bob_until.count(e.id) && bob_until[e.id] > time_s);
             if (creature && e.alive && moving) {               // squash & stretch hop
                 const float ph = std::sin(float(time_s) * 12.f + float(e.id % 17));
                 squash = 1.f + 0.08f * ph; sh *= squash; sw /= squash;
+            } else if (creature && e.alive) {                  // idle breathing
+                sh *= 1.f + 0.018f * std::sin(float(time_s) * 2.2f + float(e.id % 31));
             }
+            if (e.flora && !creature && e.alive && e.fog != Fog::Shrouded)   // foliage sway (frozen memory under the shroud)
+                sox = std::sin(float(time_s) * 1.25f + float((e.id * 2654435761u >> 8) % 1024) / 163.f) * 1.4f * cam.zoom;
             if (creature && (e.infected || e.toxin > 300 || e.temperature > 385))   // fever tremor
                 ox = std::sin(float(time_s) * 40.f + float(e.id)) * 1.2f * cam.zoom;
-            SDL_FRect dst{fx - sw / 2 + ox, fy - sh, sw, sh};
+            SDL_FRect dst{fx - sw / 2 + ox + sox, fy - sh, sw, sh};
             // ground shadow, slanted by the sun
             const float sun = float((snap.day_phase - 12)) / 12.f;
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -962,9 +1464,42 @@ struct Viewer {
             }
             if (e.bleed > 0 && e.alive && (frames / 8) % 3 == 0)
                 emit(fx, fy - sh * 0.5f, 0xFFA01010, 1);
-            if (e.temperature >= 3000) draw_glow(e.pos, 0xFF8030, 1.2f);    // fire / forge
-            if (e.epic && lens == kSacred) draw_glow(e.pos, 0xFFE090, 0.8f);
+            // gait dust: soft puffs kicked up at the feet while gliding
+            if (creature && e.alive && moving && e.fog == Fog::Visible && parts.size() < 600) {
+                auto dit = dust_at.find(e.id);
+                if (dit == dust_at.end() || time_s - dit->second > 0.14) {
+                    const float j = float((frames * 31 + int(e.id % 13)) % 17) / 17.f - 0.5f;
+                    const float fv = facing.count(e.id) ? facing[e.id] : 1.f;
+                    parts.push_back({fx + j * sw * 0.4f, fy - cam.zoom, -fv * 16.f + j * 20.f, -9.f, 0.5f, 0xD8C8B088});
+                    dust_at[e.id] = float(time_s);
+                }
+            }
+            const Vec2 vpos{std::int32_t(vit->second.x), std::int32_t(vit->second.y)};
+            if (e.temperature >= 3000) {                        // fire / forge
+                draw_glow(vpos, 0xFF8030, 1.2f);
+                if (e.fog == Fog::Visible && frames % 6 == std::uint64_t(e.id % 6) && parts.size() < 600) {
+                    const float j = float((frames + int(e.id % 7)) % 11) / 11.f;   // smoke + embers
+                    parts.push_back({fx + (j - 0.5f) * 6.f, fy - sh * 0.9f, (j - 0.5f) * 10.f, -20.f - j * 14.f, 1.3f, 0xFFB9BDC6, -14.f});
+                    if ((frames / 6) % 3 == 0)
+                        parts.push_back({fx + (j - 0.5f) * 4.f, fy - sh * 0.7f, (j - 0.5f) * 16.f, -34.f - j * 20.f, 0.7f, 0xFFFFA040, 30.f});
+                }
+            }
+            if (e.epic && lens == kSacred) draw_glow(vpos, 0xFFE090, 0.8f);
             draw_entity_lens(e, fx, fy, sw, sh);
+            // action telegraph: last causal verb floating over the head
+            if (creature && e.alive && e.fog == Fog::Visible) {
+                auto ait = c_act.find(e.id);
+                auto uit = c_act_until.find(e.id);
+                if (ait != c_act.end() && uit != c_act_until.end() && uit->second > frames) {
+                    ImDrawList* dl = ImGui::GetForegroundDrawList();
+                    const ImVec2 tp(ux(fx), ux(fy - sh) - 9.f);
+                    const ImVec2 ts = ImGui::CalcTextSize(ait->second.c_str());
+                    dl->AddRectFilled(ImVec2(tp.x - ts.x * 0.5f - 2.f, tp.y - 1.f),
+                                      ImVec2(tp.x + ts.x * 0.5f + 2.f, tp.y + ts.y + 1.f),
+                                      IM_COL32(10, 10, 14, 175), 2.f);
+                    dl->AddText(ImVec2(tp.x - ts.x * 0.5f, tp.y), c_act_col[e.id], ait->second.c_str());
+                }
+            }
             if (e.id == selected) {
                 SDL_SetRenderDrawColor(ren, 255, 230, 120, 255);
                 SDL_RenderRect(ren, &dst);
@@ -972,13 +1507,27 @@ struct Viewer {
         }
         // particles
         for (Particle& p : parts) {
-            p.life -= float(dt); p.x += p.vx * float(dt); p.y += p.vy * float(dt); p.vy += 90 * float(dt);
+            p.life -= float(dt); p.x += p.vx * float(dt); p.y += p.vy * float(dt); p.vy += p.grav * float(dt);
             if (p.life <= 0) continue;
             SDL_SetRenderDrawColor(ren, (p.c >> 16) & 0xFF, (p.c >> 8) & 0xFF, p.c & 0xFF, Uint8(255 * std::min(1.f, p.life * 2)));
             SDL_FRect d{p.x, p.y, 2 * cam.zoom, 2 * cam.zoom};
             SDL_RenderFillRect(ren, &d);
         }
         parts.erase(std::remove_if(parts.begin(), parts.end(), [](const Particle& p) { return p.life <= 0; }), parts.end());
+        // prune aux animation maps: entries for entities that died or left
+        // the snapshot would otherwise grow forever.
+        if (frames % 120 == 0 && !snap.entities.empty()) {
+            std::unordered_set<EntityId> live;
+            live.reserve(snap.entities.size());
+            for (const EntityView& e : snap.entities) live.insert(e.id);
+            auto prune = [&](auto& m) {
+                for (auto it = m.begin(); it != m.end();)
+                    it = live.count(it->first) ? std::next(it) : m.erase(it);
+            };
+            prune(last_pos); prune(facing); prune(bob_until); prune(last_integ); prune(last_pain);
+            prune(vis_pos); prune(vis_prev); prune(dust_at);
+            prune(c_act); prune(c_act_col); prune(c_act_until);
+        }
     }
 
     void draw_entity_lens(const EntityView& e, float fx, float fy, float sw, float sh) {
@@ -1004,6 +1553,19 @@ struct Viewer {
             if (e.launch_range > 0)
                 dl->AddCircle(ImVec2(fx, fy), e.launch_range * cam.zoom * kPix, IM_COL32(255, 120, 60, 110), 48);
         }
+        if (lens == kEcology && e.fauna) {
+            // apex predators (tier >= 4) get a red ring; migrants a chevron
+            if (e.trophic_tier >= 4)
+                dl->AddCircle(ImVec2(fx, fy - sh / 2), 9 * cam.zoom * kPix,
+                              IM_COL32(220, 50, 40, 200), 20, 1.5f);
+            if (e.migration_drive > 0) {
+                const float ay = fy - sh - 14.f * cam.zoom;
+                dl->AddTriangleFilled(ImVec2(fx, ay - 4.f * cam.zoom),
+                                      ImVec2(fx - 4.f * cam.zoom, ay + 3.f * cam.zoom),
+                                      ImVec2(fx + 4.f * cam.zoom, ay + 3.f * cam.zoom),
+                                      IM_COL32(240, 210, 90, 230));
+            }
+        }
     }
 
     void draw_links() {
@@ -1013,6 +1575,28 @@ struct Viewer {
             dl->AddLine(ImVec2(ux(cam.sx(float(l.a.x))), ux(cam.sy(float(l.a.y), elev_at(l.a)) - 12 * cam.zoom)),
                         ImVec2(ux(cam.sx(float(l.b.x))), ux(cam.sy(float(l.b.y), elev_at(l.b)) - 20 * cam.zoom)),
                         IM_COL32(230, 190, 60, 150), 1.5f);
+    }
+
+    // Phase 15: narrative callouts — short story lines floating over the spot
+    // where they happened, rising and fading over ~4 s of render time.
+    void draw_callouts() {
+        if (c_callouts.empty()) return;
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        for (auto it = c_callouts.begin(); it != c_callouts.end();) {
+            if (it->until <= frames) { it = c_callouts.erase(it); continue; }
+            const float life = float(it->until - frames) / 260.f;   // 1 -> 0
+            const float rise = (1.f - life) * 16.f * cam.zoom;
+            const float px = ux(cam.sx(float(it->pos.x)));
+            const float py = ux(cam.sy(float(it->pos.y))) - 30.f * cam.zoom - it->oy - rise;
+            const ImVec2 ts = ImGui::CalcTextSize(it->text.c_str());
+            const int alpha = int(225.f * std::min(1.f, life * 2.5f));
+            dl->AddRectFilled(ImVec2(px - ts.x * 0.5f - 3.f, py - 2.f),
+                              ImVec2(px + ts.x * 0.5f + 3.f, py + ts.y + 2.f),
+                              IM_COL32(8, 8, 12, alpha * 3 / 4), 3.f);
+            dl->AddText(ImVec2(px - ts.x * 0.5f, py),
+                        (it->col & 0x00FFFFFFu) | (ImU32(alpha) << 24), it->text.c_str());
+            ++it;
+        }
     }
 
     void draw_night() {
@@ -1027,25 +1611,33 @@ struct Viewer {
     }
 
     // ---- UI -------------------------------------------------------------------------
+    // ---- HUD: one slim bar. Time | day | tribe ......... Resonance Journal View Menu
+    bool show_perf = false;
+    std::string toast_msg;
+    double toast_t = -10;
     void ui_topbar() {
-        ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
-        ImGui::Begin("##top", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
-        const char* sp[] = {"Pause", "1x", "5x", "20x", "100x"};
-        for (int i = 0; i < 5; ++i) {
-            if (i) ImGui::SameLine();
-            if (ImGui::RadioButton(sp[i], speed == i)) { speed = i; speed_atomic = i; }
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(float(win_w), 0), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 6));
+        ImGui::Begin("##hud", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
+        // time controls: play/pause + speed segments
+        if (ImGui::Button(speed ? "||" : " > ", ImVec2(34, 0))) { speed = speed ? 0 : std::max(1, last_speed); speed_atomic = speed; }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pause / resume (Space)");
+        static const char* kSp[] = {"1x", "5x", "20x", "100x"};
+        for (int i = 1; i <= 4; ++i) {
+            ImGui::SameLine(0, 2);
+            const bool on = speed == i;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.52f, 0.22f, 1));
+            if (ImGui::Button(kSp[i - 1], ImVec2(42, 0))) { speed = i; speed_atomic = i; last_speed = i; }
+            if (on) ImGui::PopStyleColor();
         }
-        ImGui::SameLine(); ImGui::Text("| tick %llu  day %llu  %02d:00", (unsigned long long)c_tick,
-                                       (unsigned long long)(c_tick / 24), snap.day_phase);
-        for (int i = 0; i < 6; ++i) {
-            if (i) ImGui::SameLine();
-            if (ImGui::RadioButton(kLensName[i], lens == i)) lens = i;
-        }
-        bool tribe = fog.mode() == FogOfWar::Mode::Tribe;
-        if (ImGui::Checkbox("Tribe vision", &tribe))
-            fog.set_mode(tribe ? FogOfWar::Mode::Tribe : FogOfWar::Mode::GodEye, tribe_lang());
-        if (pw.tribe_lang.size() > 1) {
-            ImGui::SameLine(); ImGui::SetNextItemWidth(90);
+        ImGui::SameLine(0, 16);
+        ImGui::AlignTextToFramePadding();
+        ImGui::Text("Day %llu  %02d:00", (unsigned long long)(c_tick / 24), int(c_tick % 24));
+        if (pw.tribe_lang.size() > 1 && fog.mode() != FogOfWar::Mode::GodEye) {
+            ImGui::SameLine(0, 16); ImGui::SetNextItemWidth(110);
             const std::string cur = "Tribe " + std::to_string(tribe_view + 1);
             if (ImGui::BeginCombo("##tribe", cur.c_str())) {
                 for (int i = 0; i < int(pw.tribe_lang.size()); ++i)
@@ -1057,78 +1649,182 @@ struct Viewer {
                 ImGui::EndCombo();
             }
         }
-        ImGui::SameLine(); ImGui::Checkbox("Inspector", &show_inspector);
-        ImGui::SameLine(); ImGui::Checkbox("Atlas", &show_atlas);
-        ImGui::SameLine(); ImGui::Checkbox("Chronicle & Rosetta", &show_codex);
-        ImGui::Text("entities %zu (culled %zu)  FPS %.0f  RSS %zu KB  minds %zu", snap.entities.size(), snap.culled,
-                    ImGui::GetIO().Framerate, rss_kb(), c_minds);
-        if (ImGui::Button("Menu (Esc)")) { in_menu = true; speed = 0; speed_atomic = 0; }
-        ImGui::SameLine(); if (ImGui::Button("Quick save (F5)")) save_slot(1);
-        ImGui::SameLine(); if (ImGui::Button("Journal (J)")) show_journal = !show_journal;
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.55f, 0.75f, 0.95f, 1));
-        ImGui::ProgressBar(float(journal.resonance) / float(std::max<std::int64_t>(1, journal.resonance_max)), ImVec2(170, 0),
+        // right cluster
+        const float right = 150 + 8 + 74 + 8 + 66 + 8 + 66 + 12;
+        ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 12, float(win_w) - right));
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.45f, 0.68f, 0.92f, 1));
+        ImGui::ProgressBar(float(journal.resonance) / float(std::max<std::int64_t>(1, journal.resonance_max)), ImVec2(150, 0),
                            ("Resonance " + std::to_string(journal.resonance)).c_str());
         ImGui::PopStyleColor();
-        if (!status_msg.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.85f, 0.5f, 1), "%s", status_msg.c_str()); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Your power as Patron. Grows when your people live through great moments.");
+        ImGui::SameLine(); if (ImGui::Button("Journal", ImVec2(74, 0))) show_journal = !show_journal;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Rosetta lexicon, chronicle, legends, notes (J)");
+        ImGui::SameLine(); if (ImGui::Button("View", ImVec2(66, 0))) ImGui::OpenPopup("view");
+        ImGui::SameLine(); if (ImGui::Button("Menu", ImVec2(66, 0))) open_menu(kPause);
+        if (ImGui::BeginPopup("view")) {
+            ImGui::TextDisabled("Vision");
+            bool tribe = fog.mode() != FogOfWar::Mode::GodEye;
+            if (ImGui::RadioButton("What my people see", tribe) && !tribe) fog.set_mode(FogOfWar::Mode::Tribe, tribe_lang());
+            if (ImGui::RadioButton("The whole world", !tribe) && tribe) fog.set_mode(FogOfWar::Mode::GodEye);
+            ImGui::Separator();
+            ImGui::TextDisabled("Map overlay");
+            static const char* kOv[] = {"None", "Disease", "Wealth & trade", "Power", "Faith", "War", "Ecosystem"};
+            ImGui::SetNextItemWidth(170); ImGui::Combo("##ov", &lens, kOv, 7);
+            ImGui::Separator();
+            ImGui::TextDisabled("Panels");
+            ImGui::Checkbox("Inspector on selection", &show_inspector);
+            ImGui::Checkbox("Chronicle feed", &show_chronicle);
+            ImGui::Checkbox("Chronicle & Rosetta codex", &show_codex);
+            ImGui::Checkbox("Sprite atlas", &show_atlas);
+            ImGui::Checkbox("Performance stats", &show_perf);
+            if (is_planet()) { ImGui::Separator(); if (ImGui::MenuItem("Planet view", "M")) enter_globe(); }
+            ImGui::EndPopup();
+        }
         ImGui::End();
+        ImGui::PopStyleVar(2);
+        if (show_perf) {
+            ImGui::SetNextWindowPos(ImVec2(10, 48), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.6f);
+            ImGui::Begin("##perf", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                            ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Text("FPS %.0f  RSS %zu MB  entities %zu  minds %zu", ImGui::GetIO().Framerate, rss_kb() / 1024,
+                        snap.entities.size(), c_minds);
+            ImGui::End();
+        }
+    }
+    // status messages: a toast above the bottom edge, fading after 4 s
+    void ui_toast() {
+        if (status_msg != toast_msg) { toast_msg = status_msg; toast_t = time_s; }
+        const double age = time_s - toast_t;
+        if (toast_msg.empty() || age > 4.5) return;
+        const float a = float(std::clamp(4.5 - age, 0.0, 1.0));
+        const ImVec2 sz = ImGui::CalcTextSize(toast_msg.c_str());
+        ImGui::SetNextWindowPos(ImVec2((win_w - sz.x) * 0.5f - 14, 50), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.85f * a);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8);
+        ImGui::Begin("##toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextColored(ImVec4(1, 0.88f, 0.6f, 1), "%s", toast_msg.c_str());
+        ImGui::End();
+        ImGui::PopStyleVar(2);
     }
 
-    // ---- title / pause overlay: New Primordial World, Load, Continue ----------
+    // ---- menus: Title -> New Game / Continue / Load ; in game Esc -> Pause --------
+    enum Screen { kTitle = 0, kNewGame, kLoadGame, kSaveGame, kPause };
+    struct SlotInfo { bool exists = false; std::string when; long long day = 0; std::filesystem::file_time_type mtime{}; };
+    SlotInfo slot_info(int slot) const {
+        SlotInfo si;
+        std::error_code ec;
+        if (!std::filesystem::exists(slot_path(slot), ec)) return si;
+        si.exists = true;
+        si.mtime = std::filesystem::last_write_time(slot_path(slot), ec);
+        const auto sys = std::chrono::clock_cast<std::chrono::system_clock>(si.mtime);
+        const std::time_t tt = std::chrono::system_clock::to_time_t(sys);
+        char buf[64]; std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", std::localtime(&tt));
+        si.when = buf;
+        if (std::ifstream m(slot_path(slot) + ".meta"); m) {
+            long long a, b, c, d, tk = 0; m >> a >> b >> c >> d >> tk; si.day = tk / 24;
+        }
+        return si;
+    }
+    int newest_slot() const {          // most recent save of any kind, -1 none
+        int best = -1; std::filesystem::file_time_type bt{};
+        for (int s = 0; s <= 5; ++s) {
+            const SlotInfo si = slot_info(s);
+            if (si.exists && (best < 0 || si.mtime > bt)) { best = s; bt = si.mtime; }
+        }
+        return best;
+    }
+    static const char* slot_name(int s) { static const char* k[] = {"Autosave", "Slot 1", "Slot 2", "Slot 3", "Slot 4", "Slot 5"}; return k[std::clamp(s, 0, 5)]; }
+    void open_menu(int scr) { in_menu = true; screen = scr; speed = 0; speed_atomic = 0; ui_dirty = true; }
+    void close_menu() { in_menu = false; if (!speed) { speed = 1; speed_atomic = 1; } }
+    bool big_button(const char* label, bool enabled = true) {
+        ImGui::BeginDisabled(!enabled);
+        const bool r = ImGui::Button(label, ImVec2(-1, 44));
+        ImGui::EndDisabled();
+        return r && enabled;
+    }
     void ui_menu() {
-        const ImVec2 sz(460, 440);
-        ImGui::SetNextWindowPos(ImVec2((win_w - sz.x) / 2, (win_h - sz.y) / 2), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(sz, ImGuiCond_Always);
-        ImGui::Begin("Sunnyworld - Primordial Sandbox", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
-        ImGui::TextWrapped("A naked world at tick 0: rivers, forests, beasts, ore and disease - and a few bands of "
-                           "humans who know nothing but hunger, thirst, cold, fear and curiosity. No words, no tools, "
-                           "no gods. Whatever they become, they discover.");
+        const float W = 480, H = screen == kTitle ? 330.f : screen == kPause ? 380.f : 520.f;
+        ImGui::SetNextWindowPos(ImVec2((win_w - W) / 2, (win_h - H) / 2), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(W, H), ImGuiCond_Always);
+        ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
+        ImGui::SetWindowFontScale(1.6f);
+        ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.45f, 1), "SUNNYWORLD");
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextDisabled("Primordial Sandbox");
         ImGui::Separator();
-        ImGui::TextUnformatted("New Primordial World");
-        ImGui::SetNextItemWidth(160); ImGui::InputText("World seed", seed_buf, sizeof seed_buf, ImGuiInputTextFlags_CharsDecimal);
-        ImGui::SameLine();
-        if (ImGui::Button("Random")) {
-            const std::uint64_t r = SDL_GetTicksNS() ^ (std::uint64_t(SDL_GetPerformanceCounter()) << 17);
-            std::snprintf(seed_buf, sizeof seed_buf, "%llu", (unsigned long long)(r % 1000000000ull));
-        }
-        static const char* kSizes[] = {"Local Valley (64 x 64)", "Medium planet (1024 x 512)",
-                                       "Large planet (2048 x 1024)", "Colossal planet (4096 x 2048)"};
-        static const int kGrid[] = {64, 128, 128, 128};
-        static const int kPW[] = {0, 1024, 2048, 4096};
-        ImGui::SetNextItemWidth(260); ImGui::Combo("World", &menu_grid, kSizes, 4);
-        if (menu_grid > 0) ImGui::TextDisabled("2:1 planet: ice poles, wet equator, oceans, mountain spines.\n"
-                                               "Your bands live in a simulated home region; the rest sleeps until reached.");
-        ImGui::SetNextItemWidth(160); ImGui::SliderInt("Starting tribes", &menu_tribes, 1, 4);
-        ImGui::SetNextItemWidth(160); ImGui::SliderInt("Humans per tribe", &menu_per, 3, 12);
-        if (ImGui::Button("Create world", ImVec2(160, 0))) {
-            PrimordialParams p;
-            p.seed = std::strtoull(seed_buf, nullptr, 10);
-            const int mi = std::clamp(menu_grid, 0, 3);
-            p.grid = kGrid[mi];
-            p.planet = kPW[mi] > 0; p.planet_w = kPW[mi]; p.planet_h = kPW[mi] / 2;
-            p.tribes = menu_tribes; p.per_tribe = menu_per;
-            { std::lock_guard<std::mutex> lk(mx); new_world(p); }
-            in_menu = false; speed = 1; speed_atomic = 1;
-        }
-        ImGui::Separator();
-        ImGui::Text("Saved worlds  (%s)", pref_dir.c_str());
-        for (int slot = 1; slot <= 5; ++slot) {
-            std::error_code ec;
-            const bool has = std::filesystem::exists(slot_path(slot), ec);
-            ImGui::PushID(slot);
-            ImGui::Text("Slot %d: %s", slot, has ? "saved" : "empty");
-            ImGui::SameLine(150);
-            if (ImGui::Button("Save here")) save_slot(slot);
-            if (has) {
-                ImGui::SameLine();
-                if (ImGui::Button("Load")) if (load_slot(slot)) { in_menu = false; speed = 0; speed_atomic = 0; }
+        if (screen == kTitle) {
+            const int ns = newest_slot();
+            ImGui::TextWrapped("A naked planet. A few bands of humans who know only hunger, thirst, cold, fear and "
+                               "curiosity. No words, no tools, no gods - whatever they become, they discover.");
+            ImGui::Spacing();
+            std::string cont = "Continue";
+            if (ns >= 0) { const SlotInfo si = slot_info(ns); cont += std::string("   (") + slot_name(ns) + ", day " + std::to_string(si.day) + ")"; }
+            if (big_button(cont.c_str(), ns >= 0)) { if (load_slot(ns)) close_menu(); }
+            if (big_button("New Game")) screen = kNewGame;
+            if (big_button("Load Game", ns >= 0)) screen = kLoadGame;
+            if (big_button("Quit")) want_quit = true;
+        } else if (screen == kPause) {
+            ImGui::Text("Paused  -  day %llu", (unsigned long long)(c_tick / 24));
+            ImGui::Spacing();
+            if (big_button("Resume")) close_menu();
+            if (big_button("Save Game")) screen = kSaveGame;
+            if (big_button("Load Game")) screen = kLoadGame;
+            if (big_button("New Game")) screen = kNewGame;
+            if (big_button("Save & Quit to Title")) { save_slot(0); has_game = false; screen = kTitle; }
+        } else if (screen == kNewGame) {
+            ImGui::TextUnformatted("New Primordial World");
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(200); ImGui::InputText("World seed", seed_buf, sizeof seed_buf, ImGuiInputTextFlags_CharsDecimal);
+            ImGui::SameLine();
+            if (ImGui::Button("Random")) {
+                const std::uint64_t r = SDL_GetTicksNS() ^ (std::uint64_t(SDL_GetPerformanceCounter()) << 17);
+                std::snprintf(seed_buf, sizeof seed_buf, "%llu", (unsigned long long)(r % 1000000000ull));
             }
-            ImGui::PopID();
+            static const char* kSizes[] = {"Local Valley (64 x 64)", "Medium planet (1024 x 512)",
+                                           "Large planet (2048 x 1024)", "Colossal planet (4096 x 2048)"};
+            static const int kGrid[] = {64, 128, 128, 128};
+            static const int kPW[] = {0, 1024, 2048, 4096};
+            ImGui::SetNextItemWidth(280); ImGui::Combo("World", &menu_grid, kSizes, 4);
+            ImGui::TextDisabled(menu_grid > 0 ? "Whole planet to explore; your bands live in a %d x %d home region." : "A small valley, fast on any machine.",
+                                kGrid[std::clamp(menu_grid, 0, 3)], kGrid[std::clamp(menu_grid, 0, 3)] * 2 / 3);
+            ImGui::SetNextItemWidth(200); ImGui::SliderInt("Starting tribes", &menu_tribes, 1, 4);
+            ImGui::SetNextItemWidth(200); ImGui::SliderInt("Humans per tribe", &menu_per, 3, 12);
+            ImGui::Spacing();
+            if (has_game) ImGui::TextColored(ImVec4(1, 0.7f, 0.4f, 1), "The current world will be autosaved first.");
+            if (big_button("Create world")) {
+                PrimordialParams p;
+                p.seed = std::strtoull(seed_buf, nullptr, 10);
+                const int mi = std::clamp(menu_grid, 0, 3);
+                p.grid = kGrid[mi];
+                p.planet = kPW[mi] > 0; p.planet_w = kPW[mi]; p.planet_h = kPW[mi] / 2;
+                p.tribes = menu_tribes; p.per_tribe = menu_per;
+                if (has_game) save_slot(0);
+                { std::lock_guard<std::mutex> lk(mx); new_world(p); }
+                has_game = true;
+                close_menu();
+            }
+            if (big_button("Back")) screen = has_game ? kPause : kTitle;
+        } else if (screen == kLoadGame || screen == kSaveGame) {
+            const bool saving = screen == kSaveGame;
+            ImGui::TextUnformatted(saving ? "Save Game" : "Load Game");
+            ImGui::TextDisabled("%s", pref_dir.c_str());
+            ImGui::Spacing();
+            for (int s = saving ? 1 : 0; s <= 5; ++s) {
+                const SlotInfo si = slot_info(s);
+                ImGui::PushID(s);
+                const std::string label = std::string(slot_name(s)) +
+                    (si.exists ? "   day " + std::to_string(si.day) + "   " + si.when : std::string("   - empty -"));
+                if (big_button(label.c_str(), saving || si.exists)) {
+                    if (saving) { save_slot(s); screen = kPause; }
+                    else if (load_slot(s)) close_menu();
+                }
+                ImGui::PopID();
+            }
+            if (big_button("Back")) screen = has_game ? kPause : kTitle;
         }
-        ImGui::Separator();
-        if (ImGui::Button("Continue", ImVec2(120, 0))) { in_menu = false; if (!speed) { speed = 1; speed_atomic = 1; } }
-        ImGui::SameLine();
-        if (ImGui::Button("Quit", ImVec2(120, 0))) want_quit = true;
         if (!status_msg.empty()) ImGui::TextColored(ImVec4(1, 0.85f, 0.5f, 1), "%s", status_msg.c_str());
         ImGui::End();
     }
@@ -1265,79 +1961,92 @@ struct Viewer {
         std::snprintf(edit_buf, sizeof edit_buf, "%s", jw.guess.c_str());
         edit_tag = int(jw.tag);
     }
+    // ---- action bar (bottom-left): powers, or the possessed body's verbs ----
     void ui_player() {
-        ImGui::SetNextWindowPos(ImVec2(8, float(win_h) - 300), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(380, 286), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Patron");
+        ImGui::SetNextWindowPos(ImVec2(10, float(win_h) - 10), ImGuiCond_Always, ImVec2(0, 1));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+        ImGui::Begin("##actions", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
         if (avatar != kNoEntity) {
-            ImGui::TextColored(ImVec4(0.6f, 1, 0.6f, 1), "Possessing %s", sid(avatar).c_str());
-            ImGui::TextWrapped("%s", c_av_line.c_str());
-            ImGui::TextWrapped("WASD walk  |  click thing: target (%zu)  |  1-9 verbs", av_targets.size());
-            ImGui::TextUnformatted("What this body knows how to do:");
+            ImGui::TextColored(ImVec4(0.6f, 1, 0.6f, 1), "You are %s", sid(avatar).c_str());
+            ImGui::SameLine(); ImGui::TextDisabled("  %s", c_av_line.c_str());
             int n = 0;
             for (const std::string& v : c_av_verbs) {
                 if (v == "move") continue;
-                if (n % 4) ImGui::SameLine();
+                if (n % 6) ImGui::SameLine(0, 4);
                 ++n;
-                if (ImGui::Button((std::to_string(n) + " " + v).c_str(), ImVec2(86, 0))) avatar_act(v);
+                if (ImGui::Button(v.c_str(), ImVec2(90, 0))) avatar_act(v);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Key %d - acts on the thing you last clicked", n);
             }
-            if (ImGui::Button("Release to its own mind")) set_possess(kNoEntity);
+            ImGui::TextDisabled("WASD walk   click: target (%zu picked)", av_targets.size());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Release")) set_possess(kNoEntity);
             ImGui::End();
+            ImGui::PopStyleVar();
             return;
         }
-        // map tools
-        ImGui::TextUnformatted("Map powers:");
-        auto toolbtn = [&](const char* label, int t, const char* tip) {
+        auto power = [&](const char* label, int t, int cost, const char* tip) {
             const bool on = tool == t;
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.45f, 0.65f, 1));
-            if (ImGui::Button(label)) tool = on ? kToolNone : t;
-            if (on) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-        };
-        toolbtn("Beacon 10", kToolBeacon, "Click the map: two scouts feel drawn there (explore the dark).");
-        ImGui::SameLine();
-        toolbtn("Blueprint 25", kToolBlueprint, "Drag a circle: three builders dream of a shelter there.");
-        ImGui::SameLine();
-        toolbtn("Dread 15", kToolFear, "Click a thing: your people who remember it come to fear it.");
-        if (tool != kToolNone) ImGui::TextColored(ImVec4(0.6f, 0.8f, 1, 1), "Tool armed - click the map (Esc/right click cancels)");
-        ImGui::Separator();
-        if (insp.found && insp.has_mind) {
-            ImGui::Text("Selected mind %s", sid(selected).c_str());
-            const auto& verbs = curiosity_verbs();
-            ImGui::SetNextItemWidth(120);
-            if (ImGui::BeginCombo("try", verbs.empty() ? "" : verbs[std::size_t(std::clamp<int>(whisper_verb, 0, int(verbs.size()) - 1))])) {
-                for (int i = 0; i < int(verbs.size()); ++i) if (ImGui::Selectable(verbs[std::size_t(i)], i == whisper_verb)) whisper_verb = i;
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine(); ImGui::SetNextItemWidth(140);
-            const auto& mats = w.materials.defs();
-            const char* mname = whisper_mat > 0 && whisper_mat <= int(mats.size()) ? mats[std::size_t(whisper_mat - 1)].name.c_str() : "any thing";
-            if (ImGui::BeginCombo("on", mname)) {
-                if (ImGui::Selectable("any thing", whisper_mat == 0)) whisper_mat = 0;
-                for (int i = 0; i < int(mats.size()); ++i)
-                    if (ImGui::Selectable(mats[std::size_t(i)].name.c_str(), whisper_mat == i + 1)) whisper_mat = i + 1;
-                ImGui::EndCombo();
-            }
-            ImGui::BeginDisabled(journal.resonance < 20);
-            if (ImGui::Button("Plant Idea in a dream (20)")) whisper(selected);
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.48f, 0.70f, 1));
+            ImGui::BeginDisabled(journal.resonance < cost && !on);
+            if (ImGui::Button(label, ImVec2(104, 0))) tool = on ? kToolNone : t;
             ImGui::EndDisabled();
-            ImGui::TextWrapped("A hint, not a command: curiosity, fear and drive decide.");
-            if (ImGui::Button("Possess")) set_possess(selected);
+            if (on) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s (costs %d)", tip, cost);
+        };
+        power("Beacon", kToolBeacon, 10, "Click the map: two scouts feel drawn there");
+        ImGui::SameLine(0, 4);
+        power("Blueprint", kToolBlueprint, 25, "Drag a circle: builders dream of a shelter there");
+        ImGui::SameLine(0, 4);
+        power("Dread", kToolFear, 15, "Click a thing: your people who remember it come to fear it");
+        if (tool != kToolNone)
+            ImGui::TextColored(ImVec4(0.6f, 0.82f, 1, 1), tool == kToolBlueprint ? "Drag on the map - right click cancels"
+                                                                                 : "Click the map - right click cancels");
+        if (insp.found && insp.has_mind) {
+            ImGui::Separator();
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%s", sid(selected).c_str());
             ImGui::SameLine();
+            ImGui::BeginDisabled(journal.resonance < 20);
+            if (ImGui::Button("Plant idea", ImVec2(96, 0))) ImGui::OpenPopup("idea");
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Whisper a hint into a dream (costs 20)");
+            ImGui::SameLine(0, 4); if (ImGui::Button("Possess", ImVec2(80, 0))) set_possess(selected);
+            ImGui::SameLine(0, 4);
             const bool pinned = journal.pins.count(selected) != 0;
-            if (ImGui::Button(pinned ? "Unpin legend" : "Pin as legend")) {
-                if (pinned) journal.pins.erase(selected); else journal.pins.insert(selected);
+            if (ImGui::Button(pinned ? "Unpin" : "Pin", ImVec2(60, 0))) { if (pinned) journal.pins.erase(selected); else journal.pins.insert(selected); }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Follow this life in Journal > Legends");
+            if (ImGui::BeginPopup("idea")) {
+                ImGui::TextDisabled("Make it wonder about...");
+                const auto& verbs = curiosity_verbs();
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::BeginCombo("action", verbs.empty() ? "" : verbs[std::size_t(std::clamp<int>(whisper_verb, 0, int(verbs.size()) - 1))])) {
+                    for (int i = 0; i < int(verbs.size()); ++i) if (ImGui::Selectable(verbs[std::size_t(i)], i == whisper_verb)) whisper_verb = i;
+                    ImGui::EndCombo();
+                }
+                const auto& mats = w.materials.defs();
+                const char* mname = whisper_mat > 0 && whisper_mat <= int(mats.size()) ? mats[std::size_t(whisper_mat - 1)].name.c_str() : "anything";
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::BeginCombo("on", mname)) {
+                    if (ImGui::Selectable("anything", whisper_mat == 0)) whisper_mat = 0;
+                    for (int i = 0; i < int(mats.size()); ++i)
+                        if (ImGui::Selectable(mats[std::size_t(i)].name.c_str(), whisper_mat == i + 1)) whisper_mat = i + 1;
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Button("Whisper (20)", ImVec2(-1, 0))) { whisper(selected); ImGui::CloseCurrentPopup(); }
+                ImGui::EndPopup();
             }
         } else if (insp.found) {
-            ImGui::Text("Selected thing %s", sid(selected).c_str());
+            ImGui::Separator();
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%s", sid(selected).c_str());
+            ImGui::SameLine();
             ImGui::BeginDisabled(journal.resonance < 15);
-            if (ImGui::Button("Instill dread of this (15)")) instill_fear(selected);
+            if (ImGui::Button("Dread of this", ImVec2(120, 0))) instill_fear(selected);
             ImGui::EndDisabled();
-        } else {
-            ImGui::TextWrapped("Select a mind to plant an idea, pin or possess it. "
-                               "Resonance grows when your people live through great moments.");
         }
         ImGui::End();
+        ImGui::PopStyleVar();
     }
 
     // caches read under the world lock (signs, legends, avatar vocabulary)
@@ -1405,6 +2114,33 @@ struct Viewer {
             }
             c_legends.push_back(std::move(L));
         }
+        // Phase 15: stones carved by pinned legends, words + the player's own
+        // Rosetta reading — rebuilt once per world tick (inscription_words
+        // builds a lexicon index, too heavy for every 15-frame cache pass).
+        if (w.clock_.tick() != c_carved_tick) {
+            c_carved_tick = w.clock_.tick();
+            c_carved.clear();
+            const PropId auth_p = SIMLAB_PID(w.props, "inscription_author");
+            if (auth_p != kNoProp)
+                for (EntityId sid : w.entities_of_kind(SIMLAB_KIND("inscription"))) {
+                    const Entity* s = w.find(sid);
+                    if (!s || !s->alive) continue;
+                    const EntityId author = EntityId(w.prop_int(*s, auth_p, 0));
+                    if (author == kNoEntity || !journal.pins.count(author)) continue;
+                    auto& vec = c_carved[author];
+                    if (vec.size() >= 3) continue;
+                    const PropId lang_p = SIMLAB_PID(w.props, "language_id");
+                    const std::int64_t lang = lang_p != kNoProp ? w.prop_int(*s, lang_p, 0) : 0;
+                    std::string line;
+                    for (const std::string& wd : inscription_words(w, sid)) {
+                        if (!line.empty()) line += ", ";
+                        line += "\"" + wd + "\"";
+                        const std::string rd = journal_reading(w, journal, lang, wd);
+                        if (!rd.empty()) line += " (" + rd + ")";
+                    }
+                    if (!line.empty()) vec.push_back(line);
+                }
+        }
     }
 
     // ---- successor choice after the avatar's death ---------------------------
@@ -1458,20 +2194,29 @@ struct Viewer {
                         ImGui::TableSetupColumn("word"); ImGui::TableSetupColumn("heard/carved");
                         ImGui::TableSetupColumn("your meaning"); ImGui::TableSetupColumn("tag"); ImGui::TableSetupColumn("");
                         ImGui::TableHeadersRow();
-                        for (const auto& [wd, jw] : words) {
-                            ImGui::TableNextRow();
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(wd.c_str());
-                            ImGui::TableNextColumn(); ImGui::Text("%d / %d", jw.heard, jw.carved);
-                            ImGui::TableNextColumn();
-                            const bool ok = guess_confirmed(w, jw);
-                            if (jw.guess.empty()) ImGui::TextDisabled("?");
-                            else ImGui::TextColored(ok ? ImVec4(0.10f, 0.45f, 0.15f, 1) : ImVec4(0.45f, 0.30f, 0.05f, 1),
-                                                    "%s %s", jw.guess.c_str(), ok ? "[ok]" : "[?]");
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(word_tag_name(jw.tag));
-                            ImGui::TableNextColumn();
-                            ImGui::PushID((std::to_string(lang) + wd).c_str());
-                            if (ImGui::SmallButton("edit")) open_word(lang, wd);
-                            ImGui::PopID();
+                        // clipper: a tongue can hold hundreds of words — only
+                        // rasterize the rows actually inside the scroll window
+                        ImGuiListClipper clip;
+                        clip.Begin(static_cast<int>(words.size()));
+                        while (clip.Step()) {
+                            auto wit = words.begin();
+                            std::advance(wit, clip.DisplayStart);
+                            for (int wi = clip.DisplayStart; wi < clip.DisplayEnd; ++wi, ++wit) {
+                                const auto& [wd, jw] = *wit;
+                                ImGui::TableNextRow();
+                                ImGui::TableNextColumn(); ImGui::TextUnformatted(wd.c_str());
+                                ImGui::TableNextColumn(); ImGui::Text("%d / %d", jw.heard, jw.carved);
+                                ImGui::TableNextColumn();
+                                const bool ok = guess_confirmed(w, jw);
+                                if (jw.guess.empty()) ImGui::TextDisabled("?");
+                                else ImGui::TextColored(ok ? ImVec4(0.10f, 0.45f, 0.15f, 1) : ImVec4(0.45f, 0.30f, 0.05f, 1),
+                                                        "%s %s", jw.guess.c_str(), ok ? "[ok]" : "[?]");
+                                ImGui::TableNextColumn(); ImGui::TextUnformatted(word_tag_name(jw.tag));
+                                ImGui::TableNextColumn();
+                                ImGui::PushID((std::to_string(lang) + wd).c_str());
+                                if (ImGui::SmallButton("edit")) open_word(lang, wd);
+                                ImGui::PopID();
+                            }
                         }
                         ImGui::EndTable();
                     }
@@ -1480,16 +2225,21 @@ struct Viewer {
             }
             if (ImGui::BeginTabItem("Chronicle", nullptr, tabflag(1))) {
                 ImGui::TextDisabled("Firsts of this world. Click Go to fly to where it happened.");
-                for (auto it = journal.milestones.rbegin(); it != journal.milestones.rend(); ++it) {
-                    ImGui::PushID(it->key.c_str());
-                    if (ImGui::SmallButton("Go")) {
-                        cam.cx = float(it->pos.x); cam.cy = float(it->pos.y);
-                        if (w.find(it->who)) selected = it->who;
+                ImGuiListClipper clip;
+                clip.Begin(static_cast<int>(journal.milestones.size()));
+                while (clip.Step()) {
+                    for (int mi = clip.DisplayStart; mi < clip.DisplayEnd; ++mi) {
+                        const Milestone& it = journal.milestones[journal.milestones.size() - 1 - mi];
+                        ImGui::PushID(it.key.c_str());
+                        if (ImGui::SmallButton("Go")) {
+                            cam.cx = float(it.pos.x); cam.cy = float(it.pos.y);
+                            if (w.find(it.who)) selected = it.who;
+                        }
+                        ImGui::SameLine();
+                        ImGui::Text("day %llu  %s  (%s, tongue %lld)", (unsigned long long)(it.tick / 24), it.title.c_str(),
+                                    sid(it.who).c_str(), (long long)it.lang);
+                        ImGui::PopID();
                     }
-                    ImGui::SameLine();
-                    ImGui::Text("day %llu  %s  (%s, tongue %lld)", (unsigned long long)(it->tick / 24), it->title.c_str(),
-                                sid(it->who).c_str(), (long long)it->lang);
-                    ImGui::PopID();
                 }
                 ImGui::EndTabItem();
             }
@@ -1508,6 +2258,20 @@ struct Viewer {
                     if (!L.scars.empty()) {
                         std::string sc; for (const std::string& x : L.scars) sc += x + "  ";
                         ImGui::TextWrapped("scars: %s", sc.c_str());
+                    }
+                    // Phase 15: their story so far — chronicle lines they starred
+                    // in, plus their carved stones read through your Rosetta.
+                    {
+                        std::vector<std::string> deeds;
+                        for (auto it = cfeed.lines.rbegin(); it != cfeed.lines.rend() && deeds.size() < 5; ++it)
+                            if (it->who == L.id || it->about == L.id) deeds.push_back(it->text);
+                        if (!deeds.empty()) {
+                            ImGui::TextDisabled("lately:");
+                            for (const std::string& d : deeds) ImGui::BulletText("%s", d.c_str());
+                        }
+                        if (auto ci = c_carved.find(L.id); ci != c_carved.end())
+                            for (const std::string& s : ci->second)
+                                ImGui::TextWrapped("carved: %s", s.c_str());
                     }
                     if (ImGui::SmallButton("Go")) { cam.cx = float(L.pos.x); cam.cy = float(L.pos.y); selected = L.id; }
                     ImGui::SameLine();
@@ -1653,8 +2417,9 @@ struct Viewer {
         if (w.terrain.empty() || !mini_tex) return;
         const TerrainGrid& t = w.terrain;
         const float S = 180.f;
-        ImGui::SetNextWindowPos(ImVec2(float(win_w) - S - 24, float(win_h) - S - 44), ImGuiCond_Always);
-        ImGui::Begin("Minimap", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+        ImGui::SetNextWindowPos(ImVec2(float(win_w) - 10, float(win_h) - 10), ImGuiCond_Always, ImVec2(1, 1));
+        ImGui::Begin("##minimap", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
         const ImVec2 o = ImGui::GetCursorScreenPos();
         ImGui::Image(ImTextureRef((ImTextureID)(intptr_t)mini_tex), ImVec2(S, S));
         const float k = S / float(std::max(t.w, t.h));
@@ -1715,6 +2480,73 @@ struct Viewer {
             for (const auto& [k, b] : m->beliefs) insp.beliefs.emplace_back(k, (long long)b.confidence);
             for (const auto& [dk, d] : m->discoveries)
                 insp.discoveries.push_back(d.claim + "  trials " + std::to_string(d.trials));
+            // ---- Phase 15: current intent ------------------------------------
+            // Controller memory first (pending journey), then neuro overrides,
+            // then an open hypothesis, then plain needs — all read under lock.
+            {
+                std::string intent;
+                auto pit = dstate.pending.find(e->id);
+                if (pit != dstate.pending.end()) {
+                    intent = "journeying to (" + std::to_string(pit->second.target.x) + "," +
+                             std::to_string(pit->second.target.y) + ")";
+                    if (pit->second.subject != kNoEntity) intent += " after " + sid(pit->second.subject);
+                } else {
+                    const NeuroState& nr = m->neuro;
+                    if (nr.panic > 600) intent = "panicked — thrashing";
+                    else if (nr.rage > 600) intent = "enraged";
+                    else if (nr.grief > 600) intent = "grieving";
+                }
+                if (intent.empty()) {
+                    for (const auto& [dk, d] : m->discoveries)
+                        if (d.status == DiscoveryStatus::Open || d.status == DiscoveryStatus::Tested) {
+                            intent = "testing: " + d.claim; break;
+                        }
+                }
+                if (intent.empty()) {
+                    auto need = [&](const char* n, long long lim) {
+                        const PropertyDef* d = w.props.find_name(n);
+                        return d && w.prop_int(*e, d->id, 0) > lim;
+                    };
+                    if (need("hunger", 750)) intent = "foraging for food";
+                    else if (need("thirst", 750)) intent = "seeking water";
+                    const PropertyDef* ed = w.props.find_name("energy");
+                    if (intent.empty() && ed && w.prop_int(*e, ed->id, 1000) < 150) intent = "resting";
+                    if (intent.empty()) intent = "watching";
+                }
+                insp.intent = intent;
+            }
+            // ---- Phase 15: life story — deepest engrams + proofs + births -----
+            {
+                struct EM { std::int64_t score; std::string s; };
+                std::vector<EM> mems;
+                auto push_mem = [&](const MemoryEngram& g, const std::string& what) {
+                    if (g.clarity < 150) return;
+                    const std::int64_t ch = g.emotional_charge;
+                    std::string s;
+                    if (ch <= -400) s = "haunted by " + what;
+                    else if (ch >= 400) s = "holds dear " + what;
+                    else return;
+                    mems.push_back({-std::llabs(ch), s});
+                };
+                for (const auto& [eid, ms] : m->memory) {
+                    std::string what = ms.kind_name;
+                    if (ms.material != kNoMaterial)
+                        if (const MaterialDef* md = w.materials.find(ms.material)) what += " (" + md->name + ")";
+                    push_mem(ms.engram, what);
+                }
+                for (const BornEngram& b : m->born_memories) {
+                    std::string what = b.kind_name.empty() ? "something" : b.kind_name;
+                    if (b.material != kNoMaterial)
+                        if (const MaterialDef* md = w.materials.find(b.material)) what += " (" + md->name + ")";
+                    const std::int64_t ch = b.engram.emotional_charge;
+                    if (ch < 0) mems.push_back({-std::llabs(ch), "born fearing " + what});
+                }
+                for (const auto& [dk, d] : m->discoveries)
+                    if (d.status == DiscoveryStatus::Verified)
+                        mems.push_back({-5000, "proved: " + d.claim});
+                std::sort(mems.begin(), mems.end(), [](const EM& a, const EM& b) { return a.score < b.score; });
+                for (std::size_t i = 0; i < mems.size() && i < 10; ++i) insp.life.push_back(mems[i].s);
+            }
         }
         const PropId poss = P("possessed_by");
         for (const auto& ep : w.entities)
@@ -1729,21 +2561,87 @@ struct Viewer {
             if (const Entity* d = w.find(did); d && d->alive && w.prop_int(*d, debtor, 0) == std::int64_t(e->id))
                 insp.property.push_back("owes " + std::to_string(w.prop_int(*d, dv, 0)));
     }
+    // ---- Phase 15: Live Chronicle Feed -----------------------------------------
+    // Newest-first narrative lines from real causal events; click jumps the
+    // camera to the scene and selects the actor.
+    void ui_chronicle() {
+        if (!show_chronicle) return;
+        ImGui::SetNextWindowPos(ImVec2(10, float(win_h) * 0.52f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(470, 0), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Chronicle", &show_chronicle);
+        static const char* kFilters[] = {"All", "Combat", "Survival", "Discovery", "Society", "Pinned"};
+        for (int i = 0; i < 6; ++i) {
+            if (i) ImGui::SameLine();
+            const bool sel = chron_filter == i;
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.40f, 0.20f, 1));
+            if (ImGui::SmallButton(kFilters[i])) chron_filter = i;
+            if (sel) ImGui::PopStyleColor();
+        }
+        ImGui::Separator();
+        // filtered view, newest first — cfeed is UI-thread only, no lock needed
+        std::vector<const NarrativeLine*> rows;
+        rows.reserve(cfeed.lines.size());
+        for (auto it = cfeed.lines.rbegin(); it != cfeed.lines.rend(); ++it) {
+            const NarrativeLine& l = *it;
+            const bool ok = chron_filter == 0 ? true
+                : chron_filter == 1 ? (l.cat & kCatCombat) != 0
+                : chron_filter == 2 ? (l.cat & kCatSurvival) != 0
+                : chron_filter == 3 ? (l.cat & kCatDiscovery) != 0
+                : chron_filter == 4 ? (l.cat & kCatSociety) != 0
+                : (l.cat & kCatPinned) != 0;
+            if (ok) rows.push_back(&l);
+        }
+        if (rows.empty()) ImGui::TextDisabled("The chronicle is quiet — events appear as they happen.");
+        ImGuiListClipper clip;
+        clip.Begin(static_cast<int>(rows.size()));
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
+                const NarrativeLine* l = rows[i];
+                ImGui::PushID(static_cast<int>(l->seq % 100000));
+                char when[24];
+                std::snprintf(when, sizeof when, "d%llu %02dh",
+                              (unsigned long long)(l->tick / 24 + 1), int(l->tick % 24));
+                ImGui::TextDisabled("%s", when);
+                ImGui::SameLine(0, 4);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    (l->cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
+                    : (l->cat & kCatDiscovery) ? ImVec4(1.f, 0.82f, 0.5f, 1)
+                    : (l->cat & kCatSociety) ? ImVec4(0.6f, 0.9f, 0.95f, 1)
+                    : (l->cat & kCatSurvival) ? ImVec4(0.65f, 0.95f, 0.6f, 1)
+                    : ImVec4(0.85f, 0.85f, 0.88f, 1));
+                if (ImGui::Selectable(l->text.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick,
+                                      ImVec2(0, 0))) {
+                    cam.cx = float(l->pos.x); cam.cy = float(l->pos.y);
+                    if (globe) { globe = false; globe_dive = false; }
+                    if (l->who != kNoEntity) selected = l->who;
+                }
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+        }
+        ImGui::End();
+    }
+
     void ui_inspector() {
-        if (!show_inspector) return;
-        ImGui::SetNextWindowPos(ImVec2(float(win_w) - 380, 120), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, float(std::max(200, win_h - 120 - 260))), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Entity Inspector", &show_inspector);
-        if (!insp.found) { ImGui::TextDisabled("Left-click anything on the map."); ImGui::End(); return; }
+        if (!show_inspector || selected == kNoEntity || !insp.found) return;   // appears on selection only
+        ImGui::SetNextWindowPos(ImVec2(float(win_w) - 360, 52), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(350, float(std::max(220, win_h - 52 - 250))), ImGuiCond_FirstUseEver);
+        bool open = true;
+        ImGui::Begin("Inspector", &open);
+        if (!open) { selected = kNoEntity; ImGui::End(); return; }
         ImGui::TextUnformatted(insp.head.c_str());
         if (!insp.mat.empty()) ImGui::TextUnformatted(insp.mat.c_str());
         if (ImGui::BeginTabBar("insp")) {
             if (ImGui::BeginTabItem("Body")) {
                 if (ImGui::BeginTable("props", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 160))) {
-                    for (const auto& [k, v] : insp.props) {
-                        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(k.c_str());
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(v.c_str());
-                    }
+                    ImGuiListClipper clip;
+                    clip.Begin(static_cast<int>(insp.props.size()));
+                    while (clip.Step())
+                        for (int pi = clip.DisplayStart; pi < clip.DisplayEnd; ++pi) {
+                            const auto& [k, v] = insp.props[pi];
+                            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(k.c_str());
+                            ImGui::TableNextColumn(); ImGui::TextUnformatted(v.c_str());
+                        }
                     ImGui::EndTable();
                 }
                 for (const std::string& l : insp.body) ImGui::BulletText("%s", l.c_str());
@@ -1751,12 +2649,23 @@ struct Viewer {
             }
             if (insp.has_mind && ImGui::BeginTabItem("Mind")) {
                 ImGui::TextUnformatted(insp.mind_head.c_str());
-                if (ImGui::BeginTable("bel", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 260))) {
-                    for (const auto& [k, c] : insp.beliefs) {
-                        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(k.c_str());
-                        ImGui::TableNextColumn(); ImGui::Text("%lld", c);
-                    }
+                if (!insp.intent.empty())
+                    ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.45f, 1), "now: %s", insp.intent.c_str());
+                if (ImGui::BeginTable("bel", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 200))) {
+                    ImGuiListClipper clip;
+                    clip.Begin(static_cast<int>(insp.beliefs.size()));
+                    while (clip.Step())
+                        for (int bi = clip.DisplayStart; bi < clip.DisplayEnd; ++bi) {
+                            const auto& [k, c] = insp.beliefs[bi];
+                            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(k.c_str());
+                            ImGui::TableNextColumn(); ImGui::Text("%lld", c);
+                        }
                     ImGui::EndTable();
+                }
+                if (!insp.life.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("life:");
+                    for (const std::string& l : insp.life) ImGui::BulletText("%s", l.c_str());
                 }
                 for (const std::string& d : insp.discoveries) ImGui::BulletText("%s", d.c_str());
                 ImGui::EndTabItem();
@@ -1854,6 +2763,13 @@ struct Viewer {
     }
     void build_codex() {
         c_codex = w.export_lexicon_codex();
+        c_codex_lines.clear();
+        for (std::size_t i = 0; i <= c_codex.size();) {
+            const std::size_t j = c_codex.find('\n', i);
+            c_codex_lines.push_back(c_codex.substr(i, j == std::string::npos ? j : j - i));
+            if (j == std::string::npos) break;
+            i = j + 1;
+        }
         c_stones.clear();
         const PropId lp = SIMLAB_PID(w.props, "language_id"), gt = SIMLAB_PID(w.props, "glyph_text"),
                      cl = SIMLAB_PID(w.props, "clause_atoms"), tc = SIMLAB_PID(w.props, "treaty_clause");
@@ -1871,9 +2787,24 @@ struct Viewer {
         for (std::size_t i = h.size() > 200 ? h.size() - 200 : 0; i < h.size(); ++i) {
             const CausalEvent& ev = h[i];
             if (ev.action == "metabolize" || ev.action == "cool" || ev.action == "ecology") continue;
-            c_chron.push_back("t" + std::to_string(ev.tick) + " " + ev.action + (ev.failed ? " (failed)" : "") +
-                              "  " + ev.evidence.substr(0, 160));
+            // pre-wrap to ~100-char rows so the list clips uniformly
+            const std::string line = "t" + std::to_string(ev.tick) + " " + ev.action +
+                                     (ev.failed ? " (failed)" : "") + "  " + ev.evidence.substr(0, 160);
+            std::size_t start = 0;
+            while (start < line.size()) {
+                std::size_t end = std::min(start + 100, line.size());
+                if (end < line.size()) {
+                    const std::size_t sp = line.rfind(' ', end);
+                    if (sp > start + 40) end = sp;
+                }
+                c_chron.push_back(line.substr(start, end - start));
+                start = end;
+                while (start < line.size() && line[start] == ' ') ++start;
+            }
         }
+        if (std::getenv("SIMLAB_VDEBUG"))
+            std::fprintf(stderr, "codex: stones=%zu chron_rows=%zu codex_lines=%zu\n",
+                         c_stones.size(), c_chron.size(), c_codex_lines.size());
     }
     void ui_codex() {
         if (!show_codex) return;
@@ -1917,11 +2848,21 @@ struct Viewer {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Lexicon codex")) {
-                ImGui::InputTextMultiline("##codex", c_codex.data(), c_codex.size() + 1, ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+                // clipped line list — InputTextMultiline would lay out the
+                // whole codex every rasterize (~tens of ms on big lexicons)
+                ImGuiListClipper clip;
+                clip.Begin(static_cast<int>(c_codex_lines.size()));
+                while (clip.Step())
+                    for (int li = clip.DisplayStart; li < clip.DisplayEnd; ++li)
+                        ImGui::TextUnformatted(c_codex_lines[li].c_str());
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Chronicle")) {
-                for (const std::string& l : c_chron) ImGui::TextWrapped("%s", l.c_str());
+                ImGuiListClipper clip;
+                clip.Begin(static_cast<int>(c_chron.size()));
+                while (clip.Step())
+                    for (int li = clip.DisplayStart; li < clip.DisplayEnd; ++li)
+                        ImGui::TextUnformatted(c_chron[li].c_str());
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -2035,7 +2976,10 @@ struct Viewer {
             const SDL_Keycode k = e.key.key;
             if (k == SDLK_ESCAPE) {
                 if (tool != kToolNone) { tool = kToolNone; dragging = false; return; }
-                in_menu = !in_menu; if (in_menu) { speed = 0; speed_atomic = 0; } return;
+                if (!in_menu) { if (has_game) open_menu(kPause); }
+                else if (screen == kPause) close_menu();
+                else if (screen != kTitle) screen = has_game ? kPause : kTitle;
+                return;
             }
             if (k == SDLK_F5) { save_slot(1); return; }
             if (k == SDLK_J) { show_journal = !show_journal; return; }
@@ -2048,9 +2992,8 @@ struct Viewer {
                 }
                 return;
             }
-            if (k >= SDLK_1 && k <= SDLK_6) lens = int(k - SDLK_1);
-            if (k == SDLK_SPACE) speed = speed ? 0 : 1;
-            if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) speed = std::min(4, speed + 1);
+            if (k == SDLK_SPACE) speed = speed ? 0 : std::max(1, last_speed);
+            if (k == SDLK_EQUALS || k == SDLK_KP_PLUS) last_speed = speed = std::min(4, speed + 1);
             if (k == SDLK_MINUS || k == SDLK_KP_MINUS) speed = std::max(0, speed - 1);
             speed_atomic = speed;
             if (k == SDLK_F) fog.set_mode(fog.mode() == FogOfWar::Mode::GodEye ? FogOfWar::Mode::Tribe
@@ -2094,6 +3037,7 @@ struct Viewer {
 
     // one frame: snapshot (const, under the world lock) -> draw -> UI
     void frame(double dt) {
+        const auto t_frame = std::chrono::steady_clock::now();
         time_s += dt; ++frames;
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -2106,21 +3050,88 @@ struct Viewer {
         double t_cap = 0, t_ter = 0, t_ent = 0, t_ui = 0, t_im = 0, t_pr = 0;
         static const int skip = std::getenv("SIMLAB_VSKIP") ? std::atoi(std::getenv("SIMLAB_VSKIP")) : 0;
         auto t = clk::now();
-        {
-            // NEVER wait for the simulation: if a cycle is running, draw the
-            // last snapshot/caches (the world cannot have visibly changed
-            // mid-cycle anyway) and ask the sim thread to yield next time.
+        // NEVER wait for the simulation: if a cycle is running, draw the
+        // last snapshot/caches (the world cannot have visibly changed
+        // mid-cycle anyway) and ask the sim thread to yield next time.
+        // Called twice per frame — a failed try_lock early in the frame gets
+        // a second chance a few ms later, roughly doubling snapshot rate
+        // while the sim holds the world mutex ~70% of the time.
+        auto poll_world = [&]() {
             std::unique_lock<std::mutex> lk(mx, std::try_to_lock);
-            if (lk.owns_lock()) {
-                if (frames % 6 == 1) { fog.update(w); update_fog_tex(); }
+            if (lk.owns_lock() && has_game) {
+                // fog of war: recompute the visible set ~6x/s; the flat
+                // grid makes each update O(disk area) and the bulk fog
+                // textures rebuild only when the generation counter moved.
+                if (time_s - fog_update_t >= 0.12) { fog.update(w); fog_update_t = time_s; }   // ~8x/s whenever the lock is ours
+                if (fog.generation() != fog_tex_gen) {
+                    fog_tex_gen = fog.generation();
+                    if (is_planet()) fog_mark_dirty(); else build_fog_ground();
+                }
                 if (frames % 30 == 1) update_minimap();
                 // snapshot 1.5x the view: panning while the sim is busy
                 // still has content at the edges
                 ViewRect v = cam.view();
                 const std::int32_t mx_ = (v.x1 - v.x0) / 4, my_ = (v.y1 - v.y0) / 4;
                 v.x0 -= mx_; v.x1 += mx_; v.y0 -= my_; v.y1 += my_;
-                if (!globe) snap = capture(w, v, fog);      // orbit view never needs the 2.5D snapshot
+                if (!globe) {                          // orbit view never needs the 2.5D snapshot
+                    snap_back = capture(w, v, fog, &cap_scratch);
+                    {   // publish atomically: draw code keeps reading `snap`
+                        std::lock_guard<std::mutex> slk(snap_mx);
+                        std::swap(snap, snap_back);
+                        ++snap_gen;
+                    }
+                }
                 c_tick = w.clock_.tick(); c_minds = w.minds_.size();
+                // ---- action telegraph feed ---------------------------------
+                // Scan ONLY new ledger events since the last poll (amortized
+                // O(1)); maps actor -> last verb for the overhead label.
+                // Purely display-side: nothing is written back to the World.
+                {
+                    const auto& hist = w.ledger.history();
+                    // history_ is front-erased in batches, so an index cursor
+                    // would silently rescan (and re-telegraph) old events —
+                    // track the last EventId instead; ids are sequential.
+                    const std::uint64_t base = w.ledger.next_id() - hist.size();
+                    std::size_t i0 = hist.size();       // first poll: skip backlog
+                    if (act_last) {
+                        if (act_last + 1 < base) act_last = w.ledger.next_id() - 1;   // cursor evicted: skip backlog
+                        else i0 = std::size_t(act_last + 1 - base);
+                    } else {
+                        act_last = w.ledger.next_id() - 1;   // mark backlog as seen
+                    }
+                    for (std::size_t i = i0; i < hist.size(); ++i) {
+                        const CausalEvent& ev = hist[i];
+                        act_last = base + i;
+                        if (ev.participants.empty() || ev.action.empty()) continue;
+                        const std::string& a = ev.action;
+                        if (a == "metabolize" || a == "cool" || a == "ecology" ||
+                            a == "political_drift" || a == "myth_drift" || a == "language" ||
+                            a == "anatomy_drift" || a == "decay_minds" || a == "move" ||
+                            a == "perceive" || a == "witness" || a == "advance_ticks") continue;
+                        std::string label; ImU32 col = IM_COL32(205, 210, 220, 255);
+                        if (a == "consume" || a == "eat" || a == "forage")            { label = "eat";    col = IM_COL32(110, 210, 95, 255); }
+                        else if (a == "assemble" || a == "disassemble" || a == "craft" ||
+                                 a == "compose_clause" || a == "inscribe")          { label = "craft";  col = IM_COL32(230, 170, 70, 255); }
+                        else if (a == "dig" || a == "extract" || a == "quarry")      { label = "dig";    col = IM_COL32(190, 150, 100, 255); }
+                        else if (a == "plant" || a == "sow")                          { label = "plant";  col = IM_COL32(120, 200, 110, 255); }
+                        else if (a == "harvest" || a == "gather")                     { label = "harvest";col = IM_COL32(220, 190, 80, 255); }
+                        else if (a == "strike" || a == "launch" || a == "attack")    { label = "fight!"; col = IM_COL32(235, 70, 60, 255); }
+                        else if (a == "treat" || a == "heal")                         { label = "heal";   col = IM_COL32(120, 220, 220, 255); }
+                        else if (a == "communicate" || a == "speak" || a == "chant") { label = "talk";   col = IM_COL32(100, 170, 235, 255); }
+                        else if (a == "perform_ritual" || a == "consecrate")         { label = "rite";   col = IM_COL32(235, 200, 110, 255); }
+                        else if (a == "rest" || a == "sleep")                        { label = "zZz";    col = IM_COL32(185, 190, 215, 255); }
+                        else if (a == "reproduce" || a == "mate")                    { label = "family"; col = IM_COL32(235, 135, 200, 255); }
+                        else if (a == "trade" || a == "gift" || a == "share")        { label = "share";  col = IM_COL32(225, 200, 100, 255); }
+                        else if (a == "steal")                                       { label = "steal!"; col = IM_COL32(200, 90, 160, 255); }
+                        else if (a == "treaty" || a == "parley" || a == "diplomatic_parley") { label = "treaty"; col = IM_COL32(130, 225, 225, 255); }
+                        else if (a == "wield" || a == "don" || a == "doff" || a == "coat")  { label = "gear";   col = IM_COL32(170, 160, 190, 255); }
+                        else { label = a.substr(0, 10); }
+                        if (ev.failed) { label += "!"; col = IM_COL32(150, 155, 165, 255); }
+                        c_act[ev.participants[0]] = label;
+                        c_act_col[ev.participants[0]] = col;
+                        c_act_until[ev.participants[0]] = frames + 110;    // ~2 s telegraph
+                    }
+                }
                 wrap_camera();
                 if (is_planet() && frames % 30 == 3) { build_globe_fog(); if (globe) build_globe_icons(); }
                 if (is_planet() && !globe && frames % 10 == 4) update_mini_globe();
@@ -2138,6 +3149,24 @@ struct Viewer {
                     c_speaker_pos.clear();
                     for (const SpeechBubble& b : journal.bubbles)
                         if (const Entity* se = w.find(b.speaker); se && se->alive) c_speaker_pos[b.speaker] = se->pos;
+                }
+                // Narrative chronicle: same incremental ledger scan, narrates
+                // events near the camera + everything about pinned legends.
+                if (frames % 4 == 2) {
+                    ViewRect nv = cam.view();
+                    composer.scan(w, cfeed, &nv, journal.pins, &journal);
+                    for (const NarrativeLine& l : cfeed.lines) {
+                        if (l.seq <= narr_seen) continue;
+                        narr_seen = l.seq;
+                        if (!l.callout) continue;
+                        ImU32 col = IM_COL32(215, 215, 225, 255);
+                        if (l.cat & kCatCombat) col = IM_COL32(255, 110, 90, 255);
+                        else if (l.cat & kCatDiscovery) col = IM_COL32(255, 205, 90, 255);
+                        else if (l.cat & kCatSociety) col = IM_COL32(120, 215, 225, 255);
+                        else if (l.cat & kCatSurvival) col = IM_COL32(140, 225, 130, 255);
+                        c_callouts.push_back({l.pos, float(l.seq % 7) * 10.f - 30.f, l.text, frames + 260, col});
+                    }
+                    while (c_callouts.size() > 48) c_callouts.pop_front();
                 }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
@@ -2169,51 +3198,136 @@ struct Viewer {
                 }
                 if (show_inspector && (frames % 10 == 1 || insp.id != selected)) build_inspector();
                 if (show_codex && (frames % 60 == 1 || c_codex.empty())) build_codex();
-                const std::uint64_t key = (c_tick / 48) * 16 + std::uint64_t(lens);
-                if (!globe && (key != ground_key || !ground)) { build_ground(); ground_key = key; }
-            } else {
+                const std::uint64_t key = (c_tick / 240) * 16 + std::uint64_t(lens);
+                if (!globe && !is_planet() && (key != ground_key || !ground)) { build_ground(); ground_key = key; }
+            } else if (frames % 8 == 0) {
+                // ask the sim thread for a longer pause — but only on a
+                // periodic miss, not every failed try_lock, or the request
+                // flag is ~always set and halves simulation throughput.
                 ui_wants = true;
             }
-        }
+        };
+        poll_world();
         t_cap = ms(t); t = clk::now();
         globe_step(dt);
-        if (globe) {
+        if (!has_game) {
+            draw_title_globe(dt);
+        } else if (globe) {
             draw_globe();
         } else {
-            if (!(skip & 1)) { draw_far_terrain(); draw_terrain(); }
+            if (!(skip & 1)) {
+                if (is_planet()) { draw_ground_chunks(); draw_fog_chunks(); }
+                else { draw_terrain(); draw_water_glints(); }
+            }
             t_ter = ms(t); t = clk::now();
             if (!(skip & 2)) draw_entities(dt);
             draw_links();
+            draw_callouts();
             if (!(skip & 4)) draw_night();
         }
         SDL_SetRenderTarget(ren, nullptr);
         if (!(skip & 32)) SDL_RenderTexture(ren, world_rt, nullptr, nullptr);     // nearest x kPix
         t_ent = ms(t); t = clk::now();
-        if (in_menu) ui_menu();
+        {   // second lock attempt: the world draw above took ~5 ms, so the
+            // sim's slice/sleep phase may have rolled over — retry so UI
+            // windows read a fresher snapshot this frame.
+            const auto tp = clk::now();
+            poll_world();
+            t_cap += ms(tp);
+        }
+        if (in_menu || !has_game) { if (!in_menu) open_menu(kTitle); ui_menu(); }
         else if (!(skip & 16)) {
             if (globe) draw_globe_icons(); else draw_overlays();
             ui_topbar();
             if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
-            ui_inspector(); ui_player(); ui_journal(); ui_successor();
+            ui_inspector(); ui_player(); ui_journal(); ui_chronicle(); ui_successor(); ui_toast();
             if (!show_journal) ui_word_editor();
         }
-        if (!(skip & 8) && !in_menu) { ui_atlas(); ui_codex(); }
+        if (!in_menu) {
+            if (!(skip & 8) && !(skip & 128)) ui_atlas();
+            if (!(skip & 8) && !(skip & 256)) ui_codex();
+        }
         t_ui = ms(t);
         t = clk::now();
         ImGui::Render();
+        ImDrawData* dd = ImGui::GetDrawData();
         static const bool ui_direct = std::getenv("SIMLAB_VSKIP") && (std::atoi(std::getenv("SIMLAB_VSKIP")) & 64);
-        if (ui_direct) {
-            ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
-        } else if (ui_dirty || frames % 4 == 0) {
-            SDL_SetRenderTarget(ren, ui_rt);
+        // Heavy reference windows (Atlas gallery, Chronicle codex) cost ~25 ms
+        // to software-rasterize, so their draw lists go to a separate cached
+        // layer refreshed ~7.5x/s (or on any UI event) and blitted back at the
+        // window rect captured at rasterize time. HUD stays cheap + live.
+        ImGuiWindow* aux_win[2] = {
+            ImGui::FindWindowByName("Data Atlas Gallery (generated from data/*.txt)"),
+            ImGui::FindWindowByName("Chronicle & Rosetta Codex")};
+        ImDrawList* slow[2] = {nullptr, nullptr};
+        int slow_idx[2] = {-1, -1}, n_slow = 0;
+        for (int i = 0; i < 2; ++i)
+            if (aux_win[i] && aux_win[i]->DrawList &&
+                std::find(dd->CmdLists.begin(), dd->CmdLists.end(), aux_win[i]->DrawList) != dd->CmdLists.end()) {
+                slow[n_slow] = aux_win[i]->DrawList; slow_idx[n_slow] = i; ++n_slow;
+            }
+        ImDrawData fast_dd, slow_dd;
+        ImVector<ImDrawList*> fast_lists, slow_lists;
+        if (n_slow) {
+            for (ImDrawList* l : dd->CmdLists) {
+                bool s = false;
+                for (int i = 0; i < n_slow; ++i) if (l == slow[i]) { s = true; break; }
+                (s ? slow_lists : fast_lists).push_back(l);
+            }
+            fast_dd = *dd; fast_dd.CmdLists = fast_lists;
+            slow_dd = *dd; slow_dd.CmdLists = slow_lists;
+        } else {
+            fast_dd = *dd;
+        }
+        // Re-rasterize ui_rt only when the UI could have changed: an input
+        // event / explicit dirty, the fading toast, a new snapshot or world
+        // tick (clock text, resonance), or a periodic ~30 Hz / 8-frame safety
+        // net. Paused and menu-idle frames skip the glyph pass entirely.
+        const bool ui_anim = !toast_msg.empty() && (time_s - toast_t) < 4.5;
+        const bool ui_event = ui_dirty;   // sampled before the fast pass clears it
+        const bool ui_urgent = ui_event || ui_anim;
+        const bool ui_periodic = (frames % 3 == 0) &&
+            (snap_gen != ui_last_snap_gen || c_tick != ui_last_tick || frames % 9 == 0);
+        auto raster = [&](ImDrawData* d, SDL_Texture* target) {
+            SDL_SetRenderTarget(ren, target);
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
             SDL_RenderClear(ren);
-            ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
+            ImGui_ImplSDLRenderer3_RenderDrawData(d, ren);
             SDL_SetRenderTarget(ren, nullptr);
-            ui_dirty = false;
+        };
+        if (ui_direct) {
+            ImGui_ImplSDLRenderer3_RenderDrawData(dd, ren);
+        } else {
+            if (ui_urgent || ui_periodic) {
+                raster(&fast_dd, ui_rt);
+                ui_dirty = false;
+                ui_last_snap_gen = snap_gen;
+                ui_last_tick = c_tick;
+            }
+            // aux refresh: ~7.5 Hz baseline, or immediately while the pointer/
+            // keyboard is captured by ImGui (hover, InputText, window drag) —
+            // world pans must NOT retrigger the expensive pass every frame.
+            const ImGuiIO& io = ImGui::GetIO();
+            if (n_slow && ((ui_event && (io.WantCaptureMouse || io.WantCaptureKeyboard)) || frames % 32 == 0)) {
+                raster(&slow_dd, aux_rt);
+                for (int i = 0; i < n_slow; ++i) {
+                    const ImRect r = aux_win[slow_idx[i]]->Rect();
+                    float* b = aux_rect[slow_idx[i]];
+                    b[0] = (r.Min.x - dd->DisplayPos.x) * dd->FramebufferScale.x;
+                    b[1] = (r.Min.y - dd->DisplayPos.y) * dd->FramebufferScale.y;
+                    b[2] = (r.Max.x - dd->DisplayPos.x) * dd->FramebufferScale.x - b[0];
+                    b[3] = (r.Max.y - dd->DisplayPos.y) * dd->FramebufferScale.y - b[1];
+                    aux_ok[slow_idx[i]] = true;
+                }
+            }
+            SDL_RenderTexture(ren, ui_rt, nullptr, nullptr);
+            for (int i = 0; i < 2; ++i) if (aux_ok[i] && aux_win[i] && aux_win[i]->DrawList &&
+                std::find(dd->CmdLists.begin(), dd->CmdLists.end(), aux_win[i]->DrawList) != dd->CmdLists.end()) {
+                SDL_FRect src{aux_rect[i][0], aux_rect[i][1], aux_rect[i][2], aux_rect[i][3]}, dst = src;
+                SDL_RenderTexture(ren, aux_rt, &src, &dst);
+            }
         }
-        if (!ui_direct) SDL_RenderTexture(ren, ui_rt, nullptr, nullptr);
         t_im = ms(t); t = clk::now();
         if (!shot_path.empty()) {
             if (SDL_Surface* shot = SDL_RenderReadPixels(ren, nullptr)) {
@@ -2224,6 +3338,10 @@ struct Viewer {
         }
         SDL_RenderPresent(ren);
         t_pr = ms(t);
+        const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_frame).count();
+        if (std::getenv("SIMLAB_VDEBUG") && total_ms > 24.0)
+            std::printf("  SLOW frame %llu total %.1f: capture %.1f terrain %.1f entities %.1f ui %.1f imgui-draw %.1f present %.1f (ents %zu)\n",
+                        (unsigned long long)frames, total_ms, t_cap, t_ter, t_ent, t_ui, t_im, t_pr, snap.entities.size());
         if (std::getenv("SIMLAB_VDEBUG") && frames % 40 == 5)
             std::printf("  frame %llu: capture %.1f terrain %.1f entities %.1f ui %.1f imgui-draw %.1f present %.1f (ents %zu)\n",
                         (unsigned long long)frames, t_cap, t_ter, t_ent, t_ui, t_im, t_pr, snap.entities.size());
@@ -2247,10 +3365,26 @@ int main(int argc, char** argv) {
         else if (a == "--live") live = true;
     }
     if (selftest > 0 && !std::getenv("SDL_VIDEO_DRIVER")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
-    // software only: never load the GL/EGL driver stack (on a GPU box it
-    // alone costs ~80 MB of RSS; on a GPU-less box it does not exist)
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
-    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+    // Renderer selection: hardware-accelerated by default (SDL picks
+    // Vulkan/D3D11/GL/GLES as available). Software only when headless
+    // (dummy video driver, e.g. selftest) or forced via SIMLAB_RENDERER.
+    // SIMLAB_RENDERER=software|opengl|vulkan|... overrides everything.
+    const char* want = std::getenv("SIMLAB_RENDERER");
+    const bool headless = selftest > 0 ||
+        (std::getenv("SDL_VIDEODRIVER") && std::string(std::getenv("SDL_VIDEODRIVER")) == "dummy") ||
+        (std::getenv("SDL_VIDEO_DRIVER") && std::string(std::getenv("SDL_VIDEO_DRIVER")) == "dummy");
+    if (want) {
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, want);
+    } else if (headless) {
+        // software only: never load the GL/EGL driver stack (on a GPU box it
+        // alone costs ~80 MB of RSS; on a GPU-less box it does not exist)
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+        SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "0");
+    } else {
+        // pixel-art sharpness is per-texture: world_rt/ui_rt/globe_tex all
+        // set SDL_SCALEMODE_NEAREST/LINEAR explicitly (SDL3 dropped the
+        // SDL_HINT_RENDER_SCALE_QUALITY hint).
+    }
     if (!SDL_Init(SDL_INIT_VIDEO)) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
     World world(seed, data);
     if (!world.content_error.empty()) { std::fprintf(stderr, "content: %s\n", world.content_error.c_str()); return 1; }
@@ -2259,10 +3393,11 @@ int main(int argc, char** argv) {
     world.ledger.set_byte_budget(16u << 20);
     Viewer v(world);
     v.data_dir = data;
-    if (char* pref = SDL_GetPrefPath("Sunnyworld", "SimLab")) { v.pref_dir = pref; SDL_free(pref); }
+    if (const char* pd = std::getenv("SIMLAB_PREF")) v.pref_dir = pd;          // tests: never touch the user's saves
+    else if (char* pref = SDL_GetPrefPath("Sunnyworld", "SimLab")) { v.pref_dir = pref; SDL_free(pref); }
     else v.pref_dir = "./";
     std::snprintf(v.seed_buf, sizeof v.seed_buf, "%llu", (unsigned long long)seed);
-    {   // backdrop world behind the title menu (also the selftest world)
+    if (selftest > 0) {   // selftest world (the interactive game starts at the title menu)
         PrimordialParams p; p.seed = seed; p.grid = 64; p.tribes = 2; p.per_tribe = 6;
         if (const char* pl = std::getenv("SIMLAB_VPLANET")) {      // e.g. 2048 -> 2048 x 1024 planet
             p.planet = true; p.planet_w = std::atoi(pl); p.planet_h = p.planet_w / 2; p.grid = 128;
@@ -2273,11 +3408,16 @@ int main(int argc, char** argv) {
         v.fog.set_mode(FogOfWar::Mode::Tribe, v.tribe_lang());
     }
     v.speed = 0; v.speed_atomic = 0;               // paused under the title menu
+    v.has_game = selftest > 0;
+    v.title_map.build(WorldGenerator::planet_seed(std::uint32_t(seed), 1024, 512), 1024, 512, 1024);
+    v.title_view.radius = 300;
     v.win = SDL_CreateWindow("Sunnyworld - Primordial Sandbox", v.win_w, v.win_h, SDL_WINDOW_RESIZABLE);
     if (!v.win) { std::fprintf(stderr, "window: %s\n", SDL_GetError()); return 1; }
-    v.ren = SDL_CreateRenderer(v.win, "software");               // no GPU required
-    if (!v.ren) v.ren = SDL_CreateRenderer(v.win, nullptr);
-    if (!v.ren) { std::fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
+    // nullptr = SDL's preferred driver (accelerated when a GPU backend
+    // exists); software is the explicit fallback for headless/weak boxes.
+    v.ren = SDL_CreateRenderer(v.win, nullptr);
+    if (!v.ren) v.ren = SDL_CreateRenderer(v.win, "software");
+    if (!v.ren) { std::fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return 1; }
     // no vsync: with a software renderer a frame that misses 16.6 ms would be
     // held to the next vblank (60 -> 30 FPS judder); we pace frames ourselves
     SDL_SetRenderVSync(v.ren, 0);
@@ -2294,6 +3434,29 @@ int main(int argc, char** argv) {
 
     bool quit = false;
     auto last = std::chrono::steady_clock::now();
+    if (std::getenv("SIMLAB_VTITLE")) {
+        // menu flow smoke test: title -> new game -> save & quit -> continue
+        v.has_game = false; v.in_menu = true; v.screen = Viewer::kTitle;
+        for (int f = 0; f < 20; ++f) v.frame(1.0 / 60);
+        if (!shot.empty()) { v.ui_dirty = true; v.shot_path = shot + "_title.bmp"; v.frame(1.0 / 60); }
+        const int before = v.newest_slot();
+        PrimordialParams p; p.seed = 77; p.grid = 64; p.tribes = 1; p.per_tribe = 4;
+        { std::lock_guard<std::mutex> lk(v.mx); v.new_world(p); }
+        v.has_game = true; v.close_menu();
+        for (int c = 0; c < 5; ++c) autonomous_cycle(world, &v.dstate);
+        for (int f = 0; f < 10; ++f) v.frame(1.0 / 60);
+        const std::uint64_t h = world.state_hash();
+        v.open_menu(Viewer::kPause);
+        v.save_slot(0); v.has_game = false; v.screen = Viewer::kTitle;
+        for (int f = 0; f < 5; ++f) v.frame(1.0 / 60);
+        const int ns = v.newest_slot();
+        const bool ok_load = ns >= 0 && v.load_slot(ns);
+        v.close_menu();
+        for (int f = 0; f < 5; ++f) v.frame(1.0 / 60);
+        std::printf("title: newest_before=%d newest_after=%d continue_loaded=%d has_game=%d hash_restored=%d menu_closed=%d\n",
+                    before, ns, int(ok_load), int(v.has_game.load()), int(world.state_hash() == h), int(!v.in_menu));
+        return ok_load && world.state_hash() == h ? 0 : 5;
+    }
     if (selftest > 0) {
         // headless self-test: (1) render-only frames must leave state_hash
         // untouched; (2) then run the sim and report frame time + RSS.
@@ -2303,11 +3466,38 @@ int main(int argc, char** argv) {
         const bool dbg = std::getenv("SIMLAB_VDEBUG") != nullptr;
         if (dbg) std::printf("rss before frames %zu\n", rss_kb());
         for (long f = 0; f < selftest / 2; ++f) {
-            v.lens = int((f / 40) % 6);
+            v.lens = int((f / 40) % 7);
             const auto tf = std::chrono::steady_clock::now();
             v.frame(1.0 / 60);
             if (dbg && f < 6) std::printf("frame %ld %.1fms rss %zu tex %zu\n", f,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(), rss_kb(), v.tex.map.size());
+        }
+        if (std::getenv("SIMLAB_VCHRON")) {
+            // repro: click rows of the Chronicle feed with real ImGui input
+            v.show_atlas = v.show_codex = false; v.show_chronicle = true;
+            int c = 0;
+            for (; c < 150 && v.cfeed.lines.size() < 3; ++c) { autonomous_cycle(world, &v.dstate); v.frame(1.0 / 60); }
+            std::printf("chron: %zu lines after %d cycles\n", v.cfeed.lines.size(), c);
+            ImGuiIO& io = ImGui::GetIO();
+            ImGuiWindow* cw = ImGui::FindWindowByName("Chronicle");
+            const ImVec2 wp = cw ? cw->Pos : ImVec2(10, v.win_h * 0.52f);
+            std::printf("chron: window at %.0f,%.0f size %.0fx%.0f\n", wp.x, wp.y, cw ? cw->Size.x : 0.f, cw ? cw->Size.y : 0.f);
+            auto click = [&](float x, float y, int n) {
+                for (int r = 0; r < n; ++r) {
+                    io.AddMousePosEvent(x, y); v.frame(1.0 / 60);
+                    io.AddMouseButtonEvent(0, true); v.frame(1.0 / 60);
+                    io.AddMouseButtonEvent(0, false); v.frame(1.0 / 60);
+                }
+                for (int f = 0; f < 6; ++f) v.frame(1.0 / 60);
+            };
+            for (int k = 0; k < 8; ++k) {
+                click(wp.x + 90, wp.y + 64 + k * 19, k % 2 ? 2 : 1);
+                std::printf("chron: row click %d ok selected=%llu\n", k, (unsigned long long)v.selected);
+            }
+            for (int b = 0; b < 6; ++b) { click(wp.x + 20 + b * 62, wp.y + 38, 1); std::printf("chron: filter %d ok\n", b); }
+            for (int f = 0; f < 30; ++f) { autonomous_cycle(world, &v.dstate); v.frame(1.0 / 60); }
+            std::printf("chron: survived\n");
+            return 0;
         }
         if (std::getenv("SIMLAB_VGLOBE")) {
             // globe smoke test: orbit view, spin, render cost, dive back down
@@ -2345,7 +3535,10 @@ int main(int argc, char** argv) {
             const float x0 = v.cam.cx;
             v.cam.cx += float(v.planet_units_w()); v.frame(1.0 / 60);
             const bool wrapped = std::fabs(v.cam.cx - x0) < 1.0f;
-            if (!shot.empty()) { v.ui_dirty = true; v.shot_path = shot + "_surface.bmp"; v.frame(1.0 / 60); }
+            if (!shot.empty()) {
+                for (int f = 0; f < 40; ++f) v.frame(1.0 / 60);          // let chunk builds finish
+                v.ui_dirty = true; v.shot_path = shot + "_surface.bmp"; v.frame(1.0 / 60);
+            }
             // zoom back out to orbit through the wheel path
             v.cam.zoom = 0.25f;
             SDL_Event we{}; we.type = SDL_EVENT_MOUSE_WHEEL; we.wheel.y = -1; we.wheel.mouse_x = 400; we.wheel.mouse_y = 300;
@@ -2372,7 +3565,9 @@ int main(int argc, char** argv) {
                 }
                 if (v.pw.founders.size() > 1 && std::getenv("SIMLAB_VPOSSESS")) v.set_possess(v.pw.founders[1]);
             }
-            v.show_journal = true;
+            v.show_journal = !std::getenv("SIMLAB_VNOJOURNAL");
+            if (const char* z = std::getenv("SIMLAB_VZOOM")) v.cam.zoom = float(std::atof(z));
+            if (std::getenv("SIMLAB_VGOD")) v.fog.set_mode(FogOfWar::Mode::GodEye);
             if (const char* jt = std::getenv("SIMLAB_VTAB")) v.journal_tab_req = std::atoi(jt);
             for (int f = 0; f < 20; ++f) v.frame(1.0 / 60);
             for (int c = 0; c < 6; ++c) { autonomous_cycle(world, &v.dstate); v.frame(1.0 / 60); }
@@ -2386,7 +3581,7 @@ int main(int argc, char** argv) {
         const bool same = world.state_hash() == h0;
         // frame cost alone (the sim normally runs on its own thread)
         const auto t0 = std::chrono::steady_clock::now();
-        for (long f = selftest / 2; f < selftest; ++f) { v.lens = int((f / 40) % 6); v.frame(1.0 / 60); }
+        for (long f = selftest / 2; f < selftest; ++f) { v.lens = int((f / 40) % 7); v.frame(1.0 / 60); }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         // then a burst of simulation to show the world-side RAM stays bounded
         const std::size_t rss_render = rss_kb();
@@ -2401,7 +3596,9 @@ int main(int argc, char** argv) {
         if (live) {
             // smoothness under load: the sim thread runs flat out (100x)
             // while we render; a frame must never wait for a cycle
-            v.speed = 4; v.speed_atomic = 4;
+            if (const char* vs = std::getenv("SIMLAB_VSPEED")) v.speed = std::atoi(vs);
+            v.speed_atomic = v.speed;
+            const std::uint64_t snap0 = v.snap_gen;
             v.sim_thread = std::thread([&v] { v.sim_loop(); });
             std::vector<double> ft;
             for (long f = 0; f < selftest; ++f) {
@@ -2413,9 +3610,10 @@ int main(int argc, char** argv) {
             v.sim_thread.join();
             std::sort(ft.begin(), ft.end());
             double sum = 0; for (double x : ft) sum += x;
-            std::printf("live: frames=%zu avg_ms=%.2f p95_ms=%.2f max_ms=%.2f tick=%llu minds=%zu\n", ft.size(),
+            std::printf("live: frames=%zu avg_ms=%.2f p95_ms=%.2f max_ms=%.2f tick=%llu minds=%zu captures=%llu\n", ft.size(),
                         sum / double(ft.size()), ft[ft.size() * 95 / 100], ft.back(),
-                        (unsigned long long)world.clock_.tick(), world.minds_.size());
+                        (unsigned long long)world.clock_.tick(), world.minds_.size(),
+                        (unsigned long long)(v.snap_gen - snap0));
         }
         quit = true;
         if (!same) return 2;
@@ -2434,6 +3632,7 @@ int main(int argc, char** argv) {
         const double spent = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
         if (spent < 16.0) std::this_thread::sleep_for(std::chrono::microseconds(int((16.0 - spent) * 1000)));
     }
+    if (v.has_game && selftest <= 0) v.save_slot(0);   // closing the window autosaves -> Continue
     v.running = false;
     if (v.sim_thread.joinable()) v.sim_thread.join();
     v.tex.clear();

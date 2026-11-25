@@ -5,3 +5,5 @@ build-profile/
 third_party/sdl3-build/
 third_party/x11-headers/lib/
 viewer_rosetta_notes.txt
+third_party/models/
+third_party/lang-host/

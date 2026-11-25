@@ -983,6 +983,35 @@ std::size_t perceive(World& w, EntityId npc) {
     last_seen.reserve(mind.observations.size());
     for (const Observation& ob : mind.observations)
         last_seen[ob.entity] = LastSeen{ob.tick, ob.pos};
+    // Flashback candidate index (exact): the sorted set of memory entries
+    // whose engram is CURRENTLY deep trauma (the charge/stability half of
+    // the flashback predicate). Built once, then kept exact: every engram
+    // write in this call re-checks the written entry (fb_touch), and the
+    // abstraction fan-out (which rewrites other entries) forces a rebuild.
+    // Scanning this set in key order finds the same first match as scanning
+    // the whole memory map — usually it is empty or tiny.
+    const std::int64_t fb_floor = -mparams.flashback_charge;
+    auto fb_eligible = [&](const MemoryEngram& g) {
+        return g.emotional_charge <= fb_floor && g.emotional_charge < 0 &&
+               g.stability >= mparams.flashback_stability;
+    };
+    std::vector<EntityId> fb_cands;
+    bool fb_dirty = true;
+    auto fb_rebuild = [&]() {
+        fb_cands.clear();
+        for (const auto& [kid, ms] : std::as_const(mind.memory))
+            if (fb_eligible(ms.engram)) fb_cands.push_back(kid);
+        fb_dirty = false;
+    };
+    auto fb_touch = [&](EntityId id) {
+        if (fb_dirty) return;
+        const auto mit = std::as_const(mind.memory).find(id);
+        const bool elig = mit != std::as_const(mind.memory).end() && fb_eligible(mit->second.engram);
+        const auto pos = std::lower_bound(fb_cands.begin(), fb_cands.end(), id);
+        const bool present = pos != fb_cands.end() && *pos == id;
+        if (elig && !present) fb_cands.insert(pos, id);
+        else if (!elig && present) fb_cands.erase(pos);
+    };
     for (const EntityId eid : w.entities_near(me->pos, range)) {
         if (eid == npc) continue;
         const Entity* e = w.find(eid);
@@ -1047,8 +1076,11 @@ std::size_t perceive(World& w, EntityId npc) {
         const LastSeen* prev_obs = lsit == last_seen.end() ? nullptr : &lsit->second;
         const bool had_engram =
             mind.memory.find(eid) != mind.memory.end();
-        upsert_memory_g(w, mind, eid, snap, perceive_charge(w, *me, *e),
-                        mparams, range);
+        const std::int64_t pcharge = perceive_charge(w, *me, *e);
+        upsert_memory_g(w, mind, eid, snap, pcharge, mparams, range);
+        // abstraction fan-out may rewrite OTHER entries -> full re-index
+        if (mparams.abstraction_gain > 1200 &&
+            mem_abs(pcharge) >= mparams.imprint_threshold) fb_dirty = true;
         // Out-group wariness (Nhịp 5b): first sight of a conspecific
         // stranger — no engram yet, no shared collective — writes a
         // wary mark scaled by xenophobia_bias; collective mates get
@@ -1070,6 +1102,7 @@ std::size_t perceive(World& w, EntityId npc) {
                 }
             }
         }
+        fb_touch(eid);                 // after upsert + xenophobia rewrite
         // Theory of mind (Nhịp 4d): a sophisticated observer infers a
         // conspecific's agitation from OBSERVED MOTION ONLY — displacement
         // between sightings vs the observer's own top speed. Private props
@@ -1116,7 +1149,11 @@ std::size_t perceive(World& w, EntityId npc) {
             };
             bool flashed = false;
             std::int64_t fb_mag = 0;
-            for (auto& [kid, ms] : mind.memory) {
+            if (fb_dirty) fb_rebuild();
+            for (const EntityId kid : fb_cands) {
+                auto mit = mind.memory.find(kid);   // few: deep traumas only
+                if (mit == mind.memory.end()) continue;
+                AgentMind::MemorySnapshot& ms = mit->second;
                 if (!trauma_match(ms.material, ms.kind_name, ms.engram)) continue;
                 ms.engram.clarity = mparams.max_clarity;
                 fb_mag = -ms.engram.emotional_charge;
@@ -1385,13 +1422,295 @@ static void treat_gratitude(World& w, EntityId npc, const CausalEvent& ev,
     }
 }
 
+// Maritime lessons (Primordial): drowning and capsizing are written into the
+// event evidence by the locomotion law; living through one, or seeing one,
+// leaves a learned fear of deep water that the shore sense weighs before
+// every crossing. Belief only — World Truth is untouched.
+void maritime_lesson(World& w, AgentMind& mind, const CausalEvent& ev, bool self) {
+    if (ev.evidence.find("drown") == std::string::npos &&
+        ev.evidence.find("capsized") == std::string::npos) return;
+    const bool died = ev.evidence.find("drowned") != std::string::npos;
+    const std::int64_t gain = ev.evidence.find("capsized") != std::string::npos ? 200
+                            : died ? 600 : (self ? 400 : 300);
+    Belief& b = mind.belief("peril:deep_water");
+    b.confidence = std::min<std::int64_t>(1000, b.confidence + gain);
+    b.evidence_for += gain;
+    if (self) b.self_evidence += gain;
+    b.last_tick = ev.tick;
+    if (b.status == BeliefStatus::Unknown || b.status == BeliefStatus::Hypothesized)
+        b.status = BeliefStatus::Observed;
+    (void)w;
+}
+
+// ---- Phase 19: two-tier physics cognition -----------------------------------
+// Tier 1 `phenomenon:<domain>` — qualitative recognition: wood floats and
+// stone sinks, a drawn bow flies farther, fierce fire melts ore. No math
+// required; these beliefs only bias estimation (existing outcome/yield
+// machinery does the qualitative work).
+// Tier 2 gate `math:<tier>` — a tribe invents counting, ratios or
+// geometry only after repeated quantitative NEED (`mathneed:<tier>`
+// accumulates from craft events) plus sufficient abstraction. Inventing
+// math is a belief, never a World Truth write.
+// Tier 2 result `qlaw:<domain>:p<param>` — a quantitative law proven by
+// measuring real World quantities (the same local-sense precedent as
+// shore_sense: a scholar's instrument reading, not agent omniscience).
+// The winning integer parameter rides in the key, so planners can apply
+// it verbatim; transmitted copies arrive halved — claims, not proof.
+namespace {
+
+void qbump(AgentMind& mind, const std::string& key, std::int64_t gain,
+           std::uint64_t tick) {
+    Belief& b = mind.belief(key);
+    if (b.status == BeliefStatus::Unknown)
+        b.status = BeliefStatus::Observed;
+    b.confidence = std::min<std::int64_t>(1000, b.confidence + gain);
+    b.evidence_for += gain;
+    b.self_evidence += gain;
+    b.last_tick = tick;
+}
+
+// event -> (phenomenon domain or "", math tier or "")
+void quantum_observe(World& w, AgentMind& mind, EntityId npc,
+                     const CausalEvent& ev) {
+    const Entity* me = w.find(npc);
+    if (!me) return;
+    std::string domain, tier, tier2;
+    if (ev.action == "process" || ev.action == "combine") {
+        domain = "smelt"; tier = "ratio";
+    } else if (ev.action == "impact" || ev.action == "strike") {
+        domain = "trajectory"; tier = "geometry";
+    } else if (ev.action == "sow" || ev.action == "plant" ||
+               ev.action == "dig" || ev.action == "irrigate") {
+        tier = "geometry";
+    } else if (ev.action == "share" || ev.action == "consume") {
+        tier = "count";
+    }
+    // buoyancy: any craft (float_capacity > 0) touched by the event —
+    // boarding it, loading it, or watching it float/foundering. Loading a
+    // hull is a RATIO problem (load vs lift) on top of mere counting.
+    const PropId p_fc = SIMLAB_PID(w.props, "float_capacity");
+    if (p_fc != kNoProp) {
+        for (EntityId pid2 : ev.participants) {
+            const Entity* pe = w.find(pid2);
+            if (pe && pe->alive && w.prop_int(*pe, p_fc, 0) > 0) {
+                if (domain.empty()) domain = "buoyancy";
+                if (tier == "count") tier2 = "ratio";
+                else if (tier.empty()) tier = "ratio";
+                break;
+            }
+        }
+    }
+    if (domain.empty() && tier.empty() && tier2.empty()) return;
+    const std::int64_t gain = ev.failed ? 2 : 6;
+    if (!domain.empty() && !ev.failed)
+        qbump(mind, "phenomenon:" + domain, gain, ev.tick);
+    for (const std::string* t : {&tier, &tier2}) {
+        if (t->empty()) continue;
+        qbump(mind, "mathneed:" + *t, gain * 2, ev.tick);
+        // invention: sustained quantitative need + a mind that can abstract
+        const Belief* need = mind.find_belief("mathneed:" + *t);
+        const Belief* have = mind.find_belief("math:" + *t);
+        if (need && have == nullptr && need->confidence >= 550 &&
+            mind_params(w, *me).abstraction_gain >= 1100) {
+            qbump(mind, "math:" + *t, need->confidence, ev.tick);
+            mind.belief("mathneed:" + *t).confidence = 0;   // need spent
+        }
+    }
+    // quantitative proof: phenomenon + the required math tier + abstraction
+    if (domain.empty() || ev.failed) return;
+    const char* req = domain == "trajectory" ? "geometry" : "ratio";
+    const Belief* ph = mind.find_belief("phenomenon:" + domain);
+    const Belief* mt = mind.find_belief(std::string("math:") + req);
+    if (!ph || !mt || ph->confidence < 650 || mt->confidence < 550 ||
+        mind_params(w, *me).abstraction_gain < 1200)
+        return;
+    // measure the parameter from real world quantities (one reading):
+    std::int64_t param = -1;
+    if (domain == "smelt") {
+        // fuel share of the richest smelt recipe the tribe knows: the
+        // process registry is World Truth data; the mind "reads" the
+        // ratio off the crucible scale it invented with its math.
+        std::int64_t best = -1;
+        for (const ProcessDef& pd : w.processes.defs()) {
+            if (pd.fuels.empty() || pd.inputs.empty()) continue;
+            std::int64_t fq = 0, tq = 0;
+            for (const ProcessIO& f : pd.fuels) { fq += f.qty; tq += f.qty; }
+            for (const ProcessIO& i : pd.inputs) tq += i.qty;
+            if (tq <= 0) continue;
+            const std::int64_t p = fq * 1000 / tq;
+            if (p > best) best = p;
+        }
+        if (best > 0) param = best;
+    } else if (domain == "buoyancy") {
+        // safe cargo units of the best craft the mind REMEMBERS: lift minus
+        // the carrier's own mass. Props are physical-domain (never in
+        // memory snapshots), so the scholar reads the instrument — the
+        // remembered entity's live props — exactly like shore_sense reads
+        // terrain. Only ids already in memory are eligible.
+        std::int64_t cap = 0;
+        for (const auto& [kid, snap] : mind.memory) {
+            if (snap.kind_name != "composite") continue;
+            const Entity* ce = w.find(kid);
+            if (!ce || !ce->alive) continue;
+            cap = std::max(cap, w.prop_int(*ce, p_fc, 0));
+        }
+        const PropId p_mass = SIMLAB_PID(w.props, "mass");
+        const std::int64_t self = p_mass != kNoProp
+            ? w.prop_int(*me, p_mass, 0) : 0;
+        if (cap > self && cap > 0) {
+            // parameter = safe cargo in trade units (kg-scale): lift minus
+            // the carrier's own mass, converted off the gram scale. A law
+            // never advises a load that founders the vessel.
+            param = std::clamp<std::int64_t>((cap - self) / 1000, 1, 950);
+        }
+    } else if (domain == "trajectory") {
+        // hardest remembered material's hardness IS the effort permille
+        // a proven blow needs — the striker measured it hit by hit.
+        // hardness is a material prop; the struck thing's material is
+        // observable, so this stays inside remembered knowledge.
+        const PropId p_hard = SIMLAB_PID(w.props, "hardness");
+        if (p_hard != kNoProp) {
+            std::int64_t h = 0;
+            for (const auto& [kid, snap] : mind.memory) {
+                const MaterialDef* md = w.materials.find(snap.material);
+                if (!md) continue;
+                const auto hit = md->props.find(p_hard);
+                if (hit != md->props.end() && hit->second.type == ValType::Integer)
+                    h = std::max(h, hit->second.i);
+            }
+            if (h > 0) param = std::clamp<std::int64_t>(h, 100, 950);
+        }
+    }
+    if (param < 0) return;
+    // already proven? reinforce the standing law instead of re-deriving
+    const std::string prefix = "qlaw:" + domain + ":p";
+    for (const auto& [k, b] : mind.beliefs)
+        if (k.rfind(prefix, 0) == 0) {
+            Belief& lb = mind.beliefs[k];
+            lb.confidence = std::min<std::int64_t>(1000, lb.confidence + 20);
+            lb.last_tick = ev.tick;
+            return;
+        }
+    const std::string key = prefix + std::to_string(param);
+    Belief& q = mind.belief(key);
+    q.status = BeliefStatus::Verified;
+    q.confidence = std::min<std::int64_t>(
+        1000, (ph->confidence + mt->confidence) / 2 + 200);
+    q.evidence_for = q.self_evidence = ph->confidence;
+    q.last_tick = ev.tick;
+}
+
+}  // namespace
+
+// Indigenous mathematics notation (Phase 19): each language_id hashes to a
+// base in {8,10,12,20} and a glyph style {tally, dot-bar, script}. Values
+// render positionally — never an Arabic digit. Deterministic in
+// (language, seed): the same tongue always writes the same numerals.
+std::int64_t math_base_of(std::int64_t lang, std::uint64_t seed) {
+    static const std::int64_t kBases[] = {8, 10, 12, 20};
+    std::uint64_t h = static_cast<std::uint64_t>(lang) * 0x9E3779B97F4A7C15ull
+                   ^ seed * 0xD6E8FEB86659FD93ull;
+    h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+    return kBases[h % 4];
+}
+
+std::string math_render(std::int64_t lang, std::int64_t value,
+                        std::uint64_t seed) {
+    const std::int64_t base = math_base_of(lang, seed);
+    std::uint64_t h = static_cast<std::uint64_t>(lang) * 0xC2B2AE3D27D4EB4Full
+                   ^ seed * 0x165667B19E3779F9ull;
+    h ^= h >> 29; h *= 0x94D049BB133111EBull; h ^= h >> 32;
+    const int style = static_cast<int>(h % 4);      // 0 tally 1 dot 2 bar 3 script
+    static const char* kUnit[] = {"|", "•", "—", ""};
+    static const char kBaseMark[] = {'A', 'B', 'C', 'D'};   // 8/10/12/20
+    const int bidx = base == 8 ? 0 : base == 10 ? 1 : base == 12 ? 2 : 3;
+    std::string out(1, kBaseMark[bidx]);
+    if (value < 0) value = 0;
+    // positional digits, most significant first, '.' separated
+    std::int64_t digits[16]; int nd = 0;
+    std::int64_t v = value;
+    do { digits[nd++] = v % base; v /= base; } while (v > 0 && nd < 16);
+    for (int i = nd - 1; i >= 0; --i) {
+        const std::int64_t d = digits[i];
+        if (i != nd - 1) out.push_back('.');
+        if (style == 3) {                        // script: letters a..s, z=0
+            out.push_back(static_cast<char>(d == 0 ? 'z' : 'a' + d - 1));
+        } else if (d == 0) {
+            out.push_back('o');                  // zero glyph, all styles
+        } else {
+            for (std::int64_t k = 0; k < d; ++k) out += kUnit[style];
+        }
+    }
+    return out;
+}
+
+// belief tables carved onto treatises alongside the DiscoveryRecord lines —
+// "M|tier|conf", "P|domain|conf", "Q|domain|param|conf". Read back by the
+// same parser that imports R| lines (claims arrive at half confidence).
+std::string quantum_tables(const AgentMind& mind) {
+    std::string out;
+    for (const char* pre : {"math:", "phenomenon:", "qlaw:"}) {
+        for (const auto& [k, b] : mind.beliefs) {
+            if (k.rfind(pre, 0) != 0 || b.confidence < 100) continue;
+            if (!out.empty()) out.push_back('\n');
+            if (pre[0] == 'm')
+                out += "M|" + k.substr(5) + "|" + std::to_string(b.confidence);
+            else if (pre[0] == 'p')
+                out += "P|" + k.substr(11) + "|" + std::to_string(b.confidence);
+            else {
+                // qlaw:<domain>:p<param> -> Q|domain|param|conf
+                const std::size_t c = k.rfind(":p");
+                out += "Q|" + k.substr(5, c == std::string::npos ? std::string::npos : c - 5)
+                     + "|" + (c == std::string::npos ? "0" : k.substr(c + 2))
+                     + "|" + std::to_string(b.confidence);
+            }
+        }
+    }
+    return out;
+}
+
+// planner-side lookup: the proven parameter of a quantitative law, or -1.
+// Driver/cognition layers only — laws never read beliefs.
+std::int64_t qlaw_param(const AgentMind& mind, const char* domain) {
+    const std::string prefix = std::string("qlaw:") + domain + ":p";
+    std::int64_t best = -1;
+    for (const auto& [k, b] : mind.beliefs) {
+        if (k.rfind(prefix, 0) != 0 || b.confidence < 300) continue;
+        const std::string num = k.substr(prefix.size());
+        std::int64_t v = 0; bool ok = !num.empty();
+        for (char c : num) { if (c < '0' || c > '9') { ok = false; break; }
+                             v = v * 10 + (c - '0'); }
+        if (ok) best = std::max(best, v);
+    }
+    return best;
+}
+
 void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
     const CausalEvent* ev = w.ledger.find(event_id);
     if (!ev) return;
     AgentMind& mind = w.mind(npc);
     mind.learn_action(ev->action);
+    quantum_observe(w, mind, npc, *ev);
+    maritime_lesson(w, mind, *ev, /*self=*/true);
     learn_outcomes(w, mind, *ev, 34, /*self=*/true, /*mark_observed=*/true);
     learn_yields(w, mind, *ev, 34, /*self=*/true);
+    // Phase 18 specialization: repeating a craft verb forges a `craft:`
+    // conviction alongside the per-yield `yield:` beliefs — together they
+    // are the substrate of emergent division of labor: an agent that keeps
+    // succeeding at smelting/weaving/cultivating comes to prefer it, and
+    // surplus (low hunger pressure) leaves the time to practice. No role
+    // is assigned; the trade is earned one causal event at a time.
+    {
+        static const char* kCraft[] = {
+            "process", "sow", "irrigate", "combine", "treat",
+            "enclose", "assemble", "repair", "engrave"};
+        for (const char* v : kCraft) {
+            if (ev->action == v) {
+                mind.reinforce(std::string("craft:") + v, 6, ev->tick, true);
+                break;
+            }
+        }
+    }
     learn_harm_taboo(w, npc, *ev);
     // Ebbinghaus encoding: the actor's memory of every other participant
     // is charged by what the event meant to them (death, harm, crisis meal).
@@ -1451,6 +1770,7 @@ void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
 void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
     AgentMind& mind = w.mind(npc);
     mind.learn_action(ev.action);                      // saw the verb used
+    maritime_lesson(w, mind, ev, /*self=*/false);
     // Herd memory (Nhịp 5a): what others are doing right now — the raw
     // signal conformity later amplifies. Bounded ring, deterministic.
     if (!ev.participants.empty() && ev.participants.front() != npc) {
@@ -2047,9 +2367,26 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
         if (spec_pool.size() < 32) spec_pool.push_back(std::move(w));
     };
 
+    // Deterministic compute budget (replay-safe: pure counters, no wall
+    // clock). Each candidate costs one speculative clone + interact +
+    // evaluate; unbounded beam x depth x kMaxExpand reaches ~1500 sims on
+    // high-horizon minds, which is what made rounds take minutes on dense
+    // maps. Per-depth and total caps keep deep plans possible while
+    // bounding worst-case latency to a few hundred sims per call.
+    // Primordial (game) worlds bound the imagination tighter: on planet-sized
+    // maps every speculative clone is several MB, and beam + children alive
+    // at once spiked RSS by ~350 MB. Legacy worlds keep the original caps.
+    const bool lean = (w.ruleset & World::kRulePrimordial) != 0;
+    const std::size_t kDepthExpand = lean ? 12 : 24;
+    const std::size_t kTotalExpand = lean ? 96 : 160;
+    if (lean) beam_width = std::min<std::size_t>(beam_width, 6);
+    std::size_t total_expansions = 0;
+
     for (int depth = 1; depth <= max_depth && !beam.empty(); ++depth) {
         std::vector<SearchNode> next;
+        std::size_t depth_expansions = 0;
         for (auto& node : beam) {
+            if (total_expansions >= kTotalExpand) break;
             const AgentMind* nm = node.w->find_mind(npc);
             if (!nm) continue;
             std::vector<InteractionContext> cands =
@@ -2068,8 +2405,11 @@ std::vector<Plan> plan_multi(const World& w, EntityId npc, const Goal& goal,
                              [](const auto& a, const auto& b) { return a.first > b.first; });
             if (ranked.size() > kMaxExpand) ranked.resize(kMaxExpand);
             for (const auto& rk : ranked) {
+                if (depth_expansions >= kDepthExpand ||
+                    total_expansions >= kTotalExpand) break;
                 const InteractionContext& c = cands[rk.second];
                 std::unique_ptr<World> spec = fresh_spec(*node.w);
+                ++depth_expansions; ++total_expansions;
                 InteractionResult res = spec->interact(c);
                 if (!res.completed) { recycle_spec(std::move(spec)); continue; }
                 SearchNode child;
@@ -2730,7 +3070,45 @@ void social_from_event(World& w, EntityId actor,
                 std::istringstream lines(iv->s);
                 std::string line;
                 std::size_t n = 0;
+                std::size_t nq = 0;
                 while (std::getline(lines, line) && n < 8) {
+                    // Phase 19 quantum lines: M|tier|conf, P|domain|conf,
+                    // Q|domain|param|conf — transmitted as claims at half
+                    // the carved confidence (proof must be re-earned).
+                    if (line.rfind("M|", 0) == 0 ||
+                        line.rfind("P|", 0) == 0 ||
+                        line.rfind("Q|", 0) == 0) {
+                        if (++nq > 24) continue;
+                        std::vector<std::string> q;
+                        std::string qc;
+                        std::istringstream qls(line.substr(2));
+                        while (std::getline(qls, qc, '|')) q.push_back(qc);
+                        if (q.size() < 2) continue;
+                        std::string key;
+                        if (line[0] == 'M')      key = "math:" + q[0];
+                        else if (line[0] == 'P') key = "phenomenon:" + q[0];
+                        else {
+                            // Q|domain|param|conf -> [domain,param,conf]
+                            if (q.size() < 3) continue;
+                            key = "qlaw:" + q[0] + ":p" + q[1];
+                            const std::int64_t qc2 = std::atoll(q[2].c_str());
+                            Belief& qb = learner.belief(key);
+                            if (qb.status == BeliefStatus::Unknown)
+                                qb.status = BeliefStatus::Observed;
+                            qb.confidence = std::max<std::int64_t>(qb.confidence,
+                                std::min<std::int64_t>(500, qc2 / 2));
+                            qb.last_tick = ev.tick;
+                            continue;
+                        }
+                        const std::int64_t qc2 = std::atoll(q.back().c_str());
+                        Belief& qb = learner.belief(key);
+                        if (qb.status == BeliefStatus::Unknown)
+                            qb.status = BeliefStatus::Observed;
+                        qb.confidence = std::max<std::int64_t>(qb.confidence,
+                            std::min<std::int64_t>(500, qc2 / 2));
+                        qb.last_tick = ev.tick;
+                        continue;
+                    }
                     // format: R|key|status|efor|eagainst|trials|claim (6 fields)
                     if (line.rfind("R|", 0) != 0) continue;
                     std::vector<std::string> f;
@@ -2990,6 +3368,8 @@ void World::decay_minds(std::int64_t n) {
         mind.neuro.grief = std::clamp<std::int64_t>(
             mind.neuro.grief + ostr_g - dec, 0, 1000);
     }
+    // CL-1: dead agents release their brain slots (arena free-list reuse).
+    if (brains_) brain_gc(*this, *brains_);
 }
 
 

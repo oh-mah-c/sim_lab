@@ -43,6 +43,9 @@ species berry_bush
   condition temperature -100 400
   condition moisture 300 1000
   condition vegetation 400 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 300
 
 # Wild grain — a second susceptible flora. Its distinct species name makes
 # it a DIFFERENT spore host: interleaving it with berry_bush dilutes
@@ -62,6 +65,9 @@ species wild_grain
   condition temperature -50 350
   condition moisture 350 1000
   condition vegetation 400 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 350
 
 species boreal_tree
   kind flora
@@ -95,6 +101,8 @@ species grazer
   condition moisture 300 1000
   condition slope 0 25
   condition vegetation 400 1000
+  trophic_tier 1
+  prey_tier_max 0
   sight_range 400
   speed 6000
   metabolism 1800
@@ -236,6 +244,8 @@ species reservoir_beast
   condition moisture 300 1000
   condition slope 0 25
   condition vegetation 400 1000
+  trophic_tier 1
+  prey_tier_max 0
   sight_range 400
   speed 6000
   metabolism 1800
@@ -316,6 +326,8 @@ species vector_midge
   condition temperature 150 450
   condition moisture 200 1000
   condition vegetation 0 1000
+  trophic_tier 1
+  prey_tier_max 0
   sight_range 200
   speed 9000
   metabolism 900
@@ -390,6 +402,8 @@ species sapient
   innate rest
   innate move
   innate reproduce
+  trophic_tier 3
+  prey_tier_max 0
   density 6
   condition temperature 50 400
   condition moisture 250 1000
@@ -451,3 +465,835 @@ species sapient
   gene mutation_rate
   gene immune_power_base
   gene dna_repair_gain
+
+# ---- Phase 17: trophic web, seasonal migration & apex predators -------------
+# All behaviour below is emergent from the integer props — the engine holds
+# no species names. Tiers: 0 flora, 1 herbivore, 3 predator, 4/5 apex.
+
+# Migrant herd — a herd herbivore that reads the seasonal habitat gradient
+# (temperature band shifts with the calendar offset in range_drift) and
+# drifts toward whatever valley still fits its declared conditions.
+# herd_cohesion keeps the band together; no territory.
+species migrant_herd
+  kind fauna
+  material flesh
+  density 18
+  condition temperature 40 360
+  condition moisture 450 1000
+  condition slope 0 15
+  condition vegetation 550 1000
+  trophic_tier 1
+  prey_tier_max 0
+  migration_drive 600
+  herd_cohesion 700
+  territorial_radius 0
+  activity_phase 0
+  fire_fear 300
+  hunt_range 0
+  scent_radius 0
+  sight_range 600
+  speed 7000
+  metabolism 1900
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 600
+  adult_age 150
+  mutation_rate 30
+  energy 60000
+  max_energy 100000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1000
+  immune_power_base 1000
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  consciousness 1000
+  reach 200
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain
+
+# Pack stalker — a mid-tier cursorial predator. Hunts remembered tier-1
+# game inside hunt_range, follows scent_radius for carrion, holds a
+# territory around its anchor, fears fire (panic above fire_fear/2
+# suppresses the hunt reflex), and is nocturnal.
+species pack_stalker
+  kind fauna
+  material flesh
+  density 5
+  condition temperature 60 380
+  condition moisture 350 950
+  condition slope 0 35
+  condition vegetation 450 1000
+  trophic_tier 3
+  prey_tier_max 1
+  migration_drive 0
+  herd_cohesion 400
+  territorial_radius 900
+  activity_phase 2
+  fire_fear 800
+  hunt_range 500
+  scent_radius 700
+  sight_range 500
+  natural_edge 550
+  natural_blunt 250
+  natural_toxin 0
+  natural_force 40
+  speed 8000
+  metabolism 2200
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 300
+  adult_age 300
+  mutation_rate 30
+  energy 70000
+  max_energy 110000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1100
+  immune_power_base 1100
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  consciousness 1000
+  reach 260
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain
+
+# Ridge apex — a cold-slope ambush apex. Nocturnal, wide territory,
+# very fire-wary; prey_tier_max 3 lets it take herd herbivores,
+# mesopredators AND sapients (tier 3) — deep wilderness is genuinely
+# dangerous after dark.
+species ridge_apex
+  kind fauna
+  material flesh
+  density 2
+  condition temperature -60 200
+  condition moisture 200 800
+  condition slope 20 80
+  condition vegetation 250 950
+  trophic_tier 4
+  prey_tier_max 3
+  migration_drive 0
+  herd_cohesion 0
+  territorial_radius 1400
+  activity_phase 2
+  fire_fear 900
+  hunt_range 600
+  scent_radius 900
+  sight_range 550
+  natural_edge 650
+  natural_blunt 450
+  natural_toxin 250
+  natural_force 70
+  speed 8500
+  metabolism 2600
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 120
+  adult_age 600
+  mutation_rate 25
+  energy 80000
+  max_energy 120000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1200
+  immune_power_base 1200
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  consciousness 1000
+  reach 300
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain
+
+# Shore reaver — a semi-aquatic deep-apex ambusher living on wet low
+# ground. It cannot swim, but it patrols the water's edge where waders,
+# foragers and early watercraft come within reach; prey_tier_max 4
+# makes it the top of the local chain including sapients.
+species shore_reaver
+  kind fauna
+  material flesh
+  density 3
+  condition temperature -20 380
+  condition moisture 500 1000
+  condition near_water 1 1
+  condition elevation 100 400
+  condition slope 0 10
+  trophic_tier 5
+  prey_tier_max 4
+  migration_drive 0
+  herd_cohesion 0
+  territorial_radius 800
+  activity_phase 0
+  fire_fear 400
+  hunt_range 400
+  scent_radius 800
+  sight_range 500
+  natural_edge 600
+  natural_blunt 550
+  natural_toxin 500
+  natural_force 90
+  speed 7500
+  metabolism 2400
+  hunger 200
+  thirst 200
+  fatigue 100
+  fertility 200
+  adult_age 400
+  mutation_rate 25
+  energy 75000
+  max_energy 115000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1150
+  immune_power_base 1150
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  consciousness 1000
+  reach 320
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain
+
+# Commensal rat — a small fertile tier-1 that exploits any disturbed
+# ground. With no dedicated predators declared it can boom; pack_stalker
+# and ridge_apex will take it when game runs short (prey_tier_max 1/3
+# both cover tier 1), so its explosions are predator-limited, not free.
+species commensal_rat
+  kind fauna
+  material flesh
+  density 60
+  condition temperature -50 400
+  condition moisture 300 1000
+  condition slope 0 35
+  condition vegetation 250 1000
+  trophic_tier 1
+  prey_tier_max 0
+  migration_drive 0
+  herd_cohesion 200
+  territorial_radius 200
+  activity_phase 0
+  fire_fear 200
+  hunt_range 0
+  scent_radius 400
+  sight_range 250
+  speed 9000
+  metabolism 1200
+  hunger 300
+  thirst 300
+  fatigue 100
+  fertility 900
+  adult_age 60
+  mutation_rate 60
+  energy 30000
+  max_energy 60000
+  blood_volume 400
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 900
+  immune_power_base 900
+  dna_repair_gain 800
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  consciousness 1000
+  reach 120
+  gene speed
+  gene metabolism
+  gene sight_range
+  gene fertility
+  gene mutation_rate
+  gene immune_power_base
+  gene dna_repair_gain
+
+
+# ---- Phase 18: domestication candidates & crops -----------------------------
+# Domesticable fauna opt in with tameability > 0. `wildness` starts high and
+# `bond_threshold` is the level at which a `bonded` relation forms with the
+# animal's feeder; both are `gene` loci so tameness is heritable — a
+# domesticated lineage drifts wilder/tamer over generations.
+
+species trail_hound
+  kind fauna
+  material flesh
+  density 8
+  condition temperature -100 400
+  condition moisture 250 1000
+  condition slope 0 40
+  condition vegetation 200 1000
+  trophic_tier 2
+  prey_tier_max 1
+  hunt_range 500
+  scent_radius 700
+  sight_range 600
+  speed 11000
+  metabolism 1400
+  hunger 250
+  thirst 300
+  fatigue 150
+  fertility 600
+  adult_age 120
+  mutation_rate 50
+  energy 40000
+  max_energy 80000
+  blood_volume 600
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  pain_level 0
+  consciousness 1000
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 900
+  immune_power_base 900
+  dna_repair_gain 800
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  reach 140
+  quantity 0   # bonded pack cargo store (Phase 18)
+  # domestication & husbandry (Phase 18): the alert hound patrols with its
+  # bonded partner — scent_alert_radius lets it smell apex predators the
+  # partner cannot, and pack_load_bonus lets it carry trade goods.
+  wildness 850
+  bond_threshold 350
+  tameability 700
+  scent_alert_radius 700
+  pack_load_bonus 400
+  migration_drive 0
+  herd_cohesion 300
+  territorial_radius 400
+  activity_phase 1
+  fire_fear 500
+  natural_edge 300
+  natural_blunt 500
+  natural_force 2200
+  gene wildness
+  gene tameability
+  gene speed
+  gene sight_range
+  gene fertility
+  gene metabolism
+  gene immune_power_base
+  gene dna_repair_gain
+  mind_base_clarity 400
+  mind_max_clarity 1000
+  mind_base_stability 15
+  mind_max_stability 10000
+  mind_decay_rate 10
+  mind_imprint_threshold 500
+  mind_imprint_base_stability 2000
+  mind_amygdala_multiplier 5
+  mind_rehearsal_stability_bonus 50
+  mind_detail_blur_threshold 300
+  mind_sleep_prune_threshold 50
+  mind_rehearsal_interval 100
+  mind_threat_gain 1000
+  mind_reward_gain 1000
+  mind_pattern_coupling 1000
+  mind_empathy_coupling 1000
+  mind_executive_override_threshold 750
+  mind_emotion_decay 10
+  mind_plan_horizon 2
+  mind_abstraction_gain 1000
+  mind_motor_precision 1000
+  mind_theory_of_mind 1000
+  mind_brain_metabolic_cost 15
+  mind_pair_bond_gain 1000
+  mind_jealousy_gain 1000
+  mind_parental_drive 1000
+  mind_conformity_gain 1000
+  mind_xenophobia_bias 1000
+  mind_ego_defense_gain 1000
+  gene mind_plan_horizon
+  gene mind_abstraction_gain
+  gene mind_motor_precision
+  gene mind_theory_of_mind
+  gene mind_pair_bond_gain
+  gene mind_jealousy_gain
+  gene mind_parental_drive
+  gene mind_conformity_gain
+  gene mind_xenophobia_bias
+  gene mind_ego_defense_gain
+
+species dairy_beast
+  kind fauna
+  material flesh
+  density 6
+  condition temperature -50 380
+  condition moisture 350 1000
+  condition slope 0 30
+  condition vegetation 400 1000
+  trophic_tier 1
+  prey_tier_max 0
+  sight_range 350
+  speed 5000
+  metabolism 2200
+  hunger 300
+  thirst 350
+  fatigue 100
+  fertility 400
+  adult_age 300
+  mutation_rate 25
+  energy 80000
+  max_energy 140000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  pain_level 0
+  consciousness 1000
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1100
+  immune_power_base 1100
+  dna_repair_gain 900
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  reach 160
+  quantity 0   # bonded pack cargo store (Phase 18)
+  # the milk animal: bonded and well-fed it yields `milk` periodically —
+  # caloric, hydrating, perishable. wool is a trace byproduct.
+  wildness 750
+  bond_threshold 300
+  tameability 800
+  milk_yield 9
+  wool_yield 2
+  pack_load_bonus 500
+  migration_drive 0
+  herd_cohesion 600
+  territorial_radius 300
+  activity_phase 0
+  fire_fear 400
+  gene wildness
+  gene tameability
+  gene speed
+  gene sight_range
+  gene fertility
+  gene metabolism
+  gene immune_power_base
+  gene dna_repair_gain
+  mind_base_clarity 400
+  mind_max_clarity 1000
+  mind_base_stability 15
+  mind_max_stability 10000
+  mind_decay_rate 10
+  mind_imprint_threshold 500
+  mind_imprint_base_stability 2000
+  mind_amygdala_multiplier 5
+  mind_rehearsal_stability_bonus 50
+  mind_detail_blur_threshold 300
+  mind_sleep_prune_threshold 50
+  mind_rehearsal_interval 100
+  mind_threat_gain 1000
+  mind_reward_gain 1000
+  mind_pattern_coupling 1000
+  mind_empathy_coupling 1000
+  mind_executive_override_threshold 750
+  mind_emotion_decay 10
+  mind_plan_horizon 2
+  mind_abstraction_gain 1000
+  mind_motor_precision 1000
+  mind_theory_of_mind 1000
+  mind_brain_metabolic_cost 15
+  mind_pair_bond_gain 1000
+  mind_jealousy_gain 1000
+  mind_parental_drive 1000
+  mind_conformity_gain 1000
+  mind_xenophobia_bias 1000
+  mind_ego_defense_gain 1000
+  gene mind_plan_horizon
+  gene mind_abstraction_gain
+  gene mind_motor_precision
+  gene mind_theory_of_mind
+  gene mind_pair_bond_gain
+  gene mind_jealousy_gain
+  gene mind_parental_drive
+  gene mind_conformity_gain
+  gene mind_xenophobia_bias
+  gene mind_ego_defense_gain
+
+species fiber_beast
+  kind fauna
+  material flesh
+  density 5
+  condition temperature -250 200
+  condition moisture 300 1000
+  condition slope 0 35
+  condition vegetation 350 1000
+  trophic_tier 1
+  prey_tier_max 0
+  sight_range 300
+  speed 4500
+  metabolism 2400
+  hunger 350
+  thirst 300
+  fatigue 100
+  fertility 350
+  adult_age 320
+  mutation_rate 20
+  energy 90000
+  max_energy 150000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  pain_level 0
+  consciousness 1000
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1000
+  immune_power_base 1000
+  dna_repair_gain 900
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  reach 150
+  quantity 0   # bonded pack cargo store (Phase 18)
+  # the cold-climate fiber animal: high wool_yield, modest milk — its
+  # fleece is the route to woven insulation where forage is thin.
+  wildness 800
+  bond_threshold 320
+  tameability 700
+  wool_yield 14
+  milk_yield 1
+  pack_load_bonus 300
+  migration_drive 0
+  herd_cohesion 700
+  territorial_radius 350
+  activity_phase 0
+  fire_fear 500
+  gene wildness
+  gene tameability
+  gene speed
+  gene sight_range
+  gene fertility
+  gene metabolism
+  gene immune_power_base
+  gene dna_repair_gain
+  mind_base_clarity 400
+  mind_max_clarity 1000
+  mind_base_stability 15
+  mind_max_stability 10000
+  mind_decay_rate 10
+  mind_imprint_threshold 500
+  mind_imprint_base_stability 2000
+  mind_amygdala_multiplier 5
+  mind_rehearsal_stability_bonus 50
+  mind_detail_blur_threshold 300
+  mind_sleep_prune_threshold 50
+  mind_rehearsal_interval 100
+  mind_threat_gain 1000
+  mind_reward_gain 1000
+  mind_pattern_coupling 1000
+  mind_empathy_coupling 1000
+  mind_executive_override_threshold 750
+  mind_emotion_decay 10
+  mind_plan_horizon 2
+  mind_abstraction_gain 1000
+  mind_motor_precision 1000
+  mind_theory_of_mind 1000
+  mind_brain_metabolic_cost 15
+  mind_pair_bond_gain 1000
+  mind_jealousy_gain 1000
+  mind_parental_drive 1000
+  mind_conformity_gain 1000
+  mind_xenophobia_bias 1000
+  mind_ego_defense_gain 1000
+  gene mind_plan_horizon
+  gene mind_abstraction_gain
+  gene mind_motor_precision
+  gene mind_theory_of_mind
+  gene mind_pair_bond_gain
+  gene mind_jealousy_gain
+  gene mind_parental_drive
+  gene mind_conformity_gain
+  gene mind_xenophobia_bias
+  gene mind_ego_defense_gain
+
+species draft_beast
+  kind fauna
+  material flesh
+  density 4
+  condition temperature -30 360
+  condition moisture 300 1000
+  condition slope 0 20
+  condition vegetation 350 1000
+  trophic_tier 1
+  prey_tier_max 0
+  sight_range 300
+  speed 4000
+  metabolism 2600
+  hunger 400
+  thirst 400
+  fatigue 100
+  fertility 250
+  adult_age 400
+  mutation_rate 15
+  energy 120000
+  max_energy 200000
+  blood_volume 1000
+  blood_accum 0
+  bleed_rate 0
+  bleed_accum 0
+  pain_level 0
+  consciousness 1000
+  toxin_load 0
+  toxin_accum 0
+  normal_body_temp 370
+  thermoreg_gain 1000
+  hypothermia_delta 15
+  fever_delta_max 35
+  hyperpyrexia_delta 45
+  body_temp 370
+  temp_accum 0
+  immune_power 1200
+  immune_power_base 1200
+  dna_repair_gain 1000
+  immune_count 0
+  passive_immune 0
+  passive_sig_count 0
+  immune_cost_threshold 1200
+  immune_cost_permille 6
+  immune_cost_accum 0
+  reach 200
+  quantity 0   # bonded pack cargo store (Phase 18)
+  # the heavy draft animal: slow to tame, carries enormous loads once
+  # bonded — caravan backbone and (mount_capable) cavalry mount.
+  wildness 900
+  bond_threshold 250
+  tameability 550
+  pack_load_bonus 1000
+  mount_capable 1
+  milk_yield 3
+  wool_yield 0
+  migration_drive 0
+  herd_cohesion 500
+  territorial_radius 400
+  activity_phase 0
+  fire_fear 600
+  natural_blunt 400
+  natural_force 1500
+  gene wildness
+  gene tameability
+  gene speed
+  gene sight_range
+  gene fertility
+  gene metabolism
+  gene immune_power_base
+  gene dna_repair_gain
+  mind_base_clarity 400
+  mind_max_clarity 1000
+  mind_base_stability 15
+  mind_max_stability 10000
+  mind_decay_rate 10
+  mind_imprint_threshold 500
+  mind_imprint_base_stability 2000
+  mind_amygdala_multiplier 5
+  mind_rehearsal_stability_bonus 50
+  mind_detail_blur_threshold 300
+  mind_sleep_prune_threshold 50
+  mind_rehearsal_interval 100
+  mind_threat_gain 1000
+  mind_reward_gain 1000
+  mind_pattern_coupling 1000
+  mind_empathy_coupling 1000
+  mind_executive_override_threshold 750
+  mind_emotion_decay 10
+  mind_plan_horizon 2
+  mind_abstraction_gain 1000
+  mind_motor_precision 1000
+  mind_theory_of_mind 1000
+  mind_brain_metabolic_cost 15
+  mind_pair_bond_gain 1000
+  mind_jealousy_gain 1000
+  mind_parental_drive 1000
+  mind_conformity_gain 1000
+  mind_xenophobia_bias 1000
+  mind_ego_defense_gain 1000
+  gene mind_plan_horizon
+  gene mind_abstraction_gain
+  gene mind_motor_precision
+  gene mind_theory_of_mind
+  gene mind_pair_bond_gain
+  gene mind_jealousy_gain
+  gene mind_parental_drive
+  gene mind_conformity_gain
+  gene mind_xenophobia_bias
+  gene mind_ego_defense_gain
+
+# Cultivated grain — sowable crop. `growth_ticks` delays fruiting after
+# sowing; the fruit drift already handles moisture/temp suitability, and
+# `irrigation_credit` (set by the `irrigate` verb) boosts effective
+# moisture for the credited window. death_drops keep the seed loop closed.
+species cultivated_grain
+  kind flora
+  material living_wood
+  fruit_material grain
+  fruit_count 60
+  max_fruit 60
+  fruit_regrow_rate 160
+  fruit_spoil_rate 8
+  blight_susceptibility 500
+  sterilization_temp 700
+  death_drops dormant_seed=6,wood_debris=1
+  density 15
+  condition temperature -80 380
+  condition moisture 380 1000
+  condition vegetation 350 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 250
+  growth 0
+  growth_ticks 300
+
+# Cultivated pulse — a second, protein-rich crop with a narrower moisture
+# band: it rewards irrigation most where rain is unreliable.
+species cultivated_pulse
+  kind flora
+  material living_wood
+  fruit_material pulse
+  fruit_count 45
+  max_fruit 45
+  fruit_regrow_rate 140
+  fruit_spoil_rate 6
+  blight_susceptibility 550
+  sterilization_temp 700
+  death_drops dormant_seed=5,wood_debris=1
+  density 10
+  condition temperature -60 360
+  condition moisture 420 1000
+  condition vegetation 380 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 200
+  growth 0
+  growth_ticks 260

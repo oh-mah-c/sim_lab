@@ -50,6 +50,9 @@ struct PrimordialWorld {
 // Fill an EMPTY world (content loaded, no entities) — deterministic in seed.
 PrimordialWorld build_primordial(World& w, const PrimordialParams& p);
 
+// Materialize entities on-demand for a chunk surrounding pos when visited.
+void wake_chunk(World& w, Vec2 pos, int chunk_r = 16);
+
 // Count of pre-made culture at tick 0 that must not exist (enclosures,
 // inscriptions, lexical entries, concepts, debts, composites). 0 = clean.
 std::size_t primordial_violations(const World& w);

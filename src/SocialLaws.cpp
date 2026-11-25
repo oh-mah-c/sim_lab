@@ -1006,7 +1006,13 @@ PredictionResult predict_engrave(const World& w, const InteractionContext& ctx) 
     const Value* cur = w.prop_of(*t, ins);
     std::string old = (cur && cur->type == ValType::Text) ? cur->s : "";
     const std::string line = encode_record(*rec);
-    const std::string neu = old.empty() ? line : old + "\n" + line;
+    std::string neu = old.empty() ? line : old + "\n" + line;
+    // Phase 19: the scholar's quantitative cognition rides the same stone —
+    // math tiers, phenomena and proven laws as M|/P|/Q| lines.
+    {
+        const std::string qt = quantum_tables(*mind);
+        if (!qt.empty()) neu += "\n" + qt;
+    }
     if (neu.size() > kMaxInscription) { r.failure = "inscription archive full"; return r; }
     if (!charge_energy(*actor, energy, kEngraveCost, r)) return r;
     set_change_v(r, t->id, ins, Value::text(old), Value::text(neu));
@@ -1203,20 +1209,70 @@ PredictionResult predict_share(const World& w, const InteractionContext& ctx) {
     if (!av || av->type != ValType::Integer || av->i <= 0) {
         r.failure = "actor has nothing to share"; return r;
     }
+    // Phase 18 domestication: sharing with a WILD tameable animal is
+    // feeding, not storage — the animal eats a meal (wildness falls by its
+    // own tameability) and, once wildness drops to bond_threshold, forms a
+    // `bonded` relation with the feeder. A bonded animal instead uses the
+    // normal storage path — that is how pack cargo gets loaded.
+    const PropId p_tame = pid(w, "tameability");
+    const PropId p_wild = pid(w, "wildness");
+    const PropId p_bth = pid(w, "bond_threshold");
+    const bool feed = p_tame != kNoProp && p_wild != kNoProp &&
+        w.prop_int(*t, p_tame, 0) > 0 &&
+        w.prop_int(*t, p_wild, 1000) >
+            (p_bth != kNoProp ? w.prop_int(*t, p_bth, 300) : 300);
+    // Phase 19: parameters.force optionally caps the transferred amount —
+    // a quantitative-law planner shares the measured safe load, not the
+    // whole pack. 0 = legacy behavior (transfer everything).
+    const std::int64_t amount = ctx.parameters.force > 0
+        ? std::min<std::int64_t>(av->i, ctx.parameters.force) : av->i;
     if (!tv || tv->type != ValType::Integer) {
-        r.failure = "target cannot hold shared goods"; return r;
-    }
-    const PropertyDef* qd = w.props.find(qty);
-    if (qd && qd->has_range && tv->i + av->i > qd->hi) {
-        r.failure = "target store would overflow"; return r;
+        if (!feed) { r.failure = "target cannot hold shared goods"; return r; }
+    } else if (!feed) {
+        const PropertyDef* qd = w.props.find(qty);
+        std::int64_t hi = qd && qd->has_range ? qd->hi : tv->i + amount;
+        // pack_load_bonus: a pack animal's declared cargo multiplier —
+        // the bonus is data on the species, not a role assignment.
+        const PropId p_pack = pid(w, "pack_load_bonus");
+        if (p_pack != kNoProp && qd && qd->has_range) {
+            const std::int64_t bonus = w.prop_int(*t, p_pack, 0);
+            if (bonus > 0) hi = hi + hi * bonus / 1000;
+        }
+        if (qd && qd->has_range && tv->i + amount > hi) {
+            r.failure = "target store would overflow"; return r;
+        }
     }
     if (!in_reach(w, *actor, *t, reach, 0, &r)) { r.failure = "target out of reach"; return r; }
     if (pol_ostracism(w, ctx.actor, t->id) >= 500) {
         r.failure = "ostracized by the community"; return r;
     }
     if (!charge_energy(*actor, energy, kShareCost, r)) return r;
-    set_change(r, actor->id, qty, av->i, 0);
-    set_change(r, t->id, qty, tv->i, tv->i + av->i);
+    if (feed) {
+        const std::int64_t eaten = std::min<std::int64_t>(av->i, 20);
+        set_change(r, actor->id, qty, av->i, av->i - eaten);
+        const PropId p_hun2 = pid(w, "hunger");
+        if (p_hun2 != kNoProp) {
+            const std::int64_t h0 = w.prop_int(*t, p_hun2, 500);
+            set_change(r, t->id, p_hun2, h0,
+                       std::max<std::int64_t>(0, h0 - 400));
+        }
+        const std::int64_t w0 = w.prop_int(*t, p_wild, 1000);
+        const std::int64_t tame = w.prop_int(*t, p_tame, 0);
+        const std::int64_t w1 =
+            std::max<std::int64_t>(0, w0 - tame * eaten / 100);
+        set_change(r, t->id, p_wild, w0, w1);
+        const std::int64_t bth =
+            p_bth != kNoProp ? w.prop_int(*t, p_bth, 300) : 300;
+        if (w1 <= bth)
+            r.rel_changes.push_back({t->id, "bonded", ctx.actor, true});
+        r.possible = true; r.ticks = 1;
+        r.notes.push_back("feed " + std::to_string(eaten) +
+                          " wildness->" + std::to_string(w1) +
+                          (w1 <= bth ? " BOND" : ""));
+        return r;
+    }
+    set_change(r, actor->id, qty, av->i, av->i - amount);
+    set_change(r, t->id, qty, tv->i, tv->i + amount);
     // Phase 12.3: a mandated leader dispensing the public pool in scarcity
     // converts charity into legitimacy and stamps the relief tick.
     const PropId p_pool = pid(w, "public_pool");

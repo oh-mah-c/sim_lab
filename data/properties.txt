@@ -52,7 +52,7 @@ dig_resistance   integer  permille    range 0 1000     domain=physical
 formation_chance integer  permille    range 0 1000     domain=physical
 lithology         integer  class       range 0 3       domain=geological
 soil_texture      integer  class       range 0 3       domain=geological   # 1=sand 2=loam 3=clay
-temperature       integer  deci-°C     range -5000 20000 domain=physical
+temperature       integer  deciC     range -5000 20000 domain=physical
 energy            integer  milliJ      range 0 1000000000 domain=physical
 reach             integer  map_units   range 0 100000  domain=physical
 length            integer  map_units   range 0 100000  domain=physical
@@ -103,8 +103,8 @@ sprout_material    text    material_name domain=physical   # fallback material i
 sprout_since       integer ticks        range 0 1000000000 domain=physical  # germination credit start (internal)
 sprout_rate        integer permille/tick range 0 1000     domain=physical   # germination speed (material default)
 sprout_moisture_min integer permille    range 0 1000      domain=physical   # min local moisture to germinate
-sprout_temp_min    integer deci-°C      range -1000 2000  domain=physical   # germination temperature band
-sprout_temp_max    integer deci-°C      range -1000 2000  domain=physical
+sprout_temp_min    integer deciC      range -1000 2000  domain=physical   # germination temperature band
+sprout_temp_max    integer deciC      range -1000 2000  domain=physical
 
 # ---- cognitive domain: Ebbinghaus memory params (Nhịp 1) ----------------------
 # Per-mind neural tuning, read via mind_params() with these spec defaults
@@ -275,10 +275,10 @@ symbiont_contact_rate integer permille   range 0 1000    domain=biological # sym
 symbiont_incubation_ticks integer ticks  range 0 1000000 domain=biological # symbiont incubation template
 symbiont_slot       text     slot        domain=biological # symbiont preferred body_slot template ("" = any wound)
 cooked_state        integer  permille     range 0 1000    domain=physical   # 0 raw/live, 1000 heat- or chemical-sterilized/preserved
-sterilization_temp  integer  deci-°C      range 0 20000   domain=physical   # temperature at which an entity sterilizes (0 = never)
+sterilization_temp  integer  deciC      range 0 20000   domain=physical   # temperature at which an entity sterilizes (0 = never)
 antimicrobial       integer  permille     range 0 1000    domain=physical   # chemical kill/preservation potency of a material (>=500 sterilizes on combine)
 burial_medium       integer  permille     range 0 1000    domain=physical   # isolation potency of a burial material (>=500 buries corpses)
-cremation_temp      integer  deci-°C      range 0 20000   domain=physical   # temperature at which a corpse is cremated (0 = never)
+cremation_temp      integer  deciC      range 0 20000   domain=physical   # temperature at which a corpse is cremated (0 = never)
 corpse_decay_level  integer  permille     range 0 1000    domain=observable # rot stage of a dead organism (0 = fresh)
 corpse_decay_accum  integer  milli-units  range 0 100000000 domain=physical # corpse decay Euclid remainder (internal)
 buried              integer  flag         range 0 1       domain=physical   # corpse interred: odor/contamination/pathogen emission stops
@@ -307,8 +307,8 @@ ash_nutrient_bonus   integer  permille     range 0 2000    domain=physical   # m
 # ---- vector ecology, herd immunity & resistance selection (Phase 11.3) ----
 is_disease_vector   integer  flag         range 0 1       domain=biological # species is a disease vector (bites/hosts carry strains)
 vector_borne_rate   integer  permille     range 0 1000    domain=biological # strain: transmission efficiency through a vector bite
-vector_optimal_temp_min integer deci-°C   range -1000 2000 domain=biological # vector: lower bound of its active temperature band
-vector_optimal_temp_max integer deci-°C   range -1000 2000 domain=biological # vector: upper bound of its active temperature band
+vector_optimal_temp_min integer deciC   range -1000 2000 domain=biological # vector: lower bound of its active temperature band
+vector_optimal_temp_max integer deciC   range -1000 2000 domain=biological # vector: upper bound of its active temperature band
 vector_requires_stagnant_water integer flag range 0 1   domain=biological # vector: needs stagnation_level > vector_stagnation_min water nearby to be active
 vector_stagnation_min integer permille    range 0 1000    domain=biological # vector: fouling level that counts as breeding water (default 500)
 vector_dormant       integer  flag         range 0 1       domain=biological # vector: 1 = torpid (out of season / dry), no biting or breeding
@@ -462,3 +462,74 @@ combat_morale            integer permille     range 0 1000   domain=social   # f
 routed                   integer units        range 0 1    domain=social   # 1 = fled/broken ranks (morale collapse)
 war_target               integer units                    domain=social   # language_id of the community this soldier marches against
 supply_depot_link        integer units                    domain=social   # enclosure id whose stores feed this soldier
+
+# ---- maritime physics (Primordial ruleset): swimming, buoyancy, watercraft ----
+swim_skill        integer permille  range 0 1000       domain=biological # individual: practice in deep water; cheaper strokes
+float_capacity    integer grams     range 0 100000000  domain=physical   # composite: lift its parts give in water (from part densities vs water)
+wave_rating       integer permille  range 0 1000       domain=physical   # composite: swell (wave_at) it survives undamaged
+waterproofing     integer permille  range 0 1000       domain=physical   # material: seals seams/hulls against water
+
+# ---- trophic web & seasonal ranges (Phase 17) -------------------------------
+# Data-driven food-chain structure. trophic_tier orders who eats whom
+# (0 producer/flora, 1 primary consumer, 2 mesopredator, 3 predator,
+# 4 apex, 5 deep apex); prey_tier_max caps which tiers a hunter may take
+# (0 = won't hunt live prey). trophic_tier is domain=observable so minds
+# can remember "that thing is edible game" — the rest is private
+# physiology/instinct. No species names appear in engine code.
+trophic_tier            integer  units   range 0 5        domain=observable # 0 flora .. 5 deep apex
+prey_tier_max           integer  units   range 0 5        domain=biological # highest tier this organism hunts (0 = none)
+hunt_range              integer  units                   domain=biological # how far it senses live game
+scent_radius            integer  units                   domain=biological # how far carrion/game odor reaches
+herd_cohesion           integer  permille range 0 1000   domain=biological # pull toward same-kind neighbours
+territorial_radius      integer  units   range 0 100000 domain=biological # home range around anchor_x/y
+activity_phase          integer  units   range 0 3       domain=biological # 0 any, 1 diurnal, 2 nocturnal, 3 crepuscular
+fire_fear               integer  permille range 0 1000   domain=biological # panic above this/2 suppresses hunting
+migration_drive         integer  permille range 0 1000   domain=biological # per-tick chance (permille) of a range step
+anchor_x                integer  units                   domain=physical   # territorial anchor (set on first drift)
+anchor_y                integer  units                   domain=physical
+# flora seasonality: growing_mask bit s = grows in season s (0 spring..
+# 3 winter); dormant_growth_permille scales regrowth in off-seasons.
+growing_mask            integer  units   range 0 15      domain=physical
+dormant_growth_permille integer  permille range 0 1000   domain=physical
+# innate weaponry (Phase 17): a body with no wielded tool still hits with
+# whatever it grew — natural_edge reads as `sharp`, natural_blunt as
+# `blunt_mass`, natural_toxin as `coat_toxin` (envenomation on a skin
+# break). All permille of the blow profile; 0 = bare fist.
+natural_edge            integer  permille range 0 1000   domain=biological
+natural_blunt           integer  permille range 0 1000   domain=biological
+natural_toxin           integer  permille range 0 1000   domain=biological
+natural_force           integer  units   range 0 10000  domain=biological # impact energy of a bare-handed kill-blow
+
+# ---- domestication, husbandry & cultivation (Phase 18) ----------------------
+# All behavioural thresholds are data: a species opts in by declaring
+# tameability > 0; wildness starts high and falls with repeated positive
+# contact (share-fed meals). Below the species' bond_threshold the animal
+# bonds to its feeder (a `bonded` relation edge) and follows it.
+wildness               integer  permille range 0 1000   domain=biological # feral level; low = tractable
+bond_threshold         integer  permille range 0 1000   domain=biological # wildness at/below which bonding forms
+tameability            integer  permille range 0 1000   domain=biological # how readily positive contact calms fear
+milk_yield             integer  units/tick range 0 100  domain=biological # bonded milk produced per 1000 ticks
+wool_yield             integer  units/tick range 0 100  domain=biological # bonded fiber produced per 1000 ticks
+pack_load_bonus        integer  permille range 0 1000   domain=biological # cargo capacity multiplier for bonded pack animals
+scent_alert_radius     integer  units                   domain=biological # bonded watchdog: smells predators within this range
+mount_capable          integer  flag     range 0 1      domain=biological # bonded animal can carry a rider
+milk_credit            integer  milli-units range 0 100000000 domain=physical # internal yield accumulator
+wool_credit            integer  milli-units range 0 100000000 domain=physical # internal yield accumulator
+alert_cooldown         integer  ticks     range 0 100000 domain=physical   # internal scent-alert refractory
+# cultivation: `sow` consumes a propagule/seed and grows the declared
+# species as a crop; `growth` accrues toward `growth_ticks` before the
+# plant fruits; `irrigation_credit` ticks of watered soil boost the
+# effective moisture the fruit drift sees.
+cultivated             integer  flag     range 0 1      domain=physical
+growth                 integer  ticks     range 0 1000000 domain=physical
+growth_ticks           integer  ticks     range 0 1000000 domain=biological # ticks to first fruiting
+irrigation_credit      integer  ticks     range 0 100000 domain=physical   # watered-soil ticks remaining
+# husbandry products
+# metallurgy material descriptors (Phase 18): the smelting RECIPE still
+# lives in processes.txt; these props let agents assess ore quality and
+# metal workability without naming materials in code.
+smelt_temp             integer  deciC  range 0 30000  domain=physical   # material: nominal smelt temperature
+ore_tag                text     tag                  domain=physical     # material: ore family label (e.g. "copper","tin","iron")
+malleability           integer  permille range 0 1000   domain=physical   # material: how easily it work-hardens/bends
+smelt_yield            integer  permille range 0 1000   domain=physical   # material: expected metal recovery permille
+granary_seal           integer  permille range 0 1000   domain=physical   # enclosure: spoilage reduction for contained goods

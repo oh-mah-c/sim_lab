@@ -212,6 +212,9 @@ material copper_ore
   portability_score 550
   spoilage_rate 0
 
+  smelt_temp 10000
+  ore_tag copper
+  smelt_yield 800
 material iron_ore
   hardness 700
   brittleness 450
@@ -238,6 +241,9 @@ material iron_ore
   portability_score 500
   spoilage_rate 0
 
+  smelt_temp 15500
+  ore_tag iron
+  smelt_yield 750
 material host_rock
   hardness 750
   brittleness 350
@@ -661,6 +667,9 @@ material copper_metal
   portability_score 850
   spoilage_rate 0
 
+  smelt_temp 1080
+  malleability 500
+  smelt_yield 900
 material charcoal
   antimicrobial 550
   hardness 100
@@ -922,6 +931,7 @@ material wood_debris
   spoilage_rate 250
 
 material skin
+  waterproofing 300
   sterilization_temp 700
   cremation_temp 6000
   corpse_decay_level 0
@@ -1279,6 +1289,7 @@ material sinew
 
 # Cured hide: soft armor (stops cuts partly, not impulse).
 material cured_hide
+  waterproofing 650
   hardness 250
   brittleness 200
   mass 2000
@@ -1350,3 +1361,195 @@ material energetic_mix
   volatility 850
   expansion_force 900
 
+
+
+# ---- Phase 18: husbandry products & metallurgy -------------------------------
+# milk/wool are perishable goods a bonded animal yields; smelt_temp /
+# ore_tag / malleability / smelt_yield on ores and metals let agents assess
+# a charge without any material names in code (recipes stay in
+# processes.txt — these props are the physics of the material itself).
+
+material milk
+  hardness 20
+  brittleness 400
+  mass 30
+  density 1030000
+  integrity 300
+  decay_rate 8
+  flammability 0
+  thermal_mass 300
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 600
+  hydration 700
+  contamination 50
+  intrinsic_scarcity 600
+  portability_score 500
+  spoilage_rate 600
+
+material wool
+  hardness 30
+  brittleness 700
+  mass 60
+  density 900000
+  integrity 400
+  decay_rate 2
+  flammability 300
+  thermal_mass 250
+  conductivity 30
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  thermal_insulation 800
+  contamination 50
+  intrinsic_scarcity 500
+  portability_score 700
+  spoilage_rate 100
+
+material grain
+  hardness 40
+  brittleness 850
+  mass 15
+  density 750000
+  integrity 350
+  decay_rate 3
+  flammability 500
+  thermal_mass 200
+  conductivity 30
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 800
+  hydration 150
+  contamination 80
+  intrinsic_scarcity 400
+  portability_score 800
+  spoilage_rate 250
+
+material pulse
+  hardness 60
+  brittleness 800
+  mass 20
+  density 780000
+  integrity 400
+  decay_rate 3
+  flammability 400
+  thermal_mass 200
+  conductivity 30
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 900
+  hydration 120
+  contamination 80
+  intrinsic_scarcity 500
+  portability_score 800
+  spoilage_rate 200
+
+material tin_ore
+  hardness 700
+  brittleness 300
+  mass 4000
+  density 4500000
+  integrity 900
+  decay_rate 0
+  flammability 0
+  thermal_mass 600
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  geom_type 2
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+  smelt_temp 12000
+  ore_tag cassiterite
+  smelt_yield 800
+  contamination 100
+  intrinsic_scarcity 500
+  portability_score 400
+  spoilage_rate 0
+
+material bronze
+  hardness 850
+  brittleness 250
+  mass 800
+  density 8800000
+  integrity 950
+  decay_rate 0
+  flammability 0
+  thermal_mass 400
+  conductivity 700
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 800
+  edge_sharpness 700
+  smelt_temp 11000
+  malleability 600
+  smelt_yield 900
+  contamination 50
+  intrinsic_scarcity 700
+  portability_score 600
+  spoilage_rate 0
+
+material iron_ingot
+  hardness 950
+  brittleness 150
+  mass 900
+  density 7800000
+  integrity 1000
+  decay_rate 0
+  flammability 0
+  thermal_mass 450
+  conductivity 800
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  tensile 900
+  edge_sharpness 850
+  smelt_temp 15500
+  malleability 450
+  smelt_yield 850
+  contamination 50
+  intrinsic_scarcity 800
+  portability_score 600
+  spoilage_rate 0
+
+material wool_cloth
+  hardness 50
+  brittleness 600
+  mass 80
+  density 950000
+  integrity 500
+  decay_rate 2
+  flammability 350
+  thermal_mass 250
+  conductivity 25
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  thermal_insulation 950
+  contamination 60
+  intrinsic_scarcity 600
+  portability_score 750
+  spoilage_rate 80

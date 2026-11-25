@@ -438,7 +438,17 @@ PredictionResult PhysicsModel::predict(const World& w, const InteractionContext&
     const PropId reach_pid = pid(w, "reach"), energy_pid = pid(w, "energy"),
                  contained_pid = pid(w, "contained");
     const EntityId striker = wielded_tool(w, ctx.actor);
-    const Blow blow = blow_of(w, striker, tedge);
+    Blow blow = blow_of(w, striker, tedge);
+    if (striker == kNoEntity) {
+        // innate weaponry (Phase 17): claws/fangs/horns are data props on
+        // the body itself — same Blow channels a crafted edge would fill.
+        blow.sharp = std::max(blow.sharp,
+            w.prop_int(*actor, pid(w, "natural_edge"), 0));
+        blow.blunt = std::max(blow.blunt,
+            w.prop_int(*actor, pid(w, "natural_blunt"), 0));
+        blow.coat_toxin = std::max(blow.coat_toxin,
+            w.prop_int(*actor, pid(w, "natural_toxin"), 0));
+    }
     std::int64_t wear_total = 0;
 
     for (EntityId tid : ctx.targets) {

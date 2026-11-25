@@ -144,11 +144,144 @@ LawId BiologyModel::id() const { return 7; }
 
 bool BiologyModel::supports(const World& w, const InteractionContext& ctx) const {
     (void)w;
-    return ctx.parameters.action == "reproduce" && ctx.targets.size() == 1;
+    if (ctx.targets.size() != 1) return false;
+    const std::string& a = ctx.parameters.action;
+    return a == "reproduce" || a == "sow" || a == "irrigate";
 }
+
+// ---- Phase 18: cultivation -----------------------------------------------
+// `sow` — actor + one propagule (an entity carrying `sprout_target`, i.e.
+// a seed that already knows what it becomes). The seed is consumed and the
+// declared species sprouts at the actor's feet as a `cultivated` crop with
+// `growth` 0 — it fruits only after `growth_ticks` of drift (World.cpp).
+// `irrigate` — actor + one fruiting plant, requires standing water within
+// reach of the plant (the channel/haul constraint is geography, not a
+// tech flag); grants `irrigation_credit` ticks of watered soil.
+namespace {
+
+constexpr std::int64_t kSowCost = 60;        // milliJ
+constexpr std::int64_t kIrrigateCost = 40;
+constexpr std::int64_t kIrrigateCredit = 2000; // watered-soil ticks granted
+constexpr std::int64_t kIrrigateWaterScan = 6; // cells around the plant
+
+PredictionResult predict_sow(const World& w, const InteractionContext& ctx) {
+    PredictionResult r; r.law = 7; r.law_name = "biology.cultivation";
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* seed = w.find(ctx.targets.front());
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    if (!seed || !seed->alive) { r.failure = "no living seed"; return r; }
+    const PropId contained = prop_id(w, "contained");
+    if (contained != kNoProp && prop_bool(w, *actor, contained)) {
+        r.failure = "actor is contained"; return r;
+    }
+    const PropId p_target = prop_id(w, "sprout_target");
+    const Value* tv = p_target != kNoProp ? w.prop_of(*seed, p_target) : nullptr;
+    if (!tv || tv->type != ValType::Text || tv->s.empty()) {
+        r.failure = "target is not a propagule (no sprout_target)"; return r;
+    }
+    const PropId reach_p = prop_id(w, "reach");
+    if (!in_reach(w, *actor, *seed, reach_p, &r)) {
+        r.failure = "seed out of reach"; return r;
+    }
+    if (!w.terrain.empty() && w.terrain.contains(actor->pos) &&
+        w.terrain.is_water(actor->pos)) {
+        r.failure = "cannot sow on water"; return r;
+    }
+    const PropId energy_p = prop_id(w, "energy");
+    const Value* ev = energy_p != kNoProp ? w.prop_of(*actor, energy_p) : nullptr;
+    const std::int64_t e0 = ev ? ev->i : 0;
+    add_cond(r, "energy", e0, kSowCost);
+    if (energy_p == kNoProp || !ev || ev->i < kSowCost) {
+        r.failure = "actor lacks energy to sow"; return r;
+    }
+    set_change(r, actor->id, energy_p, e0, e0 - kSowCost);
+    // the propagule is spent — integrity 0 reaps it through the normal path
+    const PropId integ = prop_id(w, "integrity");
+    if (integ != kNoProp) {
+        const std::int64_t si = w.prop_int(*seed, integ, 100);
+        set_change(r, seed->id, integ, si, 0);
+    }
+    // the crop: species props, bare of fruit, marked cultivated at growth 0
+    SpawnSpec s;
+    s.pos = actor->pos;
+    if (const SpeciesDef* sp = w.species.find_name(tv->s)) {
+        s.kind = sp->name;
+        s.material = sp->material;
+        s.props = sp->props;
+    } else {
+        s.kind = tv->s;
+        const PropId p_sm = prop_id(w, "sprout_material");
+        const Value* mv = p_sm != kNoProp ? w.prop_of(*seed, p_sm) : nullptr;
+        if (mv && mv->type == ValType::Text)
+            s.material = w.materials.id_of(mv->s);
+    }
+    const PropId p_fc = prop_id(w, "fruit_count");
+    if (p_fc != kNoProp && s.props.get(p_fc))
+        s.props.set(p_fc, Value::integer(0));
+    const PropId p_cult = prop_id(w, "cultivated");
+    if (p_cult != kNoProp) s.props.set(p_cult, Value::integer(1));
+    const PropId p_g = prop_id(w, "growth");
+    if (p_g != kNoProp) s.props.set(p_g, Value::integer(0));
+    r.spawns.push_back(s);
+    r.possible = true; r.ticks = 1;
+    r.notes.push_back("sow '" + tv->s + "'");
+    return r;
+}
+
+PredictionResult predict_irrigate(const World& w, const InteractionContext& ctx) {
+    PredictionResult r; r.law = 7; r.law_name = "biology.cultivation";
+    const Entity* actor = w.find(ctx.actor);
+    const Entity* plant = w.find(ctx.targets.front());
+    if (!actor || !actor->alive) { r.failure = "no living actor"; return r; }
+    if (!plant || !plant->alive) { r.failure = "no living plant"; return r; }
+    const PropId p_fc = prop_id(w, "fruit_count");
+    if (p_fc == kNoProp || !w.prop_of(*plant, p_fc)) {
+        r.failure = "target is not a fruiting plant"; return r;
+    }
+    const PropId reach_p = prop_id(w, "reach");
+    if (!in_reach(w, *actor, *plant, reach_p, &r)) {
+        r.failure = "plant out of reach"; return r;
+    }
+    // water must be near the PLANT — irrigation is geography, not a flag:
+    // a dry field far from a channel cannot be watered by wishful thinking.
+    // The scan radius is in terrain CELLS (kIrrigateWaterScan), converted
+    // to world units by the grid pitch.
+    if (w.terrain.empty()) { r.failure = "no terrain"; return r; }
+    const std::int64_t cell = std::max(1, w.terrain.cell);
+    const std::int64_t scan = kIrrigateWaterScan * cell;
+    bool water = false;
+    for (std::int64_t dy = -scan; dy <= scan && !water; dy += cell)
+        for (std::int64_t dx = -scan; dx <= scan; dx += cell) {
+            const Vec2 q{plant->pos.x + static_cast<std::int32_t>(dx),
+                         plant->pos.y + static_cast<std::int32_t>(dy)};
+            if (w.terrain.contains(q) && w.terrain.is_water(q)) { water = true; break; }
+        }
+    if (!water) { r.failure = "no water within irrigation reach"; return r; }
+    const PropId energy_p = prop_id(w, "energy");
+    const Value* ev = energy_p != kNoProp ? w.prop_of(*actor, energy_p) : nullptr;
+    const std::int64_t e0 = ev ? ev->i : 0;
+    add_cond(r, "energy", e0, kIrrigateCost);
+    if (energy_p == kNoProp || !ev || ev->i < kIrrigateCost) {
+        r.failure = "actor lacks energy to irrigate"; return r;
+    }
+    set_change(r, actor->id, energy_p, e0, e0 - kIrrigateCost);
+    const PropId p_ic = prop_id(w, "irrigation_credit");
+    if (p_ic != kNoProp) {
+        const std::int64_t ic0 = w.prop_int(*plant, p_ic, 0);
+        set_change(r, plant->id, p_ic, ic0,
+                   std::min<std::int64_t>(100000, ic0 + kIrrigateCredit));
+    }
+    r.possible = true; r.ticks = 1;
+    r.notes.push_back("irrigate +" + std::to_string(kIrrigateCredit) + " ticks");
+    return r;
+}
+
+}  // namespace
 
 PredictionResult BiologyModel::predict(const World& w,
                                        const InteractionContext& ctx) const {
+    if (ctx.parameters.action == "sow") return predict_sow(w, ctx);
+    if (ctx.parameters.action == "irrigate") return predict_irrigate(w, ctx);
     PredictionResult r;
     r.law = id(); r.law_name = name();
     const Entity* actor = w.find(ctx.actor);

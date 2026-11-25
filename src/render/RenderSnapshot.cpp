@@ -4,6 +4,7 @@
 #include "simlab/World.hpp"
 #include "simlab/Cognition.hpp"
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 
 namespace simlab {
@@ -27,18 +28,68 @@ bool static_kind(const Entity& e) {
     return e.kind_name == SIMLAB_KIND("enclosure") || e.kind_name == SIMLAB_KIND("inscription") ||
            e.kind_name == SIMLAB_KIND("portal") || e.deposit != kNoDeposit;
 }
-std::int64_t key2(int gx, int gy) {
-    return (static_cast<std::int64_t>(gx) << 32) ^ static_cast<std::uint32_t>(gy);
-}
 
 }  // namespace
 
 // ---- fog ------------------------------------------------------------------------
+namespace {
+std::uint64_t pack_cell(int gx, int gy) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(gx)) << 32) |
+           static_cast<std::uint32_t>(gy);
+}
+}  // namespace
+
+void FogOfWar::ensure_grid(const World& w) {
+    const TerrainGrid& t = w.terrain;
+    int x0, y0, x1, y1;
+    if (bounds_set_) {
+        x0 = bx0_; y0 = by0_; x1 = bx1_; y1 = by1_;
+    } else if (!t.empty()) {
+        // terrain plus a margin so sight disks at the edge are not clipped
+        constexpr int kMargin = 48;
+        x0 = t.ox - kMargin; y0 = t.oy - kMargin;
+        x1 = t.ox + t.w + kMargin; y1 = t.oy + t.h + kMargin;
+    } else {
+        x0 = y0 = -256; x1 = y1 = 256;
+    }
+    // never shrink an already-allocated grid (lists index into it)
+    if (gw_ > 0) {
+        x0 = std::min(x0, ox_); y0 = std::min(y0, oy_);
+        x1 = std::max(x1, ox_ + gw_); y1 = std::max(y1, oy_ + gh_);
+    }
+    const int nw = x1 - x0, nh = y1 - y0;
+    if (nw <= 0 || nh <= 0) return;
+    if (gw_ == nw && gh_ == nh && ox_ == x0 && oy_ == y0) return;
+    // grow-only: copy the old window into the new grid at its offset
+    const int nox = ox_, noy = oy_, ow = gw_, oh = gh_;
+    std::vector<std::uint8_t> ng(std::size_t(nw) * nh, 0);
+    if (ow > 0) {
+        const int cx0 = std::max(0, nox - x0), cy0 = std::max(0, noy - y0);
+        const int cw = std::min(ow - cx0, nw - cx0), ch = std::min(oh - cy0, nh - cy0);
+        if (cw > 0 && ch > 0)
+            for (int y = 0; y < ch; ++y)
+                std::copy_n(grid_.data() + std::size_t(cy0 + y) * ow + cx0, cw,
+                            ng.data() + std::size_t(cy0 + y) * nw + cx0);
+    }
+    grid_.swap(ng); ox_ = x0; oy_ = y0; gw_ = nw; gh_ = nh;
+}
+
 void FogOfWar::update(const World& w) {
     cell_ = w.terrain.empty() ? 16 : std::max(1, w.terrain.cell);
-    visible_.clear();
-    if (mode_ == Mode::GodEye) return;               // God Eye: no fog at all
+    ensure_grid(w);
+    // demote last update's visible ring to shrouded (still explored)
+    for (const std::uint64_t k : visible_list_) {
+        const int gx = static_cast<int>(k >> 32), gy = static_cast<int>(std::uint32_t(k));
+        if (gx < ox_ || gy < oy_ || gx >= ox_ + gw_ || gy >= oy_ + gh_) continue;
+        std::uint8_t& c = grid_[std::size_t(gy - oy_) * gw_ + (gx - ox_)];
+        if (c == 2) c = 1;
+    }
+    visible_list_.clear();
+    if (mode_ == Mode::GodEye || gw_ <= 0) { ++generation_; return; }
     const PropId lang_p = SIMLAB_PID(w.props, "language_id");
+    // first pass: collect observers (minds of the tribe, or every mind)
+    struct Obs { int cx, cy; std::int64_t r; };
+    std::vector<Obs> obs;
     for (const auto& [mid, m] : w.minds_) {
         (void)m;
         const Entity* e = w.find(mid);
@@ -46,25 +97,43 @@ void FogOfWar::update(const World& w) {
         if (mode_ == Mode::Avatar && static_cast<std::int64_t>(mid) != tribe_) continue;
         if (mode_ == Mode::Tribe && tribe_ != 0 &&
             (lang_p == kNoProp || w.prop_int(*e, lang_p, 0) != tribe_)) continue;
-        const std::int64_t r = std::max<std::int64_t>(0, sight_radius_of(w, *e));
-        const int cx = TerrainGrid::cell_of(e->pos.x, cell_), cy = TerrainGrid::cell_of(e->pos.y, cell_);
-        const int rc = static_cast<int>(r / cell_) + 1;
-        for (int dy = -rc; dy <= rc; ++dy)
-            for (int dx = -rc; dx <= rc; ++dx) {
-                const std::int64_t mx = static_cast<std::int64_t>(dx) * cell_,
-                                   my = static_cast<std::int64_t>(dy) * cell_;
-                if (mx * mx + my * my > r * r) continue;
-                visible_.emplace(cx + dx, cy + dy);
-            }
+        Obs o;
+        o.r = std::max<std::int64_t>(0, sight_radius_of(w, *e));
+        o.cx = TerrainGrid::cell_of(e->pos.x, cell_);
+        o.cy = TerrainGrid::cell_of(e->pos.y, cell_);
+        obs.push_back(o);
     }
-    explored_.insert(visible_.begin(), visible_.end());
+    auto mark = [&](int gx, int gy) {
+        if (wrap_x_ > 0) gx = ((gx % wrap_x_) + wrap_x_) % wrap_x_;
+        if (gx < ox_ || gy < oy_ || gx >= ox_ + gw_ || gy >= oy_ + gh_) return;
+        const std::size_t i = std::size_t(gy - oy_) * gw_ + (gx - ox_);
+        std::uint8_t& c = grid_[i];
+        if (c == 0) { c = 1; explored_list_.push_back(pack_cell(gx, gy)); }
+        if (c != 2) { c = 2; visible_list_.push_back(pack_cell(gx, gy)); }
+    };
+    for (const Obs& o : obs) {
+        // scanline disk fill: for each row dy, the chord half-width in cells
+        const std::int64_t r2 = o.r * o.r;
+        const int rc = static_cast<int>(o.r / cell_) + 1;
+        for (int dy = -rc; dy <= rc; ++dy) {
+            const std::int64_t my = static_cast<std::int64_t>(dy) * cell_;
+            const std::int64_t rem = r2 - my * my;
+            if (rem < 0) continue;
+            const int dx = static_cast<int>(std::sqrt(static_cast<double>(rem)) / cell_);
+            const int gy = o.cy + dy;
+            for (int gx = o.cx - dx; gx <= o.cx + dx; ++gx) mark(gx, gy);
+        }
+    }
+    ++generation_;
 }
 
 Fog FogOfWar::cell_fog(int gx, int gy) const {
     if (mode_ == Mode::GodEye) return Fog::Visible;
-    if (visible_.count({gx, gy})) return Fog::Visible;
-    if (explored_.count({gx, gy})) return Fog::Shrouded;
-    return Fog::Unexplored;
+    if (wrap_x_ > 0) gx = ((gx % wrap_x_) + wrap_x_) % wrap_x_;
+    if (gw_ <= 0 || gx < ox_ || gy < oy_ || gx >= ox_ + gw_ || gy >= oy_ + gh_)
+        return Fog::Unexplored;
+    const std::uint8_t c = grid_[std::size_t(gy - oy_) * gw_ + (gx - ox_)];
+    return c == 2 ? Fog::Visible : c == 1 ? Fog::Shrouded : Fog::Unexplored;
 }
 Fog FogOfWar::point_fog(const World& w, Vec2 p) const {
     const int c = w.terrain.empty() ? 16 : std::max(1, w.terrain.cell);
@@ -72,7 +141,8 @@ Fog FogOfWar::point_fog(const World& w, Vec2 p) const {
 }
 
 // ---- capture --------------------------------------------------------------------
-RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
+RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog,
+                       CaptureScratch* scratch) {
     RenderSnapshot s;
     s.tick = w.clock_.tick();
     s.day_phase = static_cast<int>(s.tick % 24);
@@ -87,15 +157,16 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
             for (int gx = gx0; gx <= gx1; ++gx) {
                 int lx, ly;
                 if (!t.local_cell(gx, gy, lx, ly)) continue;
-                const std::size_t i = static_cast<std::size_t>(ly) * t.w + lx;
+                const Fog f = fog.cell_fog(gx, gy);
+                if (f == Fog::Unexplored) continue;
                 CellView c;
                 c.gx = gx; c.gy = gy;
+                const std::size_t i = static_cast<std::size_t>(ly) * t.w + lx;
                 c.elevation = t.elevation[i]; c.moisture = t.moisture[i];
                 c.temperature = t.temperature[i]; c.vegetation = t.vegetation[i];
                 c.slope = t.slope[i]; c.water = t.water[i];
                 c.wear = t.traffic_wear.size() == t.elevation.size() ? t.traffic_wear[i] : 0;
-                c.fog = fog.cell_fog(gx, gy);
-                if (c.fog == Fog::Unexplored) { c.elevation = 0; c.water = 0; c.wear = 0; }  // no leak
+                c.fog = f;
                 s.cells.push_back(c);
             }
     }
@@ -108,30 +179,51 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
                  bl = P("blunt_mass"), el = P("elasticity"), li = P("launch_impulse"), ct = P("coat_toxin"),
                  cs = P("coat_strain"), apr = P("armor_penetration_resist"), cont = P("contained"),
                  poss = P("possessed_by"), gt = P("glyph_text"), cl = P("clause_atoms"), ck = P("concept_keys"),
-                 skey = P("sacred_key"), og = P("oral_genre"), cut = P("cultivar");
+                 skey = P("sacred_key"), og = P("oral_genre"), cut = P("cultivar"),
+                 tt = P("trophic_tier"), mdrv = P("migration_drive");
     (void)cut;
-    // wealth by possessor (one pass)
-    std::unordered_map<std::int64_t, std::int64_t> wealth;
-    if (poss != kNoProp)
-        for (const auto& ep : w.entities)
-            if (ep->alive) {
-                const std::int64_t h = w.prop_int(*ep, poss, 0);
-                if (h > 0) wealth[h] += std::max<std::int64_t>(1, qty != kNoProp ? w.prop_int(*ep, qty, 1) : 1);
-            }
     // ---- entities in view ----
     const std::int64_t cxm = (static_cast<std::int64_t>(view.x0) + view.x1) / 2,
                        cym = (static_cast<std::int64_t>(view.y0) + view.y1) / 2;
-    const std::int64_t hw = (static_cast<std::int64_t>(view.x1) - view.x0) / 2 + 64,
-                       hh = (static_cast<std::int64_t>(view.y1) - view.y0) / 2 + 64;
+    const std::int64_t hw = (static_cast<std::int64_t>(view.x1) - view.x0) / 2 + 32,
+                       hh = (static_cast<std::int64_t>(view.y1) - view.y0) / 2 + 32;
     std::int64_t radius = 0; while (radius * radius < hw * hw + hh * hh) radius += 16;
     const std::vector<EntityId> near = w.entities_near({static_cast<std::int32_t>(cxm), static_cast<std::int32_t>(cym)}, radius);
     s.culled = w.entities.size() > near.size() ? w.entities.size() - near.size() : 0;
+    // wealth by possessor (only for possessors visible in near) — cached
+    // ~30 ticks in `scratch`: the scan is O(all entities), too hot per frame.
+    std::unordered_map<std::int64_t, std::int64_t> wealth_local;
+    const std::unordered_map<std::int64_t, std::int64_t>* wealth = nullptr;
+    if (poss != kNoProp) {
+        std::set<std::int64_t> in_view;
+        for (const EntityId id : near) if (w.find_mind(id)) in_view.insert(static_cast<std::int64_t>(id));
+        if (!in_view.empty()) {
+            const std::uint64_t epoch = w.clock_.tick() / 30;
+            if (scratch && scratch->epoch == epoch) {
+                wealth = &scratch->wealth;
+            } else {
+                wealth_local.clear();
+                for (const auto& ep : w.entities)
+                    if (ep->alive) {
+                        const std::int64_t h = w.prop_int(*ep, poss, 0);
+                        if (h > 0)   // accumulate for ALL possessors; callers filter by in_view
+                            wealth_local[h] += std::max<std::int64_t>(1, qty != kNoProp ? w.prop_int(*ep, qty, 1) : 1);
+                    }
+                if (scratch) { scratch->wealth = wealth_local; scratch->epoch = epoch; }
+                wealth = scratch ? &scratch->wealth : &wealth_local;
+            }
+        }
+    }
     std::set<EntityId> drawn;
+    // per-cell species census for the ecology lens — only entities that
+    // survived the fog checks above are counted, so the overlay can never
+    // reveal what the observer cannot see.
+    std::unordered_map<std::uint64_t, std::pair<int, int>> eco_density;
     for (const EntityId id : near) {
         const Entity* e = w.find(id);
         if (!e || abstract_kind(*e)) continue;
-        if (e->pos.x < view.x0 - 32 || e->pos.x >= view.x1 + 32 ||
-            e->pos.y < view.y0 - 32 || e->pos.y >= view.y1 + 64) continue;
+        if (e->pos.x < view.x0 - 16 || e->pos.x >= view.x1 + 16 ||
+            e->pos.y < view.y0 - 16 || e->pos.y >= view.y1 + 32) continue;
         if (cont != kNoProp) {                         // parts inside a body/structure
             const Value* cv = w.prop_of(*e, cont);
             if (cv && cv->type == ValType::Boolean && cv->b) continue;
@@ -139,7 +231,21 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
         const Fog f = fog.point_fog(w, e->pos);
         if (f == Fog::Unexplored) continue;
         const bool stat = static_kind(*e);
-        if (f == Fog::Shrouded && !stat) continue;     // motion hidden under the shroud
+        // map memory: everything that is not a living creature (plants,
+        // ore, water, corpses, items, structures) is remembered as last seen;
+        // under the shroud it shows frozen from that memory, creatures hide
+        bool creature = false;
+        if (e->alive) {
+            if (w.find_mind(id)) creature = true;
+            else if (const SpeciesDef* sp = w.species.find_name(e->kind_name.str()); sp && sp->fauna) creature = true;
+            else {                                     // anything that walks or hungers moves
+                const PropId spd = SIMLAB_PID(w.props, "speed"), hun = SIMLAB_PID(w.props, "hunger");
+                if ((spd != kNoProp && w.prop_int(*e, spd, 0) > 0) || (hun != kNoProp && w.prop_of(*e, hun)))
+                    creature = true;
+            }
+        }
+        const bool memorable = !creature;
+        if (f == Fog::Shrouded) continue;              // shroud: drawn from memory below
         EntityView v;
         v.id = id; v.pos = e->pos; v.kind = e->kind_name.str(); v.material = e->material;
         v.fog = f; v.alive = e->alive; v.structure = stat;
@@ -153,6 +259,7 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
         v.pain = I(pain, 0); v.bleed = I(bleed, 0); v.toxin = I(tox, 0);
         v.morale = e->props.get(morale) ? I(morale, -1) : -1; v.routed = I(routed, 0);
         v.lang = I(lang, 0); v.radius = I(rad, 0); v.barrier = I(bar, 0);
+        v.trophic_tier = I(tt, 0); v.migration_drive = I(mdrv, 0);
         v.temperature = I(temp, 200); v.quantity = I(qty, 0);
         v.lang_seed = static_cast<std::uint32_t>(v.lang * 2654435761u);
         for (const Relation& r : w.relations_of(id, "carries")) if (r.a == id) v.infected = true;
@@ -198,7 +305,10 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
                 }
             v.leader = pol_holds_mandate(w, id);
         }
-        v.wealth = wealth.count(static_cast<std::int64_t>(id)) ? wealth[static_cast<std::int64_t>(id)] : 0;
+        if (wealth) {
+            const auto wi = wealth->find(static_cast<std::int64_t>(id));
+            v.wealth = wi != wealth->end() ? wi->second : 0;
+        }
         if (e->kind_name == SIMLAB_KIND("enclosure")) {
             v.function = arch_function(w, id);
             v.sacred = v.function == "sanctuary";
@@ -209,21 +319,49 @@ RenderSnapshot capture(const World& w, const ViewRect& view, FogOfWar& fog) {
                     tv && tv->type == ValType::Text && !tv->s.empty()) { v.text = tv->s; break; }
             if (skey != kNoProp) { const Value* sv = w.prop_of(*e, skey); v.sacred = sv && sv->type == ValType::Text && !sv->s.empty(); }
         }
-        if (stat && f == Fog::Visible) fog.remembered[id] = v;      // update the map memory
+        if (memorable && f == Fog::Visible) fog.remembered[id] = v;   // update the map memory
+        else if (!memorable && f == Fog::Visible) fog.remembered.erase(id);
+        if (v.fauna || v.flora) {
+            const std::uint64_t key =
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(
+                     TerrainGrid::cell_of(e->pos.x, s.cell))) << 32) |
+                static_cast<std::uint32_t>(TerrainGrid::cell_of(e->pos.y, s.cell));
+            auto& cnt = eco_density[key];
+            if (v.fauna) ++cnt.first; else ++cnt.second;
+        }
         drawn.insert(id);
         s.entities.push_back(std::move(v));
     }
-    // shrouded areas: show the LAST SEEN architecture (it may have changed since)
-    for (const auto& [id, v] : fog.remembered) {
-        if (drawn.count(id)) continue;
-        if (v.pos.x < view.x0 - 32 || v.pos.x >= view.x1 + 32 || v.pos.y < view.y0 - 32 || v.pos.y >= view.y1 + 64) continue;
-        if (fog.point_fog(w, v.pos) != Fog::Shrouded) continue;
-        EntityView r = v; r.fog = Fog::Shrouded;
-        s.entities.push_back(std::move(r));
+    // shrouded areas: show the LAST SEEN things, frozen (they may have
+    // changed since). A remembered thing whose spot is in sight again but
+    // that is no longer there (eaten, felled, moved) is forgotten.
+    for (auto it = fog.remembered.begin(); it != fog.remembered.end();) {
+        const EntityView& v = it->second;
+        if (drawn.count(it->first) ||
+            v.pos.x < view.x0 - 32 || v.pos.x >= view.x1 + 32 || v.pos.y < view.y0 - 32 || v.pos.y >= view.y1 + 64) { ++it; continue; }
+        const Fog f = fog.point_fog(w, v.pos);
+        if (f == Fog::Visible) { it = fog.remembered.erase(it); continue; }   // looked again: gone
+        if (f == Fog::Shrouded) { EntityView r = v; r.fog = Fog::Shrouded; s.entities.push_back(std::move(r)); }
+        ++it;
     }
+    if (!eco_density.empty())
+        for (CellView& c : s.cells) {
+            const auto it = eco_density.find(
+                (static_cast<std::uint64_t>(static_cast<std::uint32_t>(c.gx)) << 32) |
+                static_cast<std::uint32_t>(c.gy));
+            if (it != eco_density.end()) { c.fauna = it->second.first; c.flora = it->second.second; }
+        }
     std::sort(s.entities.begin(), s.entities.end(), [](const EntityView& a, const EntityView& b) {
         return a.pos.y != b.pos.y ? a.pos.y < b.pos.y : a.id < b.id;
     });
+    // CL-1 shadow-brain observability: read-only stats, never fed back.
+    if (w.brain_shadow && w.brains_) {
+        s.brain_slots = static_cast<std::int64_t>(w.brains_->slots.size());
+        s.brain_wm_mae = w.brains_->wm_n > 0
+            ? w.brains_->wm_err_sum / static_cast<std::int64_t>(w.brains_->wm_n) : 0;
+        s.brain_avg_surprise = w.brains_->sigma_n > 0
+            ? w.brains_->sigma_sum / static_cast<std::int64_t>(w.brains_->sigma_n) : 0;
+    }
     return s;
 }
 

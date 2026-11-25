@@ -333,6 +333,35 @@ static PredictionResult predict_assemble(const World& w,
         }
     }
 
+    // Primordial maritime: buoyancy EMERGES from the parts' real densities.
+    // lift = sum of mass x (water - density) / density over the parts (a
+    // dense part subtracts); the swell a hull survives grows with how well
+    // its seams are sealed (best `waterproofing` among the parts) and with
+    // how many members brace it. Raft (logs + sinew) -> calm water only;
+    // hide-sealed hull -> open sea. No craft names exist in code.
+    if (w.ruleset & World::kRulePrimordial) {
+        const PropId fc_p = prop_id(w, "float_capacity"), wr_p = prop_id(w, "wave_rating"),
+                     wp_p = prop_id(w, "waterproofing"), dens_p = prop_id(w, "density");
+        const MaterialDef* wmd = w.materials.find_name("water");
+        std::int64_t D = 1000000;
+        if (wmd && dens_p != kNoProp) if (auto it = wmd->props.find(dens_p); it != wmd->props.end() && it->second.i > 0) D = it->second.i;
+        std::int64_t lift = 0, best_wp = 0;
+        for (const Part& pp : parts) {
+            const Entity* pe = w.find(pp.id);
+            if (!pe) continue;
+            const std::int64_t d = dens_p != kNoProp ? std::max<std::int64_t>(1, w.prop_int(*pe, dens_p, D)) : D;
+            lift += pp.mass * (D - d) / d;
+            if (wp_p != kNoProp) best_wp = std::max(best_wp, w.prop_int(*pe, wp_p, 0));
+        }
+        if (fc_p != kNoProp && lift > 0) {
+            seti(fc_p, lift);
+            if (wr_p != kNoProp)
+                seti(wr_p, std::clamp<std::int64_t>(
+                    150 + std::min<std::int64_t>(6, std::int64_t(parts.size())) * 25 + best_wp * 6 / 10, 0, 1000) *
+                    motor / 1000);
+        }
+    }
+
     // emergent capability: edge organized with length -> thrust_range.
     std::int64_t thrust = 0;
     if (thrust_pid != kNoProp && max_edge > 0 && sum_len > 0)
@@ -827,6 +856,11 @@ PredictionResult predict_enclose(const World& w,
     seti(p_bar, barrier);
     seti(p_da, unstable ? 63500 : 0);
     seti(p_wres, wres_a);
+    // granary seal (Phase 18): a well-sealed, high-insulation shell is a
+    // dry store — contained perishables rot slower by granary_seal
+    // permille. Derived purely from shell physics (insulation x coverage);
+    // no "granary" verb or building name exists.
+    seti(prop_id(w, "granary_seal"), ins_fac / 2);
     if (p_style != kNoProp)
         pb.set(p_style, Value::text(kStyleName[style]));
     // integrity: weakest link governs; an unstable span is born failing

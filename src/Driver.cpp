@@ -3,7 +3,9 @@
 #include "simlab/Discovery.hpp"
 #include "simlab/Laws.hpp"
 #include "simlab/WorldGen.hpp"
+#include "LawUtil.hpp"
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +35,7 @@ constexpr int kDiscoverPerCycle = 8;
 constexpr std::uint64_t kPendingTicks = 240;
 
 enum VerbSlot { kWield = 0, kWithdraw, kReproduce, kCommunicate, kEngrave, kFound, kConsume,
-                kBabble, kSite };
+                kBabble, kSite, kQuantum };
 
 PropId dpid(const World& w, const char* n) {
     static thread_local LitPidCache c_;
@@ -75,6 +77,137 @@ InteractionContext mk(EntityId actor, std::vector<EntityId> targets,
     return c;
 }
 
+// walking stride per action. Legacy/capstone: 1 (balance-critical, see
+// AGENTS.md). Game mode (concurrent rounds): 4 — a round is one action per
+// agent, so 1-tick strides made people crawl ~5 units per round on screen.
+// LocomotionModel pins the world-time cost to 1 tick either way.
+std::int64_t move_stride(const DriverState* st) { return st && st->concurrent ? 4 : 1; }
+
+// Phase 19 quantitative planner: a mind holding a proven `qlaw:buoyancy`
+// law loads a remembered craft only to the measured safe load
+// (parameters.force = the law's parameter, in trade units) instead of
+// dumping the whole pack aboard and hoping. Surplus only — a hungry
+// carrier eats first. Claims arrive halved, so a taught law still works,
+// just conservatively until re-proven.
+bool quantum_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
+    const AgentMind* mm = w.find_mind(npc);
+    const Entity* me = w.find(npc);
+    if (!mm || !me || !me->alive) return false;
+    const std::int64_t load = qlaw_param(*mm, "buoyancy");
+    if (load <= 0) return false;
+    if (dint(w, *me, dpid(w, "hunger"), 0) > 300 ||
+        dint(w, *me, dpid(w, "thirst"), 0) > 300) return false;
+    const PropId qty = dpid(w, "quantity");
+    if (qty == kNoProp || w.prop_int(*me, qty, 0) < load) return false;
+    if (!cooled(st, npc, kQuantum, now)) return false;
+    const std::int64_t rr = dint(w, *me, dpid(w, "reach"), 64);
+    const std::int64_t r2 = rr * rr;
+    for (const auto& [kid, snap] : mm->memory) {
+        if (kid == npc || snap.kind_name != "composite") continue;
+        if (dist2(me->pos, snap.pos) > r2) continue;
+        const Entity* c = w.find(kid);
+        if (!c || !c->alive) continue;
+        cool(st, npc, kQuantum, now, 48);
+        InteractionContext sc = mk(npc, {kid}, "share", 1);
+        sc.parameters.force = load;      // the proven safe load, units
+        if (w.interact(sc).completed) return true;
+    }
+    return false;
+}
+
+// ---- shore sense (game mode, Primordial ruleset) ---------------------------
+// Before a step that would leave the ford for deep water, a mind weighs the
+// crossing it can SEE: strokes to the far shore along its heading (cost from
+// the same physics the law uses) against the fatigue it has left, inflated
+// by fear learned from drownings (peril:deep_water) and its threat gain.
+//   0 = go (maybe annotated "swim"), 1 = acted otherwise (boarded a craft),
+//   2 = stay ashore (and the wish to cross — want_cross — grows).
+// Panic overrides the weighing: a fleeing mind jumps in.
+int shore_sense(World& w, DriverState* st, EntityId npc, InteractionContext& mc, bool panic) {
+    if (!(st && st->curiosity) || !(w.ruleset & World::kRulePrimordial) || w.terrain.empty()) return 0;
+    Entity* me = w.find(npc);
+    if (!me || !mc.parameters.has_destination) return 0;
+    if (lawutil::craft_of(w, npc) != kNoEntity) return 0;             // sailing: the law steers
+    const Vec2 from = me->pos, to = mc.parameters.destination;
+    const std::int64_t dx = std::int64_t(to.x) - from.x, dy = std::int64_t(to.y) - from.y;
+    const std::int64_t d2 = dx * dx + dy * dy;
+    if (d2 == 0) return 0;
+    std::int64_t dist = 1; while (dist * dist < d2) ++dist;
+    const std::int64_t speed = dint(w, *me, dpid(w, "speed"), 0);
+    const std::int64_t step = std::max<std::int64_t>(1, speed * std::max<std::int64_t>(1, mc.parameters.ticks) / 1000);
+    auto at = [&](std::int64_t k) {
+        return Vec2{static_cast<std::int32_t>(from.x + dx * k / dist), static_cast<std::int32_t>(from.y + dy * k / dist)};
+    };
+    const Vec2 first = at(std::min(step, dist));
+    if (lawutil::water_depth(w, first) <= lawutil::kWadeDepth) return 0;   // dry or a ford
+    // march the heading stroke by stroke until the far shore (or give up)
+    std::int64_t cost = 0; bool shore = false;
+    for (int i = 1; i <= 96; ++i) {
+        const Vec2 p = at(step * i);
+        if (!w.terrain.contains(p)) break;                               // open sea beyond sight
+        if (lawutil::water_depth(w, p) == 0) { shore = true; break; }
+        cost += lawutil::swim_stroke_cost(w, *me, p);
+    }
+    const AgentMind* mm = w.find_mind(npc);
+    const MindParams mp = mind_params(w, *me);
+    const Belief* peril = mm ? mm->find_belief("peril:deep_water") : nullptr;
+    const std::int64_t fear = peril ? peril->confidence : 0;
+    const std::int64_t headroom = 1000 - dint(w, *me, dpid(w, "fatigue"), 0) - 80;
+    const std::int64_t need = cost * (1000 + fear) / 1000 * std::max<std::int64_t>(500, mp.threat_gain) / 1000;
+    if (panic || (shore && need <= headroom)) { mc.parameters.note = "swim"; return 0; }
+    // too far to swim: a remembered craft in reach?
+    if (mm && mm->known_actions.count("board")) {
+        const std::int64_t rr = dint(w, *me, dpid(w, "reach"), 64);
+        const PropId fc = dpid(w, "float_capacity");
+        for (const auto& [kid, snap] : mm->memory) {
+            if (snap.kind_name != "composite" || dist2(snap.pos, me->pos) > rr * rr) continue;
+            const Entity* c = w.find(kid);
+            if (!c || !c->alive || fc == kNoProp || w.prop_int(*c, fc, 0) <= 0) continue;
+            InteractionContext bc = mk(npc, {kid}, "board", 1);
+            if (w.interact(bc).completed) return 1;
+        }
+    }
+    AgentMind& m = w.mind(npc);
+    Belief& b = m.belief("want_cross");
+    b.confidence = std::min<std::int64_t>(1000, b.confidence + 60);
+    b.last_tick = w.clock_.tick();
+    // remember WHERE it wanted to go: the far shore outlives the errand
+    for (auto it = m.beliefs.lower_bound("far_shore:"); it != m.beliefs.end() && it->first.rfind("far_shore:", 0) == 0;)
+        it = m.beliefs.erase(it);
+    Belief& fs = m.belief("far_shore:" + std::to_string(to.x) + ":" + std::to_string(to.y));
+    fs.confidence = 900; fs.last_tick = w.clock_.tick();
+    return 2;
+}
+// interact a planned move through the shore sense; true if the turn was used
+bool drive_move(World& w, DriverState* st, EntityId npc, InteractionContext& mc, bool panic = false,
+                bool* shore_blocked = nullptr) {
+    const int sense = shore_sense(w, st, npc, mc, panic);
+    if (shore_blocked) *shore_blocked = sense == 2;
+    if (sense == 1) return true;
+    if (sense == 2) return false;
+    return w.interact(mc).completed;
+}
+// afloat with a far shore in mind: paddle there first (Primordial game mode)
+bool sail_step(World& w, DriverState* st, EntityId npc) {
+    if (!(st && st->curiosity) || !(w.ruleset & World::kRulePrimordial)) return false;
+    if (lawutil::craft_of(w, npc) == kNoEntity) return false;
+    const AgentMind* mm = w.find_mind(npc);
+    if (!mm) return false;
+    const auto it = mm->beliefs.lower_bound("far_shore:");
+    if (it == mm->beliefs.end() || it->first.rfind("far_shore:", 0) != 0) return false;
+    long long x = 0, y = 0;
+    if (std::sscanf(it->first.c_str() + 10, "%lld:%lld", &x, &y) != 2) return false;
+    const std::string key = it->first;
+    InteractionContext mc = mk(npc, {}, "move", move_stride(st));
+    mc.parameters.destination = {std::int32_t(x), std::int32_t(y)};
+    mc.parameters.has_destination = true;
+    const InteractionResult r = w.interact(mc);
+    if (lawutil::craft_of(w, npc) == kNoEntity)              // stepped ashore: crossed
+        w.mind(npc).beliefs.erase(key);
+    return r.completed;
+}
+
+
 // ---- Primordial curiosity: affordance babbling (DriverState::curiosity) ----
 // An idle mind with an incomplete verb repertoire pokes at the world: it
 // picks a verb it has never used (or the one a whispered omen suggests) and
@@ -86,7 +219,7 @@ InteractionContext mk(EntityId actor, std::vector<EntityId> targets,
 // Deterministic: choices come from a hash of (seed, agent, tick).
 const char* const kBabbleVerbs[] = {
     "impact", "strike", "dig", "chop", "carve", "assemble", "disassemble",
-    "process", "heat", "wield", "combine", "consume", "treat"};
+    "process", "heat", "wield", "combine", "consume", "treat", "board"};
 
 std::uint64_t bhash(std::uint64_t a, std::uint64_t b, std::uint64_t c) {
     std::uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) ^
@@ -155,10 +288,21 @@ bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
 
     std::vector<std::string> verbs;
     if (!omen_verb.empty()) verbs.push_back(omen_verb);
+    // a mind stuck on a shore it cannot swim from (want_cross) plays with
+    // whatever FLOATS: try to bind light things together, try to get on them
+    const Belief* wc = mm->find_belief("want_cross");
+    const bool crossing = wc && wc->confidence >= 300 && (w.ruleset & World::kRulePrimordial);
+    if (crossing) {
+        if (omen_verb != "board") verbs.push_back("board");
+        if (omen_verb != "assemble") verbs.push_back("assemble");
+        cd = std::max<std::int64_t>(6, cd / 2);
+        cool(st, npc, kBabble, now, cd);
+    }
     {
         std::vector<std::string> unk;
         for (const char* v : kBabbleVerbs)
-            if (!mm->known_actions.count(v) && omen_verb != v) unk.emplace_back(v);
+            if (!mm->known_actions.count(v) && omen_verb != v &&
+                !(crossing && (std::string(v) == "board" || std::string(v) == "assemble"))) unk.emplace_back(v);
         if (!unk.empty()) {
             const std::size_t off = bhash(w.seed, npc, now) % unk.size();
             for (std::size_t i = 0; i < unk.size(); ++i)
@@ -171,6 +315,19 @@ bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
     const std::int64_t rr = dint(w, *me, dpid(w, "reach"), 64);
     struct T { EntityId id; std::int64_t d; bool hinted; };
     std::vector<T> near;
+    // light-as-water sense: material lighter than water (seen it float), or
+    // a made thing that already floats
+    std::int64_t water_d = 1000000;
+    const PropId dens_p = dpid(w, "density"), fc_p = dpid(w, "float_capacity");
+    if (const MaterialDef* wmd = w.materials.find_name("water"); wmd && dens_p != kNoProp)
+        if (auto it = wmd->props.find(dens_p); it != wmd->props.end() && it->second.i > 0) water_d = it->second.i;
+    auto floats = [&](EntityId kid, const AgentMind::MemorySnapshot& sn) {
+        if (const Entity* e = w.find(kid); e && fc_p != kNoProp && w.prop_int(*e, fc_p, 0) > 0) return true;
+        const MaterialDef* md = w.materials.find(sn.material);
+        if (!md || dens_p == kNoProp) return false;
+        const auto it = md->props.find(dens_p);
+        return it != md->props.end() && it->second.i > 0 && it->second.i < water_d;
+    };
     for (const auto& [kid, s] : mm->memory) {
         if (kid == npc) continue;
         // idle curiosity pokes at THINGS, not at living animals: harming a
@@ -180,7 +337,7 @@ bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
         if (w.find_mind(kid)) continue;
         const std::int64_t d = dist2(me->pos, s.pos);
         if (d > rr * rr) continue;
-        near.push_back({kid, d, omen_mat != kNoMaterial && s.material == omen_mat});
+        near.push_back({kid, d, (omen_mat != kNoMaterial && s.material == omen_mat) || (crossing && floats(kid, s))});
     }
     std::sort(near.begin(), near.end(), [](const T& a, const T& b) {
         if (a.hinted != b.hinted) return a.hinted;
@@ -194,8 +351,14 @@ bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
     for (const std::string& v : verbs) {
         std::vector<std::vector<EntityId>> tries;
         const bool pair = v == "assemble" || v == "combine";
+        if (pair && crossing && v == "assemble") {
+            // a raft wants several light members bound together
+            std::vector<EntityId> lot;
+            for (const T& t : near) if (t.hinted && lot.size() < 4) lot.push_back(t.id);
+            if (lot.size() >= 2) tries.push_back(lot);
+        }
         if (pair) {
-            for (std::size_t i = 0; i < near.size() && tries.size() < 3; ++i)
+            for (std::size_t i = 0; i < near.size() && tries.size() < 4; ++i)
                 for (std::size_t j = i + 1; j < near.size() && tries.size() < 3; ++j)
                     tries.push_back({near[i].id, near[j].id});
         } else {
@@ -204,12 +367,18 @@ bool babble_step(World& w, DriverState* st, EntityId npc, std::uint64_t now) {
         }
         for (const auto& tg : tries) {
             if (--budget < 0) break;
+            if (crossing && v == "disassemble" && tg.size() == 1) {   // never pull apart the hope of crossing
+                const auto ms = mm->memory.find(tg.front());
+                if (ms != mm->memory.end() && floats(tg.front(), ms->second)) continue;
+            }
             InteractionContext c = mk(npc, tg, v.c_str(), 1);
             c.parameters.force = 100000;
             if (!law_allows(w, c)) continue;
             if (w.interact(c).completed) {
                 if (!omen_key.empty() && v == omen_verb)
                     w.mind(npc).beliefs.erase(omen_key);   // the omen came true
+                if (crossing && v == "board")               // afloat: the wish is answered
+                    w.mind(npc).beliefs.erase("want_cross");
                 return true;
             }
         }
@@ -262,9 +431,11 @@ bool patron_sign_step(World& w, DriverState* st, EntityId npc, std::uint64_t now
     const std::int64_t d2 = dist2(me->pos, tgt);
     if (!site && d2 <= 96 * 96) { w.mind(npc).beliefs.erase(key); return false; }   // arrived
     if (d2 > (r + rr) * (r + rr) || (!site && d2 > 96 * 96)) {
-        InteractionContext mc = mk(npc, {}, "move", 1);
+        InteractionContext mc = mk(npc, {}, "move", move_stride(st));
         mc.parameters.destination = tgt; mc.parameters.has_destination = true;
-        if (w.interact(mc).completed) return true;
+        bool by_water = false;
+        if (drive_move(w, st, npc, mc, false, &by_water)) return true;
+        if (by_water) return false;          // not unreachable: it needs a craft (want_cross)
         // unreachable (water/cliff): the sign fades
         AgentMind& m = w.mind(npc);
         if (auto it = m.beliefs.find(key); it != m.beliefs.end() && (it->second.confidence -= 100) <= 0)
@@ -537,67 +708,44 @@ const std::vector<const char*>& curiosity_verbs() {
     return v;
 }
 
-void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
-    const std::uint64_t now = w.clock_.tick();
-    const bool concurrent = st && st->concurrent;
-    if (concurrent) { w.defer_time = true; w.deferred_dt = 0; }
-    if (st) ++st->cycles;
-    if (tally) ++tally->cycles;
+namespace {
 
-    // Agency bootstrap: a living genome-carrier with no mind becomes an
-    // agent once a minded agent can perceive it (sight_range World Truth).
-    // Its mind starts EMPTY — knowledge must still be learned socially or
-    // through its own experiments. This is the honest version of "growing
-    // up": you exist as biomass first, personhood is acquired by contact.
-    // No population cap — minds grow only as fast as nearby carriers are
-    // perceived, and births are already throttled by parental energy cost.
-    {
-        // spatial promotion: for each minded agent, only nearby candidates —
-        // O(minds x local density), not O(entities x minds) per cycle.
-        // Candidate-centric: collect the (usually few) unminded carriers
-        // first; no candidates -> no work. A candidate is promoted iff some
-        // living minded agent has it within that agent's own sight_range.
-        const PropId sight = dpid(w, "sight_range");
-        std::vector<EntityId> cands;
-        for (const auto& ep : w.entities)
-            if (ep->alive && !ep->genome.loci.empty() && !w.find_mind(ep->id))
-                cands.push_back(ep->id);
-        if (!cands.empty() && sight != kNoProp) {
-            const std::vector<EntityId> minded = w.minded_entities();
-            for (EntityId cid : cands) {
-                const Entity* ce = w.find(cid);
-                if (!ce) continue;
-                for (EntityId mid : minded) {
-                    const Entity* a = w.find(mid);
-                    if (!a || !a->alive || mid == cid) continue;
-                    const std::int64_t sr = w.prop_int(*a, sight, 0);
-                    if (sr > 0 && dist2(a->pos, ce->pos) <= sr * sr) {
-                        w.mind(cid);                            // empty AgentMind
-                        break;
-                    }
-                }
-            }
-        }
+
+// activity_phase gate shared with World::range_drift: 0 any, 1 diurnal,
+// 2 nocturnal, 3 crepuscular — the tick IS the hour (1 tick = 1 hour).
+bool phase_active(std::int64_t phase, std::int64_t hour) {
+    switch (phase) {
+        case 1: return hour >= 6 && hour < 18;
+        case 2: return hour >= 18 || hour < 6;
+        case 3: return (hour >= 5 && hour < 8) ||
+                       (hour >= 17 && hour < 20);
+        default: return true;
     }
+}
 
-    const std::vector<EntityId> agents = w.minded_entities();   // sorted ids
-    int discover_budget = kDiscoverPerCycle;   // deterministic: sorted order
-    // Primordial fairness (curiosity mode only): founders are created after
-    // worldgen, so their ids sort AFTER every promoted animal and a plain
-    // first-come budget would starve them of discovery forever. In curiosity
-    // mode the discover budget is a deterministic round-robin instead:
-    // agent #i may plan when (i + cycle) % stride == 0, and urgent
-    // hunger/thirst always may (survival reasoning never queues).
-    const std::size_t rr_stride = std::max<std::size_t>(
-        1, (agents.size() + kDiscoverPerCycle - 1) / kDiscoverPerCycle);
-    std::size_t agent_idx = 0;
-    for (EntityId npc : agents) {
-        const std::size_t my_idx = agent_idx++;
+// species with instinct verbs (data: `innate`) = cultural people
+bool cultural_kind(const World& w, const Entity& e) {
+    const SpeciesDef* sp = w.species.find_name(e.kind_name.str());
+    return sp && !sp->innate.empty();
+}
+
+// One agent's share of an autonomous round — the old autonomous_cycle
+// agent-loop body, verbatim. A do/while(false) wrapper keeps the original
+// `continue` statements working: at this level they mean "next agent",
+// which here is just "return". (`break`/`continue` inside nested loops
+// still bind to those loops.)
+void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
+                     EntityId npc, std::size_t my_idx, std::size_t rr_stride,
+                     int& discover_budget, std::uint64_t now) {
         Entity* me = w.find(npc);
-        if (!me || !me->alive) continue;
+        if (!me || !me->alive) return;
+        do {
 
-        // 1. perception
-        const std::size_t nobs = perceive(w, npc);
+        // 1. perception — game mode: beasts look around every 4th round
+        // (staggered by id); people every round
+        const bool look = !(st && st->curiosity) || cultural_kind(w, *me) ||
+                          (my_idx + static_cast<std::size_t>(st->cycles)) % 4 == 0;
+        const std::size_t nobs = look ? perceive(w, npc) : 0;
         if (tally) tally->perceived += static_cast<std::int64_t>(nobs);
 
         // 1b. lazy worldgen: materialize entity stages around the agent when
@@ -650,12 +798,125 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
             const Vec2 fd = forage_dest(w, npc);
             if (fd.x != 0 || fd.y != 0) {
                 cool(st, npc, kWield, now, 8);
-                InteractionContext fc = mk(npc, {}, "move", 1);
+                InteractionContext fc = mk(npc, {}, "move", move_stride(st));
                 fc.parameters.destination = fd;
                 fc.parameters.has_destination = true;
-                if (w.interact(fc).completed) {
+                if (drive_move(w, st, npc, fc)) {
                     if (tally) ++tally->moves;
                     continue;
+                }
+            }
+        }
+
+        // 3a. hunt reflex — a carnivore (prey_tier_max > 0, pure species
+        // data) tracks remembered game by scent and sight. Live prey is
+        // approached, then struck: the consume law refuses awake animals,
+        // so the kill is physical damage, not a menu choice. Anything
+        // edible-tier already in reach goes down directly — a carcass or
+        // an unconscious animal needs no second blow. fire_fear suppresses
+        // the hunt while panic runs hot; activity_phase gates it to the
+        // animal's declared hours. Every act still flows through interact.
+        if (cooled(st, npc, kConsume, now)) {
+            // hunting is driven by hunger like any other meal — a sated
+            // predator lets game live (trophic cascades need that slack).
+            const bool hungry =
+                dint(w, *me, hunger, 0) > 400 || dint(w, *me, thirst, 0) > 400;
+            const std::int64_t ptm = hungry
+                ? dint(w, *me, dpid(w, "prey_tier_max"), 0) : 0;
+            if (ptm > 0) {
+                const AgentMind* mm = w.find_mind(npc);
+                const std::int64_t phase =
+                    dint(w, *me, dpid(w, "activity_phase"), 0);
+                const std::int64_t ffear =
+                    dint(w, *me, dpid(w, "fire_fear"), 0);
+                const bool fearful = ffear > 0 && mm &&
+                    mm->neuro.panic * 2 > ffear;
+                if (mm && !fearful &&
+                    phase_active(phase, static_cast<std::int64_t>(now % 24))) {
+                    const std::int64_t mytier =
+                        dint(w, *me, dpid(w, "trophic_tier"), 0);
+                    const PropId tier_pid = dpid(w, "trophic_tier");
+                    const std::int64_t rr = dint(w, *me_c, reach, 64);
+                    const std::int64_t sense = std::max<std::int64_t>(
+                        dint(w, *me, dpid(w, "hunt_range"), 0),
+                        dint(w, *me, dpid(w, "scent_radius"), 0));
+                    const std::int64_t r2 = rr * rr;
+                    const std::int64_t s2 = sense * sense;
+                    const MindParams mp = mind_params(w, *me);
+                    const std::int64_t blur = mp.detail_blur_threshold;
+                    struct Prey { EntityId id; std::int64_t d; bool near; };
+                    std::vector<Prey> prey;
+                    for (const auto& [kid, s] : mm->memory) {
+                        if (kid == npc) continue;
+                        if (s.kind_name == me->kind_name.str()) continue;
+                        // the prey's tier is an observable prop, so it
+                        // survives in the mind's memory snapshot.
+                        std::int64_t t = 0;
+                        if (tier_pid != kNoProp) {
+                            const auto it = s.props.find(tier_pid);
+                            if (it != s.props.end() &&
+                                it->second.type == ValType::Integer)
+                                t = it->second.i;
+                        }
+                        if (t < 1 || t > ptm || t >= mytier) continue;
+                        const Vec2 rp = recalled_pos(s, kid, w.seed, blur);
+                        const std::int64_t d = dist2(me->pos, rp);
+                        if (d > s2) continue;
+                        prey.push_back({kid, d, d <= r2});
+                    }
+                    std::sort(prey.begin(), prey.end(),
+                              [](const Prey& a, const Prey& b) {
+                                  if (a.near != b.near) return a.near;
+                                  if (a.d != b.d) return a.d < b.d;
+                                  return a.id < b.id;
+                              });
+                    if (!prey.empty()) {
+                        const Prey& p0 = prey.front();
+                        if (p0.near) {
+                            // hunt cadence is shorter than meal pacing: a
+                            // predator works a wounded animal down over
+                            // several bites; only a completed meal re-arms
+                            // the full consume cooldown.
+                            cool(st, npc, kConsume, now, 48);
+                            if (w.interact(mk(npc, {p0.id}, "consume", 2))
+                                    .completed) {
+                                cool(st, npc, kConsume, now,
+                                     kCooldown[kConsume]);
+                                if (tally) ++tally->maintenance;
+                                continue;
+                            }
+                            // still awake and resisting: put it down —
+                            // "impact" (not the mining "strike") so the blow
+                            // routes through anatomy: claws bleed, fangs
+                            // carry natural_toxin into the wound.
+                            InteractionContext kc =
+                                mk(npc, {p0.id}, "impact");
+                            // Phase 19: a proven trajectory law replaces
+                            // the species' instinctive effort guess with
+                            // the measured hardness permille.
+                            const std::int64_t qf =
+                                (mm ? qlaw_param(*mm, "trajectory") : -1);
+                            kc.parameters.force = qf > 0
+                                ? qf * dint(w, *me, dpid(w, "natural_force"), 100) / 100
+                                : dint(w, *me, dpid(w, "natural_force"), 40);
+                            if (w.interact(kc).completed) {
+                                if (tally) ++tally->maintenance;
+                                continue;
+                            }
+                        } else {
+                            // scent contact: close on the remembered game
+                            cool(st, npc, kWield, now, 8);
+                            InteractionContext hc =
+                                mk(npc, {}, "move", move_stride(st));
+                            hc.parameters.destination = recalled_pos(
+                                mm->memory.at(p0.id), p0.id, w.seed, blur);
+                            hc.parameters.has_destination = true;
+                            if (drive_move(w, st, npc, hc)) {
+                                if (tally) ++tally->moves;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -778,13 +1039,15 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
                             }
                         }
                         rc.parameters.action = "move";
+                        rc.parameters.ticks = move_stride(st);   // flee stride matches locomotion
                         rc.parameters.destination = {me->pos.x + away.x,
                                                      me->pos.y + away.y};
                         rc.parameters.has_destination = true;
                     } else {
                         rc.parameters.action = "rest";   // grief: curl up
                     }
-                    w.interact(rc);
+                    if (rc.parameters.action == "move") drive_move(w, st, npc, rc, /*panic=*/true);
+                    else w.interact(rc);
                     continue;                    // reflex consumed the cycle
                 }
             }
@@ -848,10 +1111,19 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
                 continue;
             }
         }
+        // afloat with a far shore in mind: paddle (game mode)
+        if (sail_step(w, st, npc)) { if (tally) ++tally->moves; continue; }
         // patron signs (beacon / building site) — only when not in need
         if (st && st->curiosity && !walking_pending &&
             dint(w, *me, hunger, 0) <= 600 && dint(w, *me, dpid(w, "thirst"), 0) <= 600 &&
             patron_sign_step(w, st, npc, now)) {
+            if (tally) ++tally->moves;
+            continue;
+        }
+        // Phase 19: proven quantitative laws tune action parameters —
+        // load the craft to its measured safe limit, strike at the
+        // measured hardness. Belief-side only; laws stay World Truth.
+        if (quantum_step(w, st, npc, now)) {
             if (tally) ++tally->moves;
             continue;
         }
@@ -903,10 +1175,10 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
                 st->pending[npc] = pe;
             }
             cool(st, npc, kWield, now, 8);        // don't re-tool mid-stride
-            InteractionContext mc = mk(npc, {}, "move", 1);
+            InteractionContext mc = mk(npc, {}, "move", move_stride(st));
             mc.parameters.destination = goal.target;
             mc.parameters.has_destination = true;
-            if (w.interact(mc).completed) {
+            if (drive_move(w, st, npc, mc)) {
                 if (tally) ++tally->moves;
                 continue;
             }
@@ -1023,16 +1295,125 @@ void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
             }
         }
 
+        } while (false);
+}
+
+// ---- sliced round driver ---------------------------------------------------
+// autonomous_cycle_step() runs the SAME round as autonomous_cycle — same
+// agent order, same budgets, same interact() sequence — but returns to the
+// caller after ~max_ms of wall-clock so the viewer's UI thread can take the
+// world lock between batches. Resume state lives in DriverCycleSlice.
+static bool cycle_step(World& w, DriverState* st, DriverTally* tally,
+                       double max_ms, DriverCycleSlice& sl) {
+    if (!sl.open) {
+        const std::uint64_t now = w.clock_.tick();
+        const bool concurrent = st && st->concurrent;
+        if (concurrent) { w.defer_time = true; w.deferred_dt = 0; }
+        if (st) w.brain_shadow = st->brain_shadow;   // CL-1 shadow mode
+        if (st) ++st->cycles;
+        if (tally) ++tally->cycles;
+
+        // Agency bootstrap: a living genome-carrier with no mind becomes an
+        // agent once a minded agent can perceive it (sight_range World Truth).
+        // Its mind starts EMPTY — knowledge must still be learned socially or
+        // through its own experiments. This is the honest version of "growing
+        // up": you exist as biomass first, personhood is acquired by contact.
+        // No population cap — minds grow only as fast as nearby carriers are
+        // perceived, and births are already throttled by parental energy cost.
+        {
+            // spatial promotion: for each minded agent, only nearby candidates —
+            // O(minds x local density), not O(entities x minds) per cycle.
+            // Candidate-centric: collect the (usually few) unminded carriers
+            // first; no candidates -> no work. A candidate is promoted iff some
+            // living minded agent has it within that agent's own sight_range.
+            const PropId sight = dpid(w, "sight_range");
+            std::vector<EntityId> cands;
+            const bool game = st && st->curiosity;
+            for (const auto& ep : w.entities)
+                if (ep->alive && !ep->genome.loci.empty() && !w.find_mind(ep->id)) {
+                    if (game) {           // game mode: plants never become minds
+                        const SpeciesDef* sp = w.species.find_name(ep->kind_name.str());
+                        if (!sp || !sp->fauna || sp->anatomy.empty()) continue;   // and no mindless swarms
+                    }
+                    cands.push_back(ep->id);
+                }
+            if (!cands.empty() && sight != kNoProp) {
+                std::vector<EntityId> minded = w.minded_entities();
+                // game mode (curiosity): only CULTURAL minds (species with
+                // innate verbs) awaken others — otherwise every awakened
+                // beast awakens the next and the whole region cascades into
+                // thousands of minds (rounds of tens of seconds on a planet).
+                if (st && st->curiosity)
+                    minded.erase(std::remove_if(minded.begin(), minded.end(),
+                        [&](EntityId id) { const Entity* a = w.find(id); return !a || !cultural_kind(w, *a); }),
+                        minded.end());
+                for (EntityId cid : cands) {
+                    const Entity* ce = w.find(cid);
+                    if (!ce) continue;
+                    for (EntityId mid : minded) {
+                        const Entity* a = w.find(mid);
+                        if (!a || !a->alive || mid == cid) continue;
+                        const std::int64_t sr = w.prop_int(*a, sight, 0);
+                        if (sr > 0 && dist2(a->pos, ce->pos) <= sr * sr) {
+                            w.mind(cid);                        // empty AgentMind
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        sl.agents = w.minded_entities();                    // sorted ids
+        sl.budget = kDiscoverPerCycle;                      // deterministic order
+        // Primordial fairness (curiosity mode only): founders are created after
+        // worldgen, so their ids sort AFTER every promoted animal and a plain
+        // first-come budget would starve them of discovery forever. In curiosity
+        // mode the discover budget is a deterministic round-robin instead:
+        // agent #i may plan when (i + cycle) % stride == 0, and urgent
+        // hunger/thirst always may (survival reasoning never queues).
+        sl.stride = std::max<std::size_t>(
+            1, (sl.agents.size() + kDiscoverPerCycle - 1) / kDiscoverPerCycle);
+        sl.now = now;
+        sl.concurrent = concurrent;
+        sl.pos = 0;
+        sl.open = true;
     }
-    if (concurrent) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (sl.pos < sl.agents.size()) {
+        cycle_one_agent(w, st, tally, sl.agents[sl.pos], sl.pos,
+                        sl.stride, sl.budget, sl.now);
+        ++sl.pos;
+        if (std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count() >= max_ms)
+            break;
+    }
+    if (sl.pos < sl.agents.size()) return false;
+    if (sl.concurrent) {
         // the round lasted as long as its longest action (>= 1 tick)
         w.defer_time = false;
         const std::int64_t dt = std::max<std::int64_t>(1, w.deferred_dt);
         w.deferred_dt = 0;
         w.advance_ticks_for_test(dt);
-        return;
+    } else {
+        w.advance_ticks_for_test(1);  // ambient drift: needs, heat, clock
     }
-    w.advance_ticks_for_test(1);  // ambient drift: needs, heat, clock
+    sl.open = false;
+    sl.agents.clear();
+    sl.pos = 0;
+    sl.budget = 0;
+    return true;
+}
+}  // namespace
+
+void autonomous_cycle(World& w, DriverState* st, DriverTally* tally) {
+    DriverCycleSlice sl;
+    while (!cycle_step(w, st, tally, 1e18, sl)) {}
+}
+
+bool autonomous_cycle_step(World& w, DriverState* st, DriverTally* tally,
+                           double max_ms) {
+    if (!st) { autonomous_cycle(w, nullptr, tally); return true; }
+    return cycle_step(w, st, tally, max_ms, st->slice);
 }
 
 // Telemetry for long capstone runs: every 300 cycles print RSS + census so

@@ -327,6 +327,20 @@ std::size_t perceive(World& w, EntityId npc);
 // (d) yield beliefs for every entity the event spawned.
 void learn_from_event(World& w, EntityId npc, std::uint64_t event_id);
 
+// Phase 19 — emergent mathematics & quantitative laws (agent knowledge
+// only; never World Truth). Each language_id hashes to a base in
+// {8,10,12,20} and a glyph style; math_render writes a value positionally
+// with indigenous glyphs — never an Arabic digit.
+std::int64_t math_base_of(std::int64_t lang, std::uint64_t seed);
+std::string math_render(std::int64_t lang, std::int64_t value,
+                        std::uint64_t seed);
+// Treatise payload: "M|tier|conf" / "P|domain|conf" / "Q|domain|param|conf"
+// lines appended to an inscription's text; the read parser imports them
+// as halved-confidence claims.
+std::string quantum_tables(const AgentMind& mind);
+// Planner lookup: proven parameter of `qlaw:<domain>:p<v>`, or -1.
+std::int64_t qlaw_param(const AgentMind& mind, const char* domain);
+
 // Witness learning (TODO §10.1/§12.4 boundary): an agent that could see the
 // event learns the verb and WEAK outcome/yield evidence (self=false). The
 // world does not care who watched — only that knowledge has a source.

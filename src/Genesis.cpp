@@ -83,45 +83,9 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
     g.origin_x = ox; g.origin_y = oy;
     g.max_trees = 1 << 24;
     g.skip_species = {pp.founder_species};
+    g.defer_entities = pp.planet;
     WorldGenerator().generate(w, g);
     w.ruleset |= World::kRulePrimordial;
-
-    // living water: shoreline cells of rivers/lakes expose drinkable water
-    // as `water`-material stock entities (flowing: flow_rate 1000 -> never
-    // stagnates). This is terrain made graspable, not culture.
-    if (const MaterialDef* wm = w.materials.find_name("water")) {
-        const PropertyDef* qd = w.props.find_name("quantity");
-        const PropertyDef* fd = w.props.find_name("flow_rate");
-        const TerrainGrid& t = w.terrain;
-        for (int gy = t.oy; gy < t.oy + t.h; ++gy)
-            for (int gx = t.ox; gx < t.ox + t.w; ++gx) {
-                const Vec2 c = t.cell_center(gx, gy);
-                if (!t.is_water(c)) continue;
-                bool shore = false;
-                for (const auto& d : {std::pair{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
-                    const Vec2 q = t.cell_center(gx + d.first, gy + d.second);
-                    if (t.contains(q) && !t.is_water(q)) { shore = true; break; }
-                }
-                if (!shore || ghash(pp.seed, gx * 7919 + gy, 0x3A7Eu) % 3 != 0) continue;
-                PropertyBag pb;
-                if (qd) pb.set(qd->id, Value::integer(1000000));
-                if (fd) pb.set(fd->id, Value::integer(1000));
-                w.create_entity("water", wm->id, c, pb);
-            }
-    }
-
-    const SpeciesDef* sp = w.species.find_name(pp.founder_species);
-    if (!sp) return out;
-    auto pid = [&](const char* n) {
-        const PropertyDef* d = w.props.find_name(n);
-        return d ? d->id : kNoProp;
-    };
-    const PropId p_lang = pid("language_id"), p_age = pid("age"),
-                 p_adult = pid("adult_age");
-    // personality axes: heritable variation so curiosity, caution and
-    // drive differ between founders (and between their descendants).
-    const char* kAxes[] = {"mind_abstraction_gain", "mind_threat_gain",
-                           "mind_reward_gain", "mind_empathy_gain"};
 
     // band anchors. Valley: a ring around the centre, far apart. Planet:
     // spread east-west along the warm belt (each on its own continent if
@@ -144,6 +108,65 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
         out.tribe_lang.push_back(
             static_cast<std::int64_t>(100 + (ghash(pp.seed, t, 0x1A47u) % 900) * 4 + t));
     }
+
+    if (pp.planet) {
+        // Smart Ecological Density: spawn full ecological density only in Active Chunks
+        // around each tribe's home camp. Wilderness chunks wake on demand via wake_chunk().
+        WorldGenParams ga = g;
+        ga.defer_entities = false;
+        const int cell_sz = w.terrain.cell;
+        for (const Vec2& h : out.homes) {
+            const int hcx = TerrainGrid::cell_of(h.x, cell_sz);
+            const int hcy = TerrainGrid::cell_of(h.y, cell_sz);
+            const int r = 24;
+            const int x0 = std::max(ox, hcx - r), x1 = std::min(ox + gw, hcx + r);
+            const int y0 = std::max(oy, hcy - r), y1 = std::min(oy + gh, hcy + r);
+            WorldGenerator().generate_region(w, ga, x0, y0, x1 - x0, y1 - y0);
+        }
+    }
+
+    // living water: shoreline cells of rivers/lakes expose drinkable water
+    // as `water`-material stock entities (flowing: flow_rate 1000 -> never
+    // stagnates). This is terrain made graspable, not culture.
+    if (const MaterialDef* wm = w.materials.find_name("water")) {
+        const PropertyDef* qd = w.props.find_name("quantity");
+        const PropertyDef* fd = w.props.find_name("flow_rate");
+        const TerrainGrid& t = w.terrain;
+        for (int gy = t.oy; gy < t.oy + t.h; ++gy)
+            for (int gx = t.ox; gx < t.ox + t.w; ++gx) {
+                const Vec2 c = t.cell_center(gx, gy);
+                if (!t.is_water(c)) continue;
+                if (pp.planet) {
+                    bool near_home = false;
+                    for (const Vec2& h : out.homes) {
+                        const std::int64_t dx = c.x - h.x, dy = c.y - h.y;
+                        if (dx * dx + dy * dy <= 28 * 28 * t.cell * t.cell) { near_home = true; break; }
+                    }
+                    if (!near_home) continue;
+                }
+                bool shore = false;
+                for (const auto& d : {std::pair{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                    const Vec2 q = t.cell_center(gx + d.first, gy + d.second);
+                    if (t.contains(q) && !t.is_water(q)) { shore = true; break; }
+                }
+                if (!shore || ghash(pp.seed, gx * 7919 + gy, 0x3A7Eu) % 3 != 0) continue;
+                PropertyBag pb;
+                if (qd) pb.set(qd->id, Value::integer(1000000));
+                if (fd) pb.set(fd->id, Value::integer(1000));
+                w.create_entity("water", wm->id, c, pb);
+            }
+    }
+
+    const SpeciesDef* sp = w.species.find_name(pp.founder_species);
+    if (!sp) return out;
+    auto pid = [&](const char* n) {
+        const PropertyDef* d = w.props.find_name(n);
+        return d ? d->id : kNoProp;
+    };
+    const PropId p_lang = pid("language_id"), p_age = pid("age"),
+                 p_adult = pid("adult_age");
+    const char* kAxes[] = {"mind_abstraction_gain", "mind_threat_gain",
+                           "mind_reward_gain", "mind_empathy_gain"};
 
     std::int64_t adult = 250;
     if (p_adult != kNoProp)
@@ -200,6 +223,30 @@ std::size_t primordial_violations(const World& w) {
         for (EntityId id : w.entities_of_kind(KindName(k)))
             if (const Entity* e = w.find(id); e && e->alive) ++n;
     return n;
+}
+
+void wake_chunk(World& w, Vec2 pos, int chunk_r) {
+    if (w.terrain.empty() || !(w.ruleset & World::kRulePrimordial)) return;
+    const int cell = w.terrain.cell;
+    const int cx = TerrainGrid::cell_of(pos.x, cell);
+    const int cy = TerrainGrid::cell_of(pos.y, cell);
+    const int x0 = ((cx - w.terrain.ox) / chunk_r) * chunk_r + w.terrain.ox;
+    const int y0 = ((cy - w.terrain.oy) / chunk_r) * chunk_r + w.terrain.oy;
+    const int x1 = std::min(w.terrain.ox + w.terrain.w, x0 + chunk_r);
+    const int y1 = std::min(w.terrain.oy + w.terrain.h, y0 + chunk_r);
+    if (x0 < w.terrain.ox || y0 < w.terrain.oy || x1 <= x0 || y1 <= y0) return;
+    if (w.gen_cells_.count({x0, y0})) return;
+    WorldGenParams p;
+    p.seed = w.world_seed;
+    p.sea_level = w.gen_sea_level;
+    p.origin_x = w.terrain.ox;
+    p.origin_y = w.terrain.oy;
+    p.grid_w = w.terrain.w;
+    p.grid_h = w.terrain.h;
+    p.max_trees = 1 << 20;
+    p.defer_entities = false;
+    p.skip_species = {"sapient"};
+    WorldGenerator().generate_region(w, p, x0, y0, x1 - x0, y1 - y0);
 }
 
 }  // namespace simlab

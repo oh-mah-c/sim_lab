@@ -19,7 +19,10 @@
 #include "simlab/Discovery.hpp"
 #include "simlab/Driver.hpp"
 #include "simlab/Genesis.hpp"
+#include "../src/LawUtil.hpp"
 #include "simlab/Chronicle.hpp"
+#include "simlab/Brain.hpp"
+#include <chrono>
 
 using namespace simlab;
 
@@ -8863,7 +8866,10 @@ static void test_primordial_genesis_true_playable() {
                 bool via_event = false;
                 for (EventId i = e0; i < w.ledger.next_id(); ++i)
                     if (const CausalEvent* ev = w.ledger.find(i);
-                        ev && !ev->failed && ev->action == verb) via_event = true;
+                        ev && !ev->failed && (ev->action == verb ||          // tried it / saw it done
+                            (ev->action == "communicate" &&                 // or was taught it
+                             std::find(ev->participants.begin(), ev->participants.end(), av) != ev->participants.end())))
+                        via_event = true;
                 CHECK(via_event);
             }
         }
@@ -8968,13 +8974,882 @@ static void test_patron_journal_planet_and_beacons() {
         AgentMind& m = w.mind(scout);
         m.belief("beacon:" + std::to_string(goal.x) + ":" + std::to_string(goal.y)).confidence = 800;
         tseti(*se, w, "hunger", 0); tseti(*se, w, "thirst", 0);
+        // a rested, unhurt scout: denser Phase-18 fauna means the first
+        // living founder may have bled energy/fatigue/integrity to danger
+        // during the 30-cycle warm-up — top those up so the beacon (not
+        // exhaustion) is what the check measures.
+        tseti(*se, w, "energy", 20000); tseti(*se, w, "fatigue", 0);
+        tseti(*se, w, "integrity", 1000);
         m.neuro.panic = m.neuro.rage = m.neuro.grief = 0;
+        m.beliefs.erase("peril:deep_water");   // no learned hydrophobia either
         autonomous_run(w, 6, &st);
         const Entity* se2 = w.find(scout);
         const AgentMind* m2 = w.find_mind(scout);
         const bool kept = m2 && m2->beliefs.count("beacon:" + std::to_string(goal.x) + ":" + std::to_string(goal.y));
         std::printf("  beacon: d0=%lld d1=%lld kept=%d\n", (long long)d0, se2 ? (long long)dist2(se2->pos, goal) : -1LL, int(kept));
         CHECK(se2 && (dist2(se2->pos, goal) < d0 || !kept));
+    }
+}
+
+// Maritime causality (Primordial ruleset): depth & swell, swimming strokes,
+// drowning, learned fear, the shore sense, and rafts/hulls whose buoyancy and
+// swell rating emerge from real material densities / waterproofing.
+static World maritime_world(std::uint64_t seed, int sea_cols, std::int32_t sea_elev) {
+    World w(seed, "data");
+    w.ruleset |= World::kRulePrimordial;
+    TerrainGrid& t = w.terrain;
+    t.w = 20 + sea_cols; t.h = 12; t.cell = 16; t.ox = 0; t.oy = 0;
+    const std::size_t n = std::size_t(t.w) * t.h;
+    t.elevation.assign(n, 300); t.moisture.assign(n, 500); t.temperature.assign(n, 300);
+    t.water.assign(n, 0); t.vegetation.assign(n, 300); t.slope.assign(n, 0);
+    t.wind_x.assign(n, 0); t.wind_y.assign(n, 0); t.water_table.assign(n, 5); t.traffic_wear.assign(n, 0);
+    for (int y = 0; y < t.h; ++y)
+        for (int x = 10; x < 10 + sea_cols; ++x) {
+            t.elevation[std::size_t(y) * t.w + x] = sea_elev;
+            t.water[std::size_t(y) * t.w + x] = 1;
+        }
+    for (int y = 0; y < t.h; ++y)                          // hand-built: never lazily regenerated
+        for (int x = 0; x < t.w; ++x) w.gen_cells_.insert({x, y});
+    return w;
+}
+static EntityId mk_sapient(World& w, Vec2 pos, bool minded = true) {
+    const SpeciesDef* sp = w.species.find_name("sapient");
+    PropertyBag pb = sp ? sp->props : PropertyBag{};
+    pb.set(tpid(w, "energy"), Value::integer(100000));
+    pb.set(tpid(w, "fatigue"), Value::integer(100));
+    pb.set(tpid(w, "integrity"), Value::integer(1000));
+    const EntityId id = w.create_entity("sapient", sp ? sp->material : kNoMaterial, pos, pb);
+    if (minded) w.mind(id);
+    return id;
+}
+static InteractionContext mk_move(EntityId a, Vec2 to, bool swim) {
+    InteractionContext c; c.actor = a; c.parameters.action = "move"; c.parameters.ticks = 4;
+    c.parameters.destination = to; c.parameters.has_destination = true;
+    if (swim) c.parameters.note = "swim";
+    return c;
+}
+
+static void test_maritime_swimming_drowning_and_watercraft() {
+    using namespace simlab::lawutil;
+    // ---- legacy worlds: water stays a hard edge (byte-identical behaviour) --
+    {
+        World w = maritime_world(31, 6, 100);
+        w.ruleset = 0;
+        const EntityId a = mk_sapient(w, {9 * 16 + 8, 6 * 16 + 8});
+        for (int i = 0; i < 6; ++i) w.interact(mk_move(a, {30 * 16, 6 * 16 + 8}, true));
+        const Vec2 lp = w.find(a)->pos;                    // (it may skirt off the grid edge)
+        CHECK(!(w.terrain.contains(lp) && w.terrain.is_water(lp)));
+    }
+    // ---- depth & swell ---------------------------------------------------------
+    World w = maritime_world(32, 4, 100);                 // 4-cell strait, 100 m deep
+    CHECK(water_depth(w, {5 * 16, 5 * 16}) == 0);
+    CHECK(water_depth(w, {11 * 16, 5 * 16}) == 100);
+    CHECK(wave_at(w, {11 * 16, 5 * 16}) == 300);
+    // ---- a swimmer crosses a narrow strait, tiring and learning ---------------
+    const EntityId sw = mk_sapient(w, {9 * 16 + 12, 6 * 16 + 8});
+    const PropId fat = tpid(w, "fatigue"), skill = tpid(w, "swim_skill"), integ = tpid(w, "integrity");
+    int strokes = 0;
+    for (int i = 0; i < 12 && !(w.find(sw)->pos.x > 14 * 16); ++i)
+        if (w.interact(mk_move(sw, {16 * 16, 6 * 16 + 8}, true)).completed) ++strokes;
+    const Entity* swe = w.find(sw);
+    std::printf("  swim: strokes=%d fatigue=%lld skill=%lld x=%d\n", strokes, (long long)w.prop_int(*swe, fat, 0),
+                (long long)w.prop_int(*swe, skill, 0), swe->pos.x);
+    CHECK(swe->alive && swe->pos.x > 14 * 16);              // reached the far shore
+    CHECK(w.prop_int(*swe, fat, 0) > 100);                  // it cost strength
+    CHECK(w.prop_int(*swe, skill, 0) > 0);                  // and taught a little
+    // without the intent to swim, the law keeps a walker out of deep water
+    const EntityId walker = mk_sapient(w, {9 * 16 + 12, 3 * 16 + 8});
+    for (int i = 0; i < 4; ++i) w.interact(mk_move(walker, {16 * 16, 3 * 16 + 8}, false));
+    CHECK(!w.terrain.is_water(w.find(walker)->pos));
+    // ---- exhaustion in deep water drowns; a witness learns fear ----------------
+    {
+        World d = maritime_world(33, 20, 60);              // open water
+        const EntityId v = mk_sapient(d, {15 * 16, 6 * 16 + 8});           // already in the sea
+        const EntityId wit = mk_sapient(d, {9 * 16, 6 * 16 + 8});          // on the beach, watching
+        tseti(*d.find(v), d, "fatigue", 990);
+        for (int i = 0; i < 8 && d.find(v)->alive; ++i) d.interact(mk_move(v, {30 * 16, 6 * 16 + 8}, true));
+        CHECK(!d.find(v)->alive);
+        const AgentMind* wm = d.find_mind(wit);
+        const Belief* fear = wm ? wm->find_belief("peril:deep_water") : nullptr;
+        std::printf("  drowning: victim dead=%d witness fear=%lld\n", int(!d.find(v)->alive), fear ? (long long)fear->confidence : -1LL);
+        CHECK(fear && fear->confidence >= 300);
+    }
+    // ---- shore sense: a mind does not swim a crossing it cannot finish ----------
+    {
+        World d = maritime_world(34, 40, 60);              // 40 cells of deep water
+        const EntityId a = mk_sapient(d, {9 * 16 + 8, 6 * 16 + 8});
+        d.mind(a).belief("beacon:" + std::to_string(55 * 16) + ":" + std::to_string(6 * 16 + 8)).confidence = 900;
+        DriverState st; st.curiosity = true; st.concurrent = true;
+        for (int c = 0; c < 25; ++c) autonomous_cycle(d, &st);
+        const Entity* ae = d.find(a);
+        const Belief* wc = d.find_mind(a)->find_belief("want_cross");
+        std::printf("  shore sense: alive=%d in_water=%d want_cross=%lld\n", int(ae->alive),
+                    int(d.terrain.is_water(ae->pos)), wc ? (long long)wc->confidence : -1LL);
+        CHECK(ae->alive && !d.terrain.is_water(ae->pos));
+        CHECK(wc && wc->confidence > 0);
+    }
+    // ---- raft vs sealed hull: buoyancy & swell rating from materials -------------
+    {
+        World d = maritime_world(35, 10, 160);             // 40 m coastal water, swell 120
+        const EntityId a = mk_sapient(d, {9 * 16 + 4, 6 * 16 + 8});
+        const MaterialDef* wood = d.materials.find_name("dry_wood");
+        const MaterialDef* hide = d.materials.find_name("cured_hide");
+        CHECK(wood && hide);
+        auto part = [&](MaterialId m) { return d.create_entity("piece", m, {9 * 16 + 6, 6 * 16 + 8}, PropertyBag{}); };
+        InteractionContext as; as.actor = a; as.parameters.action = "assemble"; as.parameters.force = 100000; as.parameters.ticks = 1;
+        as.targets = {part(wood->id), part(wood->id), part(wood->id), part(wood->id)};
+        const InteractionResult rr = d.interact(as);
+        CHECK(rr.completed && !rr.spawned.empty());
+        if (!rr.completed) std::printf("  raft assemble failed: %s\n", rr.failure.c_str());
+        const EntityId raft = rr.spawned.empty() ? kNoEntity : rr.spawned.front();
+        as.targets = {part(wood->id), part(wood->id), part(wood->id), part(hide->id)};
+        const InteractionResult rh = d.interact(as);
+        const EntityId hull = rh.spawned.empty() ? kNoEntity : rh.spawned.front();
+        const PropId fc = tpid(d, "float_capacity"), wr = tpid(d, "wave_rating");
+        const Entity* re = d.find(raft); const Entity* he = d.find(hull);
+        std::printf("  craft: raft lift=%lld swell=%lld | hull lift=%lld swell=%lld | person load=%lld\n",
+                    re ? (long long)d.prop_int(*re, fc, 0) : -1LL, re ? (long long)d.prop_int(*re, wr, 0) : -1LL,
+                    he ? (long long)d.prop_int(*he, fc, 0) : -1LL, he ? (long long)d.prop_int(*he, wr, 0) : -1LL,
+                    (long long)sinking_load(d, *d.find(a)));
+        CHECK(re && d.prop_int(*re, fc, 0) > 0);
+        CHECK(he && d.prop_int(*he, wr, 0) > d.prop_int(*re, wr, 0));     // sealed seams ride bigger swell
+        // board the raft and paddle across without tiring
+        InteractionContext bd; bd.actor = a; bd.parameters.action = "board"; bd.targets = {raft}; bd.parameters.ticks = 1;
+        const InteractionResult br = d.interact(bd);
+        if (!br.completed) std::printf("  board failed: %s\n", br.failure.c_str());
+        CHECK(br.completed && craft_of(d, a) == raft);
+        const std::int64_t f0 = d.prop_int(*d.find(a), tpid(d, "fatigue"), 0);
+        for (int i = 0; i < 40 && craft_of(d, a) != kNoEntity; ++i) d.interact(mk_move(a, {24 * 16, 6 * 16 + 8}, false));
+        const Entity* ae = d.find(a);
+        std::printf("  sail: x=%d aboard=%d fatigue %lld->%lld raft integrity=%lld raft x=%d\n", ae->pos.x,
+                    int(craft_of(d, a) != kNoEntity), (long long)f0, (long long)d.prop_int(*ae, tpid(d, "fatigue"), 0),
+                    (long long)d.prop_int(*d.find(raft), integ, 0), d.find(raft)->pos.x);
+        CHECK(ae->alive && ae->pos.x >= 20 * 16 && !d.terrain.is_water(ae->pos));   // landed on the far shore
+        CHECK(craft_of(d, a) == kNoEntity);                                         // stepped ashore
+        CHECK(d.prop_int(*ae, tpid(d, "fatigue"), 0) <= f0);                        // no swimming strokes
+        CHECK(d.find(raft)->pos.x >= 18 * 16);                                      // the raft carried them
+        // the same raft in deep, rough water is battered
+        World o = maritime_world(36, 20, 20);              // 180 m deep, swell 540
+        const EntityId b = mk_sapient(o, {9 * 16 + 4, 6 * 16 + 8});
+        InteractionContext as2 = as; as2.actor = b;
+        auto part2 = [&](MaterialId m) { return o.create_entity("piece", m, {9 * 16 + 6, 6 * 16 + 8}, PropertyBag{}); };
+        as2.targets = {part2(wood->id), part2(wood->id), part2(wood->id), part2(wood->id)};
+        const InteractionResult r2 = o.interact(as2);
+        const EntityId raft2 = r2.spawned.empty() ? kNoEntity : r2.spawned.front();
+        InteractionContext bd2 = bd; bd2.actor = b; bd2.targets = {raft2};
+        CHECK(o.interact(bd2).completed);
+        const std::int64_t i0 = o.prop_int(*o.find(raft2), integ, 1000);
+        for (int i = 0; i < 6; ++i) o.interact(mk_move(b, {29 * 16, 6 * 16 + 8}, false));
+        CHECK(o.prop_int(*o.find(raft2), integ, 1000) < i0);                        // swell > rating
+    }
+    // ---- the emergent chain: blocked shore -> want_cross -> raft -> sail ----------
+    {
+        World d = maritime_world(41, 40, 170);             // a 40-cell strait, 30 m deep
+        const EntityId a = mk_sapient(d, {148, 104});
+        if (const SpeciesDef* sp = d.species.find_name("sapient"))
+            for (const std::string& v : sp->innate) d.mind(a).learn_action(v);
+        const MaterialDef* wood = d.materials.find_name("dry_wood");
+        for (int i = 0; i < 6; ++i) d.create_entity("branch", wood->id, {136 + (i % 3) * 4, 96 + (i / 3) * 8}, PropertyBag{});
+        d.mind(a).belief("beacon:880:104").confidence = 1000;
+        DriverState st; st.curiosity = true; st.concurrent = true;
+        bool built = false, boarded = false, landed = false, swam_deep = false;
+        for (int c = 0; c < 200 && !landed; ++c) {
+            Entity* ae = d.find(a);
+            tseti(*ae, d, "hunger", 100); tseti(*ae, d, "thirst", 100);    // isolate the maritime chain
+            const EventId e0 = d.ledger.next_id();
+            autonomous_cycle(d, &st);
+            for (EventId i = e0; i < d.ledger.next_id(); ++i) {
+                const CausalEvent* ev = d.ledger.find(i);
+                if (!ev || ev->failed || ev->participants.empty() || ev->participants.front() != a) continue;
+                if (ev->action == "assemble") built = true;
+                if (ev->action == "board") boarded = true;
+                if (ev->evidence.find("disembark ashore") != std::string::npos) landed = true;
+                if (ev->evidence.find("swim") != std::string::npos) swam_deep = true;
+            }
+        }
+        std::printf("  emergent crossing: built=%d boarded=%d landed=%d x=%d swam=%d\n", int(built), int(boarded),
+                    int(landed), d.find(a)->pos.x, int(swam_deep));
+        CHECK(built && boarded && landed);
+        CHECK(!swam_deep);                                 // never tried to swim a strait it could not finish
+        CHECK(d.find(a)->pos.x >= 50 * 16);                // on the far shore
+    }
+    // ---- cold water: stroke cost & immersion heat loss scale with temperature -
+    {
+        World cold = maritime_world(38, 20, 100), warm = maritime_world(38, 20, 100);
+        for (int y = 0; y < cold.terrain.h; ++y)                    // chill the sea to 5°C
+            for (int x = 10; x < 30; ++x)
+                cold.terrain.temperature[std::size_t(y) * cold.terrain.w + x] = 50;
+        const Vec2 sea{11 * 16, 6 * 16 + 8};
+        const EntityId cs = mk_sapient(cold, sea);                  // already immersed
+        const EntityId ws = mk_sapient(warm, sea);
+        const std::int64_t cc = swim_stroke_cost(cold, *cold.find(cs), sea);
+        const std::int64_t cw = swim_stroke_cost(warm, *warm.find(ws), sea);
+        std::printf("  cold water: stroke cost cold=%lld warm=%lld\n",
+                    (long long)cc, (long long)cw);
+        CHECK(cc > cw);                                            // 32°C below set-point costs strokes
+        // same immersion, same ticks: the cold sea drains body_temp faster.
+        // dt=30 batches give the pull room to matter (per-tick moves are
+        // rate-limited to 4 deciC, so short batches all look identical).
+        const PropId bt = tpid(cold, "body_temp");
+        const std::int64_t bt0 = cold.prop_int(*cold.find(cs), bt, 370);
+        cold.advance_ticks_for_test(30);
+        warm.advance_ticks_for_test(30);
+        const std::int64_t drop_c = bt0 - cold.prop_int(*cold.find(cs), bt, bt0);
+        const std::int64_t drop_w = bt0 - warm.prop_int(*warm.find(ws), bt, bt0);
+        std::printf("  immersion: body_temp drop cold=%lld warm=%lld\n",
+                    (long long)drop_c, (long long)drop_w);
+        CHECK(drop_c > drop_w);                                    // depth-scaled immersion chill
+        // a sailor is NOT immersed: aboard a craft the deep-water bonus is off
+        {
+            World s = maritime_world(39, 20, 100);
+            for (int y = 0; y < s.terrain.h; ++y)
+                for (int x = 10; x < 30; ++x)
+                    s.terrain.temperature[std::size_t(y) * s.terrain.w + x] = 200;
+            const EntityId pax = mk_sapient(s, sea);
+            const EntityId cork = s.create_entity("composite", kNoMaterial, sea, PropertyBag{});
+            s.relate(pax, "aboard", cork);
+            const PropId btt = tpid(s, "body_temp");
+            const std::int64_t b0 = s.prop_int(*s.find(pax), btt, 370);
+            s.advance_ticks_for_test(30);
+            const std::int64_t aboard_drop = b0 - s.prop_int(*s.find(pax), btt, b0);
+            // same 20°C water, same ticks: a swimmer in it chills deeper
+            World t = maritime_world(40, 20, 100);
+            for (int y = 0; y < t.terrain.h; ++y)
+                for (int x = 10; x < 30; ++x)
+                    t.terrain.temperature[std::size_t(y) * t.terrain.w + x] = 200;
+            const EntityId swim = mk_sapient(t, sea);
+            const std::int64_t t0 = t.prop_int(*t.find(swim), btt, 370);
+            t.advance_ticks_for_test(30);
+            const std::int64_t swim_drop = t0 - t.prop_int(*t.find(swim), btt, t0);
+            std::printf("  20°C water: aboard drop=%lld swimmer drop=%lld\n",
+                        (long long)aboard_drop, (long long)swim_drop);
+            CHECK(swim_drop > aboard_drop);
+        }
+    }
+    // ---- determinism of the whole maritime path -----------------------------------
+    {
+        auto run = [] {
+            World d = maritime_world(37, 4, 100);
+            const EntityId s2 = mk_sapient(d, {9 * 16 + 12, 6 * 16 + 8});
+            for (int i = 0; i < 10; ++i) d.interact(mk_move(s2, {16 * 16, 6 * 16 + 8}, true));
+            return d.state_hash();
+        };
+        CHECK(run() == run());
+    }
+}
+
+// ---- Phase 17: trophic web, seasonal migration & apex predators -------------
+// Hand-built land world with a real forage gradient: west cold/dry,
+// east warm/wet. All land (no water) so range drift never swims.
+static World eco_world(std::uint64_t seed) {
+    World w(seed, "data");
+    w.ruleset |= World::kRulePrimordial;   // awake animals resist being eaten
+    TerrainGrid& t = w.terrain;
+    t.w = 48; t.h = 16; t.cell = 16; t.ox = 0; t.oy = 0;
+    const std::size_t n = std::size_t(t.w) * t.h;
+    t.elevation.assign(n, 300);
+    t.moisture.assign(n, 800); t.temperature.assign(n, 300);
+    t.water.assign(n, 0); t.vegetation.assign(n, 800); t.slope.assign(n, 0);
+    t.wind_x.assign(n, 0); t.wind_y.assign(n, 0);
+    t.water_table.assign(n, 5); t.traffic_wear.assign(n, 0);
+    // smooth west->east gradient: cold/dry west, warm/wet east — every
+    // step east improves migrant_herd's declared-band fit until it plateaus
+    for (int y = 0; y < t.h; ++y)
+        for (int x = 0; x < t.w; ++x) {
+            const std::size_t i = std::size_t(y) * t.w + x;
+            t.temperature[i] = std::max<std::int32_t>(100, 480 - x * 8);
+            t.moisture[i] = std::min<std::int32_t>(1000, 300 + x * 12);
+        }
+    for (int y = 0; y < t.h; ++y)
+        for (int x = 0; x < t.w; ++x) w.gen_cells_.insert({x, y});
+    return w;
+}
+static EntityId mk_fauna(World& w, const char* kind, Vec2 pos) {
+    const SpeciesDef* sp = w.species.find_name(kind);
+    const EntityId id = w.create_entity(kind, sp ? sp->material : kNoMaterial,
+                                        pos, sp ? sp->props : PropertyBag{});
+    // genome carriers are the ones minds can form around — seed the same
+    // loci worldgen would so promotion/reproduction behave normally.
+    if (sp) for (const PropId g : sp->genes)
+        if (w.find(id)) w.find(id)->genome.set(g, 500);
+    return id;
+}
+static void eco_quiet(Entity& e, World& w) {
+    // test dummy metabolism: survive the scenario without starving
+    tseti(e, w, "metabolism", 100);
+    tseti(e, w, "hunger", 0); tseti(e, w, "thirst", 0); tseti(e, w, "fatigue", 0);
+}
+
+static void test_trophic_ecology_seasons_and_apex() {
+    // ---- schema: trophic props are data, parsed onto species + entities ----
+    {
+        World w(11, "data");
+        for (const char* k : {"migrant_herd", "pack_stalker", "ridge_apex",
+                              "shore_reaver", "commensal_rat"})
+            CHECK(w.species.find_name(k) != nullptr);
+        const EntityId h = mk_fauna(w, "migrant_herd", {100, 100});
+        CHECK(w.prop_int(*w.find(h), tpid(w, "trophic_tier"), -1) == 1);
+        CHECK(w.prop_int(*w.find(h), tpid(w, "migration_drive"), 0) == 600);
+        CHECK(w.prop_int(*w.find(h), tpid(w, "herd_cohesion"), 0) == 700);
+        const EntityId apex = mk_fauna(w, "ridge_apex", {200, 100});
+        CHECK(w.prop_int(*w.find(apex), tpid(w, "prey_tier_max"), 0) == 3);
+        CHECK(w.prop_int(*w.find(apex), tpid(w, "activity_phase"), 0) == 2);
+        const EntityId g = mk_fauna(w, "grazer", {150, 100});
+        CHECK(w.prop_int(*w.find(g), tpid(w, "trophic_tier"), -1) == 1);
+        const EntityId s = mk_sapient(w, {120, 100});
+        CHECK(w.prop_int(*w.find(s), tpid(w, "trophic_tier"), -1) == 3);
+    }
+    // ---- seasonal migration: herd drifts up the forage gradient ------------
+    {
+        World w = eco_world(12);
+        const EntityId h = mk_fauna(w, "migrant_herd", {4 * 16, 8 * 16});
+        eco_quiet(*w.find(h), w);
+        const Vec2 p0 = w.find(h)->pos;
+        const EventId led0 = w.ledger.next_id();
+        w.advance_ticks_for_test(400);
+        const Vec2 p1 = w.find(h)->pos;
+        std::printf("  migration: herd (%d,%d) -> (%d,%d)\n",
+                    p0.x, p0.y, p1.x, p1.y);
+        CHECK(w.find(h)->alive);
+        CHECK(p1.x > p0.x + 96);                    // east up the gradient
+        CHECK(p1.x < w.terrain.w * w.terrain.cell); // stayed on the map
+        // pure range drift must still be ledgered: an ecology event naming h
+        bool drift_led = false;
+        for (EventId i = led0; i < w.ledger.next_id(); ++i) {
+            const CausalEvent* ev = w.ledger.find(i);
+            if (ev && ev->action == "ecology" &&
+                std::find(ev->participants.begin(), ev->participants.end(), h)
+                    != ev->participants.end())
+                drift_led = true;
+        }
+        CHECK(drift_led);
+        // batch-exact: 400 at once == 40 x 10 stepped (stateless schedule)
+        World b = eco_world(12);
+        const EntityId h2 = mk_fauna(b, "migrant_herd", {4 * 16, 8 * 16});
+        eco_quiet(*b.find(h2), b);
+        for (int i = 0; i < 40; ++i) b.advance_ticks_for_test(10);
+        CHECK(b.find(h2)->pos == p1);
+    }
+    // ---- flora seasonality: winter slows declared-dormant regrowth ---------
+    {
+        auto fruit_after = [](std::uint64_t pre) {
+            World w = eco_world(13);
+            const SpeciesDef* bush = w.species.find_name("berry_bush");
+            // east side: warm/wet enough that env-scaled regrowth is > 0
+            const EntityId b = w.create_entity(bush->name, bush->material,
+                                               {26 * 16, 8 * 16}, bush->props);
+            w.advance_ticks_for_test(pre);                    // move the clock
+            tseti(*w.find(b), w, "fruit_count", 0);           // strip AFTER pre
+            tseti(*w.find(b), w, "fruit_credit", 0);
+            w.advance_ticks_for_test(200);
+            return w.prop_int(*w.find(b), tpid(w, "fruit_count"), 0);
+        };
+        const std::int64_t spring = fruit_after(0);        // ticks 0-200: spring
+        const std::int64_t winter = fruit_after(2100);     // ticks 2100-2300: winter
+        std::printf("  flora: fruit_count spring=%lld winter=%lld\n",
+                    (long long)spring, (long long)winter);
+        CHECK(spring > 0);
+        CHECK(winter < spring);                            // dormant_growth 300 vs 1000
+    }
+    // ---- predation: stalker runs down grazer, ignores sapient ---------------
+    {
+        World w = eco_world(14);
+        // east side: mild temperatures — no heat/cold damage over the run
+        const EntityId s = mk_sapient(w, {15 * 16, 8 * 16}, false);  // inert tier-3 target
+        eco_quiet(*w.find(s), w);                             // don't starve mid-test
+        const EntityId prey = mk_fauna(w, "grazer", {17 * 16, 8 * 16});
+        const EntityId pred = mk_fauna(w, "pack_stalker", {16 * 16, 8 * 16});
+        eco_quiet(*w.find(prey), w);
+        Entity* pe = w.find(pred);
+        eco_quiet(*pe, w);
+        tseti(*pe, w, "hunger", 600);                       // a hungry hunter
+        tseti(*pe, w, "activity_phase", 0);                 // hunt any hour (test)
+        w.mind(prey); w.mind(pred);
+        {   // sanity: a live grazer must resist being eaten outright
+            const EntityId probe_prey = mk_fauna(w, "grazer", {18 * 16, 8 * 16});
+            InteractionContext probe;
+            probe.actor = pred; probe.targets = {probe_prey};
+            probe.parameters.action = "consume"; probe.parameters.ticks = 2;
+            CHECK(!w.interact(probe).completed);
+        }
+        std::int64_t strikes_on_prey = 0, pred_on_sapient = 0;
+        for (int c = 0; c < 1200 && w.find(prey)->alive; ++c) {
+            const EventId e0 = w.ledger.next_id();
+            autonomous_cycle(w, nullptr);
+            for (EventId i = e0; i < w.ledger.next_id(); ++i) {
+                const CausalEvent* ev = w.ledger.find(i);
+                if (!ev || ev->failed || ev->action != "impact") continue;
+                const bool has_pred = std::find(ev->participants.begin(),
+                                                ev->participants.end(), pred)
+                                      != ev->participants.end();
+                const bool has_prey = std::find(ev->participants.begin(),
+                                                ev->participants.end(), prey)
+                                      != ev->participants.end();
+                const bool has_sap = std::find(ev->participants.begin(),
+                                               ev->participants.end(), s)
+                                     != ev->participants.end();
+                if (has_pred && has_prey) ++strikes_on_prey;
+                if (has_pred && has_sap) ++pred_on_sapient;
+            }
+        }
+        CHECK(strikes_on_prey >= 3);   // a real hunt: several bites, not one lucky hit
+        CHECK(pred_on_sapient == 0);   // tier gate: mid predator can't touch tier-3 sapients
+        // apex reaches sapients: shore_reaver (tier 5, ptm 4) vs sapient (3)
+        World a = eco_world(15);
+        const EntityId sp = mk_sapient(a, {15 * 16, 8 * 16}, false);
+        eco_quiet(*a.find(sp), a);
+        const EntityId rev = mk_fauna(a, "shore_reaver", {17 * 16, 8 * 16});
+        Entity* re = a.find(rev);
+        eco_quiet(*re, a);
+        tseti(*re, a, "hunger", 600);
+        tseti(*re, a, "activity_phase", 0);
+        a.mind(rev);
+        const std::int64_t sp_i0 = a.prop_int(*a.find(sp), tpid(a, "integrity"), 1000);
+        bool apex_struck = false;
+        for (int c = 0; c < 400 && !apex_struck; ++c) {
+            const EventId e0 = a.ledger.next_id();
+            autonomous_cycle(a, nullptr);
+            for (EventId i = e0; i < a.ledger.next_id(); ++i) {
+                const CausalEvent* ev = a.ledger.find(i);
+                if (ev && !ev->failed && ev->action == "impact" &&
+                    !ev->participants.empty() && ev->participants.front() == rev)
+                    apex_struck = true;
+            }
+        }
+        std::printf("  apex: struck_sapient=%d integrity %lld->%lld\n",
+                    int(apex_struck), (long long)sp_i0,
+                    (long long)a.prop_int(*a.find(sp), tpid(a, "integrity"), -1));
+        CHECK(apex_struck);                                   // tier 3 is within ptm 4
+        // ...but a mid-tier predator cannot take a sapient (ptm 1 < tier 3)
+        World m = eco_world(16);
+        const EntityId sp2 = mk_sapient(m, {15 * 16, 8 * 16}, false);
+        eco_quiet(*m.find(sp2), m);
+        const EntityId pk = mk_fauna(m, "pack_stalker", {16 * 16, 8 * 16});
+        Entity* ke = m.find(pk);
+        eco_quiet(*ke, m);
+        tseti(*ke, m, "hunger", 600);
+        tseti(*ke, m, "activity_phase", 0);
+        m.mind(pk);
+        bool mid_struck_sapient = false;
+        for (int c = 0; c < 300 && !mid_struck_sapient; ++c) {
+            const EventId e0 = m.ledger.next_id();
+            autonomous_cycle(m, nullptr);
+            for (EventId i = e0; i < m.ledger.next_id(); ++i) {
+                const CausalEvent* ev = m.ledger.find(i);
+                if (ev && !ev->failed && ev->action == "impact" &&
+                    !ev->participants.empty() && ev->participants.front() == pk)
+                    mid_struck_sapient = true;
+            }
+        }
+        CHECK(!mid_struck_sapient);                            // tier gate held
+    }
+}
+
+// ---------- Phase 18: domestication, agriculture & specialization -------------
+// All thresholds are species/material/process DATA — no species or material
+// name appears in engine code. Taming is repeated share-feeding; the bond
+// is a `bonded` relation; yields and alerts run on stateless credit
+// schedules inside ecology_tick (batch-exact under dormant LOD).
+static void test_domestication_agriculture_metallurgy() {
+    // ---- schema: Phase 18 content is declarative ----------------------------
+    {
+        World w(51, "data");
+        for (const char* k : {"trail_hound", "dairy_beast", "fiber_beast",
+                              "draft_beast", "cultivated_grain",
+                              "cultivated_pulse"})
+            CHECK(w.species.find_name(k) != nullptr);
+        const SpeciesDef* db = w.species.find_name("dairy_beast");
+        CHECK(db != nullptr);
+        const PropId p_wild = tpid(w, "wildness");
+        const EntityId d = mk_fauna(w, "dairy_beast", {100, 100});
+        CHECK(w.prop_int(*w.find(d), p_wild, -1) == 750);
+        CHECK(w.prop_int(*w.find(d), tpid(w, "tameability"), -1) == 800);
+        CHECK(w.prop_int(*w.find(d), tpid(w, "milk_yield"), -1) == 9);
+        CHECK(w.prop_int(*w.find(d), tpid(w, "bond_threshold"), -1) == 300);
+        // wildness is a gene locus -> tameness is heritable
+        bool wild_locus = false;
+        for (const PropId g : db->genes) if (g == p_wild) wild_locus = true;
+        CHECK(wild_locus);
+        for (const char* m : {"milk", "wool", "wool_cloth", "grain", "pulse",
+                              "tin_ore", "bronze", "iron_ingot"})
+            CHECK(w.materials.find_name(m) != nullptr);
+        const MaterialDef* tin = w.materials.find_name("tin_ore");
+        CHECK(tin != nullptr);
+        const PropId p_smelt = tpid(w, "smelt_temp");
+        const auto sit = tin->props.find(p_smelt);
+        CHECK(sit != tin->props.end() && sit->second.i == 12000);
+        CHECK(w.processes.find("smelt_bronze") != nullptr);
+        CHECK(w.processes.find("smelt_iron") != nullptr);
+        CHECK(w.processes.find("weave_wool") != nullptr);
+    }
+
+    // ---- taming: share-feed -> wildness decay -> bond -> follow -> milk -----
+    {
+        World w = eco_world(52);
+        const EntityId s = mk_sapient(w, {10 * 16, 8 * 16}, false);
+        eco_quiet(*w.find(s), w);
+        const EntityId a = mk_fauna(w, "dairy_beast", {14 * 16, 8 * 16});
+        eco_quiet(*w.find(a), w);
+        const PropId p_wild = tpid(w, "wildness");
+        const PropId p_qty = tpid(w, "quantity");
+        CHECK(w.prop_int(*w.find(a), p_wild, -1) == 750);
+        // each share is one meal: wildness falls by tameability-scaled steps
+        for (int i = 0; i < 10; ++i) {
+            tseti(*w.find(s), w, "quantity", 100);
+            const InteractionResult r = w.interact(mk_ctx(s, {a}, "share", 0));
+            CHECK(r.completed);
+        }
+        const std::int64_t wv = w.prop_int(*w.find(a), p_wild, -1);
+        CHECK(wv <= 300);                                    // at/below threshold
+        CHECK(!w.relations_of(a, "bonded").empty());         // bond edge exists
+        // bonded follow: walk the partner away, the beast closes the gap
+        const Vec2 ap = w.find(a)->pos;
+        w.find(s)->pos = {ap.x + 240, ap.y};
+        w.spatial.move(s, w.find(s)->pos);
+        w.advance_ticks_for_test(600);
+        const std::int64_t d2now = dist2(w.find(a)->pos, w.find(s)->pos);
+        CHECK(d2now < 240LL * 240LL / 4);                    // closed most of it
+        // milk yield: bonded + fed -> `milk` material entities appear
+        w.advance_ticks_for_test(500);
+        int milk_n = 0;
+        for (const auto& ep : w.entities) {
+            const Entity& e = *ep;
+            if (e.alive && e.material == w.materials.id_of("milk")) ++milk_n;
+        }
+        CHECK(milk_n >= 1);
+    }
+
+    // ---- watchdog: bonded hound scent-alerts its partner's mind ------------
+    {
+        World w = eco_world(53);
+        const EntityId s = mk_sapient(w, {15 * 16, 8 * 16});
+        eco_quiet(*w.find(s), w);
+        const EntityId h = mk_fauna(w, "trail_hound", {16 * 16, 8 * 16});
+        eco_quiet(*w.find(h), w);
+        w.relate(h, "bonded", s);
+        // apex within scent_alert_radius (700) but outside its own hunt reach
+        const EntityId apex = mk_fauna(w, "ridge_apex", {20 * 16, 8 * 16});
+        eco_quiet(*w.find(apex), w);
+        w.advance_ticks_for_test(80);
+        const AgentMind* m = w.find_mind(s);
+        CHECK(m != nullptr);
+        const Belief* pb = m->find_belief("peril:predator_scent");
+        CHECK(pb != nullptr && pb->confidence > 0);
+    }
+
+    // ---- agriculture: sow -> growth gate -> fruiting; irrigation ------------
+    {
+        World w = eco_world(54);
+        // east side: warm + wet — fruiting env is favourable
+        PropertyBag sb;
+        sb.set(tpid(w, "sprout_target"), Value::text("cultivated_grain"));
+        const EntityId seed = w.create_entity("dormant_seed",
+            w.materials.id_of("dormant_seed"), {30 * 16, 8 * 16}, sb);
+        const EntityId s = mk_sapient(w, {30 * 16 + 8, 8 * 16 + 8}, false);
+        eco_quiet(*w.find(s), w);
+        const InteractionResult r = w.interact(mk_ctx(s, {seed}, "sow", 0));
+        CHECK(r.completed);
+        CHECK(!r.spawned.empty());
+        const EntityId crop = r.spawned.back();
+        const Entity* ce = w.find(crop);
+        CHECK(ce != nullptr && ce->kind_name == "cultivated_grain");
+        CHECK(w.prop_int(*ce, tpid(w, "cultivated"), -1) == 1);
+        // sow commits 1 tick of drift, so growth is already 1, not 0
+        CHECK(w.prop_int(*ce, tpid(w, "growth"), -1) <= 1);
+        CHECK(w.prop_int(*ce, tpid(w, "fruit_count"), -1) == 0);
+        // juvenile: ~100 ticks of growth, still no fruit (growth_ticks=300)
+        w.advance_ticks_for_test(100);
+        const std::int64_t g1 = w.prop_int(*w.find(crop), tpid(w, "growth"), -1);
+        CHECK(g1 >= 100 && g1 < 300);
+        CHECK(w.prop_int(*w.find(crop), tpid(w, "fruit_count"), -1) == 0);
+        // mature: growth clamps at growth_ticks and fruit starts to set
+        w.advance_ticks_for_test(400);
+        CHECK(w.prop_int(*w.find(crop), tpid(w, "growth"), -1) == 300);
+        CHECK(w.prop_int(*w.find(crop), tpid(w, "fruit_count"), -1) > 0);
+        // irrigation: fails with no water near the plant...
+        const EntityId dry = w.create_entity("cultivated_pulse",
+            w.materials.id_of("living_wood"), {2 * 16, 8 * 16},
+            w.species.find_name("cultivated_pulse")->props);
+        // ...and a watered twin mid-map fruits faster than its dry sibling
+        const EntityId wet = w.create_entity("cultivated_pulse",
+            w.materials.id_of("living_wood"), {15 * 16 + 8, 8 * 16 + 8},
+            w.species.find_name("cultivated_pulse")->props);
+        for (EntityId p : {dry, wet}) {
+            tseti(*w.find(p), w, "fruit_count", 0);
+            tseti(*w.find(p), w, "fruit_credit", 0);
+            tseti(*w.find(p), w, "growth", 260);      // mature: isolate fruiting
+        }
+        w.find(s)->pos = {2 * 16 + 8, 8 * 16 + 8};
+        w.spatial.move(s, w.find(s)->pos);
+        InteractionResult ir = w.interact(mk_ctx(s, {dry}, "irrigate", 0));
+        CHECK(!ir.completed);                               // no water within 6 cells
+        // water within reach of the wet twin only
+        w.terrain.water[w.terrain.index({13 * 16, 8 * 16})] = 1;
+        w.find(s)->pos = {15 * 16 + 8, 8 * 16 + 8};
+        w.spatial.move(s, w.find(s)->pos);
+        ir = w.interact(mk_ctx(s, {wet}, "irrigate", 0));
+        CHECK(ir.completed);
+        CHECK(w.prop_int(*w.find(wet), tpid(w, "irrigation_credit"), -1) > 0);
+        w.advance_ticks_for_test(300);
+        const std::int64_t f_wet = w.prop_int(*w.find(wet), tpid(w, "fruit_count"), -1);
+        const std::int64_t f_dry = w.prop_int(*w.find(dry), tpid(w, "fruit_count"), -1);
+        CHECK(f_wet > f_dry);                    // watered soil out-yields rain-fed
+    }
+
+    // ---- granary: sealed enclosure slows contained spoilage -----------------
+    {
+        World w(55, "data");
+        const PropId p_seal = tpid(w, "granary_seal");
+        const PropId p_cont = tpid(w, "contained");
+        const PropId p_integ = tpid(w, "integrity");
+        const PropId p_dec = tpid(w, "decay_rate");
+        const PropId p_dcred = tpid(w, "decay_credit");
+        PropertyBag eb;
+        eb.set(p_seal, Value::integer(800));
+        const EntityId enc = w.create_entity("enclosure", kNoMaterial,
+                                             {100, 100}, eb);
+        auto mkfood = [&](Vec2 p, bool inside) {
+            PropertyBag fb;
+            fb.set(p_integ, Value::integer(1000));
+            fb.set(p_dec, Value::integer(50));
+            fb.set(p_dcred, Value::integer(0));
+            if (inside) fb.set(p_cont, Value::boolean(true));
+            const EntityId f = w.create_entity("grain",
+                w.materials.id_of("grain"), p, fb);
+            if (inside) w.relate(f, "part_of", enc);
+            return f;
+        };
+        const EntityId sealed = mkfood({100, 100}, true);
+        const EntityId open_ = mkfood({140, 100}, false);
+        w.advance_ticks_for_test(200);
+        const std::int64_t is = w.prop_int(*w.find(sealed), p_integ, -1);
+        const std::int64_t io = w.prop_int(*w.find(open_), p_integ, -1);
+        CHECK(is > io);                     // dry store preserves the surplus
+    }
+
+    // ---- metallurgy: new smelt/weave recipes actually run --------------------
+    {
+        World w(56, "data");
+        const MaterialId tin = w.materials.id_of("tin_ore");
+        const MaterialId cu = w.materials.id_of("copper_ore");
+        const MaterialId ch = w.materials.id_of("charcoal");
+        const PropId qty = tpid(w, "quantity");
+        const PropId temp = tpid(w, "temperature");
+        const EntityId worker = w.create_entity("worker", kNoMaterial, {50, 50});
+        PropertyBag o1, o2, f1, heat;
+        o1.set(qty, Value::integer(200)); o2.set(qty, Value::integer(120));
+        f1.set(qty, Value::integer(60));
+        heat.set(temp, Value::integer(20000));   // 2000°C: full smelt efficiency
+        const EntityId e1 = w.create_entity("ore", cu, {60, 50}, o1);
+        const EntityId e2 = w.create_entity("ore", tin, {61, 50}, o2);
+        const EntityId ef = w.create_entity("fuel", ch, {55, 50}, f1);
+        const EntityId eh = w.create_entity("heater", kNoMaterial, {52, 50}, heat);
+        const InteractionResult r = w.interact(
+            mk_ctx(worker, {e1, e2, ef, eh}, "process", 0, "smelt_bronze"));
+        CHECK(r.completed);
+        std::int64_t bronze_q = 0;
+        for (EntityId sid : r.spawned) {
+            const Entity* s = w.find(sid);
+            if (s && s->material == w.materials.id_of("bronze"))
+                bronze_q += w.prop_int(*s, qty, 0);
+        }
+        CHECK(bronze_q == 240);
+        // weave: wool -> wool_cloth, no heat needed
+        PropertyBag wl;
+        wl.set(qty, Value::integer(60));
+        const EntityId wool = w.create_entity("wool", w.materials.id_of("wool"),
+                                              {70, 50}, wl);
+        const InteractionResult wr = w.interact(
+            mk_ctx(worker, {wool}, "process", 0, "weave_wool"));
+        CHECK(wr.completed);
+        bool cloth = false;
+        for (EntityId sid : wr.spawned) {
+            const Entity* s = w.find(sid);
+            if (s && s->material == w.materials.id_of("wool_cloth")) cloth = true;
+        }
+        CHECK(cloth);
+    }
+
+    // ---- determinism: identical scenarios hash identically ------------------
+    {
+        auto run = [](std::uint64_t seed) {
+            World w = eco_world(seed);
+            const EntityId s = mk_sapient(w, {10 * 16, 8 * 16}, false);
+            eco_quiet(*w.find(s), w);
+            const EntityId a = mk_fauna(w, "dairy_beast", {14 * 16, 8 * 16});
+            eco_quiet(*w.find(a), w);
+            for (int i = 0; i < 6; ++i) {
+                tseti(*w.find(s), w, "quantity", 100);
+                w.interact(mk_ctx(s, {a}, "share", 0));
+            }
+            w.advance_ticks_for_test(300);
+            return w.state_hash();
+        };
+        CHECK(run(57) == run(57));
+    }
+}
+
+// Phase 19: two-tier physics cognition — qualitative phenomena, emergent
+// mathematics with indigenous notation, quantitative laws proven by
+// measurement, treatise transmission, and planner use of the parameter.
+static void test_quantitative_cognition_and_notation() {
+    // ---- indigenous notation: deterministic, legal bases, no digits ------
+    {
+        std::set<std::int64_t> bases;
+        for (std::int64_t l = 1; l <= 64; ++l)
+            bases.insert(math_base_of(l, 1234));
+        CHECK(bases.size() >= 1 && bases.size() <= 4);
+        for (std::int64_t b : bases)
+            CHECK(b == 8 || b == 10 || b == 12 || b == 20);
+        const std::string r = math_render(7, 2024, 99);
+        CHECK(r.find_first_of("0123456789") == std::string::npos);
+        CHECK(r == math_render(7, 2024, 99));               // deterministic
+        CHECK(math_base_of(7, 99) == math_base_of(7, 99));
+        // different tongues may share a base but render differently enough
+        // to be distinguishable glyph streams
+        bool any_diff = false;
+        for (std::int64_t l = 1; l <= 12 && !any_diff; ++l)
+            any_diff = math_render(l, 555, 99) != math_render(7, 555, 99);
+        CHECK(any_diff);
+    }
+
+    // ---- emergence: share-loads -> phenomenon -> math:ratio -> qlaw ------
+    World w(67, "data");
+    const EntityId s = mk_sapient(w, {100, 100});
+    tseti(*w.find(s), w, "mind_abstraction_gain", 1500);
+    tseti(*w.find(s), w, "mass", 70000);
+    tseti(*w.find(s), w, "energy", 90000000);
+    // a composite "hull" the scholar loads: lift 200kg, holds trade units
+    PropertyBag cp;
+    cp.set(tpid(w, "quantity"), Value::integer(0));
+    cp.set(tpid(w, "float_capacity"), Value::integer(200000));
+    const EntityId hull = w.create_entity("composite",
+        w.materials.id_of("living_wood"), {112, 100}, cp);
+    // ~115 successful loads: qualitative recognition + quantitative need
+    for (int i = 0; i < 115; ++i) {
+        tseti(*w.find(s), w, "quantity", 100);
+        w.interact(mk_ctx(s, {hull}, "share", 0));
+    }
+    const AgentMind* sm = w.find_mind(s);
+    CHECK(sm != nullptr);
+    CHECK(sm->find_belief("phenomenon:buoyancy") != nullptr);
+    CHECK(sm->find_belief("math:ratio") != nullptr);        // math invented
+    // proven law: safe load = (200000 - 70000) / 1000 = 130 units
+    CHECK(qlaw_param(*sm, "buoyancy") == 130);
+    const Belief* qb = sm->find_belief("qlaw:buoyancy:p130");
+    CHECK(qb && qb->status == BeliefStatus::Verified);
+
+    // ---- trajectory law: measured off the hardest remembered material ---
+    EntityId anvil = w.create_entity("rock",
+        w.materials.id_of("granite"), {105, 100});
+    auto revive = [&] {   // thousands of process ticks would starve the scholar
+        Entity& se = *w.find(s);
+        tseti(se, w, "energy", 90000000); tseti(se, w, "hunger", 0);
+        tseti(se, w, "thirst", 0);         tseti(se, w, "integrity", 1000);
+        tseti(se, w, "blood_volume", 1000);
+    };
+    for (int i = 0; i < 115; ++i) {
+        if (!w.find(anvil)->alive)                    // spent anvils get replaced
+            anvil = w.create_entity("rock",
+                w.materials.id_of("granite"), {105, 100});
+        revive();
+        w.interact(mk_ctx(s, {anvil}, "impact", 100));
+    }
+    sm = w.find_mind(s);
+    const std::int64_t tq = qlaw_param(*sm, "trajectory");
+    CHECK(tq > 0);                                            // hardness-derived
+    CHECK(sm->find_belief("math:geometry") != nullptr);
+
+    // ---- smelt law: fuel share of the richest known recipe ---------------
+    const PropId qty = tpid(w, "quantity");
+    const PropId temp = tpid(w, "temperature");
+    const EntityId cu = w.create_entity("ore", w.materials.id_of("copper_ore"),
+        {90, 90}, [&]{ PropertyBag b; b.set(qty, Value::integer(300000)); return b; }());
+    const EntityId ti = w.create_entity("ore", w.materials.id_of("tin_ore"),
+        {91, 90}, [&]{ PropertyBag b; b.set(qty, Value::integer(300000)); return b; }());
+    const EntityId fu = w.create_entity("fuel", w.materials.id_of("charcoal"),
+        {92, 90}, [&]{ PropertyBag b; b.set(qty, Value::integer(300000)); return b; }());
+    PropertyBag hb; hb.set(temp, Value::integer(20000));
+    const EntityId heat = w.create_entity("heater", kNoMaterial, {93, 90}, hb);
+    for (int i = 0; i < 115; ++i) {
+        // restock ore/fuel and stoke the furnace — process consumes them
+        for (EntityId m : {cu, ti, fu})
+            tseti(*w.find(m), w, "quantity", 300000);
+        tseti(*w.find(heat), w, "temperature", 20000);
+        revive();
+        w.interact(mk_ctx(s, {cu, ti, fu, heat}, "process", 0, "smelt_bronze"));
+    }
+    sm = w.find_mind(s);
+    const std::int64_t sq = qlaw_param(*sm, "smelt");
+    CHECK(sq > 0);                       // 60/(200+120+60) -> 157 permille
+
+    // ---- planner: parameters.force caps the transferred load ------------
+    {
+        const EntityId dock = w.create_entity("composite",
+            w.materials.id_of("living_wood"), {108, 100}, cp);
+        // law-level: a caller that knows the law asks for exactly 130
+        revive();
+        w.find(s)->pos = {100, 100};
+        tseti(*w.find(s), w, "quantity", 500);
+        tseti(*w.find(dock), w, "quantity", 0);
+        CHECK(w.interact(mk_ctx(s, {dock}, "share", 130)).completed);
+        CHECK(w.prop_int(*w.find(s), qty, -1) == 370);
+        CHECK(w.prop_int(*w.find(dock), qty, -1) == 130);
+        // driver-level: quantum_step picks the remembered hull and loads
+        // the proven amount autonomously
+        tseti(*w.find(s), w, "quantity", 500);
+        tseti(*w.find(s), w, "hunger", 0); tseti(*w.find(s), w, "thirst", 0);
+        const std::int64_t hq0 = w.prop_int(*w.find(hull), qty, -1);
+        DriverState st;
+        autonomous_run(w, 1, &st);
+        CHECK(w.prop_int(*w.find(hull), qty, -1) - hq0 == 130);
+    }
+
+    // ---- treatise: M/P/Q lines carved, imported as halved claims ---------
+    {
+        w.mind(s).discoveries["method:x"] = mk_record("method:x",
+                                                   DiscoveryStatus::Verified);
+        w.find(s)->pos = {100, 100};          // the wanderer returns
+        const EntityId stone = w.create_entity("rock", kNoMaterial, {103, 100});
+        CHECK(w.interact(mk_ctx(s, {stone}, "engrave", 0, "method:x")).completed);
+        const Value* iv = w.prop_of(*w.find(stone), tpid(w, "inscription"));
+        CHECK(iv && iv->type == ValType::Text);
+        if (iv && iv->type == ValType::Text) {
+            CHECK(iv->s.find("M|ratio|") != std::string::npos);
+            CHECK(iv->s.find("P|buoyancy|") != std::string::npos);
+            CHECK(iv->s.find("Q|buoyancy|130|") != std::string::npos);
+        }
+        const EntityId reader = mk_sapient(w, {125, 100});
+        CHECK(w.interact(mk_ctx(reader, {stone}, "read", 0)).completed);
+        const AgentMind* rm = w.find_mind(reader);
+        CHECK(rm != nullptr);
+        const Belief* mt = rm->find_belief("math:ratio");
+        CHECK(mt && mt->confidence > 0 && mt->confidence <= 500);
+        const Belief* pq = rm->find_belief("qlaw:buoyancy:p130");
+        CHECK(pq && pq->status != BeliefStatus::Verified); // claim, not proof
+        CHECK(qlaw_param(*rm, "buoyancy") == 130);           // still usable
+    }
+
+    // ---- determinism -------------------------------------------------------
+    {
+        auto run = [](std::uint64_t seed) {
+            World ww(67 + seed, "data");
+            const EntityId a = mk_sapient(ww, {100, 100});
+            tseti(*ww.find(a), ww, "mind_abstraction_gain", 1500);
+            tseti(*ww.find(a), ww, "energy", 90000000);
+            PropertyBag c2;
+            c2.set(tpid(ww, "quantity"), Value::integer(0));
+            c2.set(tpid(ww, "float_capacity"), Value::integer(200000));
+            const EntityId h2 = ww.create_entity("composite",
+                ww.materials.id_of("living_wood"), {112, 100}, c2);
+            for (int i = 0; i < 60; ++i) {
+                tseti(*ww.find(a), ww, "quantity", 100);
+                ww.interact(mk_ctx(a, {h2}, "share", 0));
+            }
+            ww.advance_ticks_for_test(120);
+            return ww.state_hash();
+        };
+        CHECK(run(0) == run(0));
     }
 }
 
@@ -9092,6 +9967,8 @@ static void test_render_snapshot_and_procedural_atlas() {
     const EntityId hut = v.create_entity("enclosure", v.materials.id_of("stone"), {130, 110}, eb);
     const EntityId stranger = mk_person(v, {140, 100});            // walks inside the scouted zone
     const EntityId far_thing = mk_person(v, {900, 900});
+    const MaterialDef* stone_md = v.materials.find_name("stone");
+    const EntityId rock = v.create_entity("rock", stone_md ? stone_md->id : kNoMaterial, {120, 110}, PropertyBag{});
     FogOfWar fog;
     fog.set_mode(FogOfWar::Mode::Tribe, 5);
     fog.update(v);
@@ -9120,6 +9997,8 @@ static void test_render_snapshot_and_procedural_atlas() {
     RenderSnapshot s2 = capture(v, all, fog);
     CHECK(has(s2, hut) && has(s2, hut)->fog == Fog::Shrouded);       // remembered architecture
     CHECK(has(s2, stranger) == nullptr);                              // motion hidden
+    CHECK(has(s1, rock) && has(s1, rock)->fog == Fog::Visible);
+    CHECK(has(s2, rock) && has(s2, rock)->fog == Fog::Shrouded);     // things stay, frozen as last seen
     // God Eye sees everything
     FogOfWar god;
     god.update(v);
@@ -9142,6 +10021,270 @@ static void test_render_snapshot_and_procedural_atlas() {
     }
     CHECK(v.state_hash() == h1);
     (void)h0; (void)atlas.size();
+}
+
+// ---------- CL-1 Phase 0: brain substrate ------------------------------------
+// BrainArena, int8 kernels, activation LUTs, hash RNG. No world behavior —
+// this suite verifies determinism and measures the GMAC/s assumption the
+// blueprint budget calculator needs.
+static void test_brain_phase0() {
+    // ---- LUTs: deterministic, sane shapes ------------------------------------
+    const std::int8_t* lin = brain_act_lut(BrainAct::kLinear);
+    const std::int8_t* th  = brain_act_lut(BrainAct::kTanh);
+    const std::int8_t* sg  = brain_act_lut(BrainAct::kSigmoid);
+    CHECK(lin && th && sg);
+    CHECK(lin[static_cast<std::uint8_t>(static_cast<std::int8_t>(0))] == 0);
+    CHECK(lin[static_cast<std::uint8_t>(static_cast<std::int8_t>(42))] == 42);
+    // tanh saturates, sigmoid is tanh(u/2) — both bounded, odd/even sane
+    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(127))] > 100);
+    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(-128))] < -100);
+    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(0))] == 0);
+    CHECK(sg[static_cast<std::uint8_t>(static_cast<std::int8_t>(127))] >
+          sg[static_cast<std::uint8_t>(static_cast<std::int8_t>(-128))]);
+    // same table object every call (built once)
+    CHECK(brain_act_lut(BrainAct::kTanh) == th);
+
+    // ---- dot + dense kernels: deterministic, activation applied --------------
+    std::vector<std::int8_t> w(4 * 8), x(8), y1(4), y2(4);
+    for (int i = 0; i < 8; ++i)
+        x[i] = static_cast<std::int8_t>(brain_rand_weight(7, 1, i, 24));
+    for (int i = 0; i < 32; ++i)
+        w[i] = static_cast<std::int8_t>(brain_rand_weight(7, 2, i, 24));
+    std::int16_t bias[4] = {3, -2, 0, 5};
+    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kLinear, y1.data());
+    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kLinear, y2.data());
+    CHECK(y1 == y2);
+    // hand-check row 0: dot = sum w[0..7]*x[0..7]
+    std::int32_t d0 = 0;
+    for (int i = 0; i < 8; ++i) d0 += w[i] * x[i];
+    CHECK(y1[0] == brain_clamp_i8((d0 >> 4) + bias[0]));
+    // tanh path differs from linear and stays in range
+    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kTanh, y2.data());
+    CHECK(y2 != y1);
+    for (int i = 0; i < 4; ++i) CHECK(y2[i] >= -128 && y2[i] <= 127);
+    // dot product cross-check against a naive int64 accumulation
+    for (int i = 0; i < 32; ++i) CHECK(w[i] >= -127 && w[i] <= 127);
+    CHECK(brain_dot_i8(x.data(), x.data(), 8) ==
+          [&]{ std::int64_t s = 0; for (int i = 0; i < 8; ++i) s += x[i]*x[i]; return (std::int32_t)s; }());
+
+    // ---- hash RNG: replay-identical draws ------------------------------------
+    CHECK(brain_rand_weight(42, 9, 100, 24) == brain_rand_weight(42, 9, 100, 24));
+    CHECK(brain_rand_weight(42, 9, 100, 24) != brain_rand_weight(42, 9, 101, 24));
+    CHECK(brain_mutation_step(1, 2, 3, 4, 5) == brain_mutation_step(1, 2, 3, 4, 5));
+    std::int32_t st = brain_mutation_step(1, 2, 3, 4, 5);
+    CHECK(st >= -5 && st <= 5);
+
+    // ---- BrainArena: deterministic alloc/free, cell granularity ----------------
+    BrainArena ar(64);
+    const std::uint64_t o1 = ar.alloc(100);    // 2 cells
+    const std::uint64_t o2 = ar.alloc(64);     // 1 cell
+    CHECK(o1 != BrainArena::kInvalid && o2 != BrainArena::kInvalid);
+    CHECK(o2 >= o1 + 128);
+    // returned offsets are slab-relative; the DATA pointers are 64B-aligned
+    CHECK(reinterpret_cast<std::uintptr_t>(ar.w8(o1)) % 64 == 0);
+    CHECK(reinterpret_cast<std::uintptr_t>(ar.w8(o2)) % 64 == 0);
+    ar.w8(o1)[0] = 42; ar.w8(o1)[63] = -7;
+    ar.free(o1, 100);
+    const std::uint64_t o3 = ar.alloc(100);    // reuses freed 2-cell block
+    CHECK(o3 == o1);
+    CHECK(ar.w8(o3)[0] == 42);                 // contents survive free
+    CHECK(ar.live_bytes() == 3 * 64);
+    ar.free(o2, 64); ar.free(o3, 100);
+    CHECK(ar.live_bytes() == 0);
+    // alloc past capacity fails cleanly
+    BrainArena tiny(2);
+    CHECK(tiny.alloc(3 * 64) == BrainArena::kInvalid);
+
+    // ---- mutation: deterministic, sparse, bounded ------------------------------
+    std::vector<std::int8_t> mw(256);
+    for (int i = 0; i < 256; ++i) mw[i] = 10;
+    brain_mutate_blocks(mw.data(), 256, 5, 6, 7, 3, 500);
+    std::vector<std::int8_t> mw2 = mw;
+    brain_mutate_blocks(mw2.data(), 256, 5, 6, 7, 3, 500);
+    // NOTE: second call mutates the ALREADY-mutated copy — instead rebuild:
+    for (int i = 0; i < 256; ++i) mw2[i] = 10;
+    brain_mutate_blocks(mw2.data(), 256, 5, 6, 7, 3, 500);
+    CHECK(mw == mw2);                                   // deterministic
+    bool changed = false;
+    for (int i = 0; i < 256; ++i) {
+        CHECK(mw[i] >= 7 && mw[i] <= 13);
+        if (mw[i] != 10) changed = true;
+    }
+    CHECK(changed);                                      // 500‰ fires somewhere
+    // different tick -> different result somewhere
+    for (int i = 0; i < 256; ++i) mw2[i] = 10;
+    brain_mutate_blocks(mw2.data(), 256, 5, 6, 8, 3, 500);
+    CHECK(mw != mw2);
+
+    // ---- GMAC/s micro-benchmark (replaces the blueprint's 3 GMAC/s guess) ------
+    // Dense GEMV shaped like an H=64 layer family: rows=64, cols=96.
+    {
+        const std::int32_t R = 64, C = 96, PAD = brain_padded_cols(C);
+        std::vector<std::int8_t> bw(static_cast<std::size_t>(R) * PAD, 0);
+        std::vector<std::int8_t> bx(C, 1), by(R);
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(R) * PAD; ++i)
+            bw[static_cast<std::size_t>(i)] =
+                static_cast<std::int8_t>(brain_rand_weight(1, 3, i, 24));
+        const int iters = 20000;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::int64_t acc = 0;
+        for (int it = 0; it < iters; ++it) {
+            brain_dense_i8(bw.data(), R, C, bx.data(), nullptr, 8,
+                           BrainAct::kLinear, by.data());
+            acc += by[it & (R - 1)];
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const double macs = static_cast<double>(iters) * R * C;
+        const double gmacs = macs / secs / 1e9;
+        std::printf("brain GEMV benchmark: %.2f GMAC/s "
+                    "(%d iters x %dx%d, acc=%lld, %.1f MB/s weights)\n",
+                    gmacs, iters, R, C, static_cast<long long>(acc),
+                    macs / secs / 1e6);
+        CHECK(gmacs > 0.05);      // sanity floor — real number printed above
+        CHECK(acc != 0);
+    }
+}
+
+static void test_brain_phase1() {
+    // ---- flag off: no brain store is ever created ---------------------------
+    {
+        World w(5, "data");
+        const EntityId s = mk_sapient(w, {50, 50});
+        w.interact(mk_ctx(s, {}, "rest", 0));
+        w.interact(mk_ctx(s, {}, "strike", 0));
+        CHECK(w.brains_ == nullptr);
+    }
+
+    // ---- flag on: state_hash bit-identical to flag off ----------------------
+    {
+        World on(11, "data"), off(11, "data");
+        const EntityId son = mk_sapient(on, {50, 50});
+        const EntityId soff = mk_sapient(off, {50, 50});
+        on.brain_shadow = true;
+        for (int i = 0; i < 60; ++i) {
+            const char* verb = (i % 3 == 0) ? "strike" : "rest";
+            on.interact(mk_ctx(son, {}, verb, 0));
+            off.interact(mk_ctx(soff, {}, verb, 0));
+        }
+        CHECK(on.state_hash() == off.state_hash());
+        CHECK(on.brains_ != nullptr);
+        CHECK(on.brains_->slots.count(son) == 1);
+        CHECK(on.brains_->wm_n > 0);
+        CHECK(off.brains_ == nullptr);
+    }
+
+    // ---- determinism: identical seeds -> identical brain fingerprint --------
+    {
+        World a(23, "data"), b(23, "data");
+        a.brain_shadow = b.brain_shadow = true;
+        const EntityId sa = mk_sapient(a, {50, 50});
+        const EntityId sb = mk_sapient(b, {50, 50});
+        for (int i = 0; i < 80; ++i) {
+            const char* verb = (i % 4 == 0) ? "strike" : "rest";
+            a.interact(mk_ctx(sa, {}, verb, 0));
+            b.interact(mk_ctx(sb, {}, verb, 0));
+        }
+        CHECK(a.state_hash() == b.state_hash());
+        CHECK(a.brains_ && b.brains_);
+        // diagnostic: locate the divergent component
+        {
+            const BrainSlot& A = a.brains_->slots.at(sa);
+            const BrainSlot& B = b.brains_->slots.at(sb);
+            CHECK(A.wbytes == B.wbytes);   // woff differs: heap-alignment slack
+            CHECK(a.brains_->slots.size() == b.brains_->slots.size());
+            CHECK(a.brains_->wm_err_sum == b.brains_->wm_err_sum);
+            CHECK(a.brains_->wm_n == b.brains_->wm_n);
+            CHECK(a.brains_->sigma_sum == b.brains_->sigma_sum);
+            CHECK(a.brains_->sigma_n == b.brains_->sigma_n);
+            CHECK(a.brains_->surprise_events == b.brains_->surprise_events);
+            CHECK(sa == sb);
+            CHECK(A.h == B.h);
+            CHECK(A.last_action == B.last_action);
+            CHECK(A.replay_count == B.replay_count);
+            CHECK(A.replay_next == B.replay_next);
+            for (int i = 0; i < 16; ++i) {
+                CHECK(A.replay[i].event_id == B.replay[i].event_id);
+                CHECK(A.replay[i].sigma == B.replay[i].sigma);
+                CHECK(A.replay[i].charge == B.replay[i].charge);
+                CHECK(A.replay[i].s == B.replay[i].s);
+                CHECK(A.replay[i].a == B.replay[i].a);
+                CHECK(A.replay[i].y == B.replay[i].y);
+            }
+            const std::int8_t* wa = a.brains_->arena.w8(A.woff);
+            const std::int8_t* wb2 = b.brains_->arena.w8(B.woff);
+            for (std::uint64_t i = 0; i < A.wbytes; ++i)
+                if (wa[i] != wb2[i]) {
+                    std::printf("brain weight diff @%llu: %d vs %d\n",
+                                (unsigned long long)i, wa[i], wb2[i]);
+                    break;
+                }
+        }
+        CHECK(brain_state_hash(*a.brains_) == brain_state_hash(*b.brains_));
+        // replay ring fills and stratified replacement keeps high-surprise rows
+        const BrainSlot& slot = a.brains_->slots.at(sa);
+        CHECK(slot.replay_count == 16);
+        CHECK(slot.pending.valid == false);          // consumed by post
+    }
+
+    // ---- learning curve: WM |y - yhat| falls over repeated interactions -----
+    {
+        World w(37, "data");
+        w.brain_shadow = true;
+        const EntityId s = mk_sapient(w, {50, 50});
+        std::int64_t a_sum = 0, a_n = 0;   // snapshot before interact i=1
+        std::int64_t b_sum = 0, b_n = 0;   // snapshot before interact i=60
+        std::int64_t c_sum = 0, c_n = 0;   // snapshot before interact i=840
+        for (int i = 0; i < 900; ++i) {
+            if ((i % 150) == 0) {          // vitals top-up: marathon, not survival
+                Entity& e = *w.find(s);
+                tseti(e, w, "energy", 90000000); tseti(e, w, "hunger", 0);
+                tseti(e, w, "thirst", 0);  tseti(e, w, "integrity", 1000);
+                tseti(e, w, "fatigue", 0); tseti(e, w, "blood_volume", 1000);
+            }
+            if (w.brains_) {
+                if (i == 1)   { a_sum = w.brains_->wm_err_sum; a_n = w.brains_->wm_n; }
+                if (i == 60)  { b_sum = w.brains_->wm_err_sum; b_n = w.brains_->wm_n; }
+                if (i == 840) { c_sum = w.brains_->wm_err_sum; c_n = w.brains_->wm_n; }
+            }
+            w.interact(mk_ctx(s, {}, (i % 5 == 4) ? "strike" : "rest", 0));
+        }
+        CHECK(w.brains_ != nullptr);
+        const std::int64_t d_sum = w.brains_->wm_err_sum, d_n = w.brains_->wm_n;
+        if (c_n == 0) { c_sum = d_sum; c_n = d_n; }
+        // windowed mean |y-yhat| per label channel: first ~60 events vs last ~60
+        const std::int64_t early_num = b_sum - a_sum, early_den = b_n - a_n;
+        const std::int64_t late_num  = d_sum - c_sum, late_den  = d_n - c_n;
+        CHECK(early_den > 0 && late_den > 0);
+        const double early_mae = static_cast<double>(early_num) / early_den;
+        const double late_mae  = static_cast<double>(late_num)  / late_den;
+        std::printf("brain WM MAE: early=%.3f late=%.3f (n=%lld events)\n",
+                    early_mae, late_mae,
+                    static_cast<long long>(d_n / kLabelChannels));
+        CHECK(late_mae < early_mae);       // the WM actually learned
+
+        // replay ring is full of valid, scored transitions
+        const BrainSlot& sl = w.brains_->slots.at(s);
+        CHECK(sl.replay_count == 16);
+        for (const Transition& t : sl.replay) CHECK(t.valid);
+    }
+
+    // ---- slot GC: dead agents release their arena slot ----------------------
+    {
+        World w(41, "data");
+        w.brain_shadow = true;
+        const EntityId s = mk_sapient(w, {50, 50});
+        const EntityId t = mk_sapient(w, {60, 50});
+        w.interact(mk_ctx(s, {}, "rest", 0));
+        w.interact(mk_ctx(t, {}, "rest", 0));
+        CHECK(w.brains_->slots.size() == 2);
+        const std::uint64_t live0 = w.brains_->arena.live_bytes();
+        w.find(s)->alive = false;
+        w.advance_ticks_for_test(50);          // decay_minds -> brain_gc
+        CHECK(w.brains_->slots.count(s) == 0);
+        CHECK(w.brains_->slots.count(t) == 1);
+        CHECK(w.brains_->arena.live_bytes() < live0);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -9203,6 +10346,12 @@ int main(int argc, char** argv) {
     RUN(test_render_snapshot_and_procedural_atlas);
     RUN(test_primordial_genesis_true_playable);
     RUN(test_patron_journal_planet_and_beacons);
+    RUN(test_maritime_swimming_drowning_and_watercraft);
+    RUN(test_trophic_ecology_seasons_and_apex);
+    RUN(test_domestication_agriculture_metallurgy);
+    RUN(test_quantitative_cognition_and_notation);
+    RUN(test_brain_phase0);
+    RUN(test_brain_phase1);
     RUN(test_infection_and_primitive_medicine);
     RUN(test_neuro_psychopathology);
     RUN(test_phase9_autonomous_civilization);
