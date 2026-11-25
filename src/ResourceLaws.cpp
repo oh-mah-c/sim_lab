@@ -1126,6 +1126,44 @@ PredictionResult SynthesisModel::predict(const World& w,
                                : "process needs a material target";
         return r;
     }
+
+    // spec 1.2 weapon coating: combining a toxicant (|toxicity| > 60) with a
+    // keen edge (edge_sharpness > 45) transfers a signed int8 charge onto
+    // the edge — no "poisoned blade" item class, just coat_toxin on the
+    // sharp entity. The toxicant is consumed; nothing is synthesized.
+    if (is_combine) {
+        const PropId tox_p = pid(w, "toxicity"),
+                     sharp_p = pid(w, "edge_sharpness"),
+                     coat_p = pid(w, "coat_toxin");
+        for (int i = 0; i < 2; ++i) {
+            const Reagent& tox_r = rs[i];
+            const Reagent& sh_r = rs[1 - i];
+            const std::int64_t tox =
+                w.prop_int(*tox_r.e, tox_p, 0);
+            const std::int64_t sh =
+                w.prop_int(*sh_r.e, sharp_p, 0);
+            if (std::llabs(tox) <= 60 || sh <= 45 || coat_p == kNoProp)
+                continue;
+            const std::int64_t charge =
+                std::clamp<std::int64_t>(tox, -128, 128);
+            const std::int64_t cur =
+                w.prop_int(*sh_r.e, coat_p, 0);
+            const std::int64_t ncoat =
+                std::clamp<std::int64_t>(cur + charge, -128, 128);
+            set_change(r, sh_r.id, coat_p, cur, ncoat);
+            // the toxicant is spent onto the edge
+            set_change(r, tox_r.id, integ_pid,
+                       w.prop_int(*tox_r.e, integ_pid, 500), 0);
+            std::ostringstream n;
+            n << "coated edge=" << sh_r.id << " charge=" << charge
+              << " tox=" << tox << " sharp=" << sh;
+            r.notes.push_back(n.str());
+            r.possible = true;
+            r.ticks = ctx.parameters.ticks;
+            return r;
+        }
+    }
+
     const std::int64_t band = std::min<std::int64_t>(7, best_temp / 1000);
 
     MaterialId pa = kNoMaterial, pb = kNoMaterial;

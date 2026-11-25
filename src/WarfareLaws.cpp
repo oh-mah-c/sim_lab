@@ -250,7 +250,11 @@ PredictionResult predict_coat(const World& w, const InteractionContext& ctx, Law
     const Entity* we = w.find(weapon);
     const PropId ct_p = SIMLAB_PID(w.props, "coat_toxin");
     const PropId cs_p = SIMLAB_PID(w.props, "coat_strain");
-    if (tox > 0) setc(r, weapon, ct_p, w.prop_int(*we, ct_p, 0), std::max(w.prop_int(*we, ct_p, 0), tox));
+    // coat_toxin is a signed int8 charge (spec 1.2): clamp into range so
+    // commit validation accepts potent sources (e.g. toxicity 250).
+    if (tox > 0) setc(r, weapon, ct_p, w.prop_int(*we, ct_p, 0),
+                      std::min<std::int64_t>(128,
+                          std::max(w.prop_int(*we, ct_p, 0), tox)));
     if (strain > 0) setc(r, weapon, cs_p, w.prop_int(*we, cs_p, 0), strain);
     const PropId q_p = SIMLAB_PID(w.props, "quantity");
     const PropId integ_p = SIMLAB_PID(w.props, "integrity");

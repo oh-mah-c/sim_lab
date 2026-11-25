@@ -29,6 +29,7 @@ struct TerrainGrid {
     std::vector<std::int32_t> wind_y;
     std::vector<std::int32_t> water_table;  // metres below surface to groundwater
     std::vector<std::int32_t> traffic_wear; // 0..1000 — footfall compaction (trails)
+    std::vector<std::int32_t> pollution;    // 0..1000 — soot/filth; suppresses flora regrowth
 
     bool empty() const { return w == 0 || h == 0; }
     // Position -> global cell (floor division, safe for negative coords).
@@ -63,6 +64,16 @@ struct TerrainGrid {
     std::int32_t water_table_at(Vec2 p) const { return water_table[index(p)]; }
     std::int32_t wear_at(Vec2 p) const {
         return traffic_wear.empty() ? 0 : traffic_wear[index(p)];
+    }
+    std::int32_t pollution_at(Vec2 p) const {
+        return pollution.empty() ? 0 : pollution[index(p)];
+    }
+    void add_pollution(Vec2 p, std::int32_t delta) {
+        if (pollution.empty() || !contains(p)) return;
+        std::int32_t& v = pollution[index(p)];
+        v = static_cast<std::int32_t>(
+            std::min<std::int64_t>(1000, std::max<std::int64_t>(0,
+                static_cast<std::int64_t>(v) + delta)));
     }
     void add_wear(Vec2 p, std::int32_t delta) {
         if (traffic_wear.empty() || !contains(p)) return;

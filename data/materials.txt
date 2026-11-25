@@ -797,6 +797,40 @@ material wild_berries
   portability_score 700
   spoilage_rate 800
 
+# alkaline purgative moss: negative toxicity = antidote. Eating it scrubs
+# toxin_load (spec 1.2) instead of poisoning — no "antidote" class, just a
+# material whose toxicity prop happens to point the other way.
+material purifying_moss
+  hardness 50
+  brittleness 900
+  mass 100
+  density 800000
+  integrity 200
+  decay_rate 200
+  flammability 100
+  thermal_mass 900
+  conductivity 60
+  fertility 0
+  metabolism 0
+  sight_range 0
+  speed 0
+  opacity 1000
+  nutrition 50
+  hydration 100
+  toxicity -80
+  tensile 100
+  geom_type 3
+  geom_len 60
+  geom_wid 60
+  geom_thk 60
+
+  antipyretic 400
+  antiseptic 700
+  contamination 0
+  intrinsic_scarcity 300
+  portability_score 500
+  spoilage_rate 400
+
 material nightshade
   hardness 50
   brittleness 900
@@ -1356,6 +1390,7 @@ material energetic_mix
   density 1700000
   integrity 200
   flammability 900
+  stability 60
   thermal_mass 400
   conductivity 30
   volatility 850

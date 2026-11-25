@@ -28,7 +28,7 @@ struct GenePoolEntry {
     BrainGenome brain;          // must be valid to be stored/injected
     Genome body;                // species loci snapshot (display/future use)
     std::string kind;           // "sapient" etc — sanity + UI label
-    std::int64_t fitness = 0;   // caller-scored: age + descendants + wealth
+    std::int64_t fitness = 0;   // caller-scored: reproductive lineage + scarcity survival
     std::uint64_t seen_tick = 0;
 };
 

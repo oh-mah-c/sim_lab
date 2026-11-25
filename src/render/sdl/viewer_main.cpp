@@ -2076,11 +2076,27 @@ struct Viewer {
             en.body = e->genome;
             en.kind = "sapient";
             en.seen_tick = w.clock_.tick();
-            std::int64_t fit = w.prop_int(*e, age_p, 0);
-            for (const auto& [k, rec] : mind.discoveries)
-                if (rec.status == DiscoveryStatus::Verified) fit += 500;
-            fit += static_cast<std::int64_t>(mind.memory.size()) * 10;
-            en.fitness = fit;
+            // spec 2.3 pure natural selection: fitness = reproductive
+            // lineage — offspring alive past their species' adult_age,
+            // tie-broken by cumulative scarcity survived (milli-ticks).
+            // The old age+discovery+memory heuristic is gone: a long-lived
+            // sage with no descendants no longer outranks a prolific
+            // survivor of lean seasons.
+            const PropId adult_p = SIMLAB_PID(w.props, "adult_age");
+            const PropId scarc_p = SIMLAB_PID(w.props, "scarcity_survived");
+            std::int64_t offspring = 0;
+            for (const Relation& rel : w.relations_of(mid, "parent_of")) {
+                if (rel.a != mid) continue;
+                const Entity* ch = w.find(rel.b);
+                if (!ch || !ch->alive) continue;
+                const std::int64_t mat = adult_p != kNoProp
+                    ? w.prop_int(*ch, adult_p, 200) : 200;
+                if (w.prop_int(*ch, age_p, 0) >= mat) ++offspring;
+            }
+            const std::int64_t scarcity =
+                scarc_p != kNoProp ? w.prop_int(*e, scarc_p, 0) : 0;
+            en.fitness = offspring * 1000000 +
+                std::min<std::int64_t>(999999, scarcity);
             gene_pool.consider(en);
         }
     }

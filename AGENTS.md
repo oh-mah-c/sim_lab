@@ -1056,3 +1056,66 @@ no engine code changes.
 - Verified: 90408 checks, 0 failures; test_open_ended_invention 43
   checks (sensor attrs, combine->syn material + idempotent rediscovery,
   smelt vs thermal fallthrough, save/load state_hash, tried-set marks).
+
+## Emergent Material Physics & Co-Evolutionary Pressure
+
+- Detonation (spec 1.1): `World::detonation_drift(n)` runs once per
+  `advance_ticks` (after terrain_wear_decay). Candidate = alive entity
+  whose MATERIAL has flammability>=600 && stability<300 (material-prop
+  scale, permille). Primed by entity `temperature`>700 deciC, terrain
+  `temp_at`>700, or `last_impact_tick` within 40 ticks (stamped by
+  deliver_blow when dmg>15). Blast: Chebyshev radius
+  `clamp((flamm-400)/100 + dens/1e6, 1, 6)`, impulse
+  `E=(flamm*(1000-stab))>>11`, damage `E/(d+1)` + shrapnel
+  `(edge_sharpness*dmg)>>10`, victim `temperature += dmg>>1` (chain
+  fuel), terrain heat+soot per covered cell, charge consumed with
+  alive=false (multi-tick drift cannot re-detonate). `energetic_mix`
+  (flamm 900, stability 60) is the canonical charge; ordinary fuels
+  default stability=1000 -> inert.
+- Coating (spec 1.2): `SynthesisModel` combine branch — |toxicity|>60
+  reagent + edge_sharpness>45 reagent -> signed `coat_toxin` int8
+  (+-128) on the sharp entity, toxicant consumed, NO synthesis.
+  `deliver_blow` anatomy path injects the charge into body `toxin_load`
+  (clamped 0..1000) on sharp hits dmg>=50 and decrements the striker's
+  coat by the dose actually delivered. `consume` treats toxicity<-40
+  as an edible purifying draught: `toxin_relief += -tox*units*2`
+  scrubs toxin_load instead of harming. `predict_coat` (WarfareModel)
+  clamps coat_toxin writes to +-128 — commit validation rejects
+  out-of-range values, which silently failed `coat` on strong toxins.
+- Emergent armor (spec 1.3): `lawutil::emergent_armor` scans the
+  victim's `wearing` edges + wielded tool for items with
+  hardness>=850 && density>=750000; pct=clamp(((h/10-80)+(d/10000-70))
+  >>1, 0, 75) -> permille reduction (max 750). Applied in BOTH
+  deliver_blow paths; shield pays integrity `absorbed/8`. No armor
+  item class — `iron_blade` (h900 d7.8e6) is a 75% plate.
+- Pollution (spec 2.1): `terrain.pollution` int32 0..1000 (save v24).
+  `World::add_pollution` (public) writes + marks `pollution_cells_`
+  dirty; `pollution_decay` fades dirty cells linearly 1/tick (batched,
+  Euclid-exact). Producers: interact heat/smelt/process/combine (+20 at
+  target pos) and detonations (E/8 per covered cell). Flora fruit
+  regrowth `regen *= (1000 - poll/2)/1000`.
+- Metabolic brain cost (spec 2.2): `drift_needs` adds a hunger tax from
+  `brain_hunger_accum` (milli-permille, Euclid remainder like
+  mind_brain_accum): overhead=(H*H)>>10 accumulated at overhead*100
+  milli/tick = overhead/10 permille/tick. H=64 ~+0.4, H=128 ~+1.6
+  permille/tick vs a ~1 baseline — the LITERAL spec rate (+4..16
+  permille/tick) 5x'd the burn and collapsed the curriculum civ
+  (alive=0); the /10 granularity keeps H^2 ordering and real selection
+  pressure without breaking the survival floor.
+- Structural mutation: `brain_child_genome` gives ~5% of offspring a
+  +-8 hidden_size shift (snap_hidden clamps 8-aligned [32,128]);
+  `remap_slow_hidden` re-lays the slow block — old synapses keep
+  values, new rows/cols get hash-seeded weights. Save v25 (brain h up
+  to 128; GRU h array widened).
+- GenePool fitness (spec 2.3): heuristic (age+500*discovery+10*memory)
+  REMOVED. viewer harvest_gene_pool + test score_world rank by
+  offspring alive past species `adult_age` (*1e6) tie-broken by
+  `scarcity_survived` milli-ticks (<=999999), which drift_needs
+  accumulates while hunger/thirst >=950.
+- Verified: 90465 checks, 0 failures; test_emergent_coevolution 54
+  checks (detonation AOE+chain, coat->toxin_load, antidote scrub,
+  armor comparison, pollution regrowth suppression + linear decay,
+  H^2 hunger tax, hidden mutation, scarcity accrual, save/load hash).
+  Capstone fingerprint changed (new laws alter dynamics) —
+  state_hash=a99f86ff9e38fac2 at cycles=1200. seq==t1==t8 and
+  dev==release bit-identical (parallel_think a7ff3016888ea075).

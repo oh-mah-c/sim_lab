@@ -154,6 +154,8 @@ public:
     void step() { advance_ticks(1); }
     // Advance n ticks with no action (used by long-horizon tests/tools).
     void advance_ticks_for_test(std::int64_t n) { advance_ticks(n); }
+    // Soot/filth write on a terrain cell (dirty-set tracked for decay).
+    void add_pollution(Vec2 p, std::int64_t delta);
     std::uint64_t state_hash() const;      // FNV-1a over all persistent state
     // Phase 12.1d: deterministic lexicon codex export (public API).
     std::string export_lexicon_codex() const;
@@ -503,6 +505,12 @@ private:
     // Footfall compaction: linear per-tick fade over dirty cells only —
     // exact under dt=1 xN vs dt=N because the decay has no memory.
     void terrain_wear_decay(std::int64_t n);
+    // Emergent detonation: volatile materials (low `stability` + high
+    // `flammability`) primed by heat or a recent kinetic hit blast —
+    // radius/impulse/shrapnel all derived from material props, integer-only.
+    void detonation_drift(std::int64_t n);
+    // Soot decay over dirty pollution cells (same contract as wear fade).
+    void pollution_decay(std::int64_t n);
     // Causal parents of an interaction: caller-supplied + the last event that
     // touched each target / wielded tool (automatic provenance chain).
     std::vector<EventId> auto_parents(const InteractionContext& ctx) const;
@@ -521,6 +529,9 @@ private:
     // rebuilt deterministically from terrain on load; only dirty cells pay
     // the per-advance decay cost.
     std::set<std::uint64_t> wear_cells_;
+    // Same dirty-cell contract for terrain.pollution (soot from fires,
+    // smelts and blasts; decays linearly, suppresses flora regrowth).
+    std::set<std::uint64_t> pollution_cells_;
 };
 
 }  // namespace simlab

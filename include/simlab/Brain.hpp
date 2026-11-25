@@ -203,8 +203,8 @@ struct BrainPending {
     std::array<std::int8_t, kLabelChannels> yhat{};
     std::array<std::int8_t, 96> wm_hidden{};   // WM layer-1 activations
     std::array<std::int8_t, 64> w1hidden{};    // worker hidden (actor SGD)
-    std::array<std::int16_t, 96> h{};          // post-GRU hidden state Q8
-    std::array<std::int8_t, 96> embed{};       // embed output (manager/worker in)
+    std::array<std::int16_t, 128> h{};         // post-GRU hidden state Q8
+    std::array<std::int8_t, 128> embed{};      // embed output (manager/worker in)
     // open-ended invention: materials of the first two material-bearing
     // targets, resolved pre-commit so brain_post can key the tried-combo
     // set on exactly what the laws will see.
@@ -215,12 +215,12 @@ struct BrainPending {
 struct BrainSlot {
     std::uint64_t woff = 0;          // arena offset of weight block
     std::uint64_t wbytes = 0;        // bytes handed to arena (for free)
-    std::int32_t hidden = 64;        // H — layer width, {32,48,64,96}
+    std::int32_t hidden = 64;        // H — layer width, 8-aligned [32,128]
     // Baldwin hyper-genes (inherited via BrainGenome / entity genome loci)
     std::int32_t lr_permille = 400;      // brain_lr — lifetime SGD rate
     std::int32_t trace_decay = 900;     // brain_trace_decay — gamma*1024
     std::int32_t mut_scale = 500;       // brain_mut_scale — birth mutation ‰
-    std::array<std::int16_t, 96> h{};   // GRU state, Q8 (first `hidden` used)
+    std::array<std::int16_t, 128> h{};  // GRU state, Q8 (first `hidden` used)
     ActionVec last_action{};                   // feeds sensor channels 80..95
     BrainPending pending{};
     std::array<Transition, 16> replay{};
@@ -281,8 +281,9 @@ struct BrainStore {
 
 // ---- Phase 1 API ----------------------------------------------------------------
 // Layer geometry (public for tests/tools). brain_layout() is the canonical
-// H=64 view; brain_layout_h(H) gives the per-hidden-size layout used by
-// Phase-2 genome-variable brains ({32,48,64,96}).
+// H variable per brain (genome-quantized, 8-aligned in [32,128]);
+// brain_layout_h(H) gives the per-hidden-size layout used by
+// Phase-2 genome-variable brains.
 struct BrainLayout {
     // offsets (bytes) inside the weight block; weights region first,
     // then the int16 bias region.

@@ -10753,11 +10753,24 @@ static void test_gene_pool_evolution() {
             en.body = e->genome;
             en.kind = "sapient";
             en.seen_tick = w.clock_.tick();
-            std::int64_t fit = w.prop_int(*e, age_p, 0);
-            for (const auto& [k, rec] : mind.discoveries)
-                if (rec.status == DiscoveryStatus::Verified) fit += 500;
-            fit += static_cast<std::int64_t>(mind.memory.size()) * 10;
-            en.fitness = fit;
+            // spec 2.3 pure natural selection: offspring alive past
+            // adult_age, tie-broken by scarcity_survived milli-ticks —
+            // mirrors viewer_main's harvest_gene_pool.
+            const PropId adult_p = SIMLAB_PID(w.props, "adult_age");
+            const PropId scarc_p = SIMLAB_PID(w.props, "scarcity_survived");
+            std::int64_t offspring = 0;
+            for (const Relation& rel : w.relations_of(mid, "parent_of")) {
+                if (rel.a != mid) continue;
+                const Entity* ch = w.find(rel.b);
+                if (!ch || !ch->alive) continue;
+                const std::int64_t mat = adult_p != kNoProp
+                    ? w.prop_int(*ch, adult_p, 200) : 200;
+                if (w.prop_int(*ch, age_p, 0) >= mat) ++offspring;
+            }
+            const std::int64_t scarcity =
+                scarc_p != kNoProp ? w.prop_int(*e, scarc_p, 0) : 0;
+            en.fitness = offspring * 1000000 +
+                std::min<std::int64_t>(999999, scarcity);
             hall.consider(en);
         }
         return hall;
@@ -11308,6 +11321,230 @@ static void test_open_ended_invention() {
     }
 }
 
+// ---------- Emergent Material Physics & Co-Evolutionary Pressure -----------
+// spec pillars: detonation (1.1), coating/antidote (1.2), emergent armor
+// (1.3), pollution ecology (2.1), metabolic brain cost + hidden mutation
+// (2.2), lineage fitness evidence (2.3).
+static void test_emergent_coevolution() {
+
+    // (1) detonation: volatile charge primed by heat -> AOE + chain --------
+    {
+        World w(301, "data");
+        const MaterialId em = w.materials.id_of("energetic_mix");
+        CHECK(em != kNoMaterial);
+        PropertyBag pc;
+        pc.set(pid(w, "integrity"), Value::integer(500));
+        pc.set(pid(w, "temperature"), Value::integer(800));   // >700 deciC
+        const EntityId c1 = w.create_entity("charge", em, {50, 50}, pc);
+        // chain charge: warm but under the primer — c1's blast pushes it
+        // over 700 deciC and it must go up in the same drift window.
+        PropertyBag pc2;
+        pc2.set(pid(w, "integrity"), Value::integer(500));
+        pc2.set(pid(w, "temperature"), Value::integer(650));
+        const EntityId c2 = w.create_entity("charge", em, {52, 50}, pc2);
+        PropertyBag pv;
+        pv.set(pid(w, "integrity"), Value::integer(900));
+        const MaterialId stone = w.materials.id_of("stone");
+        CHECK(stone != kNoMaterial);
+        const EntityId vic = w.create_entity("victim", stone, {51, 50}, pv);
+        const EntityId far = w.create_entity("victim", stone, {90, 50}, pv);
+        w.advance_ticks_for_test(2);
+        CHECK(!w.find(c1)->alive);                  // consumed by the blast
+        CHECK(!w.find(c2)->alive);                  // chain detonation
+        const std::int64_t vi = tint(*w.find(vic), w, "integrity");
+        CHECK(vi < 900 && vi > 0);                  // attenuated AOE damage
+        CHECK(tint(*w.find(far), w, "integrity") == 900);  // outside radius
+    }
+
+    // (2) coating via combine + toxin injection on a penetrating blow ------
+    {
+        World w(302, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId night = w.materials.id_of("nightshade");
+        const MaterialId copper = w.materials.id_of("copper_metal");
+        CHECK(night != kNoMaterial && copper != kNoMaterial);
+        PropertyBag q;
+        q.set(pid(w, "quantity"), Value::integer(10));
+        const EntityId tox = w.create_entity("item", night, {51, 50}, q);
+        const EntityId blade = w.create_entity("item", copper, {51, 51}, q);
+        InteractionResult r = w.interact(mk_ctx(a, {tox, blade}, "combine", 0));
+        CHECK(r.completed);
+        CHECK(w.synthesized_.empty());              // coating, not synthesis
+        // nightshade toxicity 250 -> signed charge clamped to int8 range
+        CHECK(tint(*w.find(blade), w, "coat_toxin") == 128);
+        CHECK(tint(*w.find(tox), w, "integrity") == 0);   // toxicant spent
+
+        // wield the coated edge and land a penetrating blow on a body
+        w.relate(a, "wielding", blade);
+        const EntityId body = mk_body(w, {55, 50});
+        mk_part(w, body, "arm_l", "muscle", "arm_l", "arm", 0, 200);
+        const std::int64_t tl0 = tint(*w.find(body), w, "toxin_load", 0);
+        InteractionResult hit = w.interact(mk_ctx(a, {body}, "impact", 300));
+        CHECK(hit.completed);
+        CHECK(tint(*w.find(body), w, "toxin_load") > tl0);
+        CHECK(tint(*w.find(blade), w, "coat_toxin") < 128); // charge spent
+    }
+
+    // (3) antidote: negative-toxicity draught scrubs toxin_load ------------
+    {
+        World w(303, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "toxin_load", 600);
+        const MaterialId moss = w.materials.id_of("purifying_moss");
+        CHECK(moss != kNoMaterial);
+        PropertyBag q;
+        q.set(pid(w, "quantity"), Value::integer(5));
+        const EntityId m = w.create_entity("item", moss, {51, 50}, q);
+        InteractionResult r = w.interact(mk_ctx(a, {m}, "consume", 0));
+        CHECK(r.completed);
+        // tox -80 -> relief 80*2 = 160 off the blood
+        CHECK(tint(*w.find(a), w, "toxin_load") == 440);
+    }
+
+    // (4) emergent armor: rigid carried item attenuates + pays durability --
+    {
+        World w(304, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const MaterialId iron = w.materials.id_of("iron_blade");
+        const MaterialId stone = w.materials.id_of("stone");
+        CHECK(iron != kNoMaterial && stone != kNoMaterial);
+        PropertyBag pv;
+        pv.set(pid(w, "integrity"), Value::integer(900));
+        const EntityId shield = w.create_entity("item", iron, {50, 51}, pv);
+        const EntityId armored = w.create_entity("item", stone, {51, 50}, pv);
+        const EntityId plain = w.create_entity("item", stone, {52, 50}, pv);
+        w.relate(armored, "wearing", shield);       // carried, not wielded
+        InteractionResult r1 = w.interact(mk_ctx(a, {armored}, "impact", 100));
+        InteractionResult r2 = w.interact(mk_ctx(a, {plain}, "impact", 100));
+        CHECK(r1.completed && r2.completed);
+        const std::int64_t i_arm = tint(*w.find(armored), w, "integrity");
+        const std::int64_t i_pln = tint(*w.find(plain), w, "integrity");
+        CHECK(i_arm > i_pln);                       // measurably less damage
+        CHECK(tint(*w.find(shield), w, "integrity") < 900); // paid durability
+    }
+
+    // (5) pollution: soot suppresses flora regrowth and decays ------------
+    {
+        WorldGenParams gp; gp.seed = 77;
+        World w1(gp.seed, "data"), w2(gp.seed, "data");
+        WorldGenerator gen;
+        CHECK(gen.generate(w1, gp));
+        CHECK(gen.generate(w2, gp));
+        // land cell with the best vegetation (most fruit potential)
+        int blx = -1, bly = -1, bveg = -1;
+        for (int y = 0; y < w1.terrain.h; ++y)
+            for (int x = 0; x < w1.terrain.w; ++x) {
+                const std::size_t ci =
+                    static_cast<std::size_t>(y) * w1.terrain.w + x;
+                if (w1.terrain.water[ci] != 0) continue;
+                if (w1.terrain.vegetation[ci] > bveg) {
+                    bveg = w1.terrain.vegetation[ci]; blx = x; bly = y;
+                }
+            }
+        CHECK(blx >= 0);
+        const Vec2 pp = w1.terrain.cell_center(blx + w1.terrain.ox,
+                                             bly + w1.terrain.oy);
+        CHECK(w1.terrain.contains(pp));
+        auto mk_plant = [&](World& w) {
+            PropertyBag pb;
+            pb.set(pid(w, "fruit_count"), Value::integer(0));
+            pb.set(pid(w, "max_fruit"), Value::integer(1000000));
+            pb.set(pid(w, "fruit_regrow_rate"), Value::integer(1000));
+            pb.set(pid(w, "fruit_credit"), Value::integer(0));
+            pb.set(pid(w, "fruit_spoil_rate"), Value::integer(0));
+            pb.set(pid(w, "integrity"), Value::integer(1000));
+            const MaterialId lw = w.materials.id_of("living_wood");
+            return w.create_entity("test_bush", lw, pp, pb);
+        };
+        const EntityId p1 = mk_plant(w1);
+        const EntityId p2 = mk_plant(w2);
+        w2.add_pollution(pp, 1000);
+        CHECK(w2.terrain.pollution_at(pp) == 1000);
+        w1.advance_ticks_for_test(60);
+        w2.advance_ticks_for_test(60);
+        const std::int64_t f1 = tint(*w1.find(p1), w1, "fruit_count");
+        const std::int64_t f2 = tint(*w2.find(p2), w2, "fruit_count");
+        CHECK(f1 > 0);
+        CHECK(f2 < f1);                            // soot chokes regrowth
+        // pollution fades linearly: 1000 - 60 ticks * 1 = 940
+        CHECK(w2.terrain.pollution_at(pp) == 940);
+
+        // a process/combine-class action also writes soot on its cell
+        const EntityId a = mk_sapient(w1, pp);
+        PropertyBag q;
+        q.set(pid(w1, "quantity"), Value::integer(5));
+        const MaterialId berry = w1.materials.id_of("wild_berries");
+        const EntityId it = w1.create_entity("item", berry, pp, q);
+        const std::int32_t before = w1.terrain.pollution_at(w1.find(it)->pos);
+        InteractionResult rr = w1.interact(mk_ctx(a, {it}, "process", 0));
+        CHECK(rr.completed);
+        CHECK(w1.terrain.pollution_at(w1.find(it)->pos) > before);
+    }
+
+    // (6) metabolic brain cost: bigger hidden burns more hunger ------------
+    {
+        World w(305, "data");
+        auto mk_brained = [&](std::int32_t H) {
+            const EntityId id = mk_sapient(w, {50, 50});
+            BrainGenome g;
+            g.valid = true; g.hidden = H;
+            g.slow.assign(brain_layout_h(H).total_bytes, 1);
+            brain_install_spawn(w, id, g);
+            return id;
+        };
+        const EntityId small = mk_brained(32);    // (32^2)>>10 = 1
+        const EntityId big = mk_brained(128);     // (128^2)>>10 = 16
+        w.advance_ticks_for_test(10);
+        const std::int64_t hs = tint(*w.find(small), w, "hunger");
+        const std::int64_t hb = tint(*w.find(big), w, "hunger");
+        CHECK(hb > hs);                           // calorie overhead scales H^2
+        // save/load keeps brain state + hash identical (format v25)
+        const std::string path = "/tmp/simlab_coevo_save.bin";
+        const std::uint64_t h = w.state_hash();
+        CHECK(w.save(path));
+        World w3(305, "data");
+        CHECK(w3.load(path));
+        CHECK(w3.state_hash() == h);
+    }
+
+    // (7) structural mutation: ~5% of offspring shift hidden +-8 -----------
+    {
+        World w(306, "data");
+        BrainGenome ga, gb;
+        ga.valid = gb.valid = true;
+        ga.hidden = gb.hidden = 64;
+        ga.slow.assign(brain_layout_h(64).total_bytes, 3);
+        gb.slow.assign(brain_layout_h(64).total_bytes, 5);
+        int mutated = 0;
+        EntityId aid = 1000;
+        for (EntityId bid = 2000; bid < 2200 && mutated < 5; ++bid, ++aid) {
+            BrainGenome c = brain_child_genome(w, aid, bid, ga, gb);
+            if (c.hidden != 64) {
+                ++mutated;
+                CHECK(c.hidden % 8 == 0);                 // AVX2-aligned
+                CHECK(c.hidden >= 32 && c.hidden <= 128); // clamped range
+                CHECK(c.slow.size() ==
+                      brain_layout_h(c.hidden).total_bytes);
+            }
+        }
+        CHECK(mutated > 0);      // 5% over 200 draws -> ~10 expected
+    }
+
+    // (8) scarcity survival: the GenePool tie-break accrues in milli-ticks -
+    {
+        World w(307, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "hunger", 960);
+        w.advance_ticks_for_test(10);
+        const std::int64_t sc1 = tint(*w.find(a), w, "scarcity_survived");
+        CHECK(sc1 > 0);
+        CHECK(sc1 <= 20000);                        // <= starving milli-ticks
+        w.advance_ticks_for_test(10);
+        const std::int64_t sc2 = tint(*w.find(a), w, "scarcity_survived");
+        CHECK(sc2 > sc1);                           // keeps accumulating
+    }
+}
+
 static void test_parallel_think() {
     auto build = [](std::uint64_t seed) {
         World w(seed, "data");
@@ -11411,6 +11648,7 @@ int main(int argc, char** argv) {
     RUN(test_narrative_host);
     RUN(test_brain_deep_cognition);
     RUN(test_open_ended_invention);
+    RUN(test_emergent_coevolution);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);

@@ -329,6 +329,14 @@ MaterialId World::materialize_synth(const SpawnSpec::SynthSpec& spec,
         def.props[pi->id] = Value::integer(500);
     if (const PropertyDef* pm = props.find_name("mass"))
         def.props[pm->id] = Value::integer(500);
+    // spec 1.1: a synthesized charge inherits instability from its fuel
+    // content — flammability 900 leaves stability 100, primed by heat or
+    // impact. Inert feeds (flammability < 300) stay stability 1000.
+    if (const PropertyDef* ps = props.find_name("stability")) {
+        const std::int64_t fl = spec.attrs[1];
+        def.props[ps->id] = Value::integer(
+            std::clamp<std::int64_t>(1000 - fl, 0, 1000));
+    }
     const MaterialId mid = materials.add(std::move(def));
     if (mid == kNoMaterial) return kNoMaterial;
     SynthRecord rec;
@@ -491,6 +499,9 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
         if (src.traffic_wear.size() == src.elevation.size())
             cp(src.traffic_wear, dst.traffic_wear);
         else dst.traffic_wear.assign(n, 0);
+        if (src.pollution.size() == src.elevation.size())
+            cp(src.pollution, dst.pollution);
+        else dst.pollution.assign(n, 0);
         dst.water.assign(n, 0);
         for (int ly = 0; ly < dst.h; ++ly)
             for (int lx = 0; lx < dst.w; ++lx) {
@@ -566,7 +577,8 @@ void World::advance_ticks(std::int64_t n) {
     }
     metabolize(n); dissipate_heat(n); ecology_tick(n);
     language_tick(clock_.tick()); decay_minds(n); political_drift(n); myth_drift(n);
-    terrain_wear_decay(n);
+    terrain_wear_decay(n); pollution_decay(n);
+    detonation_drift(n);
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -710,12 +722,73 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     const bool has_t = np.thirst != kNoProp && prop_of(e, np.thirst);
     const std::int64_t h_start = has_h ? prop_int(e, np.hunger, 0) : 0;
     const std::int64_t t_start = has_t ? prop_int(e, np.thirst, 0) : 0;
+    // spec 2.2 metabolic brain cost: an active brain's hidden size sets a
+    // calorie overhead — metabolic_overhead = (H*H)>>10. Our hunger rate is
+    // permille/tick with an integer baseline of ~1, so the raw overhead is
+    // accumulated at 1/10 permille granularity in `brain_hunger_accum`
+    // (milli-permille, Euclid-exact like mind_brain_accum): H=64 costs
+    // ~0.4 permille/tick, H=128 ~1.6 — bigger brains plan deeper but
+    // starve faster in scarcity. The same rate feeds the starvation-
+    // threshold math so batched and per-tick drift agree exactly.
+    // `brain_drop` is the window TOTAL in permille (accumulator output) —
+    // it is added to the hunger bump directly, not via the per-tick rate.
+    std::int64_t brain_drop = 0;
+    if (brains_ && has_h) {
+        const auto bit = brains_->slots.find(e.id);
+        if (bit != brains_->slots.end()) {
+            const std::int64_t H = bit->second.hidden;
+            const std::int64_t overhead = (H * H) >> 10;
+            if (overhead > 0) {
+                static thread_local SeqPidCache bh_c_;
+                SeqPid bhp(bh_c_, props);
+                const PropId p_ba = bhp("brain_hunger_accum");
+                if (p_ba != kNoProp) {
+                    const bool had = prop_of(e, p_ba) != nullptr;
+                    const std::int64_t a0 = prop_int(e, p_ba, 0);
+                    const std::int64_t a1 =
+                        a0 + overhead * 100 * static_cast<std::int64_t>(dt_u);
+                    const std::int64_t drop = a1 / 1000;
+                    const std::int64_t rem = a1 % 1000;
+                    brain_drop = drop;
+                    if (rem != a0 || !had) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = p_ba;
+                        ch.had_before = had;
+                        ch.before = had ? Value::integer(a0)
+                                        : Value::integer(0);
+                        ch.after = Value::integer(rem);
+                        e.props.set(p_ba, ch.after);
+                        ev.changes.push_back(ch);
+                        touched = true;
+                    }
+                }
+            }
+        }
+    }
     if (has_need && met > 0) {
-        bump(np.hunger, met / 1000);
+        const std::int64_t h_rate = met / 1000;
+        if (brain_drop == 0) {
+            bump(np.hunger, h_rate);
+        } else if (has_h) {
+            // metabolic brain tax lands as a flat window total on top of
+            // the metabolic rate (same clamp as bump()).
+            const std::int64_t cur = prop_int(e, np.hunger, 0);
+            const std::int64_t nxt = std::min<std::int64_t>(
+                1000, cur + h_rate * dt + brain_drop);
+            if (nxt != cur) {
+                StateChange ch;
+                ch.entity = e.id; ch.prop = np.hunger; ch.had_before = true;
+                ch.before = Value::integer(cur);
+                ch.after = Value::integer(nxt);
+                e.props.set(np.hunger, ch.after);
+                ev.changes.push_back(ch);
+                touched = true;
+            }
+        }
         bump(np.thirst, met / 500);
         bump(np.fatigue, met / 2000);
         if (np.integrity != kNoProp) {
-            const std::int64_t rh = met / 1000, rt = met / 500;
+            const std::int64_t rh = h_rate, rt = met / 500;
             auto first_starving = [&](bool has, std::int64_t cur,
                                       std::int64_t rate) {
                 if (!has) return std::numeric_limits<std::int64_t>::max();
@@ -728,6 +801,31 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                 first_starving(has_t, t_start, rt));
             const std::int64_t starving = s <= dt ? dt - s + 1 : 0;
             if (starving > 0) {
+                // spec 2.3: scarcity survival is lineage fitness evidence —
+                // accumulate the endured starving ticks (milli-ticks) on
+                // the survivor; the GenePool ranks by it as tie-break.
+                {
+                    static thread_local SeqPidCache sc_c_;
+                    SeqPid scp(sc_c_, props);
+                    const PropId p_sc = scp("scarcity_survived");
+                    if (p_sc != kNoProp &&
+                        (prop_of(e, p_sc) || minds_.count(e.id))) {
+                        const std::int64_t sc0 = prop_int(e, p_sc, 0);
+                        const std::int64_t sc1 =
+                            std::min<std::int64_t>(1000000000,
+                                sc0 + starving * 1000);
+                        if (sc1 != sc0) {
+                            StateChange sch;
+                            sch.entity = e.id; sch.prop = p_sc;
+                            sch.had_before = true;
+                            sch.before = Value::integer(sc0);
+                            sch.after = Value::integer(sc1);
+                            e.props.set(p_sc, sch.after);
+                            ev.changes.push_back(sch);
+                            touched = true;
+                        }
+                    }
+                }
                 const std::int64_t cur = prop_int(e, np.integrity, 500);
                 const std::int64_t dmg =
                     std::max<std::int64_t>(1, met / 200) * starving;
@@ -1036,7 +1134,9 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             std::int64_t net = 0;    // milli-units per tick, signed
             if (has_freg && cur < mx) {
                 std::int64_t env = 500;
+                std::int64_t poll = 0;   // spec 2.1: soot chokes regrowth
                 if (!terrain.empty() && terrain.contains(e.pos)) {
+                    poll = terrain.pollution_at(e.pos);
                     std::int64_t moist =
                         std::clamp<std::int64_t>(terrain.moist_at(e.pos), 0, 1000);
                     // watered soil (Phase 18): `irrigation_credit` ticks of
@@ -1054,6 +1154,10 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                 std::int64_t regen =
                     prop_int(e, np.fruit_regrow_rate, 0) * env / 1000;
                 regen = regen * grow_eff / 1000;
+                // spec 2.1: pollution permille halves regrowth at 1000 —
+                // soot is World Truth read straight off the terrain cell.
+                if (poll > 0)
+                    regen = regen * (1000 - poll / 2) / 1000;
                 // juvenile plants (Phase 18): `growth` below `growth_ticks`
                 // means the crop has not fruited yet — sowing is an
                 // investment, not an instant harvest.
@@ -3548,8 +3652,16 @@ void World::environmental_drift(Entity& e, std::uint64_t pending_u,
         // Phase 11.2: a soil patch is a living-world entity whose spore
         // bank decays when no host replenishes it — fallowing self-cleans.
         if (ssl_p != kNoProp && prop_of(e, ssl_p)) {
-            const std::int64_t srate = sdr_p != kNoProp
+            std::int64_t srate = sdr_p != kNoProp
                 ? prop_int(e, sdr_p, 0) : 0;
+            // spec 2.1: soot preserves and selects for spores — polluted
+            // soil decays its blight reservoir at half rate (permille),
+            // so fire-scarred ground stays infectious longer.
+            if (srate > 0 && !terrain.empty() && terrain.contains(e.pos)) {
+                const std::int64_t poll = terrain.pollution_at(e.pos);
+                if (poll > 0)
+                    srate = srate * (1000 - poll / 2) / 1000;
+            }
             if (srate > 0 && sda_p != kNoProp) {
                 const std::int64_t a0 = prop_int(e, sda_p, 0);
                 const std::int64_t acc = a0 + pending * srate;
@@ -5524,6 +5636,21 @@ InteractionResult World::interact(const InteractionContext& ctx) {
     // else the caller's tick count (default 1). Time passing also
     // metabolizes needs (ledgered as "metabolize" events).
     const std::int64_t dt = pred.ticks > 0 ? pred.ticks : ctx.parameters.ticks;
+    // spec 2.1: fires, smelts and forced reactions soot their cell —
+    // pollution is terrain truth, written inside the same causal event.
+    if (ctx.parameters.action == "heat" ||
+        ctx.parameters.action == "smelt" ||
+        ctx.parameters.action == "process" ||
+        ctx.parameters.action == "combine") {
+        Vec2 pp{};
+        bool have = false;
+        if (const Entity* ae = find(ctx.actor)) { pp = ae->pos; have = true; }
+        if (!ctx.targets.empty())
+            if (const Entity* te = find(ctx.targets.front())) {
+                pp = te->pos; have = true;
+            }
+        if (have) add_pollution(pp, 20);
+    }
     ev.spawned = res.spawned;
     if (defer_time) deferred_dt = std::max(deferred_dt, dt);
     else advance_ticks(dt);
@@ -5821,7 +5948,7 @@ std::uint64_t World::content_hash() const {
     };
     vec(terrain.elevation); vec(terrain.moisture); vec(terrain.temperature);
     vec(terrain.vegetation); vec(terrain.slope); vec(terrain.water_table);
-    vec(terrain.traffic_wear);
+    vec(terrain.traffic_wear); vec(terrain.pollution);
     for (std::uint8_t x : terrain.water) h = fnv(h, x);
     for (const auto& col : subsurface.cells)
         for (const Stratum& s : col) { h = fnv(h, s.material); h = fnv(h, static_cast<std::uint32_t>(s.top)); h = fnv(h, static_cast<std::uint32_t>(s.bottom)); }
@@ -5915,6 +6042,7 @@ std::uint64_t World::state_hash() const {
         mixv(terrain.elevation); mixv(terrain.moisture); mixv(terrain.temperature);
         mixv(terrain.vegetation); mixv(terrain.slope); mixv(terrain.wind_x); mixv(terrain.wind_y);
         mixv(terrain.water_table); mixv(terrain.traffic_wear);
+        mixv(terrain.pollution);
         for (std::uint8_t x : terrain.water) mix(x);
     }
     if (!subsurface.empty()) {
@@ -6096,7 +6224,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 23;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set
+constexpr std::uint32_t kSaveFormat = 25;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128)
 
 struct Writer {
     std::ofstream f;
@@ -6230,6 +6358,7 @@ bool World::save(const std::string& path, std::string* err) const {
     write_i32vec(w, terrain.slope); write_i32vec(w, terrain.wind_x);
     write_i32vec(w, terrain.wind_y); write_i32vec(w, terrain.water_table);
     write_i32vec(w, terrain.traffic_wear);
+    write_i32vec(w, terrain.pollution);
     write_u8vec(w, terrain.water);
     // subsurface
     w.put(subsurface.w); w.put(subsurface.h); w.put(subsurface.ox); w.put(subsurface.oy);
@@ -6575,6 +6704,7 @@ bool World::load(const std::string& path, std::string* err) {
         !read_i32vec(r, terrain.slope) || !read_i32vec(r, terrain.wind_x) ||
         !read_i32vec(r, terrain.wind_y) || !read_i32vec(r, terrain.water_table) ||
         !read_i32vec(r, terrain.traffic_wear) ||
+        !read_i32vec(r, terrain.pollution) ||
         !read_u8vec(r, terrain.water)) return fail("truncated terrain");
 
     int sw = 0, sh = 0, sox = 0, soy = 0, sdepth = 0; std::uint32_t scc = 0;
@@ -8122,6 +8252,222 @@ void World::terrain_wear_decay(std::int64_t n) {
         } else {
             terrain.traffic_wear[ci] = static_cast<std::int32_t>(w);
             ++it;
+        }
+    }
+}
+
+// ---- emergent material physics ---------------------------------------------
+// Soot: fires, smelts and blasts write terrain.pollution (permille 0..1000)
+// through add_pollution; dirty cells fade linearly — same no-memory contract
+// as traffic_wear, so dt=1 xN == dt=N.
+void World::add_pollution(Vec2 p, std::int64_t delta) {
+    if (delta == 0 || terrain.pollution.empty() || !terrain.contains(p))
+        return;
+    terrain.add_pollution(p, static_cast<std::int32_t>(
+        std::clamp<std::int64_t>(delta, -1000, 1000)));
+    if (!terrain.cell) return;
+    const int gx = TerrainGrid::cell_of(p.x, terrain.cell);
+    const int gy = TerrainGrid::cell_of(p.y, terrain.cell);
+    pollution_cells_.insert((static_cast<std::uint64_t>(
+        static_cast<std::uint32_t>(gx)) << 32) |
+        static_cast<std::uint32_t>(gy));
+}
+
+void World::pollution_decay(std::int64_t n) {
+    if (n <= 0 || pollution_cells_.empty() || terrain.pollution.empty())
+        return;
+    constexpr std::int64_t kFade = 1;    // pollution units lost per tick
+    for (auto it = pollution_cells_.begin(); it != pollution_cells_.end();) {
+        const std::uint64_t key = *it;
+        const int gx = static_cast<std::int32_t>(key >> 32);
+        const int gy = static_cast<std::int32_t>(key & 0xFFFFFFFFull);
+        int lx = 0, ly = 0;
+        if (!terrain.local_cell(gx, gy, lx, ly)) {
+            it = pollution_cells_.erase(it); continue;
+        }
+        const std::size_t ci =
+            static_cast<std::size_t>(ly) * terrain.w + lx;
+        const std::int64_t v =
+            static_cast<std::int64_t>(terrain.pollution[ci]) - n * kFade;
+        if (v <= 0) {
+            terrain.pollution[ci] = 0;
+            it = pollution_cells_.erase(it);
+        } else {
+            terrain.pollution[ci] = static_cast<std::int32_t>(v);
+            ++it;
+        }
+    }
+}
+
+// Volatile-charge detonation. A material is a candidate when its `stability`
+// prop (permille; absent = 1000 inert) is low AND `flammability` is high.
+// Priming: entity temperature > 70C (700 deciC), the terrain cell hotter
+// than that, or a kinetic hit within the last 40 ticks (`last_impact_tick`,
+// stamped by deliver_blow). Blast geometry is pure integer math on the
+// material's own numbers — no material is ever named in code:
+//   R  = clamp((flammability-400)/100 + density/1000000, 1, 6)   [tiles]
+//   E  = (flammability * (1000 - stability)) >> 11               [impulse]
+//   dmg(d) = E/(d+1) + (edge_sharpness*dmg)>>10                  [shrapnel]
+// Chebyshev distance, damage lands on `integrity`, the charge's own cell
+// and every cell in radius gain heat + soot (chain-detonation fuel).
+void World::detonation_drift(std::int64_t n) {
+    if (n <= 0) return;
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_temp = pid("temperature"),
+                 p_stab = pid("stability"),
+                 p_flamm = pid("flammability"),
+                 p_dens = pid("density"),
+                 p_sharp = pid("edge_sharpness"),
+                 p_integ = pid("integrity"),
+                 p_impact = pid("last_impact_tick"),
+                 p_contained = pid("contained");
+    if (p_temp == kNoProp || p_stab == kNoProp || p_flamm == kNoProp ||
+        p_integ == kNoProp) return;
+
+    // Candidate set: alive entities whose MATERIAL could ever detonate.
+    // Rebuilt once per call — membership only changes on spawn/death, and
+    // both are rare relative to n; prop VALUES are re-read every tick.
+    struct Cand { EntityId id; std::int64_t flamm, stab, dens, sharp; };
+    std::vector<Cand> cands;
+    for (const auto& ep : entities) {
+        const Entity& e = *ep;
+        if (!e.alive || e.material == kNoMaterial) continue;
+        const MaterialDef* md = materials.find(e.material);
+        if (!md) continue;
+        auto mp = [&](PropId p, std::int64_t dflt) -> std::int64_t {
+            const auto it = p != kNoProp ? md->props.find(p) : md->props.end();
+            return (it != md->props.end() &&
+                    it->second.type == ValType::Integer) ? it->second.i : dflt;
+        };
+        const std::int64_t fl = mp(p_flamm, 0), st = mp(p_stab, 1000);
+        if (fl >= 600 && st < 300)
+            cands.push_back({e.id, fl, st, mp(p_dens, 1000000),
+                             mp(p_sharp, 0)});
+    }
+    if (cands.empty()) return;
+
+    const std::uint64_t now0 = clock_.tick();
+    const std::uint64_t t0 = now0 >= static_cast<std::uint64_t>(n)
+        ? now0 - static_cast<std::uint64_t>(n) : 0;
+    for (std::int64_t k = 0; k < n; ++k) {
+        const std::uint64_t now = t0 + static_cast<std::uint64_t>(k) + 1;
+        bool any_blast = false;
+        CausalEvent ev;
+        ev.tick = now;
+        ev.action = "detonation";
+        ev.applied_laws.push_back(4);                    // physics.heat
+        for (const Cand& c : cands) {
+            const Entity* src = find(c.id);
+            if (!src || !src->alive) continue;
+            if (lawutil::is_contained(*this, *src, p_contained)) continue;
+            // ---- priming check -------------------------------------------
+            bool primed = false;
+            const Value* tv = prop_of(*src, p_temp);
+            if (tv && tv->type == ValType::Integer && tv->i > 700) primed = true;
+            if (!primed && !terrain.empty() && terrain.contains(src->pos) &&
+                terrain.temp_at(src->pos) > 700) primed = true;
+            if (!primed && p_impact != kNoProp) {
+                const std::int64_t it = prop_int(*src, p_impact, 0);
+                if (it > 0 && now - static_cast<std::uint64_t>(it) <= 40)
+                    primed = true;
+            }
+            if (!primed) continue;
+
+            // ---- blast geometry (integer-only, material-driven) -----------
+            const std::int64_t R = std::clamp<std::int64_t>(
+                (c.flamm - 400) / 100 + c.dens / 1000000, 1, 6);
+            const std::int64_t E =
+                (c.flamm * (1000 - c.stab)) >> 11;
+            if (E <= 0) continue;
+            // every entity within Chebyshev R takes attenuated damage
+            for (const auto& vp : entities) {
+                Entity& v = *vp;
+                if (!v.alive) continue;
+                const std::int64_t dx = v.pos.x - src->pos.x;
+                const std::int64_t dy = v.pos.y - src->pos.y;
+                if (dx < 0 ? -dx > R : dx > R) continue;
+                if (dy < 0 ? -dy > R : dy > R) continue;
+                const std::int64_t d = std::max<std::int64_t>(
+                    dx < 0 ? -dx : dx, dy < 0 ? -dy : dy);
+                std::int64_t dmg = E / (d + 1);
+                if (dmg <= 0) continue;
+                dmg += (c.sharp * dmg) >> 10;        // shrapnel bonus
+                const std::int64_t vi = prop_int(v, p_integ, 500);
+                const std::int64_t vn = std::max<std::int64_t>(0, vi - dmg);
+                if (vn == vi) continue;
+                StateChange ch;
+                ch.entity = v.id; ch.prop = p_integ; ch.had_before = true;
+                ch.before = Value::integer(vi); ch.after = Value::integer(vn);
+                v.props.set(p_integ, ch.after);
+                ev.changes.push_back(ch);
+                ev.participants.push_back(v.id);
+                any_blast = true;
+                // heat spike on the victim (chain-fuel for neighbours)
+                if (p_temp != kNoProp) {
+                    const Value* cv = prop_of(v, p_temp);
+                    const std::int64_t cur =
+                        cv && cv->type == ValType::Integer ? cv->i : 200;
+                    const std::int64_t nv = std::min<std::int64_t>(
+                        20000, cur + (dmg >> 1));
+                    if (nv != cur) {
+                        StateChange tc;
+                        tc.entity = v.id; tc.prop = p_temp;
+                        tc.had_before = cv != nullptr;
+                        tc.before = cv ? *cv : Value::integer(200);
+                        tc.after = Value::integer(nv);
+                        v.props.set(p_temp, tc.after);
+                        ev.changes.push_back(tc);
+                    }
+                }
+            }
+            // terrain: heat + soot in every cell the blast covers
+            if (!terrain.empty()) {
+                const int reach = static_cast<int>(R) + 1;
+                for (int oy = -reach; oy <= reach; ++oy)
+                    for (int ox = -reach; ox <= reach; ++ox) {
+                        const Vec2 cp{src->pos.x + ox * terrain.cell,
+                                      src->pos.y + oy * terrain.cell};
+                        if (!terrain.contains(cp)) continue;
+                        const std::size_t ci = terrain.index(cp);
+                        const std::int64_t cheb = std::max<std::int64_t>(
+                            std::llabs(ox), std::llabs(oy));
+                        const std::int64_t heat = std::max<std::int64_t>(
+                            0, E / 4 - cheb * E / 8);
+                        if (heat > 0)
+                            terrain.temperature[ci] = static_cast<std::int32_t>(
+                                std::min<std::int64_t>(20000,
+                                    static_cast<std::int64_t>(
+                                        terrain.temperature[ci]) + heat));
+                        add_pollution(cp, E / 8);
+                    }
+            }
+            // the charge itself is consumed — kill it outright (same reap
+            // convention as integrity<=0) so a multi-tick drift call cannot
+            // re-detonate it on the next sub-tick before metabolize runs.
+            {
+                Entity* s = find(c.id);
+                if (s && s->alive) {
+                    StateChange ch;
+                    ch.entity = s->id; ch.prop = p_integ; ch.had_before = true;
+                    ch.before = Value::integer(prop_int(*s, p_integ, 500));
+                    ch.after = Value::integer(0);
+                    s->props.set(p_integ, ch.after);
+                    ev.changes.push_back(ch);
+                    ev.participants.push_back(s->id);
+                    any_blast = true;
+                    s->alive = false;
+                    spatial.erase(s->id);
+                }
+            }
+            std::ostringstream nt;
+            nt << "detonation id=" << c.id << " flamm=" << c.flamm
+               << " stab=" << c.stab << " R=" << R << " E=" << E;
+            ev.evidence += nt.str() + "; ";
+        }
+        if (any_blast) {
+            ev.evidence = "volatile charge detonated; " + ev.evidence;
+            ledger.append(std::move(ev));
         }
     }
 }

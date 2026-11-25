@@ -29,6 +29,41 @@ std::int64_t armor_resist(const World& w, EntityId body) {
     return std::clamp<std::int64_t>(best, 0, 1000);
 }
 
+// Emergent armor (spec 1.3): no armor class exists — any rigid item the
+// body wears or wields contributes passive kinetic attenuation when its
+// material props clear the hardness/density bar:
+//   eligible: hardness >= 850 (permille) && density >= 750000 (kg/m3 fixed)
+//   pct      = clamp(((hardness/10 - 80) + (density/10000 - 70)) >> 1, 0, 75)
+// Returns the best reduction in PERMILLE (pct*10, max 750) and the shield
+// entity that provided it (for durability cost). Property-driven only.
+std::int64_t emergent_armor(const World& w, EntityId body, EntityId& shield) {
+    shield = kNoEntity;
+    const PropId hard_p = pid(w, "hardness"),
+                 dens_p = pid(w, "density"),
+                 integ_p = pid(w, "integrity"),
+                 sev_p = pid(w, "severed");
+    if (hard_p == kNoProp || dens_p == kNoProp) return 0;
+    std::int64_t best = 0;
+    auto consider = [&](EntityId iid) {
+        const Entity* it = w.find(iid);
+        if (!it || !it->alive) return;
+        if (sev_p != kNoProp && w.prop_int(*it, sev_p, 0) != 0) return;
+        if (is_contained(w, *it, pid(w, "contained"))) return;
+        const std::int64_t h = w.prop_int(*it, hard_p, 0);
+        const std::int64_t d = w.prop_int(*it, dens_p, 0);
+        if (h < 850 || d < 750000) return;
+        const std::int64_t pct = std::clamp<std::int64_t>(
+            (((h / 10) - 80) + ((d / 10000) - 70)) >> 1, 0, 75);
+        const std::int64_t red = pct * 10;    // percent -> permille
+        if (red > best) { best = red; shield = iid; }
+    };
+    for (const Relation& rel : w.relations_of(body, "wearing"))
+        if (rel.a == body) consider(rel.b);
+    consider(wielded_tool(w, body));
+    (void)integ_p;
+    return best;
+}
+
 Blow blow_of(const World& w, EntityId weapon, std::int64_t base_edge) {
     Blow b;
     b.sharp = base_edge;
@@ -103,6 +138,17 @@ void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
         const std::int64_t apr = armor_resist(w, tid);
         if (sharp) dmg = dmg * (1000 - apr) / 1000;
         else dmg = dmg * (1000 + b.blunt) / 1000 * (1000 - apr / 3) / 1000;
+        // spec 1.3: rigid carried/worn items attenuate the transmitted blow
+        // and pay durability for the energy they absorb.
+        EntityId shield_id = kNoEntity;
+        const std::int64_t ear = emergent_armor(w, tid, shield_id);
+        std::int64_t absorbed = 0;
+        if (ear > 0 && dmg > 0) {
+            const std::int64_t before = dmg;
+            dmg = dmg * (1000 - ear) / 1000;
+            if (dmg < 1 && E > 0) dmg = 1;
+            absorbed = before - dmg;
+        }
         if (dmg < 1 && E > 0 && apr < 1000) dmg = 1;
         const PropId br_p = pid(w, "bleed_rate"),
                      fr_p = pid(w, "fracture_level"),
@@ -315,18 +361,55 @@ void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
             setp(tid, body_integ, bi, 0);
         }
         setp(tid, pa_p, body_pain, n_pain);
+        // spec 1.3 durability: the rigid item pays for absorbed energy.
+        if (absorbed > 0 && shield_id != kNoEntity) {
+            const Entity* sh = w.find(shield_id);
+            if (sh) {
+                const PropId si_p = pid(w, "integrity");
+                const std::int64_t si = w.prop_int(*sh, si_p, 500);
+                setp(shield_id, si_p, si,
+                     std::max<std::int64_t>(0, si - std::max<std::int64_t>(1, absorbed / 8)));
+            }
+        }
+        // kinetic priming: solid hits above threshold arm volatile charges.
+        {
+            const PropId ip = pid(w, "last_impact_tick");
+            if (ip != kNoProp && dmg > 15)
+                setp(tid, ip, w.prop_int(*t, ip, 0),
+                     static_cast<std::int64_t>(w.clock_.tick()));
+        }
         if (striker != kNoEntity && striker != part_id)
             wear_total += reaction_wear(w, striker, integ - (amputate ? 60 : n_integ), hard);
         // coated edge (Phase 12.6): a blade/point that actually breaks the
         // skin carries its coating into the blood — toxin straight into
         // toxin_load, a pathogen strain as a fresh ActiveInfection.
+        // spec 1.2: the coating charge is consumed by what it delivers.
         bool injected = false;
         if (sharp && dmg >= 50) {
             const PropId tox_p = pid(w, "toxin_load");
-            if (b.coat_toxin > 0 && tox_p != kNoProp) {
+            if (b.coat_toxin != 0 && tox_p != kNoProp) {
                 const std::int64_t tv = w.prop_int(*t, tox_p, 0);
-                setp(tid, tox_p, tv, std::min<std::int64_t>(1000, tv + b.coat_toxin));
-                injected = true;
+                // signed charge: positive toxifies, negative purges
+                // (clamped int8 charge, toxin_load bounded 0..1000).
+                const std::int64_t dose = std::clamp<std::int64_t>(
+                    b.coat_toxin, -128, 128);
+                const std::int64_t ntv = std::clamp<std::int64_t>(
+                    tv + dose, 0, 1000);
+                const std::int64_t actual = ntv - tv;
+                if (actual != 0) {
+                    setp(tid, tox_p, tv, ntv);
+                    if (striker != kNoEntity) {
+                        const Entity* sw = w.find(striker);
+                        if (sw) {
+                            const PropId ct_p = pid(w, "coat_toxin");
+                            const std::int64_t ct = w.prop_int(*sw, ct_p, 0);
+                            if (ct != 0)
+                                setp(striker, ct_p, ct,
+                                     std::clamp<std::int64_t>(ct - actual, -128, 128));
+                        }
+                    }
+                    injected = true;
+                }
             }
             if (b.coat_strain > 0) {
                 const Entity* se = w.find(static_cast<EntityId>(b.coat_strain));
@@ -368,6 +451,15 @@ void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
     const std::int64_t mass_factor = 1000 + mass / 50;      // heavier absorbs more
     std::int64_t dmg = E * (1000 + 2 * brit) / ((hard + 500) * mass_factor / 1000);
     dmg = dmg * (1000 + b.blunt) / 1000;                     // weapon mass channel
+    // spec 1.3: rigid carried/worn items soak up part of the blow.
+    EntityId shield_id = kNoEntity;
+    const std::int64_t ear = emergent_armor(w, tid, shield_id);
+    std::int64_t absorbed = 0;
+    if (ear > 0 && dmg > 0) {
+        const std::int64_t before = dmg;
+        dmg = dmg * (1000 - ear) / 1000;
+        absorbed = before - dmg;
+    }
     if (dmg < 1 && E > 0) dmg = 1;
     // brittle targets fracture when the hit exceeds what their surface can take
     const bool fracture = dmg * 4 > (hard + brit) && brit > 600;
@@ -378,6 +470,31 @@ void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
     ch.before = Value::integer(integ);
     ch.after = Value::integer(new_integ);
     r.changes.push_back(ch);
+    // shield pays durability for the energy it absorbed
+    if (absorbed > 0 && shield_id != kNoEntity) {
+        const Entity* sh = w.find(shield_id);
+        if (sh) {
+            const PropId si_p = pid(w, "integrity");
+            const std::int64_t si = w.prop_int(*sh, si_p, 500);
+            StateChange sc;
+            sc.entity = shield_id; sc.prop = si_p; sc.had_before = true;
+            sc.before = Value::integer(si);
+            sc.after = Value::integer(std::max<std::int64_t>(
+                0, si - std::max<std::int64_t>(1, absorbed / 8)));
+            r.changes.push_back(sc);
+        }
+    }
+    // kinetic priming stamp for volatile materials
+    {
+        const PropId ip = pid(w, "last_impact_tick");
+        if (ip != kNoProp && dmg > 15) {
+            StateChange ic;
+            ic.entity = tid; ic.prop = ip; ic.had_before = true;
+            ic.before = Value::integer(w.prop_int(*t, ip, 0));
+            ic.after = Value::integer(static_cast<std::int64_t>(w.clock_.tick()));
+            r.changes.push_back(ic);
+        }
+    }
     if (striker != kNoEntity && striker != tid)
         wear_total += reaction_wear(w, striker, integ - new_integ, hard);
 

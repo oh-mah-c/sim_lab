@@ -286,14 +286,11 @@ static BrainLayout layout_for(std::int32_t H) {
     return l;
 }
 
-// hidden sizes are genome-quantized to {32,48,64,96}; anything else falls
-// back to the nearest supported size (deterministic).
+// hidden sizes are genome-quantized to 8-aligned values in [32,128]
+// (AVX2-friendly); anything else snaps to the nearest step.
 static std::int32_t snap_hidden(std::int32_t h) {
-    if (h <= 32) return 32;
-    if (h <= 48) return 48;
-    if (h <= 64) return 64;
-    if (h <= 96) return 96;
-    return 96;
+    h = std::max(32, std::min(128, h));
+    return ((h + 4) / 8) * 8;
 }
 
 // dense forward with int16 bias: y[o] = act(clamp((dot>>shift)+bias[o]))
@@ -324,10 +321,10 @@ std::int32_t huber_i32(std::int32_t e) {
 const BrainLayout& brain_layout() { return brain_layout_h(kHid); }
 
 const BrainLayout& brain_layout_h(std::int32_t hidden) {
-    static BrainLayout cache[7];   // index = H/16 - 2  ({32..96} -> 0..4)
-    static bool init[7] = {};
+    static BrainLayout cache[13];  // index = H/8 - 4  ({32..128 step 8})
+    static bool init[13] = {};
     const std::int32_t H = snap_hidden(hidden);
-    const int idx = H / 16 - 2;
+    const int idx = H / 8 - 4;
     if (!init[idx]) { cache[idx] = layout_for(H); init[idx] = true; }
     return cache[idx];
 }
@@ -491,14 +488,14 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
         reinterpret_cast<const std::int16_t*>(base + L.wm2b);
 
     // embed: sensor(96) -> e(H), tanh
-    std::array<std::int8_t, 96> e{};
+    std::array<std::int8_t, 128> e{};
     dense16(embed_w, H, kSensorChannels, p.s.data(), embed_b,
             kShEmbed, BrainAct::kTanh, e.data());
     for (int i = 0; i < H; ++i) p.embed[i] = e[i];
 
     // minGRU: gates read the EMBEDDED input only (no recurrence inside the
     // gates); the recurrence is one elementwise multiply — the cheap part.
-    std::array<std::int8_t, 96> z{}, hh{};
+    std::array<std::int8_t, 128> z{}, hh{};
     dense16(zw, H, H, e.data(), zb, kShGru, BrainAct::kSigmoid, z.data());
     dense16(hw, H, H, e.data(), hb, kShGru, BrainAct::kTanh, hh.data());
     for (int i = 0; i < H; ++i) {
@@ -529,7 +526,7 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
             ds[d] = m2[d] * 8 + (fm ? drive_bias(fm->neuro, d) : 0);
         int drive = 0;
         for (int d = 1; d < 8; ++d) if (ds[d] > ds[drive]) drive = d;
-        std::array<std::int8_t, 128> wwin{};
+        std::array<std::int8_t, 160> wwin{};
         for (int i = 0; i < H; ++i)
             wwin[i] = static_cast<std::int8_t>(s.h[i] >> 8);
         wwin[H + drive] = 100;
@@ -539,7 +536,7 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
     }
 
     // WM input: hidden state dequantized to int8 ++ action one-hot (pad16)
-    std::array<std::int8_t, 128> win{};
+    std::array<std::int8_t, 160> win{};
     for (int i = 0; i < H; ++i)
         win[i] = static_cast<std::int8_t>(s.h[i] >> 8);
     for (int i = 0; i < kActionVerbs; ++i)
@@ -1040,6 +1037,81 @@ std::int64_t brain_genetic_distance(const BrainGenome& a,
     return sum * 1000 / (static_cast<std::int64_t>(a.slow.size()) * 255);
 }
 
+// spec 2.2 structural mutation support: re-lay a slow weight block from
+// hidden width H_old to H_new. Every layer keeps its top-left
+// min(rows)xmin(cols) corner (existing synapses preserved verbatim);
+// newly exposed rows/columns get small hash-seeded int8 values so the
+// enlarged brain does not start with dead symmetry. Bias tails copy the
+// shared prefix and zero-fill the rest (0 = neutral). Fully deterministic
+// per (world_seed, parents, tick).
+static std::vector<std::int8_t> remap_slow_hidden(
+    const std::vector<std::int8_t>& src, std::int32_t H_old,
+    std::int32_t H_new, std::uint64_t seed, std::uint64_t a,
+    std::uint64_t b, std::uint64_t tick) {
+    const BrainLayout& lo = brain_layout_h(H_old);
+    const BrainLayout& ln = brain_layout_h(H_new);
+    std::vector<std::int8_t> dst(ln.total_bytes, 0);
+    std::uint64_t salt = seed ^ (a * 0x9E3779B97F4A7C15ull) ^
+        (b * 0xBF58476D1CE4E5B9ull) ^ (tick * 0x94D049BB133111EBull);
+    auto seeded = [&](std::uint64_t off) -> std::int8_t {
+        salt = Rng::hash(salt ^ off);
+        return static_cast<std::int8_t>((salt % 7) - 3);   // -3..3
+    };
+    // copy preserved corner of one weight layer, seed the new territory
+    auto layer = [&](std::uint32_t so, std::uint32_t dn,
+                     std::int32_t ro, std::int32_t rn,
+                     std::int32_t co, std::int32_t cn) {
+        const std::int32_t rr = std::min(ro, rn);
+        const std::int32_t cc = std::min(co, cn);
+        for (std::int32_t i = 0; i < rr; ++i) {
+            std::memcpy(dst.data() + dn + static_cast<std::int64_t>(i) * cn,
+                        src.data() + so + static_cast<std::int64_t>(i) * co,
+                        static_cast<std::size_t>(cc));
+            for (std::int32_t j = cc; j < cn; ++j)
+                dst[dn + static_cast<std::int64_t>(i) * cn + j] =
+                    seeded(dn + static_cast<std::int64_t>(i) * cn + j);
+        }
+        for (std::int32_t i = rr; i < rn; ++i)
+            for (std::int32_t j = 0; j < cn; ++j)
+                dst[dn + static_cast<std::int64_t>(i) * cn + j] =
+                    seeded(dn + static_cast<std::int64_t>(i) * cn + j);
+    };
+    const std::int32_t wco = (H_old + 8 + 15) & ~15;
+    const std::int32_t wcn = (H_new + 8 + 15) & ~15;
+    const std::int32_t mco = (H_old + kActionVerbs + 15) & ~15;
+    const std::int32_t mcn = (H_new + kActionVerbs + 15) & ~15;
+    layer(lo.embed_w, ln.embed_w, H_old, H_new, kSensorChannels, kSensorChannels);
+    layer(lo.zw,     ln.zw,     H_old, H_new, H_old, H_new);
+    layer(lo.hw,     ln.hw,     H_old, H_new, H_old, H_new);
+    layer(lo.m1w,    ln.m1w,    32,    32,    H_old, H_new);
+    layer(lo.m2w,    ln.m2w,    8,     8,     32,    32);
+    layer(lo.w1w,    ln.w1w,    64,    64,    wco,   wcn);
+    layer(lo.w2w,    ln.w2w,    kActionVerbs, kActionVerbs, 64, 64);
+    layer(lo.aqw,    ln.aqw,    16,    16,    H_old, H_new);
+    layer(lo.wm1w,   ln.wm1w,   96,    96,    mco,   mcn);
+    layer(lo.wm2w,   ln.wm2w,   25,    25,    96,    96);
+    layer(lo.valw,   ln.valw,   1,     1,     H_old, H_new);
+    // bias tails are int16: copy the shared prefix, zero-fill the rest
+    auto bias = [&](std::uint32_t so, std::uint32_t dn,
+                    std::int32_t ro, std::int32_t rn) {
+        const std::int32_t rr = std::min(ro, rn);
+        std::memcpy(dst.data() + dn,
+                    src.data() + so, static_cast<std::size_t>(rr) * 2);
+    };
+    bias(lo.embed_b, ln.embed_b, H_old, H_new);
+    bias(lo.zb,     ln.zb,     H_old, H_new);
+    bias(lo.hb,     ln.hb,     H_old, H_new);
+    bias(lo.m1b,    ln.m1b,    32,    32);
+    bias(lo.m2b,    ln.m2b,    8,     8);
+    bias(lo.w1b,    ln.w1b,    64,    64);
+    bias(lo.w2b,    ln.w2b,    kActionVerbs, kActionVerbs);
+    bias(lo.aqb,    ln.aqb,    16,    16);
+    bias(lo.wm1b,   ln.wm1b,   96,    96);
+    bias(lo.wm2b,   ln.wm2b,   25,    25);
+    bias(lo.valb,   ln.valb,   1,     1);
+    return dst;
+}
+
 BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
                                const BrainGenome& ga, const BrainGenome& gb) {
     BrainGenome g;
@@ -1070,6 +1142,26 @@ BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
     // mutation at the child's own mut_scale (permille), step 3
     brain_mutate_blocks(g.slow.data(), static_cast<std::int64_t>(n),
                         w.world_seed, a, tick, 3, g.mut_scale);
+    // spec 2.2 structural mutation: 5% of offspring shift hidden_size by
+    // +-8 neurons — 8-aligned for AVX2 dots, clamped to [32,128]. The slow
+    // block is re-laid-out at the new width: existing synapses keep their
+    // values, newly exposed rows/columns get small hash-seeded weights.
+    std::int32_t child_h = ga.hidden;
+    {
+        const std::uint64_t mh = Rng::hash(w.world_seed ^
+            (a * 0xD6E8FEB86659FD93ull) ^ (b * 0xA0761D6478BD642Full) ^
+            (tick * 0xE7037ED1A0B428DBull) ^ 0x5EEDull);
+        if (mh % 1000 < 50) {
+            const std::int32_t dir = (mh & 0x100) ? 8 : -8;
+            child_h = snap_hidden(ga.hidden + dir);
+        }
+    }
+    if (child_h != ga.hidden &&
+        g.slow.size() >= brain_layout_h(ga.hidden).total_bytes) {
+        g.slow = remap_slow_hidden(g.slow, ga.hidden, child_h,
+                                   w.world_seed, a, b, tick);
+        g.hidden = child_h;
+    }
     // clamp int16 bias halves back into range (byte-level crossover can
     // produce out-of-range pairs)
     const BrainLayout& L = brain_layout_h(g.hidden);
@@ -1129,14 +1221,14 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     // ---- 1-2. encode -> embed -> minGRU (on a COPY of h — decide must not
     // commit recurrent state; brain_pre does that at interact time) --------
     const SensorVec sv = sensor_encode(w, npc, &s.last_action);
-    std::array<std::int8_t, 96> e{}, z{}, hh{};
+    std::array<std::int8_t, 128> e{}, z{}, hh{};
     dense16(W(L.embed_w), H, kSensorChannels, sv.data(), B(L.embed_b),
             kShEmbed, BrainAct::kTanh, e.data());
     dense16(W(L.zw), H, H, e.data(), B(L.zb), kShGru, BrainAct::kSigmoid,
             z.data());
     dense16(W(L.hw), H, H, e.data(), B(L.hb), kShGru, BrainAct::kTanh,
             hh.data());
-    std::array<std::int8_t, 96> h8{};
+    std::array<std::int8_t, 128> h8{};
     for (int i = 0; i < H; ++i) {
         const std::int64_t zq = static_cast<std::int64_t>(z[i]) + 128;
         const std::int64_t target = static_cast<std::int64_t>(hh[i]) * 256;
@@ -1160,7 +1252,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     }
 
     // ---- worker: (h8 ++ drive) -> 64 -> 16 verb logits + 16 attn query -----
-    std::array<std::int8_t, 128> win{};
+    std::array<std::int8_t, 160> win{};
     for (int i = 0; i < H; ++i) win[i] = h8[i];
     win[H + drive] = 100;
     std::array<std::int8_t, 64> w1{};
@@ -1324,7 +1416,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                     ++k;
                 }
             }
-            std::array<std::int8_t, 128> aw{};
+            std::array<std::int8_t, 160> aw{};
             for (int i = 0; i < H; ++i) aw[i] = h8[i];
             aw[H + vstep] = 100;
             dense16(W(L.wm1w), kWmHidden, mc, aw.data(), B(L.wm1b),

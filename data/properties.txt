@@ -24,6 +24,8 @@ adult_age       integer  ticks       range 0 1000000 domain=biological
 mutation_rate   integer  permille     range 0 1000   domain=biological
 repro_cooldown  integer  ticks       range 0 1000000 domain=biological   # min ticks between births (default 200)
 last_reproduce  integer  ticks       range 0 1000000000 domain=biological # clock tick of last birth (internal timer)
+scarcity_survived integer milli-ticks range 0 1000000000 domain=biological # cumulative ticks endured at hunger>=950 (GenePool tie-break)
+brain_hunger_accum  integer milli-permille range 0 1000000 domain=need # sub-unit brain metabolic hunger remainder (Euclid LOD, internal)
 max_energy      integer  milliJ      range 0 1000000000 domain=physical   # energy storage ceiling (default 500000)
 max_quantity    integer  units       range 0 100000000 domain=physical   # flora regrowth ceiling
 regrow_rate     integer  milli-units/tick range 0 1000000 domain=physical # flora regrowth speed at ideal conditions
@@ -36,8 +38,10 @@ fruit_spoil_rate  integer milli-units/tick range 0 1000000 domain=biological # f
 fruit_credit    integer  milli-units  range -1000000000 1000000000 domain=physical # signed fruit accumulator (internal)
 decay_rate      integer  permille/tick range 0 1000 domain=physical     # integrity rot speed (material fallback; 0 = never spoils)
 decay_credit    integer  milli-integrity range 0 1000000000 domain=physical # sub-point decay accumulator (internal)
-toxicity        integer  permille     range 0 1000   domain=physical     # integrity-scale damage per unit consumed (0 = safe)
+toxicity        integer  permille     range -1000 1000 domain=physical    # integrity-scale damage per unit consumed; NEGATIVE = purifying/antidote (0 = safe)
 fruit_decay_rate integer  milli-units/tick range 0 1000000 domain=physical # fruit rot on the branch: drains quantity only, never kills the plant (0 = fruit never spoils)
+stability        integer  permille     range 0 1000   domain=physical     # resistance to runaway reaction: low + high flammability = detonates when primed (1000 default = inert)
+last_impact_tick integer  ticks        range 0 1000000000 domain=physical  # last kinetic hit (detonation primer; internal)
 
 # ---- resource / deposit domain ----------------------------------------------
 reserve          integer  units       range 0 100000000 domain=physical
@@ -454,7 +458,7 @@ elasticity               integer permille     range 0 1000   domain=physical # s
 armor_penetration_resist integer permille     range 0 1000   domain=physical # worn/held protection: blocks cutting, blunts impulse by 1/3
 volatility               integer permille     range 0 1000   domain=physical # ignition sensitivity of an energetic material
 expansion_force          integer permille     range 0 1000   domain=physical # gas expansion pressure when it ignites (blast)
-coat_toxin               integer permille     range 0 1000   domain=physical # weapon: toxin a penetrating edge injects (toxin_load)
+coat_toxin               integer permille     range -128 128  domain=physical # weapon: signed toxin charge a penetrating edge injects into toxin_load (negative = antidote film)
 coat_strain              integer units                    domain=physical # weapon: pathogen strain id a penetrating edge injects
 launch_impulse           integer units        range 0 1000000 domain=physical # emergent: elastic frame x string tension (composite)
 # agent military state (World Truth on the agent entity)

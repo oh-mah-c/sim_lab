@@ -18,6 +18,9 @@ struct Blow {
     const char* mech = nullptr;
 };
 std::int64_t armor_resist(const World& w, EntityId body);
+// Passive kinetic attenuation from rigid carried/worn items (spec 1.3).
+// Returns reduction in permille (0..750); `shield` gets the best item.
+std::int64_t emergent_armor(const World& w, EntityId body, EntityId& shield);
 Blow blow_of(const World& w, EntityId weapon, std::int64_t base_edge);
 void deliver_blow(const World& w, PredictionResult& r, EntityId tid,
                   std::int64_t E, const Blow& b, EntityId striker,

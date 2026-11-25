@@ -112,6 +112,7 @@ static PredictionResult predict_consume(const World& w,
     std::int64_t mass_gain = 0;     // solid matter awaiting the gut (10.3)
     std::int64_t fluid_gain = 0;    // liquid awaiting the kidneys (10.3)
     std::int64_t toxin_gain = 0;    // Phase 11.2: blighted meals poison
+    std::int64_t toxin_relief = 0;  // spec 1.2: antidote draughts scrub blood
     std::int64_t energy_penalty = 0;// the gut and the calories both suffer
 
     for (EntityId tid : ctx.targets) {
@@ -165,7 +166,9 @@ static PredictionResult predict_consume(const World& w,
         const std::int64_t nut = food_prop(nutrition);
         const std::int64_t hyd = food_prop(hydration);
         const std::int64_t tox = food_prop(toxicity);
-        if (nut <= 0 && hyd <= 0) {
+        // spec 1.2: a strongly negative-toxicity substance is a purifying
+        // draught — edible even with no nutrition/hydration.
+        if (nut <= 0 && hyd <= 0 && tox >= -40) {
             r.notes.push_back("target " + std::to_string(tid) + " not edible/drinkable");
             continue;
         }
@@ -228,6 +231,9 @@ static PredictionResult predict_consume(const World& w,
         // so a bad meal still fills the belly while it kills. This is the
         // data hook that lets a witnessed death teach a material taboo.
         if (tox > 0) harm += tox * units;
+        // spec 1.2 metabolic neutralization: strongly negative toxicity
+        // (< -40) is an antidote — it scrubs toxin_load, not integrity.
+        if (tox < -40) toxin_relief += -tox * units * 2;
         // Phase 11.2 blight: raw fruit from a spore-infected plant is a
         // gut poison — toxin_load rises and calorie gain is blunted. A
         // cooked_state >= 500 plant is preserved: the same heat/chemical
@@ -298,12 +304,13 @@ static PredictionResult predict_consume(const World& w,
         const std::int64_t ib = w.prop_int(*actor, integrity, 0);
         set_change(r, ctx.actor, integrity, ib, std::max<std::int64_t>(0, ib - harm));
     }
-    if (toxin_gain > 0) {
+    if (toxin_gain > 0 || toxin_relief > 0) {
         const PropId tl_p = prop_id(w, "toxin_load");
         if (tl_p != kNoProp && w.prop_of(*actor, tl_p)) {
             const std::int64_t tb = w.prop_int(*actor, tl_p, 0);
             set_change(r, ctx.actor, tl_p, tb,
-                       std::min<std::int64_t>(1000, tb + toxin_gain));
+                       std::clamp<std::int64_t>(tb + toxin_gain - toxin_relief,
+                                                0, 1000));
         }
     }
     if (energy_penalty > 0)
