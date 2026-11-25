@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define SIMLAB_BRAIN_X86 1
+#endif
 
 namespace simlab {
 
@@ -82,8 +86,46 @@ const std::int8_t* brain_act_lut(BrainAct act) {
     }
 }
 
+#if SIMLAB_BRAIN_X86
+// AVX2 int8 dot: widen to i16, madd pairs -> i32 lanes, accumulate in
+// vectors. int32 lane sums are reassociated vs the scalar loop, but mod-2^32
+// addition is fully associative/commutative -> bit-identical result.
+__attribute__((target("avx2")))
+std::int32_t brain_dot_i8_avx2(const std::int8_t* a, const std::int8_t* b,
+                               std::int32_t n) {
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    std::int32_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256i a8 =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+        const __m256i b8 =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a8)),
+            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b8))));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(
+            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a8, 1)),
+            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b8, 1))));
+    }
+    acc0 = _mm256_add_epi32(acc0, acc1);
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc0),
+                              _mm256_extracti128_si256(acc0, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    std::int32_t acc = _mm_cvtsi128_si32(s);
+    for (; i < n; ++i)
+        acc += static_cast<std::int32_t>(a[i]) * b[i];
+    return acc;
+}
+#endif
+
 std::int32_t brain_dot_i8(const std::int8_t* a, const std::int8_t* b,
                           std::int32_t n) {
+#if SIMLAB_BRAIN_X86
+    static const bool have_avx2 = __builtin_cpu_supports("avx2");
+    if (have_avx2) return brain_dot_i8_avx2(a, b, n);
+#endif
     std::int32_t acc = 0;
     for (std::int32_t i = 0; i < n; ++i)
         acc += static_cast<std::int32_t>(a[i]) * b[i];

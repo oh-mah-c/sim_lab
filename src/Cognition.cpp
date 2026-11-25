@@ -116,9 +116,8 @@ std::int64_t mem_isqrt(std::int64_t v) {
     return x;
 }
 
-std::int64_t need_of(const World& w, const Entity& e, const char* name) {
-    const PropertyDef* d = w.props.find_name(name);
-    return d ? w.prop_int(e, d->id, 0) : 0;
+std::int64_t need_of(const World& w, const Entity& e, PropId id) {
+    return id != kNoProp ? w.prop_int(e, id, 0) : 0;
 }
 
 // Does the target look edible to a beholder? Material nutrition/hydration
@@ -128,19 +127,23 @@ std::int64_t need_of(const World& w, const Entity& e, const char* name) {
 bool looks_edible(const World& w, const Entity& t) {
     if (t.material != kNoMaterial) {
         if (const MaterialDef* md = w.materials.find(t.material)) {
-            const PropertyDef* nut = w.props.find_name("nutrition");
-            const PropertyDef* hyd = w.props.find_name("hydration");
-            if (nut && md->props.count(nut->id) && md->props.at(nut->id).i > 0)
-                return true;
-            if (hyd && md->props.count(hyd->id) && md->props.at(hyd->id).i > 0)
-                return true;
+            const PropId nut = SIMLAB_PID(w.props, "nutrition");
+            const PropId hyd = SIMLAB_PID(w.props, "hydration");
+            if (nut != kNoProp) {
+                const auto it = md->props.find(nut);
+                if (it != md->props.end() && it->second.i > 0) return true;
+            }
+            if (hyd != kNoProp) {
+                const auto it = md->props.find(hyd);
+                if (it != md->props.end() && it->second.i > 0) return true;
+            }
         }
     }
-    const PropertyDef* fmp = w.props.find_name("fruit_material");
-    const PropertyDef* fcp = w.props.find_name("fruit_count");
-    if (!fmp || !fcp) return false;
-    const Value* fv = w.prop_of(t, fmp->id);
-    const Value* fc = w.prop_of(t, fcp->id);
+    const PropId fmp = SIMLAB_PID(w.props, "fruit_material");
+    const PropId fcp = SIMLAB_PID(w.props, "fruit_count");
+    if (fmp == kNoProp || fcp == kNoProp) return false;
+    const Value* fv = w.prop_of(t, fmp);
+    const Value* fc = w.prop_of(t, fcp);
     return fv && fv->type == ValType::Text && !fv->s.empty() &&
            fc && fc->type == ValType::Integer && fc->i > 0;
 }
@@ -156,8 +159,17 @@ AgentMind::MemorySnapshot snapshot_now(const World& w, EntityId eid,
         s.pos = e->pos;
         s.material = e->material;
         s.kind_name = e->kind_name;
-        for (PropId p : w.observable_props())
-            if (const Value* v = w.prop_of(*e, p)) s.props[p] = *v;
+        // same effective set as prop_of() over observable_props, gathered
+        // by walking the two sorted bags once (instance wins over material)
+        const std::vector<PropId>& obs = w.observable_props();
+        for (const auto& [p, v] : e->props.entries)
+            if (std::binary_search(obs.begin(), obs.end(), p)) s.props[p] = v;
+        if (e->material != kNoMaterial) {
+            if (const MaterialDef* md = w.materials.find(e->material))
+                for (const auto& [p, v] : md->props)
+                    if (std::binary_search(obs.begin(), obs.end(), p) &&
+                        !e->props.get(p)) s.props[p] = v;
+        }
     }
     return s;
 }
@@ -167,8 +179,8 @@ AgentMind::MemorySnapshot snapshot_now(const World& w, EntityId eid,
 std::int64_t perceive_charge(const World& w, const Entity& npc,
                              const Entity& target) {
     std::int64_t charge = 0;
-    const std::int64_t hunger = need_of(w, npc, "hunger");
-    const std::int64_t thirst = need_of(w, npc, "thirst");
+    const std::int64_t hunger = need_of(w, npc, SIMLAB_PID(w.props, "hunger"));
+    const std::int64_t thirst = need_of(w, npc, SIMLAB_PID(w.props, "thirst"));
     const bool desperate = hunger > 850 || thirst > 850;
     const bool urgent = desperate || hunger > 500 || thirst > 500;
     if (looks_edible(w, target))
@@ -176,30 +188,33 @@ std::int64_t perceive_charge(const World& w, const Entity& npc,
     // water is as vital as food: a drinkable-looking target in crisis
     if (urgent && !looks_edible(w, target) && target.material != kNoMaterial) {
         if (const MaterialDef* md = w.materials.find(target.material)) {
-            const PropertyDef* hyd = w.props.find_name("hydration");
-            if (hyd && md->props.count(hyd->id) && md->props.at(hyd->id).i > 0)
-                charge += desperate ? 600 : 250;
+            const PropId hyd = SIMLAB_PID(w.props, "hydration");
+            if (hyd != kNoProp) {
+                const auto it = md->props.find(hyd);
+                if (it != md->props.end() && it->second.i > 0)
+                    charge += desperate ? 600 : 250;
+            }
         }
     }
     // Phase 11: stench and filth repel — observable odor/contamination on
     // a perceived entity writes a negative engram charge (disgust/grief),
     // the same channel every other valence uses.
     {
-        const PropertyDef* od = w.props.find_name("odor");
-        const PropertyDef* ct = w.props.find_name("contamination");
+        const PropId od = SIMLAB_PID(w.props, "odor");
+        const PropId ct = SIMLAB_PID(w.props, "contamination");
         std::int64_t bad = 0;
-        if (od) bad += w.prop_int(target, od->id, 0) * 3 / 5;
-        if (ct) bad += w.prop_int(target, ct->id, 0) / 4;
+        if (od != kNoProp) bad += w.prop_int(target, od, 0) * 3 / 5;
+        if (ct != kNoProp) bad += w.prop_int(target, ct, 0) / 4;
         charge -= std::min<std::int64_t>(800, bad);
     }
     // Phase 11.2: visible blight/wilt marks on flora repel through the
     // same observable-prop channel — a marked plant reads as sickly even
     // when it still looks edible.
     {
-        const PropertyDef* bm = w.props.find_name("blight_marks");
-        if (bm)
+        const PropId bm = SIMLAB_PID(w.props, "blight_marks");
+        if (bm != kNoProp)
             charge -= std::min<std::int64_t>(500,
-                w.prop_int(target, bm->id, 0) / 2);
+                w.prop_int(target, bm, 0) / 2);
     }
     return mem_clamp(charge, -1000, 1000);
 }
@@ -229,18 +244,18 @@ std::int64_t event_charge(const World& w, EntityId learner,
     // ate/drank in crisis: the meal itself becomes salient (positive)
     if (ev.action == "consume" && tid != learner) {
         const Entity* me = w.find(learner);
-        if (me && (need_of(w, *me, "hunger") > 850 ||
-                   need_of(w, *me, "thirst") > 850))
+        if (me && (need_of(w, *me, SIMLAB_PID(w.props, "hunger")) > 850 ||
+                   need_of(w, *me, SIMLAB_PID(w.props, "thirst")) > 850))
             charge += 500;
     }
     // Phase 11.2: a meal that raised the learner's toxin_load marks the
     // food as the culprit — blighted fruit forges a strong negative
     // engram through the same causal channel as every other valence.
     if (ev.action == "consume" && tid != learner) {
-        const PropertyDef* tl = w.props.find_name("toxin_load");
-        if (tl) {
+        const PropId tl = SIMLAB_PID(w.props, "toxin_load");
+        if (tl != kNoProp) {
             for (const StateChange& c : ev.changes)
-                if (c.entity == learner && c.prop == tl->id &&
+                if (c.entity == learner && c.prop == tl &&
                     c.before.type == ValType::Integer &&
                     c.after.type == ValType::Integer &&
                     c.after.i > c.before.i) { charge -= 800; break; }
@@ -717,7 +732,8 @@ std::int64_t care_bonus(const World& w, EntityId npc,
             * rel / 1000 * distress / 1000;
         // survival opposition: own worst need vs empathy-bought immunity
         const std::int64_t pressure = std::max(
-            need_of(w, *me, "hunger"), need_of(w, *me, "thirst"));
+            need_of(w, *me, SIMLAB_PID(w.props, "hunger")),
+            need_of(w, *me, SIMLAB_PID(w.props, "thirst")));
         const std::int64_t opp = std::max<std::int64_t>(0,
             1000 - mp.empathy_coupling * 3 / 4);   // emp0->1000, emp3000->250
         const std::int64_t keep = 1000 - std::min<std::int64_t>(
@@ -963,10 +979,13 @@ std::size_t perceive(World& w, EntityId npc) {
 
     // observable-domain props: the only props allowed into a mind (the
     // registry is frozen after load_content, so build the list once)
-    const std::vector<PropId>& obs_props = w.observable_props();
+    const std::vector<PropId>& obs_props = w.observable_props();   // sorted by PropId
 
-    const PropertyDef* exd = w.props.find_name("exposed");
-    const PropId exposed_p = exd ? exd->id : kNoProp;
+    const PropId exposed_p = SIMLAB_PID(w.props, "exposed");
+    const PropId qty_pid_p = SIMLAB_PID(w.props, "quantity");
+    const PropId cdl_id = SIMLAB_PID(w.props, "corpse_decay_level");
+    const PropId buried_p = SIMLAB_PID(w.props, "buried");
+    const PropId cremated_p = SIMLAB_PID(w.props, "cremated");
     const MindParams mparams = mind_params(w, *me);
     neuro_touch(w, npc);
 
@@ -974,8 +993,6 @@ std::size_t perceive(World& w, EntityId npc) {
     // Phase 12.2: perceived supply per material — what the agent actually
     // SEES nearby becomes its pa:<mat> abundance belief (private economics).
     std::map<MaterialId, std::int64_t> seen_supply;
-    const PropertyDef* qty_d_p = w.props.find_name("quantity");
-    const PropId qty_pid_p = qty_d_p ? qty_d_p->id : kNoProp;
     // previous VISUAL sighting per entity (latest wins) — tick + pos only,
     // copied out because observe() below may erase/shift the deque.
     struct LastSeen { std::uint64_t tick; Vec2 pos; };
@@ -1021,12 +1038,11 @@ std::size_t perceive(World& w, EntityId npc) {
         // stench), an interred or burned husk is not.
         if (!e->alive) {
             auto dead_visible = [&]() {
-                const PropertyDef* cdl = w.props.find_name("corpse_decay_level");
-                if (!cdl || !w.prop_of(*e, cdl->id)) return false;
-                const PropertyDef* b = w.props.find_name("buried");
-                if (b && w.prop_int(*e, b->id, 0) != 0) return false;
-                const PropertyDef* cr = w.props.find_name("cremated");
-                if (cr && w.prop_int(*e, cr->id, 0) != 0) return false;
+                if (cdl_id == kNoProp || !w.prop_of(*e, cdl_id)) return false;
+                if (buried_p != kNoProp && w.prop_int(*e, buried_p, 0) != 0)
+                    return false;
+                if (cremated_p != kNoProp && w.prop_int(*e, cremated_p, 0) != 0)
+                    return false;
                 return true;
             };
             if (!dead_visible()) continue;
@@ -1046,18 +1062,26 @@ std::size_t perceive(World& w, EntityId npc) {
         if (dx * dx + dy * dy > r2) continue;
         Observation o;
         o.entity = eid; o.tick = w.clock_.tick(); o.pos = e->pos;
-        const PropertyDef* cdl_d = w.props.find_name("corpse_decay_level");
-        const PropId cdl_id = cdl_d ? cdl_d->id : kNoProp;
-        for (PropId p : obs_props) {
-            if (buried && p == exposed_p) continue;          // exposure state is not a sign
-            if (buried) {                                    // only declared evidence props
-                const DepositDef* dd = w.deposits.find(e->deposit);
-                if (!dd->evidence.get(p)) continue;
-            }
+        // Same effective prop set prop_of() would return for obs_props,
+        // gathered by walking the two sorted bags once instead of ~60
+        // binary searches per entity. Instance props win over material
+        // defaults exactly like prop_of(); o.props is a sorted map so
+        // insertion order is irrelevant.
+        const DepositDef* ev_dd = buried ? w.deposits.find(e->deposit) : nullptr;
+        auto admit = [&](PropId p) {
+            if (buried && p == exposed_p) return false;   // exposure state is not a sign
+            if (buried && !(ev_dd && ev_dd->evidence.get(p))) return false;
             // rot stage is a corpse sign only — a living body's material
             // default must not masquerade as one in memory snapshots.
-            if (e->alive && p == cdl_id) continue;
-            if (const Value* v = w.prop_of(*e, p)) o.props[p] = *v;
+            if (e->alive && p == cdl_id) return false;
+            return std::binary_search(obs_props.begin(), obs_props.end(), p);
+        };
+        for (const auto& [p, v] : e->props.entries)
+            if (admit(p)) o.props[p] = v;
+        if (e->material != kNoMaterial) {
+            if (const MaterialDef* md = w.materials.find(e->material))
+                for (const auto& [p, v] : md->props)
+                    if (admit(p) && !e->props.get(p)) o.props[p] = v;
         }
         // fog-of-war memory: Ebbinghaus-encoded snapshot of what was just
         // perceived — stale belief the planner may use after the entity
@@ -2255,12 +2279,12 @@ std::vector<InteractionContext> gen_candidates(const World& w, EntityId npc,
     std::vector<InteractionContext> out;
     auto corpse_target = [&](const Entity* e) {
         if (e->alive) return true;
-        const PropertyDef* cdl = w.props.find_name("corpse_decay_level");
-        if (!cdl || !w.prop_of(*e, cdl->id)) return false;
-        const PropertyDef* b = w.props.find_name("buried");
-        if (b && w.prop_int(*e, b->id, 0) != 0) return false;
-        const PropertyDef* cr = w.props.find_name("cremated");
-        if (cr && w.prop_int(*e, cr->id, 0) != 0) return false;
+        const PropId cdl = SIMLAB_PID(w.props, "corpse_decay_level");
+        if (cdl == kNoProp || !w.prop_of(*e, cdl)) return false;
+        const PropId b = SIMLAB_PID(w.props, "buried");
+        if (b != kNoProp && w.prop_int(*e, b, 0) != 0) return false;
+        const PropId cr = SIMLAB_PID(w.props, "cremated");
+        if (cr != kNoProp && w.prop_int(*e, cr, 0) != 0) return false;
         return true;
     };
     std::vector<EntityId> targets;

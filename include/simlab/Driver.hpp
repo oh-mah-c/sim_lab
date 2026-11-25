@@ -95,10 +95,22 @@ struct DriverState {
     //   true: the Phase-3 stabilized hybrid — social floor first, urgent
     //     needs and 7/8 off-cycles fall back to the legacy planner.
     bool legacy_planner_compat = false;
-    // CL-1 Phase 3: reserved for motor-persistence cache (unused while the
-    // brain is a sparse advisor — kept for the future always-on mode).
-    // Controller memory only: never saved, never hashed.
+    // CL-1 Phase 3: motor-persistence cache — Phase 4b parallel think
+    // pre-computes each agent's BrainChoice against the frozen round-start
+    // world and brain_step replays it. Controller memory only: never saved,
+    // never hashed.
     std::map<EntityId, BrainChoice> brain_last;
+    // CL-1 Phase 4b: deterministic parallel think (opt-in). When on with
+    // brain_control + !legacy_planner_compat, cycle_step pre-computes every
+    // agent's brain_decide on a small thread pool BEFORE the agent loop,
+    // then brain_step replays the cached choice. Each decide is a pure
+    // function of (frozen round-start world, own brain slot), so results
+    // are identical for ANY thread count — but differ from the sequential
+    // interleaved baseline by design (agents no longer see same-round
+    // actions of earlier agents). Default OFF keeps every legacy hash.
+    bool parallel_think = false;
+    int think_threads = 0;      // 0 = auto (hardware_concurrency, cap 16)
+    std::uint64_t think_round = 0;   // round tick the cached choices belong to
     std::set<EntityId> possessed;
 };
 

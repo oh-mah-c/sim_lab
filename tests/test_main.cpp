@@ -10806,6 +10806,40 @@ static void test_gene_pool_evolution() {
     std::filesystem::remove(pfile);
 }
 
+// CL-1 Phase 4b — parallel think: identical state_hash for any thread
+// count (each decide is a pure function of frozen round-start world +
+// own slot). Sequential mode stays the legacy baseline.
+static void test_parallel_think() {
+    auto build = [](std::uint64_t seed) {
+        World w(seed, "data");
+        PrimordialParams pp; pp.seed = static_cast<int>(seed); pp.grid = 48;
+        pp.tribes = 1; pp.per_tribe = 3;
+        build_primordial(w, pp);
+        return w;
+    };
+    World a = build(31), b = build(31), c = build(31);
+    DriverState sa; sa.curiosity = true; sa.concurrent = true;
+    sa.brain_control = true;                    // 100% neural, sequential
+    DriverState sb = sa; sb.parallel_think = true; sb.think_threads = 1;
+    DriverState sc = sa; sc.parallel_think = true; sc.think_threads = 8;
+    for (int i = 0; i < 60; ++i) {
+        autonomous_cycle(a, &sa);
+        autonomous_cycle(b, &sb);
+        autonomous_cycle(c, &sc);
+    }
+    const auto ha = a.state_hash(), hb = b.state_hash(), hc = c.state_hash();
+    std::printf("  parallel_think: seq=%016llx t1=%016llx t8=%016llx\n",
+                (unsigned long long)ha, (unsigned long long)hb,
+                (unsigned long long)hc);
+    CHECK(hb == hc);              // thread-count invariant — the hard guarantee
+    CHECK(a.brains_ && b.brains_ && c.brains_);
+    CHECK(b.brains_->slots.size() == c.brains_->slots.size());
+    // parallel mode is allowed to differ from sequential (frozen-snapshot
+    // semantics) — assert only that it stays deterministic, which hb==hc
+    // across two independently-threaded runs already proves.
+    (void)ha;
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -10876,6 +10910,7 @@ int main(int argc, char** argv) {
     RUN(test_brain_curriculum);
     RUN(test_narrative_host);
     RUN(test_gene_pool_evolution);
+    RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);
     RUN(test_neuro_psychopathology);
     RUN(test_phase9_autonomous_civilization);

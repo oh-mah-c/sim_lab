@@ -1384,13 +1384,14 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
         // environmental contamination: worst filth material near the body
         std::int64_t env_contam = 0;
         {
-            const std::int64_t r2 = 96 * 96;
-            for (const auto& ep : entities) {
-                const Entity& o = *ep;
-                if (!o.alive || o.id == e.id) continue;
-                if (dist2(o.pos, e.pos) > r2) continue;
-                env_contam = std::max(env_contam, prop_int(o, contam_p, 0));
-            }
+            // spatial query returns the same dist2<=96^2 set as the old
+            // full-entity scan (max is order-free); alive check kept.
+            spatial.for_each_within(e.pos, 96, [&](EntityId oid) {
+                if (oid == e.id) return;
+                const Entity* op = find(oid);
+                if (!op || !op->alive) return;
+                env_contam = std::max(env_contam, prop_int(*op, contam_p, 0));
+            });
         }
         const std::int64_t energy_r = std::max<std::int64_t>(
             300, prop_int(e, pid("energy"), 60000) / 40);
@@ -1991,14 +1992,14 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             // hypothermia — the dose makes the poison, emergently.
             bool cool_near = false;
             {
-                const std::int64_t r2 = 24 * 24;
-                for (const auto& ep : entities) {
-                    const Entity& o = *ep;
-                    if (!o.alive || o.id == e.id) continue;
-                    if (dist2(o.pos, e.pos) > r2) continue;
+                // same within-24 set as the old full scan; `any` is order-free
+                spatial.for_each_within(e.pos, 24, [&](EntityId oid) {
+                    if (cool_near || oid == e.id) return;
+                    const Entity* op = find(oid);
+                    if (!op || !op->alive) return;
                     if (ap_p != kNoProp &&
-                        prop_int(o, ap_p, 0) >= 400) { cool_near = true; break; }
-                }
+                        prop_int(*op, ap_p, 0) >= 400) cool_near = true;
+                });
             }
             if (cool_near)
                 target = fever_active ? normal
@@ -2289,14 +2290,14 @@ void World::anatomy_drift(Entity& e, std::uint64_t dt_u, std::uint64_t now,
             // pressure, keeping the common path cheap.
             std::int64_t env_mut = 0;
             {
-                const std::int64_t r2 = 64 * 64;
-                for (const auto& ep : entities) {
-                    const Entity& o = *ep;
-                    if (!o.alive || o.id == e.id) continue;
-                    if (dist2(o.pos, e.pos) > r2) continue;
+                // same within-64 set as the old full scan; max is order-free
+                spatial.for_each_within(e.pos, 64, [&](EntityId oid) {
+                    if (oid == e.id) return;
+                    const Entity* op = find(oid);
+                    if (!op || !op->alive) return;
                     if (mu_p != kNoProp)
-                        env_mut = std::max(env_mut, prop_int(o, mu_p, 0));
-                }
+                        env_mut = std::max(env_mut, prop_int(*op, mu_p, 0));
+                });
             }
             const std::int64_t dr = std::max<std::int64_t>(1,
                 prop_int(e, dr_p, 1000));

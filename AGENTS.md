@@ -248,6 +248,21 @@ no engine code changes.
   only runs `flush_needs(minds)`, `dissipate_heat`, `decay_minds`; no
   per-entity metabolize pass, ecology/language/political/myth/terrain
   drift, witness learning or `*_from_event` hooks. Never true on a real world.
+- Spatial queries beat full-entity scans: `spatial.for_each_within(pos,r,fn)`
+  (Spatial.hpp) visits the same dist2<=r^2 set as scanning `entities` with
+  no allocation/sort — use it for order-free reductions (max/any) inside
+  per-entity drift passes (anatomy_drift does this for contamination,
+  antipyretic and mutagenic neighbourhood reads).
+- Observable-prop snapshots: `w.observable_props()` is sorted by PropId;
+  collect effective props by walking `e->props.entries` + the material's
+  `props` map once (instance wins, exactly like `prop_of`) instead of
+  calling `prop_of` per observable prop — see `perceive`/`snapshot_now`.
+- `SIMLAB_SIM_BENCH=N ./build/sunnyworld_viewer --selftest 1` runs N pure
+  sim cycles headless and prints avg/p50/p95 ms + state_hash — the fast
+  way to A/B engine performance without SDL.
+- `DriverState::parallel_think` pre-computes `brain_decide` for all agents
+  on a thread pool against the frozen round-start world (thread-count
+  invariant, NOT sequential-equivalent — engages only above ~48 minds).
 - The capstone test prints `capstone fingerprint: ... state_hash=...`;
   baseline hashes for SIMLAB_CYCLES 100/300/500/800 are d43a7c624c9084ec /
   fe23ce3faf80853c / 1270c51471227658 / d978b3ec11b5982d (re-baselined

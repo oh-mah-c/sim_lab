@@ -15,6 +15,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <thread>
 
 namespace simlab {
 
@@ -211,7 +212,17 @@ bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
     // No social floor, no urgent-need bailout, no sparsity, no plan_multi
     // fallback — natural selection is the only safety net. An undecidable
     // brain rests (which also runs sleep consolidation on its replay).
-    BrainChoice ch = brain_decide(w, npc);
+    // parallel_think: replay the choice pre-computed against the frozen
+    // round-start world; otherwise decide at this agent's turn (sees all
+    // earlier same-round actions, exactly like the legacy path).
+    BrainChoice ch;
+    const auto cit = st->brain_last.find(npc);
+    if (st->parallel_think && st->think_round == now &&
+        cit != st->brain_last.end()) {
+        ch = cit->second;
+    } else {
+        ch = brain_decide(w, npc);
+    }
     InteractionContext c = ch.valid ? mk(npc, {}, ch.verb.c_str(), 1)
                                     : mk(npc, {}, "rest", 1);
     if (ch.target != kNoEntity) c.targets.push_back(ch.target);
@@ -222,6 +233,74 @@ bool brain_step(World& w, DriverState* st, EntityId npc, std::uint64_t now,
     }
     w.interact(c);
     return true;
+}
+
+// CL-1 Phase 4b: deterministic parallel think pre-pass. Runs at round open,
+// while the world is still frozen (no interacts yet this round). Every
+// agent's brain_decide is a pure function of (round-start world, own brain
+// slot) — per-slot writes (last_action, mac_pending) are disjoint, so any
+// partition/thread count yields identical BrainChoice results. Choices are
+// staged per-thread and merged in agent order; brain_step replays them.
+static void parallel_think_pass(World& w, DriverState* st,
+                                const std::vector<EntityId>& agents,
+                                std::uint64_t now) {
+    st->brain_last.clear();
+    st->think_round = now;
+    if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+    BrainStore& store = *w.brains_;
+    // Sequential slot pre-creation: BrainArena may grow its slab and the
+    // slots map must not be inserted into concurrently.
+    for (EntityId id : agents) {
+        const Entity* e = w.find(id);
+        if (e && e->alive && w.find_mind(id)) brain_slot(w, store, id);
+    }
+    const std::size_t n = agents.size();
+    if (n == 0) return;
+    // Small populations: spawning a thread pool costs more than the
+    // decides it saves — leave think_round stale so brain_step decides
+    // live, exactly as if parallel_think were off.
+    std::size_t minds = 0;
+    for (EntityId id : agents) {
+        const Entity* e = w.find(id);
+        if (e && e->alive && w.find_mind(id)) ++minds;
+    }
+    if (minds < 48) { st->think_round = 0; return; }
+    const unsigned hw = std::thread::hardware_concurrency();
+    int T = st->think_threads > 0 ? st->think_threads
+                                  : static_cast<int>(hw ? hw : 2);
+    T = std::max(1, std::min(T, 16));
+    T = std::min<int>(T, static_cast<int>(agents.size()));
+    if (T <= 1) {
+        for (EntityId id : agents) {
+            const Entity* e = w.find(id);
+            if (!e || !e->alive || !w.find_mind(id)) continue;
+            const BrainChoice ch = brain_decide(w, id);
+            if (ch.valid) st->brain_last[id] = ch;
+        }
+        return;
+    }
+    std::vector<std::vector<std::pair<EntityId, BrainChoice>>> parts(T);
+    auto work = [&](int t) {
+        const std::size_t lo = n * static_cast<std::size_t>(t) /
+                               static_cast<std::size_t>(T);
+        const std::size_t hi = n * static_cast<std::size_t>(t + 1) /
+                               static_cast<std::size_t>(T);
+        for (std::size_t i = lo; i < hi; ++i) {
+            const EntityId id = agents[i];
+            const Entity* e = w.find(id);
+            if (!e || !e->alive || !w.find_mind(id)) continue;
+            const BrainChoice ch = brain_decide(w, id);
+            if (ch.valid) parts[static_cast<std::size_t>(t)]
+                              .emplace_back(id, ch);
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<std::size_t>(T) - 1);
+    for (int t = 1; t < T; ++t) pool.emplace_back(work, t);
+    work(0);
+    for (auto& th : pool) th.join();
+    for (auto& p : parts)
+        for (auto& [id, ch] : p) st->brain_last[id] = ch;
 }
 
 // ---- shore sense (game mode, Primordial ruleset) ---------------------------
@@ -1496,6 +1575,11 @@ static bool cycle_step(World& w, DriverState* st, DriverTally* tally,
         sl.now = now;
         sl.concurrent = concurrent;
         sl.pos = 0;
+        // Phase 4b: parallel think — pre-compute all brain choices against
+        // the frozen round-start world before the first interact lands.
+        if (st && st->parallel_think && st->brain_control &&
+            !st->legacy_planner_compat && !w.speculative)
+            parallel_think_pass(w, st, sl.agents, now);
         sl.open = true;
     }
     const auto t0 = std::chrono::steady_clock::now();

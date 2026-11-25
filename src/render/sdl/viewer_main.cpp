@@ -389,6 +389,9 @@ struct Viewer {
     explicit Viewer(World& world) : w(world) {
         dstate.curiosity = true; dstate.concurrent = true;
         dstate.brain_control = true;      // CL-1 is the sapient controller
+        dstate.parallel_think = true;     // 100% neural + parallel think
+        if (std::getenv("SIMLAB_NO_BRAIN")) dstate.brain_control = false;
+        if (std::getenv("SIMLAB_NO_PARALLEL")) dstate.parallel_think = false;
         composer.load(data_dir + "/narrative_templates.txt");
     }
     ~Viewer() {
@@ -427,7 +430,7 @@ struct Viewer {
     // reset every viewer-side cache after the World was replaced
     void reset_view() {
         dstate = DriverState{}; dstate.curiosity = true; dstate.concurrent = true;
-        dstate.brain_control = true;
+        dstate.brain_control = true; dstate.parallel_think = true;
         fog = FogOfWar{};
         fog.set_mode(FogOfWar::Mode::Tribe, tribe_lang());
         selected = kNoEntity; avatar = kNoEntity; av_targets.clear();
@@ -3749,6 +3752,22 @@ int main(int argc, char** argv) {
         v.pw = build_primordial(world, p);
         if (!v.pw.homes.empty()) { v.cam.cx = float(v.pw.homes[0].x); v.cam.cy = float(v.pw.homes[0].y); }
         v.fog.set_mode(FogOfWar::Mode::Tribe, v.tribe_lang());
+        if (const char* sb = std::getenv("SIMLAB_SIM_BENCH")) {   // pure-sim timing, no render
+            const int n = std::atoi(sb);
+            std::vector<double> ms;
+            ms.reserve(n);
+            for (int c = 0; c < n; ++c) {
+                const auto a = std::chrono::steady_clock::now();
+                autonomous_cycle(world, &v.dstate);
+                ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
+            }
+            std::sort(ms.begin(), ms.end());
+            double sum = 0; for (double x : ms) sum += x;
+            std::printf("simbench: cycles=%d avg=%.1fms p50=%.1f p95=%.1f entities=%zu minds=%zu hash=%016llx\n",
+                        n, sum / n, ms[n / 2], ms[n * 95 / 100], world.entities.size(), world.minds_.size(),
+                        (unsigned long long)world.state_hash());
+            return 0;
+        }
     }
     v.speed = 0; v.speed_atomic = 0;               // paused under the title menu
     v.has_game = selftest > 0;
