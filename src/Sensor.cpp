@@ -32,7 +32,16 @@ const std::array<std::int32_t, kInteroChannels> kInteroSign = {
 const char* const kVerbs[kActionVerbs] = {
     "consume", "move", "strike", "impact", "rest", "share", "dig", "sow",
     "irrigate", "process", "combine", "reproduce", "communicate", "engrave",
-    "read", "enclose"};
+    "read", "enclose",
+    // Phase 4c free-will expansion: verbs the laws already support but the
+    // 16-slot table could not express. Indices 0..15 are frozen (p.a[4]
+    // sleep-consolidation check and saved brains depend on them).
+    // NOTE: "smelt" is not an interact verb (smelting = "process" + note
+    // "smelt_*") and "court" is an architecture function, not an action —
+    // the slots went to real verbs "evacuate"/"adjudicate" instead.
+    "wield", "unwield", "withdraw", "steal", "take", "trade", "treat",
+    "chop", "heat", "evacuate", "assemble", "disassemble", "carve",
+    "perform_ritual", "consecrate", "adjudicate"};
 
 std::int64_t isqrt_i64(std::int64_t v) {
     if (v <= 0) return 0;

@@ -952,6 +952,15 @@ void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
         const Entity* me_c = w.find(npc);
         if (!me_c) continue;
 
+        // CL-1 free will (Phase 4c): in 100% neural mode the survival/
+        // social reflex stack below is OFF — affect reaches behaviour
+        // through rollout scoring inside brain_decide instead of hardcoded
+        // hijacks, so depression/anorexia/withdrawal can emerge. The
+        // legacy_planner_compat path keeps the full reflex suite.
+        const bool neural_free =
+            st && st->brain_control && !st->legacy_planner_compat;
+
+        if (!neural_free) {
         // 2a. maintenance: wield best tool when hands are empty
         // (primordial: a reflex needs the verb — nobody "knows" tools yet)
         const bool wield_known = !(st && st->curiosity) ||
@@ -1240,6 +1249,7 @@ void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
                 }
             }
         }
+        }   // !neural_free — reflex stack skipped in 100% neural mode
 
         // 4. cognition & discovery — plan/goal caching (Phase 9):
         //  * a cached ExploreGoal waypoint keeps the agent walking WITHOUT
@@ -1319,12 +1329,13 @@ void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
         // every cycle (its own C=5 imagination budget is internal); the
         // legacy discover/plan_multi path only fires as a bootstrap
         // fallback while the brain has no usable policy yet.
-        if (st && st->brain_control && !walking_pending && !gated &&
+        if (st && st->brain_control && !walking_pending &&
+            (neural_free || !gated) &&
             brain_step(w, st, npc, now, tally)) {
             if (tally) ++tally->experiments;
             continue;
         }
-        bool may_discover = discover_budget > 0;
+        bool may_discover = discover_budget > 0 && !neural_free;
         if (st && st->curiosity) {
             const bool urgent = dint(w, *me, hunger, 0) > 600 ||
                                 dint(w, *me, dpid(w, "thirst"), 0) > 600;

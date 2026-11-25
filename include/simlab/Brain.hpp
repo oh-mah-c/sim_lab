@@ -149,10 +149,12 @@ public:
     }
 
 private:
-    // slab_ holds slab_cells_ * kCell bytes, 64-byte aligned via vector of
-    // uint64_t (16-byte aligned on x86-64; we over-align by allocating
-    // cells*8 + 64 and offsetting — see reserve())
-    std::vector<std::uint64_t> slab_;
+    // 64-byte-aligned cell: operator new honors over-alignment (C++17), so
+    // slab_.data() is ALWAYS 64B-aligned and slab_base_off_ stays 0 across
+    // every realloc. (The old uint64_t slab could realign on growth, which
+    // silently shifted every live brain's weights — a nondeterminism bug.)
+    struct alignas(64) Cell { std::uint64_t v; };
+    std::vector<Cell> slab_;
     std::uint64_t slab_base_off_ = 0;   // byte offset of cell 0 inside slab_
     std::uint64_t slab_cells_ = 0;
     std::uint64_t high_water_ = 0;      // bump pointer, in cells
@@ -199,6 +201,7 @@ struct BrainPending {
     ActionVec a{};
     std::array<std::int8_t, kLabelChannels> yhat{};
     std::array<std::int8_t, 96> wm_hidden{};   // WM layer-1 activations
+    std::array<std::int8_t, 64> w1hidden{};    // worker hidden (actor SGD)
     std::array<std::int16_t, 96> h{};          // post-GRU hidden state Q8
     std::array<std::int8_t, 96> embed{};       // embed output (manager/worker in)
 };

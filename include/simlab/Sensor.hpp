@@ -7,8 +7,8 @@
 // PERCEIVED world into fixed-width integer vectors — never reads World
 // Truth beyond what AgentMind::memory/perceive() already recorded.
 //
-//   sensor vec : 96 x int8   (intero 16 | neuro 8 | entities 48 | env+act 24)
-//   action vec : 16 x int8   (verb one-hot over the law vocabulary)
+//   sensor vec : 112 x int8  (intero 16 | neuro 8 | entities 48 | env 8 | act 32)
+//   action vec : 32 x int8   (verb one-hot over the law vocabulary)
 //   label vec  : 25 x int8   (16 intero deltas | 8 outcome classes | reward)
 //
 // All quantization is integer permille->int8; no floats anywhere.
@@ -20,14 +20,14 @@ struct InteractionContext;
 struct CausalEvent;
 struct Entity;
 
-constexpr int kSensorChannels = 96;
+constexpr int kSensorChannels = 112;
 constexpr int kInteroChannels = 16;    // sensor channels 0..15
 constexpr int kNeuroChannels   = 8;    // channels 16..23
 constexpr int kEntitySlots     = 6;    // channels 24..71 (6 x 8)
 constexpr int kEntityFeats     = 8;
 constexpr int kEnvChannels     = 8;    // channels 72..79
-constexpr int kActChannels     = 16;   // channels 80..95 (last action)
-constexpr int kActionVerbs     = 16;
+constexpr int kActChannels     = 32;   // channels 80..111 (last action)
+constexpr int kActionVerbs     = 32;
 constexpr int kLabelChannels   = 25;   // 16 deltas | 8 outcomes | reward
 
 using SensorVec = std::array<std::int8_t, kSensorChannels>;

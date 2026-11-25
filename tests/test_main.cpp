@@ -10,6 +10,8 @@
 #include <set>
 #include <map>
 #include <string>
+#include <cstring>
+#include <array>
 #include "simlab/World.hpp"
 #include "simlab/Geometry.hpp"
 #include "simlab/WorldGen.hpp"
@@ -10809,6 +10811,174 @@ static void test_gene_pool_evolution() {
 // CL-1 Phase 4b — parallel think: identical state_hash for any thread
 // count (each decide is a pure function of frozen round-start world +
 // own slot). Sequential mode stays the legacy baseline.
+// ---------- CL-1 Phase 4c: 100% neural free will -----------------------------
+static void test_brain_free_will() {
+    // (a) 32-verb action space: table, one-hot encoding, decide validity ----
+    CHECK(kActionVerbs == 32);
+    CHECK(kSensorChannels == 112);
+    CHECK(kActChannels == 32);
+    {
+        const char* const* vt = sensor_verb_table();
+        CHECK(std::strcmp(vt[16], "wield") == 0);
+        CHECK(std::strcmp(vt[17], "unwield") == 0);
+        CHECK(std::strcmp(vt[18], "withdraw") == 0);
+        CHECK(std::strcmp(vt[19], "steal") == 0);
+        CHECK(std::strcmp(vt[20], "take") == 0);
+        CHECK(std::strcmp(vt[21], "trade") == 0);
+        CHECK(std::strcmp(vt[22], "treat") == 0);
+        CHECK(std::strcmp(vt[23], "chop") == 0);
+        CHECK(std::strcmp(vt[24], "heat") == 0);
+        CHECK(std::strcmp(vt[25], "evacuate") == 0);   // "smelt" is not a
+        CHECK(std::strcmp(vt[31], "adjudicate") == 0); // verb; "court" isn't
+        // an action either — real verbs took those slots (see Sensor.cpp)
+        CHECK(std::strcmp(vt[26], "assemble") == 0);
+        CHECK(std::strcmp(vt[27], "disassemble") == 0);
+        CHECK(std::strcmp(vt[28], "carve") == 0);
+        CHECK(std::strcmp(vt[29], "perform_ritual") == 0);
+        CHECK(std::strcmp(vt[30], "consecrate") == 0);
+        // indices 0..15 frozen: p.a[4] sleep-consolidation relies on "rest"
+        CHECK(std::strcmp(vt[4], "rest") == 0);
+        CHECK(std::strcmp(vt[0], "consume") == 0);
+        // sensor_action one-hot over the widened table
+        InteractionContext cx = mk_ctx(kNoEntity, {}, "wield", 0);
+        const ActionVec av = sensor_action(cx);
+        CHECK(av[16] == 100);
+        bool any = false;
+        for (int i = 0; i < kActionVerbs; ++i) any |= av[i] == 100;
+        CHECK(any);
+        InteractionContext cz = mk_ctx(kNoEntity, {}, "treaty", 0);
+        const ActionVec az = sensor_action(cz);
+        for (int i = 0; i < kActionVerbs; ++i) CHECK(az[i] == 0);
+    }
+    // decide honours the widened mask: a mind that "knows" only wield gets
+    // choices restricted to {wield, move, rest}
+    {
+        World w(67, "data");
+        w.brain_shadow = true;
+        const EntityId s = mk_sapient(w, {50, 50});
+        w.mind(s).known_actions.insert("wield");
+        bool saw_wield_or_basic = false;
+        for (int i = 0; i < 12; ++i) {
+            BrainChoice ch = brain_decide(w, s);
+            CHECK(ch.valid);
+            CHECK(ch.verb == "wield" || ch.verb == "move" ||
+                  ch.verb == "rest");
+            saw_wield_or_basic = true;
+            w.interact(mk_ctx(s, {}, "rest", 0));   // advance one tick
+        }
+        CHECK(saw_wield_or_basic);
+    }
+
+    // (b) neural_free: executive override + consume reflex are OFF; affect
+    // reaches behaviour only through rollout scoring. A panic-maxed agent
+    // whose ONLY known verb is "rest" cannot be hijacked into strike/flee.
+    {
+        World w(71, "data");
+        const EntityId s = mk_sapient(w, {50, 50});
+        w.brain_shadow = true;
+        AgentMind& m = w.mind(s);
+        m.neuro.panic = 1000;                 // >> executive_override (750)
+        m.neuro.rage = 1000;
+        m.neuro.grief = 1000;
+        m.known_actions.clear();              // only innate move+rest
+        DriverState st;
+        st.brain_control = true;
+        st.legacy_planner_compat = false;     // 100% neural mode
+        const std::size_t ledger0 = w.ledger.size();
+        for (int i = 0; i < 20; ++i) autonomous_cycle(w, &st);
+        // no strike/consume/flee interact may appear: the brain only knows
+        // move+rest, and no reflex layer may preempt it any more.
+        const auto& hist = w.ledger.history();
+        for (std::size_t i = ledger0; i < hist.size(); ++i) {
+            const CausalEvent& ev = hist[i];
+            CHECK(ev.action != "strike");
+            CHECK(ev.action != "consume");
+            CHECK(ev.action != "flee");
+        }
+    }
+
+    // (c) grief/anhedonia bends imagined reward: identical worlds differing
+    // only in neuro.grief must diverge in the ACTION STREAM (state_hash
+    // differs trivially — neuro is hashed — so compare ledger verbs).
+    {
+        auto build = [](std::uint64_t seed, std::int64_t grief) {
+            World w(seed, "data");
+            PrimordialParams pp; pp.seed = static_cast<int>(seed); pp.grid = 48;
+            pp.tribes = 1; pp.per_tribe = 3;
+            build_primordial(w, pp);
+            w.brain_shadow = true;
+            for (EntityId id : w.minded_entities()) {
+                AgentMind& m = w.mind(id);
+                m.neuro.grief = grief;
+                m.known_actions.insert("consume");
+            }
+            return w;
+        };
+        World calm = build(83, 0), grieving = build(83, 1000);
+        DriverState st;
+        st.brain_control = true;
+        st.legacy_planner_compat = false;
+        st.curiosity = false;
+        for (int i = 0; i < 400; ++i) {
+            // grief is a TRANSIENT axis (decays every tick): re-apply each
+            // cycle so the grieving world stays depressed — chronic
+            // anhedonia, not a one-off shock.
+            for (EntityId id : calm.minded_entities()) calm.mind(id).neuro.grief = 0;
+            for (EntityId id : grieving.minded_entities())
+                grieving.mind(id).neuro.grief = 1000;
+            autonomous_cycle(calm, &st);
+            autonomous_cycle(grieving, &st);
+        }
+        // state_hash differs trivially (neuro is hashed), so the proof that
+        // affect reaches behaviour is the ledger action stream itself.
+        std::string stream_c, stream_g;
+        for (const CausalEvent& ev : calm.ledger.history())
+            if (!ev.action.empty()) { stream_c += ev.action; stream_c += ';'; }
+        for (const CausalEvent& ev : grieving.ledger.history())
+            if (!ev.action.empty()) { stream_g += ev.action; stream_g += ';'; }
+        CHECK(stream_c != stream_g);
+    }
+
+    // (d) actor learning: w2w policy rows update in brain_post. Only the
+    // executed verb's 64-weight row may change; untouched rows stay frozen.
+    {
+        World w(89, "data");
+        w.brain_shadow = true;
+        const EntityId s = mk_sapient(w, {50, 50});
+        w.interact(mk_ctx(s, {}, "rest", 0));      // prime the slot
+        const BrainSlot& sl0 = w.brains_->slots.at(s);
+        const BrainLayout& L = brain_layout_h(sl0.hidden);
+        const std::int8_t* wb0 = w.brains_->arena.w8(sl0.woff);
+        std::array<std::int8_t, 64> rest0{}, court0{}, consume0{};
+        std::memcpy(rest0.data(), wb0 + L.w2w + 4 * 64, 64);    // "rest"
+        std::memcpy(court0.data(), wb0 + L.w2w + 31 * 64, 64);  // "adjudicate"
+        std::memcpy(consume0.data(), wb0 + L.w2w + 0 * 64, 64);// "consume"
+        for (int i = 0; i < 80; ++i) {
+            // mix outcomes so homeostatic reward + surprise both vary
+            const char* v = (i % 3 == 0) ? "strike" : "rest";
+            w.interact(mk_ctx(s, {}, v, 0));
+            if ((i % 25) == 24) {                  // keep the body alive
+                Entity& e = *w.find(s);
+                tseti(e, w, "energy", 90000000);
+                tseti(e, w, "hunger", 0);
+                tseti(e, w, "thirst", 0);
+                tseti(e, w, "integrity", 1000);
+                tseti(e, w, "fatigue", 0);
+                tseti(e, w, "blood_volume", 1000);
+            }
+        }
+        const BrainSlot& sl1 = w.brains_->slots.at(s);
+        const std::int8_t* wb1 = w.brains_->arena.w8(sl1.woff);
+        std::array<std::int8_t, 64> rest1{}, court1{}, consume1{};
+        std::memcpy(rest1.data(), wb1 + L.w2w + 4 * 64, 64);
+        std::memcpy(court1.data(), wb1 + L.w2w + 31 * 64, 64);
+        std::memcpy(consume1.data(), wb1 + L.w2w + 0 * 64, 64);
+        CHECK(rest1 != rest0);    // "rest" was executed -> its row learned
+        CHECK(court1 == court0);  // "adjudicate" never ran -> row frozen
+        CHECK(consume1 == consume0);  // "consume" never executed -> frozen
+    }
+}
+
 static void test_parallel_think() {
     auto build = [](std::uint64_t seed) {
         World w(seed, "data");
@@ -10906,6 +11076,7 @@ int main(int argc, char** argv) {
     RUN(test_brain_phase0);
     RUN(test_brain_phase1);
     RUN(test_brain_phase2);
+    RUN(test_brain_free_will);
     RUN(test_amphibian_evolution);
     RUN(test_brain_curriculum);
     RUN(test_narrative_host);

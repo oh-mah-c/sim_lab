@@ -199,15 +199,11 @@ void brain_mutate_blocks(std::int8_t* w, std::int64_t n_weights,
 
 void BrainArena::reserve(std::uint64_t cells) {
     if (cells <= slab_cells_) return;
-    const std::uint64_t need_bytes =
-        cells * kCell + kCell;   // +1 cell slack for 64B alignment
-    const std::uint64_t need_u64 = (need_bytes + 7) / 8;
-    slab_.resize(need_u64, 0);
-    // find first 64-byte-aligned offset inside the allocation
-    const std::uintptr_t base =
-        reinterpret_cast<std::uintptr_t>(slab_.data());
-    const std::uint64_t mis = (64 - (base & 63)) & 63;
-    slab_base_off_ = mis;
+    // Cell is alignas(64): data() is always 64B-aligned, so cell 0 sits at
+    // byte offset 0 and every previously handed-out offset stays valid
+    // across realloc. (+1 spare cell replaces the old alignment slack.)
+    slab_.resize(cells + 1);
+    slab_base_off_ = 0;
     slab_cells_ = cells;
 }
 
@@ -273,17 +269,17 @@ static BrainLayout layout_for(std::int32_t H) {
     const std::uint32_t wc = static_cast<std::uint32_t>(
         (H + 8 + 15) & ~15);    // worker input: h(H) ++ drive(8), padded
     const std::uint32_t mc = static_cast<std::uint32_t>(
-        (H + 16 + 15) & ~15);   // WM input: h(H) ++ action(16), padded
+        (H + kActionVerbs + 15) & ~15);   // WM input: h(H) ++ action(32), padded
     const std::uint32_t Hu = static_cast<std::uint32_t>(H);
-    layer(Hu, 96,  l.embed_w, l.embed_b);   // sensor 96 -> hidden H
+    layer(Hu, kSensorChannels, l.embed_w, l.embed_b); // sensor -> hidden H
     layer(Hu, Hu,  l.zw,     l.zb);         // GRU update gate
     layer(Hu, Hu,  l.hw,     l.hb);         // GRU candidate
     layer(32, Hu,  l.m1w,    l.m1b);        // manager H -> 32
     layer(8,  32,  l.m2w,    l.m2b);        // manager 32 -> 8 drives
     layer(64, wc,  l.w1w,    l.w1b);        // worker (H+8) -> 64
-    layer(16, 64,  l.w2w,    l.w2b);        // worker 64 -> 16 verbs
+    layer(kActionVerbs, 64, l.w2w, l.w2b);  // worker 64 -> 32 verbs
     layer(16, Hu,  l.aqw,    l.aqb);        // worker attention queries
-    layer(96, mc,  l.wm1w,   l.wm1b);       // WM (H+16) -> 96
+    layer(96, mc,  l.wm1w,   l.wm1b);       // WM (H+32) -> 96
     layer(25, 96,  l.wm2w,   l.wm2b);       // WM 96 -> 25 outputs
     layer(1,  Hu,  l.valw,   l.valb);       // value H -> 1
     l.total_bytes = o;
@@ -410,7 +406,7 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
         };
         clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
         clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
-        clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, 16); clamp_bias(L.aqb, 16);
+        clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, kActionVerbs); clamp_bias(L.aqb, 16);
         clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
     } else {
         for (std::uint64_t i = 0; i < bytes; ++i)
@@ -421,7 +417,7 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
         };
         zero_bias(L.embed_b, H); zero_bias(L.zb, H); zero_bias(L.hb, H);
         zero_bias(L.m1b, 32);    zero_bias(L.m2b, 8);
-        zero_bias(L.w1b, 64);    zero_bias(L.w2b, 16); zero_bias(L.aqb, 16);
+        zero_bias(L.w1b, 64);    zero_bias(L.w2b, kActionVerbs); zero_bias(L.aqb, 16);
         zero_bias(L.wm1b, 96);   zero_bias(L.wm2b, 25); zero_bias(L.valb, 1);
     }
     // Phase 3 plasticity: fast weights start at ZERO (Baldwin — never
@@ -468,13 +464,15 @@ static void wm2_forward(const std::int8_t* wm2w, const std::int8_t* fast,
             kShWm2, BrainAct::kLinear, y);
 }
 
+namespace { std::int32_t drive_bias(const NeuroState& nr, int d); }
+
 // forward trunk + world model; fills pending. Caller guarantees slot exists.
 static void brain_forward(World& w, BrainStore& store, EntityId npc,
                           BrainPending& p) {
     BrainSlot& s = brain_slot(w, store, npc);
     const std::int32_t H = s.hidden;
     const BrainLayout& L = brain_layout_h(H);
-    const std::int32_t wm_in = ((H + 16 + 15) & ~15);   // padded cols
+    const std::int32_t wm_in = ((H + kActionVerbs + 15) & ~15);   // padded cols
     std::int8_t* base = store.arena.w8(s.woff);
     const std::int8_t* embed_w = base + L.embed_w;
     const std::int16_t* embed_b =
@@ -512,8 +510,36 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
         p.h[i] = s.h[i];
     }
 
+    // worker forward for actor learning: manager -> drive -> w1 hidden.
+    // brain_post uses p.w1hidden to SGD the executed verb's w2w row, so
+    // policy improves within a lifetime, not only across generations.
+    {
+        const std::int32_t wc = (H + 8 + 15) & ~15;
+        const AgentMind* fm = w.find_mind(npc);
+        std::array<std::int8_t, 32> m1{};
+        dense16(base + L.m1w, 32, H, e.data(),
+                reinterpret_cast<const std::int16_t*>(base + L.m1b),
+                kShGru, BrainAct::kTanh, m1.data());
+        std::array<std::int8_t, 8> m2{};
+        dense16(base + L.m2w, 8, 32, m1.data(),
+                reinterpret_cast<const std::int16_t*>(base + L.m2b),
+                kShGru, BrainAct::kLinear, m2.data());
+        std::int32_t ds[8];
+        for (int d = 0; d < 8; ++d)
+            ds[d] = m2[d] * 8 + (fm ? drive_bias(fm->neuro, d) : 0);
+        int drive = 0;
+        for (int d = 1; d < 8; ++d) if (ds[d] > ds[drive]) drive = d;
+        std::array<std::int8_t, 128> wwin{};
+        for (int i = 0; i < H; ++i)
+            wwin[i] = static_cast<std::int8_t>(s.h[i] >> 8);
+        wwin[H + drive] = 100;
+        dense16(base + L.w1w, 64, wc, wwin.data(),
+                reinterpret_cast<const std::int16_t*>(base + L.w1b),
+                kShWm1, BrainAct::kTanh, p.w1hidden.data());
+    }
+
     // WM input: hidden state dequantized to int8 ++ action one-hot (pad16)
-    std::array<std::int8_t, 112> win{};
+    std::array<std::int8_t, 128> win{};
     for (int i = 0; i < H; ++i)
         win[i] = static_cast<std::int8_t>(s.h[i] >> 8);
     for (int i = 0; i < kActionVerbs; ++i)
@@ -645,6 +671,38 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                 s.fast[o * kWmHidden + i] = static_cast<std::int8_t>(
                     std::max<std::int64_t>(-96,
                         std::min<std::int64_t>(96, v)));
+            }
+        }
+    }
+
+    // ---- Phase 4c: actor learning — w2w policy-row SGD ---------------------
+    // REINFORCE-flavoured: advantage = homeostatic reward (label ch24,
+    // already in channel units) + a novelty bonus for high-surprise
+    // outcomes, applied ONLY to the executed verb's logit row through the
+    // worker hidden stored by brain_forward. Lets coping habits, tastes
+    // and pathological fixations actually be reinforced within a lifetime.
+    {
+        int verb = -1;
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (p.a[i] == 100) { verb = i; break; }
+        if (verb >= 0) {
+            const std::int64_t adv =
+                static_cast<std::int64_t>(y[24]) * 8 +
+                (sigma >= 400 ? 96 : 0) - 64;
+            if (adv != 0) {
+                const std::int64_t eta_a =
+                    std::max<std::int64_t>(8, s.lr_permille / 8);
+                std::int8_t* w2w = base + L.w2w;
+                for (int i = 0; i < 64; ++i) {
+                    const std::int64_t dw =
+                        (eta_a * adv * p.w1hidden[i]) >> 17;
+                    const std::int64_t d = std::max<std::int64_t>(-4,
+                                               std::min<std::int64_t>(4, dw));
+                    if (d == 0) continue;
+                    const std::int64_t v =
+                        static_cast<std::int64_t>(w2w[verb * 64 + i]) + d;
+                    w2w[verb * 64 + i] = brain_clamp_i8(v);
+                }
             }
         }
     }
@@ -828,7 +886,7 @@ BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
     const std::int32_t H = g.hidden;
     clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
     clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
-    clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, 16); clamp_bias(L.aqb, 16);
+    clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, kActionVerbs); clamp_bias(L.aqb, 16);
     clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
     return g;
 }
@@ -865,7 +923,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     const std::int32_t H = s.hidden;
     const BrainLayout& L = brain_layout_h(H);
     const std::int32_t wc = (H + 8 + 15) & ~15;
-    const std::int32_t mc = (H + 16 + 15) & ~15;
+    const std::int32_t mc = (H + kActionVerbs + 15) & ~15;
     const std::int8_t* base = store.arena.w8(s.woff);
     auto W = [&](std::uint32_t o) { return base + o; };
     auto B = [&](std::uint32_t o) {
@@ -1002,6 +1060,16 @@ BrainChoice brain_decide(World& w, EntityId npc) {
         mind_params(w, *me).plan_horizon, 1, 6);
     const std::int64_t gamma =
         std::clamp<std::int64_t>(s.trace_decay, 0, 1024);   // Q10 discount
+    // ---- affect shaping (Phase 4c): NeuroState bends imagined futures ----
+    // grief/anhedonia blunts the homeostatic pull (depression -> anorexia,
+    // withdrawal emerge naturally); panic taxes imagined failure and
+    // trauma-tagged targets; rage rewards approaching hated ones. All
+    // integer arithmetic over NeuroState — no disease labels anywhere.
+    const NeuroState& ns = mind->neuro;
+    const std::int64_t homeo_q =
+        1024 - std::min<std::int64_t>(768, ns.grief * 3 / 4);
+    const std::int64_t panic_q = ns.panic;
+    const std::int64_t rage_q = ns.rage;
     std::array<std::int8_t, kLabelChannels> yhat{};
     std::array<std::int8_t, kWmHidden> wh{};
     std::int64_t best_total = INT64_MIN;
@@ -1023,15 +1091,20 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                     ++k;
                 }
             }
-            std::array<std::int8_t, 112> aw{};
+            std::array<std::int8_t, 128> aw{};
             for (int i = 0; i < H; ++i) aw[i] = h8[i];
             aw[H + vstep] = 100;
             dense16(W(L.wm1w), kWmHidden, mc, aw.data(), B(L.wm1b),
                     kShWm1, BrainAct::kTanh, wh.data());
             wm2_forward(W(L.wm2w), s.fast.data(), B(L.wm2b),
                         wh.data(), yhat.data());
-            const std::int32_t r =
+            std::int32_t r =
                 yhat[24] + (yhat[16] > 0 ? 24 : yhat[16] < 0 ? -24 : 0);
+            // grief dampens reward pull; panic taxes predicted failure
+            r = static_cast<std::int32_t>(
+                (static_cast<std::int64_t>(r) * homeo_q) >> 10);
+            r -= static_cast<std::int32_t>(
+                (panic_q * (127 - yhat[16])) >> 11);
             total = (total * gamma + r * 1024) >> 10;
         }
         // terminal value of the imagined state
@@ -1039,6 +1112,15 @@ BrainChoice brain_decide(World& w, EntityId npc) {
         dense16(W(L.valw), 1, H, h8.data(), B(L.valb), kShGru,
                 BrainAct::kLinear, vv.data());
         total += static_cast<std::int64_t>(vv[0]) * 256;
+        // rage approaches hated memories; panic avoids trauma-tagged ones
+        if (cd.tgt >= 0 && cd.tgt < nnear) {
+            const auto mit = mind->memory.find(near[cd.tgt].id);
+            if (mit != mind->memory.end() &&
+                mit->second.engram.emotional_charge < 0) {
+                const std::int64_t chg = -mit->second.engram.emotional_charge;
+                total += rage_q * chg / 3072 - panic_q * chg / 4096;
+            }
+        }
         // small deterministic exploration jitter (genome-scaled)
         const std::uint64_t jit =
             Rng::hash(w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^

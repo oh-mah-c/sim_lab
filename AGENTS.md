@@ -906,3 +906,36 @@ no engine code changes.
   determinism/~70% draw/save-load round-trip) + end-to-end (game1 empty
   pool -> harvest survivors -> game2 same seed inherits -> byte-exact
   slow-block install check + alive2 >= alive1).
+
+## CL-1 Phase 4c — free will, 32 verbs, actor learning
+
+- Reflex preemption is OFF when `legacy_planner_compat == false`
+  (`neural_free` in Driver.cpp): wield/withdraw/forage/hunt/consume
+  (incl. >900 desperation) and the executive panic/rage/grief override no
+  longer hijack the agent. Affect reaches behaviour ONLY through rollout
+  scoring in `brain_decide`: `homeo_q = 1024 - min(768, grief*3/4)` scales
+  imagined reward r (anhedonia -> anorexia/withdrawal emerge), `panic_q`
+  taxes predicted failure `yhat[16]`, `rage_q`/`panic_q` add/subtract on
+  negatively-charged memory targets. NOTE: NeuroState panic/rage/grief
+  are TRANSIENT (decay every tick) — tests must re-apply them per cycle.
+- Verb space 16 -> 32 (`kActionVerbs`, `kActChannels`, `kSensorChannels`
+  96->112): indices 0..15 FROZEN (p.a[4] sleep check + saved brains);
+  16..31 = wield, unwield, withdraw, steal, take, trade, treat, chop,
+  heat, evacuate, assemble, disassemble, carve, perform_ritual,
+  consecrate, adjudicate. ("smelt"/"court" are not interact verbs.)
+  `BrainLayout` grew accordingly: w2w is 32x64, wm1 input is H+32 —
+  `brain_state_hash` and save v20 sizes follow `wbytes` dynamically.
+- Actor learning (Phase 4c): `brain_forward` also runs the worker trunk
+  (manager->drive->w1) into `BrainPending::w1hidden`; `brain_post` applies
+  a REINFORCE-flavoured SGD step to the EXECUTED verb's w2w row
+  (`adv = y[24]*8 + (sigma>=400 ? 96:0) - 64`, eta ~ lr/8, dw clamp +-4).
+  Policy improves within a lifetime, not only across generations.
+- `BrainArena` slab is now `alignas(64)` cells: the old uint64_t vector
+  could REALIGN on growth, changing `slab_base_off_` and silently
+  shifting every live brain's weights (nondeterminism — found via
+  test_brain_curriculum diverging at cycle ~266). Offsets are now stable
+  across realloc forever; do NOT revert to a plain vector.
+- `test_brain_free_will`: 32-verb table/mask checks, panic+rage+grief
+  agent with only move+rest never gets strike/flee, sustained-grief vs
+  calm worlds produce different ledger action streams, w2w rows update
+  only for executed verbs.
