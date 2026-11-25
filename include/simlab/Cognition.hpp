@@ -351,7 +351,7 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev);
 // engrams initialise from emotional_charge (imprint vs base); existing
 // ones rehearse (clarity refresh + throttled stability doubling).
 void upsert_memory(AgentMind& mind, EntityId eid,
-                   const AgentMind::MemorySnapshot& snap,
+                   AgentMind::MemorySnapshot snap,
                    std::int64_t emotional_charge, const MindParams& p);
 // Semantic drift: retrieval-time blur. Below detail_blur_threshold the
 // remembered position jitters by a deterministic hash of

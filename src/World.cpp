@@ -3017,9 +3017,14 @@ void World::metabolize(std::int64_t dt) {
                 .push_back(me->pos);
         }
     }
+    const std::int64_t dormant_stride =
+        kDormantStride * lod_stride_;
     const std::int64_t lod_r2 = kLodRadius * kLodRadius;
     auto is_active = [&](const Entity& e) {
         if (minds_.count(e.id)) return true;
+        // warp LOD: only minds stay hot — every other entity batches its
+        // drift into the dormant catch-up path (accumulator-exact dt).
+        if (lod_stride_ > 1) return false;
         const std::int64_t cx = cell_of(e.pos.x), cy = cell_of(e.pos.y);
         for (std::int64_t ax = cx - 1; ax <= cx + 1; ++ax)
             for (std::int64_t ay = cy - 1; ay <= cy + 1; ++ay) {
@@ -3073,14 +3078,19 @@ void World::metabolize(std::int64_t dt) {
     for (const auto& ep : entities) {
         Entity& e = *ep;
         const std::uint64_t pending = now - e.last_metabolized;
+        // per-entity phase stagger (id-hash) keeps catch-up bursts from
+        // synchronizing across the whole dormant population during warp.
+        const std::uint64_t cstride =
+            static_cast<std::uint64_t>(dormant_stride) +
+            (lod_stride_ > 1
+                 ? e.id % static_cast<std::uint64_t>(lod_stride_) : 0);
         if (!e.alive) {
             // Phase 11: corpses are environmental reservoirs — they keep
             // decaying, emitting odor and shedding strain_ref long after
             // the organism's needs stopped mattering. Same LOD contract:
             // dormant catch-up is one batched, accumulator-exact update.
             if (pending > 0) {
-                if (lod && pending < static_cast<std::uint64_t>(kDormantStride) &&
-                    !is_active(e))
+                if (lod && pending < cstride && !is_active(e))
                     continue;
                 const std::size_t chg0 = ev.changes.size();
                 environmental_drift(e, pending, ev);
@@ -3094,8 +3104,7 @@ void World::metabolize(std::int64_t dt) {
         }
         // LOD: dormant entities wait until enough ticks accrued — cheapest
         // possible reject before ANY property lookup.
-        if (lod && pending < static_cast<std::uint64_t>(kDormantStride) &&
-            !is_active(e))
+        if (lod && pending < cstride && !is_active(e))
             continue;
         // reap first: integrity at 0 destroys the organism — same rule the
         // interact commit applies, extended to metabolism-driven death.

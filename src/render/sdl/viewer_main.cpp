@@ -1197,6 +1197,7 @@ struct Viewer {
                     bool done = false;
                     {
                         std::lock_guard<std::mutex> lk(mx);
+                        w.set_lod_stride(4);   // warp LOD: batch dormant drift
                         done = autonomous_cycle_step(w, &dstate, nullptr, 40.0);
                         if (done && ++pool_rounds >= 300) {
                             pool_rounds = 0;
@@ -1214,6 +1215,7 @@ struct Viewer {
                 if (has_game) {
                     {
                         std::lock_guard<std::mutex> lk(mx);
+                        w.set_lod_stride(1);   // warp over — back to exact ticks
                         round_done = autonomous_cycle_step(w, &dstate, nullptr, 10.0);
                         if (round_done && ++pool_rounds >= 300) {
                             pool_rounds = 0;
@@ -3754,6 +3756,10 @@ int main(int argc, char** argv) {
         v.fog.set_mode(FogOfWar::Mode::Tribe, v.tribe_lang());
         if (const char* sb = std::getenv("SIMLAB_SIM_BENCH")) {   // pure-sim timing, no render
             const int n = std::atoi(sb);
+            // SIMLAB_SIM_STRIDE=N emulates warp LOD (dormant metabolize
+            // batching + perceive memory cache) without the UI.
+            if (const char* st = std::getenv("SIMLAB_SIM_STRIDE"))
+                world.set_lod_stride(std::atoll(st));
             std::vector<double> ms;
             ms.reserve(n);
             for (int c = 0; c < n; ++c) {
@@ -3763,8 +3769,10 @@ int main(int argc, char** argv) {
             }
             std::sort(ms.begin(), ms.end());
             double sum = 0; for (double x : ms) sum += x;
-            std::printf("simbench: cycles=%d avg=%.1fms p50=%.1f p95=%.1f entities=%zu minds=%zu hash=%016llx\n",
-                        n, sum / n, ms[n / 2], ms[n * 95 / 100], world.entities.size(), world.minds_.size(),
+            std::size_t alive_n = 0;
+            for (const auto& ep : world.entities) if (ep->alive) ++alive_n;
+            std::printf("simbench: cycles=%d avg=%.1fms p50=%.1f p95=%.1f entities=%zu alive=%zu minds=%zu hash=%016llx\n",
+                        n, sum / n, ms[n / 2], ms[n * 95 / 100], world.entities.size(), alive_n, world.minds_.size(),
                         (unsigned long long)world.state_hash());
             return 0;
         }

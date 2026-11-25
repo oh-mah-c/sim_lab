@@ -222,6 +222,13 @@ public:
     static constexpr std::uint32_t kRulePrimordial = 1u;
     std::uint32_t ruleset = 0;
     std::int64_t deferred_dt = 0;
+    // Time-warp LOD stride (viewer god-tool): >1 batches dormant metabolize
+    // catch-up and caches fresh perceive() memory writes for unmoved
+    // entities. Transient perf knob — never saved, hashed or cloned; the
+    // driver resets it to 1 when warp ends so normal play stays exact.
+    std::int64_t lod_stride_ = 1;
+    void set_lod_stride(std::int64_t s) { lod_stride_ = s < 1 ? 1 : s; }
+    std::int64_t lod_stride() const { return lod_stride_; }
 
     // ---- public state ----
     std::uint64_t seed = 0;

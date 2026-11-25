@@ -263,6 +263,15 @@ no engine code changes.
 - `DriverState::parallel_think` pre-computes `brain_decide` for all agents
   on a thread pool against the frozen round-start world (thread-count
   invariant, NOT sequential-equivalent — engages only above ~48 minds).
+- `World::lod_stride_` (default 1, transient — never saved/hashed): the
+  viewer's Time Warp sets it to 4 and back to 1 when warp ends
+  (`SIMLAB_SIM_STRIDE=N` emulates it in simbench). At stride>1 metabolize
+  treats ONLY minds as active (every other entity joins the dormant
+  catch-up path with per-entity phase stagger `id % stride`), and
+  `perceive()` skips the memory/engrams block for entities unmoved since
+  their last write while still emitting the Observation. Deliberately
+  changes state_hash during warp (epidemiology/birth timing shift);
+  stride 1 is bit-identical.
 - The capstone test prints `capstone fingerprint: ... state_hash=...`;
   baseline hashes for SIMLAB_CYCLES 100/300/500/800 are d43a7c624c9084ec /
   fe23ce3faf80853c / 1270c51471227658 / d978b3ec11b5982d (re-baselined

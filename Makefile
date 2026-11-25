@@ -9,8 +9,8 @@ MODE ?= dev
 BASEFLAGS := -std=c++20 -Wall -Wextra -Iinclude -Ithird_party/lang-host/include -Ithird_party/lang-host/ggml/include
 ifeq ($(MODE),release)
   BUILDDIR := build-release
-  CXXFLAGS ?= $(BASEFLAGS) -O3 -flto=auto -DNDEBUG
-  LDFLAGS  ?= -O3 -flto=auto
+  CXXFLAGS ?= $(BASEFLAGS) -O3 -flto=auto -march=native -DNDEBUG
+  LDFLAGS  ?= -O3 -flto=auto -march=native
 else ifeq ($(MODE),profile)
   BUILDDIR := build-profile
   CXXFLAGS ?= $(BASEFLAGS) -O2 -g -pg

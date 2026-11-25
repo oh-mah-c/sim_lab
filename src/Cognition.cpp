@@ -376,13 +376,14 @@ void sleep_consolidate(AgentMind& mind, const MindParams& p) {
 }
 
 void upsert_memory(AgentMind& mind, EntityId eid,
-                   const AgentMind::MemorySnapshot& snap,
+                   AgentMind::MemorySnapshot snap,
                    std::int64_t emotional_charge, const MindParams& p) {
     auto it = mind.memory.find(eid);
     const bool fresh = it == mind.memory.end() || it->second.engram.clarity <= 0;
     AgentMind::MemorySnapshot& ms = mind.memory[eid];
     ms.tick = snap.tick; ms.pos = snap.pos; ms.material = snap.material;
-    ms.kind_name = snap.kind_name; ms.props = snap.props;
+    ms.kind_name = std::move(snap.kind_name);
+    ms.props = std::move(snap.props);
     MemoryEngram& g = ms.engram;
     if (fresh) {
         // Salience encoding: a charge at/above imprint_threshold forges a
@@ -446,13 +447,15 @@ void generalize_abstraction(const World& w, AgentMind& mind, EntityId src,
 // upsert_memory + abstraction fan-out. `fresh` is evaluated BEFORE the
 // upsert so only first-time imprints propagate to kin entities.
 void upsert_memory_g(const World& w, AgentMind& mind, EntityId eid,
-                     const AgentMind::MemorySnapshot& snap,
+                     AgentMind::MemorySnapshot snap,
                      std::int64_t charge, const MindParams& p,
                      std::int64_t radius) {
     const auto it = mind.memory.find(eid);
     const bool fresh = it == mind.memory.end() || it->second.engram.clarity <= 0;
-    upsert_memory(mind, eid, snap, charge, p);
+    // generalize touches only OTHER entities' entries — running it before
+    // the src upsert lets the src snapshot move into memory afterwards.
     if (fresh) generalize_abstraction(w, mind, eid, snap, charge, p, radius);
+    upsert_memory(mind, eid, std::move(snap), charge, p);
 }
 
 // sight radius of `e` — the honest perception bound for generalization.
@@ -1083,6 +1086,22 @@ std::size_t perceive(World& w, EntityId npc) {
                 for (const auto& [p, v] : md->props)
                     if (admit(p) && !e->props.get(p)) o.props[p] = v;
         }
+        // Time-warp LOD: the entity has not moved since its last memory
+        // write — the engram is still fresh, so skip the snapshot rebuild,
+        // salience charge and social side-effects for lod_stride_-1 ticks.
+        // The Observation itself is still emitted (sensor stays live);
+        // only the memory/engrams path is cached. Never active at stride 1.
+        bool mem_fresh = false;
+        if (w.lod_stride() > 1) {
+            const auto mit = mind.memory.find(eid);
+            if (mit != mind.memory.end() &&
+                mit->second.pos.x == e->pos.x &&
+                mit->second.pos.y == e->pos.y &&
+                static_cast<std::int64_t>(o.tick - mit->second.tick) <
+                    w.lod_stride())
+                mem_fresh = true;
+        }
+        if (!mem_fresh) {
         // fog-of-war memory: Ebbinghaus-encoded snapshot of what was just
         // perceived — stale belief the planner may use after the entity
         // leaves sight range, never written back to World Truth. Charge
@@ -1101,7 +1120,7 @@ std::size_t perceive(World& w, EntityId npc) {
         const bool had_engram =
             mind.memory.find(eid) != mind.memory.end();
         const std::int64_t pcharge = perceive_charge(w, *me, *e);
-        upsert_memory_g(w, mind, eid, snap, pcharge, mparams, range);
+        upsert_memory_g(w, mind, eid, std::move(snap), pcharge, mparams, range);
         // abstraction fan-out may rewrite OTHER entries -> full re-index
         if (mparams.abstraction_gain > 1200 &&
             mem_abs(pcharge) >= mparams.imprint_threshold) fb_dirty = true;
@@ -1211,6 +1230,7 @@ std::size_t perceive(World& w, EntityId npc) {
             }
             seen_supply[e->material] += q;
         }
+        }   // !mem_fresh — warp LOD cache
         mind.observe(std::move(o));
         ++added;
     }
