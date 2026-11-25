@@ -860,23 +860,35 @@ no engine code changes.
   `DriverState.brain_control = true` is now the viewer default
   (ctor + reset_view) — CL-1 sparse-advisor + social floor drives
   sapients; `brain_shadow` hooks still train the WM on every interact.
-- Continuous Chronicle (Biên Niên Sử, viewer-side): salient ledger facts
-  collected inside `llm_scan` accumulate in `chron_facts`; `chron_tick`
-  flushes a chapter every ~300 ticks (>=2 facts) or immediately on a
-  catastrophic trigger (first-seen entity kind, last sapient dying).
-  `NarrativeHost::submit_prompt(key, sys, user)` (new API; `submit`
-  unchanged) sends the chapter prompt — system prompt enforces
+- Continuous Chronicle (Biên Niên Sử, viewer-side): EVERY causal ledger
+  event passing `llm_skip_verb` (i.e. all real actions — `rest`, `move`,
+  `metabolize` etc. excluded) becomes a `ChapterFact` inside `llm_scan`
+  (cap `kChronFactCap`=1024/window + `chron_overflow` counter). `chron_tick`
+  flushes a chapter every ~300 ticks (>=2 facts), when the fact buffer
+  fills, or immediately on a catastrophic trigger (first-seen entity
+  kind, last sapient dying); `llm_ch_outstanding >= 8` applies
+  backpressure. The LLM prompt carries only the first ~4800 chars of
+  facts (plus an "…and N further events" note) — but the persisted
+  record is COMPLETE: `record` (single-line `; `-joined) and `raw`
+  (plain lines) hold every fact, written to `saves/chronicle_<world_seed>.md`
+  as `### [t0 – t1] title` + body + `*(Dữ kiện gốc: ...)*` footer.
+  Without a loaded model `chron_tick` still appends a raw "Records"
+  chapter so the chronicle captures everything regardless. Facts are
+  collected even while the host is inactive (the one-liner chronicler
+  stays gated on `active()`). `NarrativeHost::submit_prompt(key, sys,
+  user)` sends the chapter prompt — system prompt enforces
   truth-to-facts + title-line/prose format; user prompt carries
-  `[Previous passage]` = `chron_tail` (last ~3 sentences of the prior
-  chapter) + world context + the fact list. Finished chapters parse
-  title/body, append to `saves/chronicle_<world_seed>.md`
-  (`### [t0 – t1] title` + `*(Dữ kiện gốc: ...)*` footer) and reload on
-  world attach via `chron_load` (called from `planet_setup`, before the
-  valley early-return). UI: chapters listed chronologically in the
-  Chronicle window — click flies the camera (smooth `cam_goal` lerp in
-  frame()), "Export .md" copies the path. Config defaults bumped:
-  `max_new_tokens` 48->192, `n_ctx` 1024->2048 (one-liners still stop at
-  EOG). All presentation-only — state_hash untouched.
+  `[Previous passage]` = `chron_tail` + world context + facts.
+  `chron_load` reloads chapters + tail on world attach (from
+  `planet_setup`, before the valley early-return). UI: the Field
+  Journal "Chronicle" tab (J) is the SINGLE chronicle surface —
+  `ui_chapters()` (click flies camera via `cam_goal` lerp, "Export .md"
+  copies path) + the full live `cfeed` record with category filters +
+  Firsts/milestones; the old floating Chronicle window and the codex
+  "Chronicle" tab duplicate were removed (codex keeps "Codex chronicle"
+  text lines only). Long bodies/facts are display-truncated at 6000
+  chars (the .md keeps all). Config defaults: `max_new_tokens` 48->192,
+  `n_ctx` 1024->2048. All presentation-only — state_hash untouched.
 
 ## CL-1 Phase 4 — 100% neural CL-1 + persistent GenePool
 

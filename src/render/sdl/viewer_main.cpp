@@ -219,7 +219,6 @@ struct Viewer {
     struct Callout { Vec2 pos; float oy = 0; std::string text; std::uint64_t until; ImU32 col; };
     std::deque<Callout> c_callouts;
     std::uint64_t narr_seen = 0;             // last NarrativeLine.seq drained
-    bool show_chronicle = true;
     int chron_filter = 0;                    // 0 all 1 combat 2 survival 3 discovery 4 society 5 pinned
     std::map<EntityId, std::vector<std::string>> c_carved;   // legend -> translated stone words
     std::uint64_t c_carved_tick = ~0ull;                      // rebuild gate (world tick)
@@ -261,6 +260,8 @@ struct Viewer {
     std::string chron_tail;                     // last ~3 sentences of prev chapter
     std::string chron_path;                     // saves/chronicle_<seed>.md
     int chron_open = -1;                        // expanded chapter row (-1 none)
+    static constexpr std::size_t kChronFactCap = 1024;  // facts per chapter window
+    std::uint64_t chron_overflow = 0;           // facts dropped past the cap (this window)
     // smooth camera fly-to (chapter click)
     bool cam_goal = false;
     float cam_gx = 0, cam_gy = 0, cam_gz = 1;
@@ -1818,7 +1819,7 @@ struct Viewer {
             ImGui::Separator();
             ImGui::TextDisabled("Panels");
             ImGui::Checkbox("Inspector on selection", &show_inspector);
-            ImGui::Checkbox("Chronicle feed", &show_chronicle);
+            ImGui::Checkbox("Field journal (chronicle)", &show_journal);
             ImGui::Checkbox("Chronicle & Rosetta codex", &show_codex);
             ImGui::Checkbox("Sprite atlas", &show_atlas);
             ImGui::Checkbox("Performance stats", &show_perf);
@@ -2491,6 +2492,66 @@ struct Viewer {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Chronicle", nullptr, tabflag(1))) {
+                // THE chronicle — the single home for the world's story:
+                // LLM-written chapters on top (persisted to
+                // saves/chronicle_<seed>.md), then the complete live record
+                // (every event, template + LLM one-liners), then Firsts.
+                ui_chapters();
+                ImGui::Separator();
+                ImGui::TextDisabled("Live record — every event, newest first.");
+                {
+                    static const char* kFilters[] = {"All", "Combat", "Survival", "Discovery", "Society", "Pinned"};
+                    for (int i = 0; i < 6; ++i) {
+                        if (i) ImGui::SameLine();
+                        const bool sel = chron_filter == i;
+                        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.40f, 0.20f, 1));
+                        if (ImGui::SmallButton(kFilters[i])) chron_filter = i;
+                        if (sel) ImGui::PopStyleColor();
+                    }
+                    ImGui::Separator();
+                    std::vector<const NarrativeLine*> rows;
+                    rows.reserve(cfeed.lines.size());
+                    for (auto it = cfeed.lines.rbegin(); it != cfeed.lines.rend(); ++it) {
+                        const NarrativeLine& l = *it;
+                        const bool ok = chron_filter == 0 ? true
+                            : chron_filter == 1 ? (l.cat & kCatCombat) != 0
+                            : chron_filter == 2 ? (l.cat & kCatSurvival) != 0
+                            : chron_filter == 3 ? (l.cat & kCatDiscovery) != 0
+                            : chron_filter == 4 ? (l.cat & kCatSociety) != 0
+                            : (l.cat & kCatPinned) != 0;
+                        if (ok) rows.push_back(&l);
+                    }
+                    if (rows.empty()) ImGui::TextDisabled("The chronicle is quiet — events appear as they happen.");
+                    ImGuiListClipper feedclip;
+                    feedclip.Begin(static_cast<int>(rows.size()));
+                    while (feedclip.Step()) {
+                        for (int i = feedclip.DisplayStart; i < feedclip.DisplayEnd; ++i) {
+                            const NarrativeLine* l = rows[i];
+                            ImGui::PushID(static_cast<int>(l->seq % 100000));
+                            char when[24];
+                            std::snprintf(when, sizeof when, "d%llu %02dh",
+                                          (unsigned long long)(l->tick / 24 + 1), int(l->tick % 24));
+                            ImGui::TextDisabled("%s", when);
+                            ImGui::SameLine(0, 4);
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                l->llm ? ImVec4(1.f, 0.9f, 0.55f, 1)
+                                : (l->cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
+                                : (l->cat & kCatDiscovery) ? ImVec4(1.f, 0.82f, 0.5f, 1)
+                                : (l->cat & kCatSociety) ? ImVec4(0.6f, 0.9f, 0.95f, 1)
+                                : (l->cat & kCatSurvival) ? ImVec4(0.65f, 0.95f, 0.6f, 1)
+                                : ImVec4(0.85f, 0.85f, 0.88f, 1));
+                            if (ImGui::Selectable(l->text.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick,
+                                                  ImVec2(0, 0))) {
+                                cam.cx = float(l->pos.x); cam.cy = float(l->pos.y);
+                                if (globe) { globe = false; globe_dive = false; }
+                                if (l->who != kNoEntity) selected = l->who;
+                            }
+                            ImGui::PopStyleColor();
+                            ImGui::PopID();
+                        }
+                    }
+                }
+                ImGui::Separator();
                 ImGui::TextDisabled("Firsts of this world. Click Go to fly to where it happened.");
                 ImGuiListClipper clip;
                 clip.Begin(static_cast<int>(journal.milestones.size()));
@@ -2873,10 +2934,20 @@ struct Viewer {
                 if (chron_open == ci) {
                     ImGui::Indent(12.f);
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.84f, 0.9f, 1));
-                    ImGui::TextWrapped("%s", c.body.c_str());
+                    // body/facts can be huge for raw record chapters — cap
+                    // the on-screen text; the .md file keeps everything.
+                    constexpr std::size_t kDisp = 6000;
+                    if (c.body.size() <= kDisp) ImGui::TextWrapped("%s", c.body.c_str());
+                    else ImGui::TextWrapped("%.*s\n…(truncated — full record in %s)",
+                                            int(kDisp), c.body.c_str(), chron_path.c_str());
                     if (!c.facts.empty()) {
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.62f, 1));
-                        ImGui::TextWrapped("Facts: %s", c.facts.c_str());
+                        if (c.facts.size() <= kDisp)
+                            ImGui::TextWrapped("Facts: %s", c.facts.c_str());
+                        else
+                            ImGui::TextWrapped("Facts: %.*s\n…(+%zu chars in %s)",
+                                               int(kDisp), c.facts.c_str(),
+                                               c.facts.size() - kDisp, chron_path.c_str());
                         ImGui::PopStyleColor();
                     }
                     ImGui::PopStyleColor();
@@ -2888,68 +2959,6 @@ struct Viewer {
         ImGui::Separator();
     }
 
-    // ---- Phase 15: Live Chronicle Feed -----------------------------------------
-    // Newest-first narrative lines from real causal events; click jumps the
-    // camera to the scene and selects the actor.
-    void ui_chronicle() {
-        if (!show_chronicle) return;
-        ImGui::SetNextWindowPos(ImVec2(10, float(win_h) * 0.52f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(470, 0), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Chronicle", &show_chronicle);
-        static const char* kFilters[] = {"All", "Combat", "Survival", "Discovery", "Society", "Pinned"};
-        for (int i = 0; i < 6; ++i) {
-            if (i) ImGui::SameLine();
-            const bool sel = chron_filter == i;
-            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.40f, 0.20f, 1));
-            if (ImGui::SmallButton(kFilters[i])) chron_filter = i;
-            if (sel) ImGui::PopStyleColor();
-        }
-        ImGui::Separator();
-        ui_chapters();   // Biên Niên Sử — LLM chapters (also in codex tab)
-        // filtered view, newest first — cfeed is UI-thread only, no lock needed
-        std::vector<const NarrativeLine*> rows;
-        rows.reserve(cfeed.lines.size());
-        for (auto it = cfeed.lines.rbegin(); it != cfeed.lines.rend(); ++it) {
-            const NarrativeLine& l = *it;
-            const bool ok = chron_filter == 0 ? true
-                : chron_filter == 1 ? (l.cat & kCatCombat) != 0
-                : chron_filter == 2 ? (l.cat & kCatSurvival) != 0
-                : chron_filter == 3 ? (l.cat & kCatDiscovery) != 0
-                : chron_filter == 4 ? (l.cat & kCatSociety) != 0
-                : (l.cat & kCatPinned) != 0;
-            if (ok) rows.push_back(&l);
-        }
-        if (rows.empty()) ImGui::TextDisabled("The chronicle is quiet — events appear as they happen.");
-        ImGuiListClipper clip;
-        clip.Begin(static_cast<int>(rows.size()));
-        while (clip.Step()) {
-            for (int i = clip.DisplayStart; i < clip.DisplayEnd; ++i) {
-                const NarrativeLine* l = rows[i];
-                ImGui::PushID(static_cast<int>(l->seq % 100000));
-                char when[24];
-                std::snprintf(when, sizeof when, "d%llu %02dh",
-                              (unsigned long long)(l->tick / 24 + 1), int(l->tick % 24));
-                ImGui::TextDisabled("%s", when);
-                ImGui::SameLine(0, 4);
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    l->llm ? ImVec4(1.f, 0.9f, 0.55f, 1)
-                    : (l->cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
-                    : (l->cat & kCatDiscovery) ? ImVec4(1.f, 0.82f, 0.5f, 1)
-                    : (l->cat & kCatSociety) ? ImVec4(0.6f, 0.9f, 0.95f, 1)
-                    : (l->cat & kCatSurvival) ? ImVec4(0.65f, 0.95f, 0.6f, 1)
-                    : ImVec4(0.85f, 0.85f, 0.88f, 1));
-                if (ImGui::Selectable(l->text.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick,
-                                      ImVec2(0, 0))) {
-                    cam.cx = float(l->pos.x); cam.cy = float(l->pos.y);
-                    if (globe) { globe = false; globe_dive = false; }
-                    if (l->who != kNoEntity) selected = l->who;
-                }
-                ImGui::PopStyleColor();
-                ImGui::PopID();
-            }
-        }
-        ImGui::End();
-    }
 
     void ui_inspector() {
         if (!show_inspector || selected == kNoEntity || !insp.found) return;   // appears on selection only
@@ -3186,9 +3195,9 @@ struct Viewer {
                         ImGui::TextUnformatted(c_codex_lines[li].c_str());
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Chronicle")) {
-                ui_chapters();   // Biên Niên Sử — persistent LLM chapters
-                ImGui::TextDisabled("— codex chronicle —");
+            if (ImGui::BeginTabItem("Codex chronicle")) {
+                // The Biên Niên Sử lives ONLY in the Field Journal "Chronicle"
+                // tab now — this tab keeps the exported codex text lines.
                 ImGuiListClipper clip;
                 clip.Begin(static_cast<int>(c_chron.size()));
                 while (clip.Step())
@@ -3374,6 +3383,7 @@ struct Viewer {
         return a.empty() || a == "metabolize" || a == "cool" || a == "ecology" ||
                a == "political_drift" || a == "myth_drift" || a == "language" ||
                a == "anatomy_drift" || a == "decay_minds" || a == "move" ||
+               a == "rest" ||
                a == "perceive" || a == "witness" || a == "advance_ticks" ||
                a == "flush_needs";
     }
@@ -3414,6 +3424,7 @@ struct Viewer {
         chron_facts.clear(); chron_chapters.clear();
         llm_ch_pending.clear(); llm_ch_outstanding.clear();
         chron_tail.clear(); chron_catastrophic = false; chron_open = -1;
+        chron_overflow = 0;
         chron_kinds.clear();
         for (const auto& ep : w.entities)
             if (ep->alive) chron_kinds.insert(std::string(ep->kind_name));
@@ -3483,6 +3494,9 @@ struct Viewer {
         f << "\n";
     }
     // Window check + catastrophic flush; called under the world lock.
+    // EVERY action event is a fact now — the chapter prompt gets up to
+    // ~4800 chars of them and the .md keeps a single-line record of the
+    // same, so the chronicle is a complete account, not just milestones.
     void chron_tick(const World& w) {
         const std::uint64_t now = w.clock_.tick();
         if (chron_facts.empty()) {
@@ -3490,7 +3504,9 @@ struct Viewer {
             return;
         }
         const bool due = now - chron_win_start >= 300 && chron_facts.size() >= 2;
-        if (!due && !chron_catastrophic) return;
+        const bool full = chron_facts.size() >= kChronFactCap;
+        if (!due && !chron_catastrophic && !full) return;
+        if (llm_ch_outstanding.size() >= 8) return;   // backpressure: keep accumulating
         chron_catastrophic = false;
         // ---- compose the chapter prompt -------------------------------------
         std::uint64_t alive = 0, minds = 0;
@@ -3501,45 +3517,77 @@ struct Viewer {
             species.insert(std::string(ep->kind_name));
         }
         minds = w.minds_.size();
-        std::string facts;
-        std::string facts_short;
+        std::string facts;    // "- ..." bullet block for the LLM prompt (≤4800)
+        std::string record;   // single-line persistent fact record (.md) — COMPLETE
+        std::string raw;      // plain lines — body of a model-less chapter — COMPLETE
         std::int64_t sx = 0, sy = 0;
-        std::size_t used = 0;
+        std::size_t used = 0, np = 0;
         const std::size_t n = chron_facts.size();
-        for (std::size_t i = 0; i < n && used < 2000; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             std::string t = chron_facts[i].text;
             if (t.size() > 150) t = t.substr(0, 147) + "...";
+            for (char& ch : t) if (ch == '\n' || ch == '\r') ch = ' ';   // record stays one line
             const std::string line = "- " + t + "\n";
-            if (used + line.size() > 2000 && i > 0) break;   // keep chronological head
-            facts += line; used += line.size();
-            if (facts_short.size() < 280) {
-                if (!facts_short.empty()) facts_short += "; ";
-                facts_short += t;
+            if (np == 0 || used + line.size() <= 4800) {
+                facts += line; used += line.size(); ++np;
             }
+            raw += t; raw += '\n';
+            if (!record.empty()) record += "; ";
+            record += t;
             sx += chron_facts[i].pos.x; sy += chron_facts[i].pos.y;
         }
+        // The prompt only carries the first ~4800 chars of facts; tell the
+        // model (and the reader) how much of the chapter it did not see.
+        // record/raw above are NOT truncated — the .md keeps every event.
+        const std::uint64_t more = (n - np) + chron_overflow;
+        if (more)
+            facts += "- ...and " + std::to_string(more) +
+                     " further events this chapter.\n";
         const std::uint64_t t0 = chron_facts.front().tick;
         const std::uint64_t t1 = chron_facts.back().tick;
-        std::string user = std::string("[Previous passage]:\n") +
-            (chron_tail.empty() ? std::string("(The chronicle begins here.)")
-                                : chron_tail) + "\n\n";
-        user += "[World context — cycles " + std::to_string(t0) + " -> " +
-                std::to_string(t1) + "]:\n";
-        user += "Survivors: " + std::to_string(alive) + " | Species: " +
-                std::to_string(species.size()) + " | Minds: " +
-                std::to_string(minds) + "\n\n";
-        user += "[Events of this chapter]:\n" + facts + "\n";
-        user += "Write the next chronicle chapter:\n";
-        ChapterStub stub;
-        stub.tick0 = t0; stub.tick1 = t1;
-        stub.pos = n ? Vec2{std::int32_t(sx / std::int64_t(n)),
-                            std::int32_t(sy / std::int64_t(n))} : Vec2{};
-        stub.facts = facts_short;
-        const std::uint64_t key = ++llm_key_seq;
-        llm_ch_pending.emplace(key, std::move(stub));
-        llm_ch_outstanding.push_back(key);
-        llm_host.submit_prompt(key, kChapterSys(), user);
+        const Vec2 cen = n ? Vec2{std::int32_t(sx / std::int64_t(n)),
+                                 std::int32_t(sy / std::int64_t(n))} : Vec2{};
+        auto commit = [&](ChronicleChapter& c) {
+            chron_append(c);
+            chron_tail = chron_tail_of(c.body);
+            chron_chapters.push_back(std::move(c));
+            if (chron_chapters.size() > 500) {       // memory cap; file keeps all
+                chron_chapters.erase(chron_chapters.begin(),
+                    chron_chapters.begin() + (chron_chapters.size() - 500));
+            }
+        };
+        if (!llm_host.active()) {
+            // No model: still persist the raw record so the chronicle
+            // captures EVERYTHING even without LLM narration.
+            ChronicleChapter c;
+            c.tick0 = t0; c.tick1 = t1; c.pos = cen; c.facts = record;
+            c.title = "Records day " + std::to_string(t0 / 24 + 1) + " - day " +
+                      std::to_string(t1 / 24 + 1);
+            c.body = chron_trim(raw);
+            if (c.body.empty()) c.body = "(no narrated events)";
+            commit(c);
+        } else {
+            std::string user = std::string("[Previous passage]:\n") +
+                (chron_tail.empty() ? std::string("(The chronicle begins here.)")
+                                    : chron_tail) + "\n\n";
+            user += "[World context — cycles " + std::to_string(t0) + " -> " +
+                    std::to_string(t1) + "]:\n";
+            user += "Survivors: " + std::to_string(alive) + " | Species: " +
+                    std::to_string(species.size()) + " | Minds: " +
+                    std::to_string(minds) + "\n\n";
+            user += "[Events of this chapter]:\n" + facts + "\n";
+            user += "Write the next chronicle chapter:\n";
+            ChapterStub stub;
+            stub.tick0 = t0; stub.tick1 = t1;
+            stub.pos = cen;
+            stub.facts = record;
+            const std::uint64_t key = ++llm_key_seq;
+            llm_ch_pending.emplace(key, std::move(stub));
+            llm_ch_outstanding.push_back(key);
+            llm_host.submit_prompt(key, kChapterSys(), user);
+        }
         chron_facts.clear();
+        chron_overflow = 0;
         chron_win_start = now;
     }
     void llm_ch_drain() {
@@ -3594,9 +3642,13 @@ struct Viewer {
     }
 
     void llm_scan(const World& w) {
-        // While the model is still loading, fast-forward the cursor so the
-        // first active scan doesn't replay (and drop) the whole backlog.
-        if (!llm_host.active()) {
+        // Chapter facts are collected whether or not the model is loaded —
+        // chron_tick() persists them as raw "Records" chapters, so the
+        // chronicle still records EVERYTHING without an LLM. Only the
+        // expensive one-liner submissions below require an active host.
+        // While the model is still loading, fast-forward the cursor ONCE so
+        // the first scan doesn't replay (and drop) the whole backlog.
+        if (!llm_host.active() && !llm_primed) {
             if (!w.ledger.history().empty()) llm_scanned = w.ledger.next_id() - 1;
             llm_primed = true;
             return;
@@ -3613,7 +3665,7 @@ struct Viewer {
         std::size_t made = 0;
         const PropId pain_p = SIMLAB_PID(w.props, "pain_level");
         const PropId integ_p = SIMLAB_PID(w.props, "integrity");
-        for (std::size_t i = i0; i < hist.size() && made < 4; ++i) {
+        for (std::size_t i = i0; i < hist.size(); ++i) {
             const CausalEvent& ev = hist[i];
             llm_scanned = base + i;
             const std::string& a = ev.action;
@@ -3639,6 +3691,42 @@ struct Viewer {
             }
             const bool trauma = hurt >= 400 ||
                 (be && integ_p != kNoProp && w.prop_int(*be, integ_p, 1000) <= 0);
+            // Structured summary — used BOTH as a chapter fact (every action
+            // event is recorded) and, for salient events, as the one-liner
+            // chronicler prompt below.
+            std::string s = "Day " + std::to_string(ev.tick / 24 + 1) + ", hour " +
+                            std::to_string(ev.tick % 24) + ". ";
+            s += NarrativeComposer::describe(w, actor);
+            s += " "; s += a;
+            if (about != kNoEntity) { s += " "; s += NarrativeComposer::describe(w, about); }
+            if (ev.failed && !ev.failure.empty()) { s += " — failed: "; s += ev.failure; }
+            // ---- Continuous chronicle: EVERY action event becomes a fact ---
+            // (previously only the salient subset reached the .md, so whole
+            // stretches of ordinary life were never recorded). Catastrophic
+            // triggers are tracked even when the fact buffer is full.
+            for (EntityId sid : ev.spawned)
+                if (const Entity* se = w.find(sid))
+                    if (chron_kinds.insert(std::string(se->kind_name)).second)
+                        chron_catastrophic = true;
+            if (death) {
+                const Entity* dead = (ae && !ae->alive) ? ae : be;
+                if (dead && dead->kind_name == SIMLAB_KIND("sapient")) {
+                    bool any_sapient = false;
+                    for (EntityId sid : w.entities_of_kind(SIMLAB_KIND("sapient")))
+                        if (const Entity* se = w.find(sid); se && se->alive) {
+                            any_sapient = true; break;
+                        }
+                    if (!any_sapient) chron_catastrophic = true;
+                }
+            }
+            if (chron_facts.size() < kChronFactCap)
+                chron_facts.push_back({ev.tick, s,
+                    ae ? ae->pos : (be ? be->pos : Vec2{})});
+            else ++chron_overflow;
+            // ---- one-liner chronicler: salient events only ------------------
+            // (skipped entirely while the model is offline — facts above are
+            // still recorded, so nothing is lost from the chronicle)
+            if (made >= 4 || !llm_host.active()) continue;
             if (!death && !birth && !rare && !trauma) continue;
             // Per actor+class cooldown: one feud must not fill the queue.
             const std::uint64_t cls = death ? 1 : birth ? 2 : rare ? 3 : 4;
@@ -3647,13 +3735,6 @@ struct Viewer {
             const std::uint64_t cd = (death || birth) ? 480 : 960;   // ~20 / ~40 days
             if (it->second && ev.tick < it->second + cd) continue;
             it->second = ev.tick;
-            // Structured summary for the chronicler (plain facts, no lore).
-            std::string s = "Day " + std::to_string(ev.tick / 24 + 1) + ", hour " +
-                            std::to_string(ev.tick % 24) + ". ";
-            s += NarrativeComposer::describe(w, actor);
-            s += " "; s += a;
-            if (about != kNoEntity) { s += " "; s += NarrativeComposer::describe(w, about); }
-            if (ev.failed && !ev.failure.empty()) { s += " — failed: "; s += ev.failure; }
             NarrativeLine l;
             l.tick = ev.tick;
             l.pos = ae ? ae->pos : (be ? be->pos : Vec2{});
@@ -3664,27 +3745,6 @@ struct Viewer {
             llm_pending.emplace(key, l);
             llm_outstanding.push_back(key);
             llm_host.submit(key, s);
-            // Continuous chronicle: batch this fact into the next chapter.
-            // Catastrophic triggers flush the window immediately: a kind
-            // seen for the first time, or the last sapient dying out.
-            if (chron_facts.size() < 64) {
-                chron_facts.push_back({ev.tick, s, l.pos});
-                for (EntityId sid : ev.spawned)
-                    if (const Entity* se = w.find(sid))
-                        if (chron_kinds.insert(std::string(se->kind_name)).second)
-                            chron_catastrophic = true;
-                if (death) {
-                    const Entity* dead = (ae && !ae->alive) ? ae : be;
-                    if (dead && dead->kind_name == SIMLAB_KIND("sapient")) {
-                        bool any_sapient = false;
-                        for (EntityId sid : w.entities_of_kind(SIMLAB_KIND("sapient")))
-                            if (const Entity* se = w.find(sid); se && se->alive) {
-                                any_sapient = true; break;
-                            }
-                        if (!any_sapient) chron_catastrophic = true;
-                    }
-                }
-            }
             ++made;
         }
     }
@@ -3937,7 +3997,7 @@ struct Viewer {
             if (globe) draw_globe_icons(); else draw_overlays();
             ui_topbar();
             if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
-            ui_inspector(); ui_player(); ui_journal(); ui_chronicle(); ui_successor(); ui_toast();
+            ui_inspector(); ui_player(); ui_journal(); ui_successor(); ui_toast();
             if (!show_journal) ui_word_editor();
         }
         if (!in_menu) {
@@ -4196,13 +4256,15 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count(), rss_kb(), v.tex.map.size());
         }
         if (std::getenv("SIMLAB_VCHRON")) {
-            // repro: click rows of the Chronicle feed with real ImGui input
-            v.show_atlas = v.show_codex = false; v.show_chronicle = true;
+            // repro: click rows of the Chronicle tab (Field Journal) with
+            // real ImGui input
+            v.show_atlas = v.show_codex = false;
+            v.show_journal = true; v.journal_tab_req = 1;
             int c = 0;
             for (; c < 150 && v.cfeed.lines.size() < 3; ++c) { autonomous_cycle(world, &v.dstate); v.frame(1.0 / 60); }
             std::printf("chron: %zu lines after %d cycles\n", v.cfeed.lines.size(), c);
             ImGuiIO& io = ImGui::GetIO();
-            ImGuiWindow* cw = ImGui::FindWindowByName("Chronicle");
+            ImGuiWindow* cw = ImGui::FindWindowByName("Field Journal");
             const ImVec2 wp = cw ? cw->Pos : ImVec2(10, v.win_h * 0.52f);
             std::printf("chron: window at %.0f,%.0f size %.0fx%.0f\n", wp.x, wp.y, cw ? cw->Size.x : 0.f, cw ? cw->Size.y : 0.f);
             auto click = [&](float x, float y, int n) {
