@@ -1,0 +1,464 @@
+[
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -fvisibility=hidden -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -fopenmp -o CMakeFiles/ggml-base.dir/ggml.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml.c",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/ggml.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -fvisibility=hidden -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -fopenmp -o CMakeFiles/ggml-base.dir/ggml-alloc.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-alloc.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-alloc.c",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/ggml-backend.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-meta.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-meta.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/ggml-opt.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-opt.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-opt.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/ggml-threading.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-threading.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-threading.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -fvisibility=hidden -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -fopenmp -o CMakeFiles/ggml-base.dir/ggml-quants.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-quants.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-quants.c",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_base_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -fopenmp -o CMakeFiles/ggml-base.dir/gguf.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/gguf.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/gguf.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-base.dir/gguf.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ggml-cpu.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ggml-cpu.c",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ggml-cpu.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ggml-cpu.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/repack.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/repack.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/hbm.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/hbm.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/quants.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/quants.c",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/traits.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/traits.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/amx.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/amx/amx.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/amx/amx.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/amx.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/mmq.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/amx/mmq.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/amx/mmq.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/mmq.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/tiled/tiled.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/tiled/tiled.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/tiled/tiled.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/tiled/tiled.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/tiled/tiled-kernel.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/tiled/tiled-kernel.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/tiled/tiled-kernel.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/binary-ops.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/binary-ops.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/binary-ops.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/binary-ops.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/unary-ops.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/unary-ops.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/unary-ops.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/unary-ops.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/vec.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/vec.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/vec.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/vec.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/ops.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ops.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/ops.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ops.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/llamafile/sgemm.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/llamafile/sgemm.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/cc -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu11 -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/quants.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/arch/x86/quants.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/arch/x86/quants.c",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/quants.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_AVX -DGGML_AVX2 -DGGML_BACKEND_BUILD -DGGML_BACKEND_SHARED -DGGML_BMI2 -DGGML_F16C -DGGML_FMA -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_SSE42 -DGGML_USE_CPU_REPACK -DGGML_USE_LLAMAFILE -DGGML_USE_OPENMP -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_cpu_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -msse4.2 -mf16c -mfma -mbmi2 -mavx -mavx2 -fopenmp -o CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/repack.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/arch/x86/repack.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-cpu/arch/x86/repack.cpp",
+  "output": "ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/repack.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/ggml.dir/ggml-backend-dl.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-dl.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-dl.cpp",
+  "output": "ggml/src/CMakeFiles/ggml.dir/ggml-backend-dl.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_BUILD -DGGML_SCHED_MAX_COPIES=4 -DGGML_SHARED -DGGML_USE_CPU -D_GNU_SOURCE -D_XOPEN_SOURCE=600 -Dggml_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/ggml.dir/ggml-backend-reg.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-reg.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/ggml-backend-reg.cpp",
+  "output": "ggml/src/CMakeFiles/ggml.dir/ggml-backend-reg.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_11_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_10_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_10_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_10_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_10_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_9_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_9_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_9_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_9_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_8_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_8_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_8_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_8_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_7_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_7_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_7_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_7_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_6_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_6_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_6_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_6_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_5_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_5_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_5_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_5_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_4_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_4_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_4_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_4_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_3_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_3_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_3_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_3_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_2_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_2_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_2_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_2_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_1_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_1_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_1_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_1_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/Unity/unity_0_cxx.cxx.o -c /home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_0_cxx.cxx",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src/CMakeFiles/llama.dir/Unity/unity_0_cxx.cxx",
+  "output": "src/CMakeFiles/llama.dir/Unity/unity_0_cxx.cxx.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-adapter.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-adapter.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-adapter.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-adapter.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-arch.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-arch.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-arch.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-arch.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-batch.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-batch.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-batch.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-batch.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-chat.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-chat.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-chat.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-chat.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-context.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-context.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-context.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-context.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-cparams.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-cparams.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-cparams.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-cparams.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-grammar.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-grammar.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-grammar.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-grammar.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-graph.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-graph.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-graph.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-graph.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-hparams.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-hparams.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-hparams.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-hparams.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-impl.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-impl.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-impl.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-impl.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-io.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-io.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-io.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-io.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache-iswa.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-iswa.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-iswa.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache-iswa.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache-dsa.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsa.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsa.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache-dsa.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache-dsa-iswa.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsa-iswa.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsa-iswa.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache-dsa-iswa.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache-msa.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-msa.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-msa.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache-msa.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-kv-cache-dsv4.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsv4.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-kv-cache-dsv4.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-kv-cache-dsv4.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-memory.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-memory.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-moe-cache.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-moe-cache.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-moe-cache.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-moe-cache.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-memory-hybrid.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-memory-hybrid.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-memory-hybrid-iswa.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid-iswa.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid-iswa.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-memory-hybrid-iswa.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-memory-hybrid-idx.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid-idx.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-hybrid-idx.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-memory-hybrid-idx.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-memory-recurrent.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-recurrent.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-memory-recurrent.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-memory-recurrent.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-mmap.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-mmap.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-mmap.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-mmap.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-model-loader.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model-loader.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model-loader.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-model-loader.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-model-saver.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model-saver.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model-saver.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-model-saver.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-model.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-model.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-model.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-quant.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-quant.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-quant.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-quant.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-sampler.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-sampler.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-sampler.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-sampler.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/llama-vocab.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-vocab.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/llama-vocab.cpp",
+  "output": "src/CMakeFiles/llama.dir/llama-vocab.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/unicode-data.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/unicode-data.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/unicode-data.cpp",
+  "output": "src/CMakeFiles/llama.dir/unicode-data.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/src",
+  "command": "/usr/bin/c++ -DGGML_BACKEND_SHARED -DGGML_SHARED -DGGML_USE_CPU -DLLAMA_BUILD -DLLAMA_SHARED -Dllama_EXPORTS -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/. -I/home/hutech/Downloads/sim_lab/third_party/llama-build/src -I/home/hutech/Downloads/sim_lab/third_party/lang-host/src/../include -I/home/hutech/Downloads/sim_lab/third_party/lang-host/ggml/src/../include -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/llama.dir/unicode.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/src/unicode.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/src/unicode.cpp",
+  "output": "src/CMakeFiles/llama.dir/unicode.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/hash",
+  "command": "/usr/bin/c++  -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/. -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -o CMakeFiles/vendor-hash.dir/hash.cpp.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/hash.cpp",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/hash.cpp",
+  "output": "vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/hash",
+  "command": "/usr/bin/cc  -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/. -O3 -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -w -o CMakeFiles/vendor-hash.dir/xxhash/xxhash.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/xxhash/xxhash.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/xxhash/xxhash.c",
+  "output": "vendor/hash/CMakeFiles/vendor-hash.dir/xxhash/xxhash.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/hash",
+  "command": "/usr/bin/c++  -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/. -x c++ -O3 -DNDEBUG -fPIC -Wmissing-declarations -Wmissing-noreturn -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-array-bounds -Wextra-semi -w -o CMakeFiles/vendor-hash.dir/sha1/sha1.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/sha1/sha1.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/sha1/sha1.c",
+  "output": "vendor/hash/CMakeFiles/vendor-hash.dir/sha1/sha1.c.o"
+},
+{
+  "directory": "/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/hash",
+  "command": "/usr/bin/cc  -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/.. -I/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/. -O3 -DNDEBUG -fPIC -Wshadow -Wstrict-prototypes -Wpointer-arith -Wmissing-prototypes -Werror=implicit-int -Werror=implicit-function-declaration -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wdouble-promotion -w -o CMakeFiles/vendor-hash.dir/sha256/sha256.c.o -c /home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/sha256/sha256.c",
+  "file": "/home/hutech/Downloads/sim_lab/third_party/lang-host/vendor/hash/sha256/sha256.c",
+  "output": "vendor/hash/CMakeFiles/vendor-hash.dir/sha256/sha256.c.o"
+}
+]

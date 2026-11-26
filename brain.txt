@@ -1,0 +1,2245 @@
+# DEVIN ENGINEERING SPECIFICATION
+# Sunnyworld — Bio-Inspired Modular Spiking Brain
+## CL-1 Neural Architecture | Save Format v29
+
+**Specification Type:** Full Engineering Architecture & Implementation Contract  
+**Target:** CPU-only, deterministic, integer-only neural simulation  
+**Language:** C++  
+**SIMD:** AVX2  
+**Core:** Event-Driven Sparse Modular Spiking Neural Network  
+**Integration:** Sunnyworld World Engine, BrainArena, BrainGenome, GenePool, Memory System, Sensor System, Action System  
+**Primary Objective:** Build a biologically inspired miniature human brain simulation capable of perception, memory, learning, emotion, reasoning, planning, decision-making and behavioral adaptation.
+
+---
+
+# PART I — ARCHITECTURAL OBJECTIVES
+
+## 1. System Definition
+
+Replace the existing monolithic CL-1 neural block with a complete modular neural architecture.
+
+The system must simulate the major functional structures of a human brain, their interactions, and their effects on an NPC's behavior.
+
+The architecture must support:
+
+1. Sensory perception.
+2. Multisensory integration.
+3. Attention and salience detection.
+4. Reflexes and automatic responses.
+5. Motor coordination and movement learning.
+6. Homeostatic regulation.
+7. Emotional processing.
+8. Reward and punishment learning.
+9. Short-term and working memory.
+10. Episodic memory.
+11. Semantic memory.
+12. Procedural memory.
+13. Associative learning.
+14. Spatial cognition and navigation.
+15. Prediction and prediction-error processing.
+16. Goal formation and prioritization.
+17. Decision-making and action selection.
+18. Multi-step reasoning and planning.
+19. Language acquisition and communication.
+20. Sleep, forgetting and memory consolidation.
+21. Neural plasticity and individual development.
+22. Heritable neural architecture and behavioral predispositions.
+
+The brain must not contain predefined knowledge about the world.
+
+It must acquire knowledge through sensory observations, experiences, experimentation, memory and communication with other agents.
+
+## 2. Architectural Invariants
+
+The following requirements are mandatory.
+
+### 2.1 Integer-only computation
+
+All neural computations must use integer arithmetic.
+
+Allowed:
+- int8_t
+- uint8_t
+- int16_t
+- uint16_t
+- int32_t
+- uint32_t
+- int64_t
+- uint64_t
+
+Forbidden:
+- float
+- double
+- floating-point SIMD
+- floating-point neural activation
+- floating-point probability calculations
+- floating-point decay functions
+
+All continuous-like biological quantities must use documented fixed-point integer representations.
+
+Every operation must have explicitly defined overflow, saturation and rounding behavior.
+
+### 2.2 Deterministic execution
+
+Identical initial states and identical input sequences must produce identical outputs.
+
+Required invariants:
+
+- dev == release
+- single-thread == multi-thread
+- t1 == t8
+- save/load == uninterrupted simulation
+- identical genome + identical experience = identical neural evolution
+
+Parallel processing must never introduce nondeterministic accumulation order.
+
+### 2.3 CPU efficiency
+
+The architecture must support thousands of independently simulated NPCs.
+
+Requirements:
+
+- No heap allocation in neural hot paths.
+- Preallocated BrainArena.
+- Sparse spike propagation.
+- Event-driven module activation.
+- Multi-rate scheduling.
+- Cache-friendly SoA storage.
+- AVX2 acceleration.
+- Bounded neural processing budgets.
+- No unnecessary full-brain updates.
+- No unbounded mental simulation loops.
+
+### 2.4 Separation of responsibilities
+
+The following must remain separate:
+
+- Neural computation.
+- Anatomical organization.
+- Memory storage.
+- World knowledge.
+- Sensory encoding.
+- Motor execution.
+- Behavioral decision-making.
+- Genetic inheritance.
+
+The neural system must not directly modify world state.
+
+It produces neural signals and action preferences. The existing action system validates and executes actions.
+
+---
+
+# PART II — COMPLETE ANATOMICAL ARCHITECTURE
+
+## 3. Brain Organization
+
+Implement 12 anatomical-functional systems.
+
+These systems are independent processing modules connected through a sparse directed connectome.
+
+Each module contains:
+- Neural population.
+- Membrane potentials.
+- Firing thresholds.
+- Refractory states.
+- Local synaptic connections.
+- Incoming and outgoing tracts.
+- Activation priority.
+- Processing clock.
+- Plasticity parameters.
+- Module-specific state.
+
+The module architecture must not assume that all regions contain the same number of neurons.
+
+Use configurable neuron populations and bounded memory allocation.
+
+## 4. Anatomical Modules
+
+### Module 0 — Brainstem
+
+**Priority:** Critical  
+**Execution:** Every tick
+
+Responsibilities:
+
+- Immediate reflex processing.
+- Survival reflexes.
+- Automatic movement patterns.
+- Wakefulness and arousal.
+- Rapid hazard responses.
+- Basic autonomic regulation.
+- Emergency action initiation.
+
+Inputs:
+- Sensory signals.
+- Threat signals.
+- Internal physiological state.
+- Hypothalamic regulation.
+
+Outputs:
+- Reflex activation.
+- Immediate motor commands.
+- Arousal signals.
+- Emergency priority signals.
+
+Must remain operational even when higher cognitive modules are inactive.
+
+### Module 1 — Thalamus
+
+**Priority:** High  
+**Execution:** Every tick or when sensory events arrive.
+
+Responsibilities:
+
+- Sensory signal routing.
+- Sensory prioritization.
+- Filtering irrelevant signals.
+- Attention-dependent signal amplification.
+- Synchronization of sensory information.
+- Routing information to appropriate cortical systems.
+
+Input:
+- Raw encoded sensory channels.
+- Attention state.
+- Emotional salience.
+- Internal body signals.
+
+Output:
+- Routed sensory representations.
+- Salience-weighted signals.
+- Sensory gating signals.
+
+Do not implement the thalamus as a simple direct pass-through.
+
+It must be capable of changing which information reaches higher processing systems.
+
+### Module 2 — Hypothalamus
+
+**Priority:** Critical  
+**Execution:** Every 4 ticks or on significant homeostatic events.
+
+Responsibilities:
+
+- Hunger regulation.
+- Thirst regulation.
+- Energy balance.
+- Temperature regulation.
+- Fatigue.
+- Sleep pressure.
+- Physiological stress.
+- Reproductive motivation where supported by the world model.
+- Homeostatic goal generation.
+
+Inputs:
+- Internal body state.
+- Energy reserves.
+- Environmental temperature.
+- Hydration.
+- Injury and illness signals.
+- Sleep history.
+
+Outputs:
+- Homeostatic drives.
+- Autonomic modulation.
+- Hormonal modulation.
+- Motivation signals.
+
+The Hypothalamus must not directly assign actions.
+
+It generates internal needs and priorities that other systems process.
+
+### Module 3 — Cerebellum
+
+**Priority:** High  
+**Execution:** Every tick during active movement; otherwise event-driven.
+
+Responsibilities:
+
+- Motor coordination.
+- Movement timing.
+- Balance simulation.
+- Trajectory error correction.
+- Motor prediction.
+- Repeated movement learning.
+- Skill refinement.
+- Predictive compensation.
+
+Inputs:
+- Motor commands.
+- Proprioceptive feedback.
+- Previous movement outcomes.
+- Movement prediction.
+- Observed movement errors.
+
+Outputs:
+- Motor correction signals.
+- Coordination adjustments.
+- Learned movement parameters.
+- Prediction-error signals.
+
+Motor learning must improve through repeated experience.
+
+The system must not provide NPCs with predefined perfect movement skills.
+
+### Module 4 — Basal Ganglia
+
+**Priority:** High  
+**Execution:** Every 4 ticks and whenever action selection is triggered.
+
+Responsibilities:
+
+- Candidate action selection.
+- Action inhibition.
+- Action initiation.
+- Habit formation.
+- Reward-based reinforcement.
+- Competition between behavioral alternatives.
+- Behavioral switching.
+
+Implement an abstract direct/indirect/hyperdirect pathway model.
+
+The architecture must support:
+
+- Action facilitation.
+- Action suppression.
+- Conflict resolution.
+- Reinforcement learning.
+- Habit persistence.
+
+Inputs:
+- Candidate actions.
+- Motivation signals.
+- Reward predictions.
+- Dopamine modulation.
+- Emotional state.
+- Prefrontal signals.
+
+Outputs:
+- Action gating.
+- Action selection scores.
+- Inhibition signals.
+- Habit activation.
+
+### Module 5 — Amygdala
+
+**Priority:** High  
+**Execution:** On salient sensory or emotional events.
+
+Responsibilities:
+
+- Threat detection.
+- Fear conditioning.
+- Emotional salience.
+- Danger association.
+- Learned threat responses.
+- Social threat assessment.
+- Emotional memory modulation.
+
+Inputs:
+- Sensory information.
+- Previous dangerous experiences.
+- Pain and damage signals.
+- Social information.
+- Hippocampal memories.
+
+Outputs:
+- Threat intensity.
+- Fear-related signals.
+- Emotional salience.
+- Defensive action bias.
+- Cortisol modulation.
+
+Threat assessment must be learned and context-dependent.
+
+Do not hard-code a universal list of dangerous entities.
+
+### Module 6 — Hippocampus
+
+**Priority:** Medium  
+**Execution:** On significant events, spatial changes, learning events and rest.
+
+Responsibilities:
+
+- Episodic memory formation.
+- Spatial memory.
+- Contextual association.
+- Event sequencing.
+- Memory indexing.
+- Pattern completion.
+- Memory retrieval.
+- Replay during consolidation.
+
+Each episodic memory should reference:
+
+- Event identity.
+- Time.
+- Location.
+- Participants.
+- Observed objects.
+- Sensory representation.
+- Actions performed.
+- Outcomes.
+- Emotional context.
+- Confidence.
+- Associated semantic concepts.
+
+Memory must reference existing Sunnyworld entities and event records rather than duplicating entire world objects.
+
+Support:
+- Encoding.
+- Retrieval.
+- Reinforcement.
+- Interference.
+- Forgetting.
+- Consolidation.
+
+### Module 7 — Prefrontal Cortex
+
+**Priority:** Conditional  
+**Execution:** Event-driven, subject to cognitive budget.
+
+Responsibilities:
+
+- Goal management.
+- Working-memory control.
+- Multi-step planning.
+- Deliberation.
+- Impulse control.
+- Behavioral inhibition.
+- Conflict resolution.
+- Future outcome evaluation.
+- Abstract problem-solving.
+
+Implement three functional subdivisions:
+
+**Dorsolateral PFC**
+- Working-memory manipulation.
+- Rule maintenance.
+- Multi-step reasoning.
+- Goal maintenance.
+
+**Ventromedial PFC**
+- Value integration.
+- Emotional decision integration.
+- Outcome valuation.
+
+**Orbitofrontal Cortex**
+- Expected outcome evaluation.
+- Context-dependent value updating.
+- Behavioral switching.
+
+The Prefrontal Cortex must support bounded world-model rollouts.
+
+Mental simulation must never directly change the real world.
+
+A rollout must use a read-only snapshot and produce predicted outcomes.
+
+Use configurable planning depth and candidate limits.
+
+### Module 8 — Sensory Cortex
+
+**Priority:** High  
+**Execution:** On sensory input.
+
+Implement distinct sensory processing pathways:
+
+**Visual Processing**
+- Object features.
+- Spatial relationships.
+- Movement detection.
+- Shape and color properties where supported.
+
+**Auditory Processing**
+- Sound patterns.
+- Direction.
+- Intensity.
+- Temporal patterns.
+- Voice and communication signals.
+
+**Somatosensory Processing**
+- Touch.
+- Pressure.
+- Pain.
+- Temperature.
+- Proprioception.
+
+**Olfactory Processing**
+- Smell signatures.
+- Environmental chemical cues.
+- Food and threat associations.
+
+**Gustatory Processing**
+- Taste signatures.
+- Food-related sensory associations.
+
+All inputs must originate from Sunnyworld sensor interfaces.
+
+The neural system must not directly inspect hidden world information.
+
+### Module 9 — Motor Cortex
+
+**Priority:** High  
+**Execution:** When voluntary movement or motor control is required.
+
+Responsibilities:
+
+- Voluntary movement planning.
+- Motor command generation.
+- Motor sequence activation.
+- Action parameter selection.
+- Movement intention.
+- Coordination with Cerebellum.
+
+Outputs must use the existing action interface.
+
+The motor cortex does not execute physics.
+
+It generates intended movement commands which are evaluated by the world simulation.
+
+### Module 10 — Association Cortex
+
+**Priority:** Medium  
+**Execution:** Event-driven.
+
+Responsibilities:
+
+- Multisensory integration.
+- Object association.
+- Concept formation.
+- Cross-modal recognition.
+- Semantic association.
+- Contextual interpretation.
+- Abstract representation.
+- Relationship discovery.
+
+This module connects sensory representations with memory and cognitive systems.
+
+Example:
+
+An NPC observes:
+- A tree.
+- A falling branch.
+- A broken branch.
+- A usable piece of wood.
+
+The Association Cortex can associate these experiences.
+
+However, it must not automatically know that wood is suitable for making a tool.
+
+That knowledge must be discovered through experience, experimentation or communication.
+
+### Module 11 — Language Network
+
+**Priority:** Conditional  
+**Execution:** When communication, language learning or verbal reasoning is required.
+
+Implement distributed functional components:
+
+- Speech perception.
+- Phonological representation.
+- Lexical memory.
+- Semantic language representation.
+- Grammar and sequence processing.
+- Language production.
+- Communication intention.
+
+Support:
+- Learning new words.
+- Associating words with observed concepts.
+- Learning word combinations.
+- Understanding contextual meaning.
+- Communicating learned knowledge.
+- Misunderstanding and incomplete knowledge.
+
+Language must not be an independent source of world truth.
+
+A communicated statement becomes an observation with a source, confidence and reliability.
+
+---
+
+# PART III — NEURAL SUBSTRATE
+
+## 5. Neuron Model
+
+Implement integer-based Leaky Integrate-and-Fire neurons.
+
+Each neuron stores:
+
+- int16_t membrane_potential.
+- int16_t threshold.
+- int16_t reset_potential.
+- uint8_t refractory_remaining.
+- uint8_t neuron_flags.
+- uint8_t activation_state.
+- uint8_t plasticity_class.
+
+Neuron parameters must be configurable and heritable.
+
+### 5.1 LIF update
+
+For non-refractory neurons:
+
+1. Apply membrane leak.
+2. Receive synaptic inputs.
+3. Apply modulation.
+4. Compare against firing threshold.
+5. Generate spike if threshold is reached.
+6. Reset membrane.
+7. Start refractory period.
+
+Example:
+
+```cpp
+membrane -= membrane >> leak_shift;
+
+membrane += synaptic_input;
+
+if (membrane >= threshold) {
+    spike_mask |= (1ULL << neuron_index);
+    membrane = reset_potential;
+    refractory = refractory_period;
+}
+```
+
+Define signed shift behavior explicitly. Use deterministic division or an equivalent defined integer operation where compiler differences could affect results.
+
+### 5.2 Neuron populations
+
+Support multiple functional neuron classes:
+
+- Excitatory.
+- Inhibitory.
+- Fast-response.
+- Slow-response.
+- Modulatory.
+- Memory-associated.
+- Motor-associated.
+
+Inhibitory and excitatory effects must be represented explicitly.
+
+Do not implement every synapse as positive accumulation.
+
+### 5.3 Sparse firing
+
+Use uint64_t bitmasks for groups of 64 neurons.
+
+```cpp
+struct SpikeGroup {
+    uint64_t active_mask;
+};
+```
+
+Support efficient bit enumeration using:
+
+```cpp
+while (active) {
+    const uint32_t index = __builtin_ctzll(active);
+    active &= active - 1;
+}
+```
+
+All iteration orders must be deterministic.
+
+## 6. Synaptic Architecture
+
+Implement sparse directed synaptic connections.
+
+Each connection contains:
+
+- Source neuron.
+- Target neuron.
+- Signed weight.
+- Connection type.
+- Delay.
+- Plasticity flags.
+- Modulation sensitivity.
+
+Use compact fixed-capacity adjacency structures.
+
+Recommended storage:
+
+```cpp
+struct Synapse {
+    uint16_t target;
+    int8_t weight;
+    uint8_t flags;
+    uint8_t delay;
+};
+```
+
+Use CSR-style adjacency indexing:
+
+- row_offsets[source]
+- synapse_data[]
+- synapse_count
+
+The connection structure must support intra-module and inter-module connections.
+
+### 6.1 Connection categories
+
+- Local excitatory connections.
+- Local inhibitory connections.
+- Feedforward connections.
+- Feedback connections.
+- Recurrent connections.
+- Long-range association connections.
+- Modulatory connections.
+
+### 6.2 Connection delays
+
+Support deterministic delayed propagation.
+
+Use fixed-size ring buffers.
+
+No dynamic queues in the hot path.
+
+### 6.3 Connectome heritability
+
+BrainGenome must contain:
+
+- Module population configuration.
+- Neural thresholds.
+- Leak parameters.
+- Refractory parameters.
+- Connection density.
+- Inter-module tract weights.
+- Excitatory/inhibitory distribution.
+- Plasticity parameters.
+- Neuromodulator sensitivity.
+- Cognitive processing biases.
+
+Crossover and mutation must operate on bounded, validated gene structures.
+
+Individual learning must not modify the inherited genome unless an explicit evolutionary mechanism allows it.
+
+---
+
+# PART IV — NEURAL COMMUNICATION
+
+## 7. Connectome
+
+Implement a directed anatomical connectivity graph.
+
+Required primary pathways:
+
+| Source | Destination | Function |
+|---|---|---|
+| Sensory Cortex | Thalamus | Sensory routing |
+| Thalamus | Sensory Cortex | Sensory information delivery |
+| Thalamus | Amygdala | Salient sensory signals |
+| Sensory Cortex | Association Cortex | Multisensory association |
+| Association Cortex | Hippocampus | Memory encoding |
+| Hippocampus | Prefrontal Cortex | Memory retrieval |
+| Amygdala | Hypothalamus | Threat-related homeostasis |
+| Amygdala | Prefrontal Cortex | Emotional modulation |
+| Hypothalamus | Brainstem | Autonomic regulation |
+| Hypothalamus | Basal Ganglia | Motivation |
+| Prefrontal Cortex | Basal Ganglia | Action control |
+| Basal Ganglia | Motor Cortex | Action gating |
+| Motor Cortex | Cerebellum | Motor command |
+| Cerebellum | Motor Cortex | Motor correction |
+| Motor Cortex | Brainstem | Motor execution pathways |
+| Prefrontal Cortex | Association Cortex | Top-down cognition |
+| Association Cortex | Language Network | Semantic language |
+| Language Network | Association Cortex | Language interpretation |
+| Hippocampus | Association Cortex | Contextual memory |
+| Brainstem | Thalamus | Arousal modulation |
+
+The connectome must also support additional pathways through configuration.
+
+Do not hard-code every connection inside processing functions.
+
+All connectivity must be data-driven.
+
+## 8. Network Activation
+
+A module activates when:
+
+- It receives a new sensory event.
+- An incoming spike arrives.
+- Its internal state crosses an activation threshold.
+- A connected module requests processing.
+- Its scheduled clock expires.
+- A homeostatic or emotional event requires processing.
+
+Implement activation propagation with bounded work queues.
+
+Duplicate activation requests must be coalesced.
+
+Modules must not repeatedly activate each other indefinitely within one simulation tick.
+
+---
+
+# PART V — SENSORY AND PERCEPTION SYSTEM
+
+## 9. Dynamic Sensor Interface
+
+Preserve dynamic kSensorChannels.
+
+Do not hard-code sensory channel count.
+
+Implement a versioned sensory schema.
+
+Each sensor signal should contain:
+
+- Channel identifier.
+- Integer intensity.
+- Source category.
+- Spatial information.
+- Temporal information.
+- Confidence.
+- Salience.
+- Validity flags.
+
+Example:
+
+```cpp
+struct SensorySignal {
+    uint16_t channel_id;
+    int16_t intensity;
+    int16_t position_x;
+    int16_t position_y;
+    uint16_t source_id;
+    uint8_t confidence;
+    uint8_t flags;
+};
+```
+
+Actual world coordinates must use the appropriate Sunnyworld coordinate type rather than assuming int16_t is sufficient.
+
+### 9.1 Perception pipeline
+
+```text
+World Observation
+      |
+Sensor Encoding
+      |
+Thalamic Filtering
+      |
+Sensory Cortex
+      |
+Association Cortex
+      |
+Attention / Salience
+      |
+Memory Retrieval
+      |
+Cognitive Interpretation
+```
+
+### 9.2 Perceptual uncertainty
+
+Perception must support:
+
+- Missing information.
+- Noisy information.
+- Conflicting signals.
+- Ambiguous objects.
+- Occlusion.
+- Incorrect interpretations.
+- Incomplete observations.
+
+NPCs must not automatically receive perfect object identities.
+
+### 9.3 Attention
+
+Implement limited attention capacity.
+
+Attention allocation considers:
+
+- Novelty.
+- Threat.
+- Homeostatic urgency.
+- Current goals.
+- Emotional salience.
+- Unexpected events.
+- Social relevance.
+
+Attention must influence sensory processing and memory encoding.
+
+---
+
+# PART VI — MEMORY ARCHITECTURE
+
+## 10. Memory Subsystems
+
+Memory must be independent from the neural substrate.
+
+Use neural activity to encode, retrieve, associate and consolidate memory records.
+
+Implement five primary memory systems.
+
+### 10.1 Sensory Memory
+
+Very short-lived representations of recent sensory information.
+
+Responsibilities:
+- Retain recent observations.
+- Support temporal continuity.
+- Provide input for attention.
+- Support recognition of changing stimuli.
+
+Must have a bounded capacity and deterministic expiration.
+
+### 10.2 Working Memory
+
+Temporary active information used during cognition.
+
+Required slots:
+
+- Current goal.
+- Current situation.
+- Relevant objects.
+- Active threats.
+- Retrieved memories.
+- Candidate actions.
+- Current planning step.
+- Expected outcomes.
+
+Support:
+- Updating.
+- Replacement.
+- Interference.
+- Decay.
+- Attention-based retention.
+
+Capacity must be configurable and bounded.
+
+### 10.3 Episodic Memory
+
+Stores experiences and events.
+
+Example:
+
+```text
+Event:
+NPC observed another NPC using a stone.
+
+Context:
+Location A.
+Time T.
+Object: Stone.
+Action: Striking.
+Outcome: Material fractured.
+
+Emotional Context:
+Surprise: High.
+
+Confidence:
+Observed directly.
+```
+
+The NPC must remember what happened without automatically understanding why it happened.
+
+### 10.4 Semantic Memory
+
+Stores acquired knowledge and relationships.
+
+Examples:
+
+- Object properties.
+- Material characteristics.
+- Spatial knowledge.
+- Learned concepts.
+- Causal relationships.
+- Social knowledge.
+- Language concepts.
+
+Semantic knowledge must originate from experience, inference, experimentation or communication.
+
+Support confidence and contradictory beliefs.
+
+### 10.5 Procedural Memory
+
+Stores learned skills and action patterns.
+
+Examples:
+
+- Walking.
+- Running.
+- Climbing.
+- Tool manipulation.
+- Material processing.
+- Combat movements.
+- Repeated work procedures.
+
+Procedural memory must improve through repeated successful execution and error correction.
+
+### 10.6 Memory forgetting
+
+Forgetting must be a natural process.
+
+Retention must depend on:
+
+- Recency.
+- Repetition.
+- Emotional importance.
+- Retrieval frequency.
+- Semantic associations.
+- Consolidation strength.
+- Memory interference.
+
+Never delete memories randomly.
+
+Forgetting must be deterministic and based on explicit memory rules.
+
+## 11. Memory Retrieval
+
+Implement indexed retrieval.
+
+Avoid scanning all memories on every cognitive operation.
+
+Use bounded associative indices and deterministic candidate ranking.
+
+Retrieval scores may consider:
+
+- Semantic similarity.
+- Spatial relevance.
+- Temporal relevance.
+- Emotional relevance.
+- Contextual relevance.
+- Retrieval history.
+
+Use integer scoring.
+
+Return both retrieved information and confidence.
+
+## 12. Sleep and Consolidation
+
+Implement sleep as an internal biological processing state.
+
+During sleep:
+
+- Reduce active sensory processing.
+- Suspend unnecessary cognitive rollouts.
+- Replay selected episodic memories.
+- Strengthen useful associations.
+- Consolidate procedural learning.
+- Update semantic knowledge.
+- Resolve selected memory conflicts.
+- Apply forgetting and interference rules.
+
+Dream replay must not create knowledge without an existing memory basis.
+
+Dreams may recombine previously experienced elements but cannot introduce arbitrary external facts.
+
+---
+
+# PART VII — LEARNING AND NEUROPLASTICITY
+
+## 13. Synaptic Plasticity
+
+Implement integer-only plasticity.
+
+Support:
+
+- Hebbian learning.
+- Spike-Timing-Dependent Plasticity (STDP).
+- Reward-modulated plasticity.
+- Error-driven learning.
+- Association strengthening.
+- Synaptic weakening.
+- Long-term potentiation.
+- Long-term depression.
+
+### 13.1 STDP
+
+Maintain bounded pre- and post-synaptic traces.
+
+Use deterministic integer trace decay.
+
+When a relevant spike relationship occurs, update synaptic weight.
+
+```cpp
+weight += plasticity_delta;
+weight = clamp(weight, min_weight, max_weight);
+```
+
+The timing window and update coefficients must be configurable and heritable.
+
+### 13.2 Reward-Modulated Learning
+
+Use dopamine modulation to influence learning.
+
+Reward signals must be generated from experienced outcomes, not arbitrary positive reinforcement.
+
+Implement a bounded reward-prediction error:
+
+```text
+Prediction Error =
+Actual Outcome Value - Expected Outcome Value
+```
+
+Use this signal for reinforcement learning.
+
+### 13.3 Learning from failure
+
+Failure must produce learning signals.
+
+Examples:
+
+- Failed movement.
+- Failed material processing.
+- Incorrect predictions.
+- Social rejection.
+- Injury.
+- Resource acquisition failure.
+
+The NPC must be able to modify future behavior based on repeated failure.
+
+### 13.4 Learning from observation
+
+Support observational learning.
+
+An NPC can observe another agent's behavior, associate actions with outcomes and later attempt similar behavior.
+
+Observation alone must not guarantee successful skill acquisition.
+
+### 13.5 Learning through experimentation
+
+Support:
+
+1. Problem recognition.
+2. Hypothesis formation.
+3. Experiment selection.
+4. Action execution.
+5. Outcome observation.
+6. Prediction comparison.
+7. Memory encoding.
+8. Knowledge revision.
+
+This process must use Sunnyworld's existing discovery and material systems.
+
+The brain must not contain a predefined crafting or technology database.
+
+---
+
+# PART VIII — EMOTION AND NEUROMODULATION
+
+## 14. Neuromodulator System
+
+Implement integer-based neuromodulation.
+
+Required primary systems:
+
+### Dopamine
+
+Functions:
+
+- Reward prediction error.
+- Motivation.
+- Reinforcement learning.
+- Reward anticipation.
+- Exploration modulation.
+- Habit learning.
+
+### Serotonin
+
+Functions:
+
+- Behavioral regulation.
+- Impulse modulation.
+- Mood-related state regulation.
+- Patience and behavioral persistence.
+- Social and affective modulation.
+
+Do not reduce serotonin to a single happiness or satiety variable.
+
+### Norepinephrine
+
+Functions:
+
+- Arousal.
+- Alertness.
+- Attention amplification.
+- Unexpected-event response.
+- Cognitive resource allocation.
+
+### Acetylcholine
+
+Functions:
+
+- Attention.
+- Sensory signal processing.
+- Learning readiness.
+- Memory encoding modulation.
+- Signal-to-noise regulation.
+
+### GABA
+
+Functions:
+
+- Neural inhibition.
+- Activity stabilization.
+- Excitation control.
+- Local circuit regulation.
+
+### Glutamate
+
+Functions:
+
+- Excitatory transmission.
+- Learning-related synaptic activity.
+- Memory formation.
+- Neural signal propagation.
+
+### Cortisol
+
+Model as a slower endocrine stress signal.
+
+Functions:
+
+- Sustained stress.
+- Energy mobilization.
+- Long-duration stress effects.
+- Suppression or alteration of selected cognitive processes.
+
+Do not treat cortisol as an instantaneous spike transmitter.
+
+### 14.1 Modulation state
+
+All modulators must use integer concentration ranges and deterministic update equations.
+
+Use distinct update rates.
+
+Fast modulation:
+- Every tick or event.
+
+Intermediate modulation:
+- Every 4 ticks.
+
+Slow modulation:
+- Every 8–32 ticks.
+
+The exact rate must be configurable.
+
+### 14.2 Emotional state
+
+Emotion must emerge from the interaction of:
+
+- Homeostatic drives.
+- Threat assessments.
+- Reward prediction.
+- Social relationships.
+- Memory.
+- Neuromodulation.
+- Current context.
+
+Maintain separate dimensions for:
+
+- Fear.
+- Anger.
+- Curiosity.
+- Sadness.
+- Joy.
+- Disgust.
+- Surprise.
+- Trust.
+- Attachment.
+
+These are functional simulation variables, not claims that human emotions correspond to isolated brain chemicals or single anatomical structures.
+
+Emotions must influence attention, memory, action selection and decision-making.
+
+---
+
+# PART IX — COGNITIVE ARCHITECTURE
+
+## 15. Attention and Salience
+
+Implement a shared attention controller.
+
+The controller receives requests from sensory, emotional and cognitive systems.
+
+Rank information using deterministic integer scores.
+
+Attention must be limited by a configurable processing budget.
+
+High-priority information can interrupt lower-priority processing.
+
+## 16. Prediction System
+
+Implement predictive processing.
+
+Each relevant cognitive system may maintain predictions about:
+
+- Sensory input.
+- Environmental changes.
+- Object behavior.
+- Movement outcomes.
+- Social interactions.
+- Action consequences.
+
+When new information arrives:
+
+1. Retrieve the corresponding prediction.
+2. Compare prediction with observation.
+3. Calculate prediction error.
+4. Update relevant memory.
+5. Generate learning signals.
+6. Trigger additional processing if necessary.
+
+Predictions must never be treated as confirmed world facts.
+
+## 17. Goal Management
+
+Implement a hierarchical goal system.
+
+Goal categories:
+
+- Homeostatic goals.
+- Survival goals.
+- Exploration goals.
+- Social goals.
+- Resource goals.
+- Learned goals.
+- Long-term goals.
+
+Each goal contains:
+
+- Goal identity.
+- Origin.
+- Priority.
+- Current progress.
+- Preconditions.
+- Expected outcome.
+- Failure conditions.
+- Expiration conditions.
+- Associated memories.
+
+Goals may conflict.
+
+Prefrontal Cortex and Basal Ganglia must cooperate to resolve competing goals.
+
+Goals must not automatically become actions.
+
+## 18. Decision-Making
+
+Implement a multi-stage decision pipeline.
+
+```text
+Sensory / Internal Input
+          |
+Situation Interpretation
+          |
+Goal Activation
+          |
+Memory Retrieval
+          |
+Candidate Action Generation
+          |
+Prefrontal Evaluation
+          |
+Basal Ganglia Gating
+          |
+Motor / Language Output
+          |
+Action Validation
+          |
+World Execution
+          |
+Outcome Observation
+          |
+Learning
+```
+
+Each candidate action must have:
+
+- Preconditions.
+- Expected outcome.
+- Estimated cost.
+- Risk.
+- Expected reward.
+- Goal relevance.
+- Confidence.
+- Required capabilities.
+
+The brain must not directly assume that an action will succeed.
+
+The world engine remains authoritative.
+
+## 19. Planning and Mental Simulation
+
+Implement bounded mental rollouts.
+
+Requirements:
+
+- Configurable planning depth.
+- Configurable candidate count.
+- Maximum rollout operations per NPC.
+- Integer-only evaluation.
+- Read-only world snapshot.
+- Deterministic branch ordering.
+- Explicit uncertainty.
+- No real-world side effects.
+
+Planning is activated when:
+
+- Multiple goals conflict.
+- Current action fails.
+- Novelty exceeds a threshold.
+- Uncertainty is high.
+- A dangerous decision is required.
+- A learned task requires multiple steps.
+
+Simple reflexes must bypass expensive planning.
+
+---
+
+# PART X — LANGUAGE AND SOCIAL COGNITION
+
+## 20. Language Acquisition
+
+Implement language as learned associations between sensory patterns, concepts and communicative intentions.
+
+Support:
+
+- Vocabulary acquisition.
+- Word-to-object associations.
+- Word-to-action associations.
+- Sequence learning.
+- Grammar pattern learning.
+- Context-dependent interpretation.
+- Communication production.
+
+NPCs must not start with complete language knowledge unless the simulation explicitly provides that prior knowledge.
+
+## 21. Social Cognition
+
+Implement:
+
+- Recognition of familiar agents.
+- Social memory.
+- Relationship evaluation.
+- Trust learning.
+- Cooperation prediction.
+- Threat assessment.
+- Imitation.
+- Social reward and punishment.
+- Communication reliability assessment.
+
+An NPC must distinguish:
+
+- What it directly observed.
+- What another NPC communicated.
+- What it inferred.
+- What it merely suspects.
+
+Support incorrect beliefs and conflicting information.
+
+---
+
+# PART XI — MOTOR CONTROL
+
+## 22. Motor Execution Architecture
+
+Motor Cortex generates intended actions.
+
+Cerebellum refines movement.
+
+Basal Ganglia gates action initiation.
+
+Brainstem maintains automatic movement and emergency responses.
+
+The final action is passed to Sunnyworld's existing action execution system.
+
+### 22.1 Motor learning
+
+Store learned movement parameters independently from world physics.
+
+Support:
+
+- Movement timing.
+- Movement sequences.
+- Coordination.
+- Error correction.
+- Repetition-based improvement.
+- Skill degradation through disuse.
+
+### 22.2 Motor feedback
+
+After every relevant movement, receive:
+
+- Intended movement.
+- Actual movement.
+- Deviation.
+- Energy consumption.
+- Collision.
+- Injury.
+- Success or failure.
+
+Use this feedback to update procedural memory and Cerebellar learning.
+
+---
+
+# PART XII — GENETICS AND INDIVIDUAL DIFFERENCES
+
+## 23. BrainGenome
+
+Each NPC inherits a neural genome.
+
+The genome defines predispositions rather than fully learned knowledge.
+
+Required heritable parameters:
+
+- Neural population sizes.
+- Module connectivity.
+- Connection density.
+- Excitatory/inhibitory ratios.
+- Firing thresholds.
+- Membrane leak rates.
+- Refractory characteristics.
+- Learning rates.
+- Memory capacities.
+- Attention capacity.
+- Neuromodulator sensitivity.
+- Stress responsiveness.
+- Reward sensitivity.
+- Cognitive processing budgets.
+- Motor learning characteristics.
+
+### 23.1 Individual variation
+
+Two NPCs with identical environments must still be capable of developing different neural states due to differences in inherited predispositions and experiences.
+
+### 23.2 Development
+
+Support age-dependent neural development.
+
+Development may influence:
+
+- Plasticity.
+- Learning speed.
+- Memory capacity.
+- Motor refinement.
+- Cognitive processing.
+- Neural maturation.
+
+Do not implement age as a single multiplier affecting all brain functions equally.
+
+---
+
+# PART XIII — CPU EXECUTION ARCHITECTURE
+
+## 24. Multi-Rate Scheduler
+
+Implement a deterministic neural scheduler.
+
+| System | Processing frequency |
+|---|---|
+| Brainstem | Every tick |
+| Thalamus | Every tick / sensory event |
+| Sensory Cortex | Sensory event |
+| Motor Cortex | Motor event |
+| Cerebellum | Movement event / every tick while moving |
+| Hypothalamus | Every 4 ticks / homeostatic event |
+| Basal Ganglia | Every 4 ticks / action event |
+| Amygdala | Salient event |
+| Hippocampus | Memory event / rest |
+| Association Cortex | Event-driven |
+| Prefrontal Cortex | Conditional |
+| Language Network | Communication event |
+
+Scheduler must support event coalescing and bounded activation propagation.
+
+## 25. BrainArena
+
+Preallocate neural memory.
+
+Required allocations:
+
+- Neuron state.
+- Spike masks.
+- Synapse storage.
+- Delayed spike buffers.
+- Module states.
+- Neuromodulator states.
+- Plasticity traces.
+- Working memory.
+- Memory indices.
+- Event queues.
+- Cognitive rollout scratch buffers.
+
+Use 64-byte alignment.
+
+No heap allocation during normal neural processing.
+
+Memory capacities must be configurable per NPC class.
+
+Provide a minimal profile for low-cost NPCs and a full profile for important agents.
+
+### 25.1 Population scaling
+
+The system must not assume that every NPC requires an identical neural population.
+
+Implement configurable profiles:
+
+- Minimal: basic perception, reflexes, homeostasis and action selection.
+- Standard: all major anatomical systems with bounded populations and memory.
+- Full: expanded cognitive, memory, social and planning capacities.
+
+Profiles must preserve the same architecture and behavioral interfaces.
+
+They may differ in processing capacity, not in the fundamental laws governing the brain.
+
+## 26. AVX2 Optimization
+
+Implement optimized kernels for:
+
+- Synaptic accumulation.
+- Membrane updates.
+- Trace updates.
+- Weight updates.
+- Integer decay.
+- Population-level modulation.
+
+Use AVX2 only where it produces measurable benefits.
+
+Important: AVX2 does not provide AVX-VNNI integer dot-product instructions. Implement exact integer accumulation using safe widening and multiply-add operations.
+
+Avoid saturating intermediate arithmetic unless saturation is explicitly part of the mathematical specification.
+
+Scalar fallback must produce bit-identical results.
+
+## 27. Performance Requirements
+
+Benchmark against the previous CL-1 implementation.
+
+Measure:
+
+- Cycles per NPC.
+- Cycles per active neuron.
+- Synaptic operations.
+- Average active spike ratio.
+- Memory per NPC.
+- Cache misses.
+- Scheduler overhead.
+- Cognitive rollout cost.
+- Save/load performance.
+
+Target sparse firing rate: approximately 1–5% during ordinary low/moderate activity.
+
+This is a target, not a hard-coded firing restriction.
+
+The 5–10x throughput improvement must be demonstrated through benchmarks rather than assumed.
+
+---
+
+# PART XIV — DETERMINISM AND STATE HASH
+
+## 28. Deterministic Neural Execution
+
+All processing must use stable ordering.
+
+Required ordering:
+
+1. Module identifier.
+2. Neuron identifier.
+3. Source spike identifier.
+4. Synapse index.
+5. Event sequence.
+6. Plasticity update order.
+
+Parallel workers must calculate independent contributions and combine them in a fixed order.
+
+Do not use floating-point reductions, unordered container iteration or thread-dependent mutation.
+
+## 29. state_hash()
+
+Extend state_hash() to include every persistent state component affecting future neural behavior.
+
+Include:
+
+- Neural membrane potentials.
+- Spike masks.
+- Refractory states.
+- Synaptic weights.
+- Delayed spike buffers.
+- Plasticity traces.
+- Neuromodulators.
+- Emotional state.
+- Attention state.
+- Working memory.
+- Memory records.
+- Memory indices affecting retrieval.
+- Learning parameters.
+- Goal state.
+- Scheduler state.
+- Pending neural events.
+- Genome-derived parameters.
+- Random generator state, where used.
+
+Do not hash:
+- Pointers.
+- Memory addresses.
+- Padding bytes.
+- Uninitialized memory.
+- SIMD scratch buffers that do not affect future behavior.
+- Thread scheduling metadata.
+
+Hash logical state in canonical order.
+
+---
+
+# PART XV — SAVE FORMAT V29
+
+## 30. Serialization
+
+Implement versioned serialization for the complete neural architecture.
+
+All persistent state must survive binary round-trips.
+
+Required serialized components:
+
+1. BrainGenome.
+2. Module configuration.
+3. Neuron populations.
+4. Membrane states.
+5. Refractory states.
+6. Spike history.
+7. Synaptic plasticity state.
+8. Neuromodulator state.
+9. Emotional state.
+10. Attention state.
+11. Working memory.
+12. Memory references.
+13. Procedural learning state.
+14. Goal state.
+15. Scheduler state.
+16. Delayed event buffers.
+17. Neural random state.
+
+### 30.1 Serialization rules
+
+- Explicit field serialization.
+- No raw struct memory dumps.
+- Fixed-width integer types.
+- Defined byte order.
+- Bounded collection sizes.
+- Schema validation.
+- Deterministic ordering.
+- Corruption detection.
+- Explicit version handling.
+
+### 30.2 Compatibility
+
+Provide migration from previous supported save formats.
+
+Unknown optional fields must be handled according to explicit version rules.
+
+Invalid neural state must fail safely.
+
+A v29 save round-trip must preserve state_hash() exactly.
+
+---
+
+# PART XVI — SOFTWARE ARCHITECTURE
+
+## 31. Required Source Organization
+
+Organize implementation into independently testable components.
+
+Suggested structure:
+
+```text
+src/brain/
+    Brain.cpp
+    Brain.h
+
+    BrainArena.cpp
+    BrainArena.h
+
+    BrainGenome.cpp
+    BrainGenome.h
+
+    BrainScheduler.cpp
+    BrainScheduler.h
+
+    NeuralCore.cpp
+    NeuralCore.h
+
+    Neuron.cpp
+    Neuron.h
+
+    Synapse.cpp
+    Synapse.h
+
+    Connectome.cpp
+    Connectome.h
+
+    Neuromodulation.cpp
+    Neuromodulation.h
+
+    Plasticity.cpp
+    Plasticity.h
+
+    SensoryProcessing.cpp
+    SensoryProcessing.h
+
+    Attention.cpp
+    Attention.h
+
+    MemorySystem.cpp
+    MemorySystem.h
+
+    EpisodicMemory.cpp
+    EpisodicMemory.h
+
+    SemanticMemory.cpp
+    SemanticMemory.h
+
+    ProceduralMemory.cpp
+    ProceduralMemory.h
+
+    WorkingMemory.cpp
+    WorkingMemory.h
+
+    EmotionalSystem.cpp
+    EmotionalSystem.h
+
+    Homeostasis.cpp
+    Homeostasis.h
+
+    CognitiveSystem.cpp
+    CognitiveSystem.h
+
+    Planning.cpp
+    Planning.h
+
+    DecisionSystem.cpp
+    DecisionSystem.h
+
+    MotorSystem.cpp
+    MotorSystem.h
+
+    LanguageSystem.cpp
+    LanguageSystem.h
+
+    SleepConsolidation.cpp
+    SleepConsolidation.h
+
+    BrainSerialization.cpp
+    BrainSerialization.h
+```
+
+Adapt filenames to existing Sunnyworld conventions rather than duplicating existing functionality.
+
+## 32. Interface Contracts
+
+The brain must expose a limited set of public operations.
+
+```cpp
+class Brain {
+public:
+    void initialize(
+        BrainArena& arena,
+        const BrainGenome& genome
+    );
+
+    void receive_sensory(
+        const SensorySignal& signal
+    );
+
+    void receive_internal_state(
+        const InternalState& state
+    );
+
+    void receive_event(
+        const BrainEvent& event
+    );
+
+    void think(
+        uint64_t world_tick
+    );
+
+    bool has_action_intent() const;
+
+    ActionIntent get_action_intent() const;
+
+    void receive_action_result(
+        const ActionResult& result
+    );
+
+    void enter_sleep();
+
+    void wake_up();
+
+    void serialize(BinaryWriter& writer) const;
+
+    void deserialize(BinaryReader& reader);
+
+    uint64_t state_hash() const;
+};
+```
+
+The actual signatures must be adapted to Sunnyworld's existing interfaces.
+
+Brain must not own the world simulation.
+
+---
+
+# PART XVII — VERIFICATION AND TESTING
+
+## 33. Neural Core Tests
+
+Verify:
+
+- Integer-only arithmetic.
+- LIF integration.
+- Membrane decay.
+- Threshold firing.
+- Refractory behavior.
+- Spike-mask correctness.
+- Inhibitory connections.
+- Excitatory connections.
+- Delayed propagation.
+- Sparse synaptic accumulation.
+- SIMD/scalar equivalence.
+
+## 34. Anatomical Tests
+
+Create dedicated tests for all 12 modules.
+
+Verify:
+
+- Correct activation.
+- Correct input routing.
+- Correct output routing.
+- Inter-module communication.
+- Activation gating.
+- Module-specific processing.
+- Disabled-module behavior.
+- Scheduler frequency.
+
+## 35. Cognitive Tests
+
+Verify:
+
+- Sensory perception.
+- Attention selection.
+- Working-memory retention.
+- Episodic encoding.
+- Semantic association.
+- Memory retrieval.
+- Procedural learning.
+- Prediction-error processing.
+- Goal conflict resolution.
+- Action selection.
+- Multi-step planning.
+- Language acquisition.
+- Social information processing.
+
+## 36. Learning Tests
+
+Verify:
+
+- STDP.
+- Hebbian learning.
+- Reward modulation.
+- Negative reinforcement.
+- Learning from failure.
+- Observational learning.
+- Motor learning.
+- Memory consolidation.
+- Forgetting.
+- Memory interference.
+
+## 37. Biological Regulation Tests
+
+Verify:
+
+- Homeostatic regulation.
+- Neuromodulator updates.
+- Stress response.
+- Arousal.
+- Sleep transitions.
+- Emotional modulation.
+- Interaction between physiological drives and decision-making.
+
+## 38. Genetic Tests
+
+Verify:
+
+- Genome initialization.
+- Genome crossover.
+- Genome mutation.
+- Heritable tract configuration.
+- Individual neural variation.
+- Developmental changes.
+- Separation of inherited and learned parameters.
+
+## 39. Determinism Tests
+
+Mandatory:
+
+- dev == release.
+- Scalar == AVX2.
+- t1 == t8.
+- Identical initial states produce identical results.
+- Identical event sequences produce identical neural states.
+- Save/load preserves state_hash().
+- Save/load preserves future behavior.
+- Memory allocation does not depend on thread scheduling.
+
+## 40. Performance Tests
+
+Benchmark:
+
+- 100 NPCs.
+- 1,000 NPCs.
+- 5,000 NPCs.
+- 10,000 NPCs.
+
+Measure:
+
+- Average CPU time.
+- Worst-case CPU time.
+- Memory consumption.
+- Active neuron percentage.
+- Synaptic operations.
+- Cognitive processing overhead.
+- Memory subsystem overhead.
+
+Include both normal activity and high-stress scenarios.
+
+Do not report performance improvements without measured results.
+
+---
+
+# PART XVIII — IMPLEMENTATION PHASES
+
+## Phase 0 — Existing Architecture Audit
+
+Before changing code:
+
+- Inspect existing Brain implementation.
+- Inspect BrainArena.
+- Inspect BrainGenome.
+- Inspect GenePool.
+- Inspect Sensor::encode.
+- Inspect kSensorChannels.
+- Inspect kLabelChannels.
+- Inspect memory and discovery systems.
+- Inspect ActionSystem.
+- Inspect state_hash().
+- Inspect binary serialization.
+- Inspect current test infrastructure.
+
+Produce a dependency map.
+
+Identify existing functionality that must be reused.
+
+Do not duplicate existing systems.
+
+## Phase 1 — Neural Substrate
+
+Implement:
+
+- LIF neurons.
+- Sparse spike groups.
+- Synaptic storage.
+- Refractory states.
+- Integer propagation.
+- SIMD kernels.
+- BrainArena integration.
+
+Acceptance: deterministic sparse neural simulation.
+
+## Phase 2 — Anatomical Connectome
+
+Implement all 12 anatomical modules.
+
+Implement:
+
+- Module interfaces.
+- Directed connectome.
+- Inter-module tracts.
+- Excitatory/inhibitory pathways.
+- Multi-rate scheduling.
+- Event activation.
+
+Acceptance: all anatomical modules communicate through the connectome.
+
+## Phase 3 — Sensory and Motor Systems
+
+Implement:
+
+- Dynamic sensor encoding.
+- Thalamic routing.
+- Sensory processing.
+- Attention.
+- Motor cortex.
+- Cerebellar correction.
+- Action feedback.
+
+Acceptance: NPCs can perceive environmental changes and generate motor intentions.
+
+## Phase 4 — Memory Architecture
+
+Implement:
+
+- Sensory memory.
+- Working memory.
+- Episodic memory.
+- Semantic memory.
+- Procedural memory.
+- Memory retrieval.
+- Forgetting.
+- Memory consolidation.
+
+Acceptance: NPCs retain and retrieve experiences.
+
+## Phase 5 — Emotion and Homeostasis
+
+Implement:
+
+- Hypothalamus.
+- Amygdala.
+- Neuromodulation.
+- Emotional states.
+- Homeostatic drives.
+- Stress regulation.
+
+Acceptance: internal physiological and emotional states influence behavior through neural pathways.
+
+## Phase 6 — Learning and Plasticity
+
+Implement:
+
+- STDP.
+- Hebbian learning.
+- Reward-modulated learning.
+- Prediction errors.
+- Observational learning.
+- Motor learning.
+- Dream replay.
+
+Acceptance: experience changes neural behavior and learned capabilities.
+
+## Phase 7 — Cognitive Architecture
+
+Implement:
+
+- Association Cortex.
+- Prefrontal Cortex.
+- Goal management.
+- Working-memory control.
+- Prediction.
+- Multi-step planning.
+- Decision-making.
+- Action gating.
+
+Acceptance: NPCs can make context-dependent decisions and plan bounded sequences of actions.
+
+## Phase 8 — Language and Social Cognition
+
+Implement:
+
+- Language Network.
+- Vocabulary learning.
+- Semantic communication.
+- Social memory.
+- Trust learning.
+- Observational knowledge transfer.
+
+Acceptance: NPCs can acquire and communicate knowledge.
+
+## Phase 9 — Genetic and Developmental Systems
+
+Implement:
+
+- BrainGenome.
+- Crossover.
+- Mutation.
+- Developmental plasticity.
+- Individual neural variation.
+
+Acceptance: neural predispositions are heritable while acquired knowledge remains individually learned.
+
+## Phase 10 — Serialization and Determinism
+
+Implement:
+
+- Save v29.
+- Migration.
+- State hashing.
+- Scalar/SIMD equivalence.
+- Parallel determinism.
+- Full regression.
+
+Acceptance: uninterrupted and save/load simulations are bit-identical.
+
+## Phase 11 — Optimization and Scale Testing
+
+Implement and benchmark:
+
+- Sparse scheduling.
+- SIMD optimization.
+- Cache optimization.
+- Memory compression.
+- Cognitive budgets.
+- Population scaling.
+
+Acceptance: documented CPU and memory budgets with no deterministic regressions.
+
+---
+
+# PART XIX — FINAL ACCEPTANCE CRITERIA
+
+The implementation is not complete merely because all 12 modules exist.
+
+The following conditions must all be satisfied:
+
+1. All 12 anatomical-functional systems are implemented.
+2. All major neural pathways are represented.
+3. All neural processing uses deterministic integer arithmetic.
+4. Sensory input is dynamically configurable.
+5. The brain cannot access hidden world information.
+6. Memory is independent from the neural substrate.
+7. NPCs can learn through experience.
+8. NPCs can form and revise knowledge.
+9. NPCs can learn from failure and observation.
+10. NPCs can develop emotional responses.
+11. NPCs can form goals and resolve conflicts.
+12. NPCs can perform bounded multi-step planning.
+13. NPCs can learn motor skills.
+14. NPCs can acquire and communicate language knowledge.
+15. Neural traits can be inherited.
+16. Learned knowledge is not automatically inherited.
+17. Neural activity is sparse and event-driven.
+18. CPU processing is bounded.
+19. Hot paths allocate no heap memory.
+20. AVX2 and scalar implementations are bit-identical.
+21. Single-thread and multi-thread executions are bit-identical.
+22. Save/load preserves the complete neural state.
+23. state_hash() covers all future-affecting persistent state.
+24. Existing Sunnyworld systems remain compatible.
+25. All existing regression tests pass.
+
+## FINAL ENGINEERING DIRECTIVE
+
+Do not implement this specification as 12 independent artificial intelligence modules.
+
+Implement one integrated neural system with:
+
+- Shared neural substrate.
+- Anatomically organized populations.
+- Directed sparse connectome.
+- Distributed memory and cognition.
+- Shared neuromodulatory systems.
+- Event-driven communication.
+- Experience-dependent plasticity.
+
+Anatomical modules must interact through explicit neural pathways rather than directly invoking each other's private functions.
+
+Do not create predefined intelligence, knowledge, technology, recipes, survival strategies or behavioral scripts.
+
+The brain must provide the mechanisms through which intelligence and behavior emerge from the interaction between inherited neural architecture, sensory experience, memory, learning, environmental constraints and social interaction.
+
+**Primary engineering principle:**
+
+The world determines what is physically possible. The brain determines what an NPC perceives, remembers, learns, predicts, desires and decides. The action system determines what it can actually execute.
+
+Preserve this separation throughout the implementation.
+
+**Do not sacrifice determinism, causal correctness or long-term extensibility for short-term performance.**

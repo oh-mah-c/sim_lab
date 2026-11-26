@@ -1,0 +1,17 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/ggml/src/ggml-cpu/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/src/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/hash/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/miniaudio/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/nlohmann/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/sheredom/cmake_install.cmake",
+		"/home/hutech/Downloads/sim_lab/third_party/llama-build/vendor/stb/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
