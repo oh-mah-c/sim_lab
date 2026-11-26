@@ -6783,6 +6783,7 @@ bool World::save(const std::string& path, std::string* err) const {
                               s.pending.a.size()));
             w.put(s.pending.tick);
             w.put(s.pending.pm_a); w.put(s.pending.pm_b);
+            w.put(s.pending.pm_pos.x); w.put(s.pending.pm_pos.y);  // v29
             w.put(s.replay_next); w.put(s.replay_count);
             w.put(s.mac_pending); w.put(s.mac_frac);
             for (const Transition& t : s.replay) {
@@ -6796,6 +6797,21 @@ bool World::save(const std::string& path, std::string* err) const {
             }
             w.put(s.tried_next);                          // v23
             for (std::uint64_t k : s.tried) w.put(k);
+            // v29: vital state — neuromodulators, emotion, homeostatic
+            // drives, fear conditioning, attention gains, working memory
+            const BrainVital& v = s.vital;
+            for (std::int16_t m : v.mod) w.put(m);
+            for (std::int16_t e : v.emo) w.put(e);
+            w.put(v.drive_hunger); w.put(v.drive_thirst);
+            w.put(v.drive_fatigue); w.put(v.drive_temp);
+            w.put(v.drive_stress); w.put(v.drive_repro);
+            for (const BrainVital::FearTrace& f : v.fears) {
+                w.put(f.ctx); w.put(f.valence); w.put(f.strength); w.put(f.last);
+            }
+            for (std::int16_t g : v.attn_gain) w.put(g);
+            w.put(v.attn_last); w.put(v.sleep_pressure); w.put(v.mod_accum);
+            w.put(v.wm_verb); w.put(v.wm_target); w.put(v.wm_conf);
+            w.put(v.last_reward); w.put(v.last_sigma); w.put(v.last_charge);
         }
         w.put(bs.wm_err_sum); w.put(bs.wm_n);
         w.put(bs.sigma_sum); w.put(bs.sigma_n);
@@ -7463,7 +7479,9 @@ bool World::load(const std::string& path, std::string* err) {
                         !r.get(pv) || !r.str(ps) || ps.size() != s.pending.s.size() ||
                         !r.str(pa) || pa.size() != s.pending.a.size() ||
                         !r.get(s.pending.tick) ||
-                        !r.get(s.pending.pm_a) || !r.get(s.pending.pm_b))
+                        !r.get(s.pending.pm_a) || !r.get(s.pending.pm_b) ||
+                        !r.get(s.pending.pm_pos.x) ||
+                        !r.get(s.pending.pm_pos.y))
                         return fail("truncated brain pending");
                     s.pending.valid = pv != 0;
                     std::memcpy(s.last_action.data(), ablob.data(), ablob.size());
@@ -7494,6 +7512,28 @@ bool World::load(const std::string& path, std::string* err) {
                         return fail("truncated brain tried");
                     for (std::uint64_t& k : s.tried)
                         if (!r.get(k)) return fail("truncated brain tried");
+                    // v29 vital state
+                    BrainVital& v = s.vital;
+                    for (std::int16_t& m : v.mod)
+                        if (!r.get(m)) return fail("truncated brain mod");
+                    for (std::int16_t& e : v.emo)
+                        if (!r.get(e)) return fail("truncated brain emo");
+                    if (!r.get(v.drive_hunger) || !r.get(v.drive_thirst) ||
+                        !r.get(v.drive_fatigue) || !r.get(v.drive_temp) ||
+                        !r.get(v.drive_stress) || !r.get(v.drive_repro))
+                        return fail("truncated brain drives");
+                    for (BrainVital::FearTrace& f : v.fears)
+                        if (!r.get(f.ctx) || !r.get(f.valence) ||
+                            !r.get(f.strength) || !r.get(f.last))
+                            return fail("truncated brain fears");
+                    for (std::int16_t& g : v.attn_gain)
+                        if (!r.get(g)) return fail("truncated brain attn");
+                    if (!r.get(v.attn_last) || !r.get(v.sleep_pressure) ||
+                        !r.get(v.mod_accum) || !r.get(v.wm_verb) ||
+                        !r.get(v.wm_target) || !r.get(v.wm_conf) ||
+                        !r.get(v.last_reward) || !r.get(v.last_sigma) ||
+                        !r.get(v.last_charge))
+                        return fail("truncated brain vital");
                     bs->slots.emplace(nid, std::move(s));
                 } else {
                     // ---- v20..v28 legacy monolithic brain: parse-and-discard --

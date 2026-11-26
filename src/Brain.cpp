@@ -238,6 +238,221 @@ void engram_snapshot(const BrainNet& net, std::array<std::int8_t, 96>& wh,
         w1h[i] = q(net.st[sen.first + i].membrane);
 }
 
+// ---- Phase 3-5: vital state (neuromod / emotion / homeostasis) ----------------
+// All integer, all deterministic. Called once per brain_decide / brain_post.
+
+inline std::int16_t clampi16(std::int64_t v) {
+    return static_cast<std::int16_t>(clampi(v, -1000, 1000));
+}
+
+// modality group for a sensor channel (Sensor.hpp layout)
+inline int chan_group(int c) {
+    if (c < 24) return kBGrpSomatic;      // 0..15 intero, 16..23 neuro
+    if (c < 52) return kBGrpVisual;       // 24..51 entity slots
+    if (c < 68) return kBGrpSomatic;      // 52..67 material focus
+    if (c < 72) return kBGrpSocial;       // 68..71 social
+    if (c < 80) return kBGrpVisual;       // 72..79 environment
+    if (c < 112) return kBGrpMotor;       // 80..111 efference copy
+    return kBGrpVisual;                   // 112..116 conditioning tail
+}
+
+// amygdala context key: material + coarse position bucket — learned
+// associations only, no hard-coded threat list (spec §5).
+std::uint64_t fear_ctx_of(const Entity* me, MaterialId m) {
+    std::uint64_t h = Rng::hash(static_cast<std::uint64_t>(m) + 0xFEA201);
+    if (me) {
+        h = Rng::hash(h ^ (static_cast<std::uint64_t>(
+                     (me->pos.x / 64 + 4096) & 0xFFFF) << 20));
+        h = Rng::hash(h ^ static_cast<std::uint64_t>(
+                     (me->pos.y / 64 + 4096) & 0xFFFF));
+    }
+    return h | 1;
+}
+
+void brain_vital_tick(World& w, BrainSlot& s, const Entity* me,
+                      const AgentMind* mind) {
+    BrainVital& v = s.vital;
+    static thread_local SeqPidCache vc_;
+    SeqPid vp(vc_, w.props);
+    auto prop = [&](const char* n) -> std::int64_t {
+        const PropId p = vp(n);
+        return (p != kNoProp && me) ? w.prop_int(*me, p, 0) : 0;
+    };
+    const std::int64_t hunger = prop("hunger"), thirst = prop("thirst"),
+                      fatigue = prop("fatigue");
+    const std::int64_t panic = mind ? std::abs(mind->neuro.panic) : 0;
+    const std::int64_t rage = mind ? std::abs(mind->neuro.rage) : 0;
+    const std::int64_t grief = mind ? std::abs(mind->neuro.grief) : 0;
+    std::int64_t tempstress = 0;
+    if (me && w.terrain.contains(me->pos)) {
+        const std::int32_t t = w.terrain.temp_at(me->pos);
+        tempstress = std::abs(static_cast<std::int64_t>(t) - 500) / 4;
+    }
+    v.drive_hunger = clampi16(hunger);
+    v.drive_thirst = clampi16(thirst);
+    v.drive_fatigue = clampi16(fatigue);
+    v.drive_temp = static_cast<std::int16_t>(clampi(tempstress, 0, 1000));
+    v.drive_stress = static_cast<std::int16_t>(clampi(
+        (panic + grief) * 2 / 3 + v.drive_temp / 4, 0, 1000));
+    v.drive_repro = 0;   // no dedicated reproductive-drive prop yet
+    // sleep pressure tracks fatigue (decays on rest in brain_post)
+    v.sleep_pressure = static_cast<std::int16_t>(clampi(
+        (static_cast<std::int64_t>(v.drive_fatigue) * 3 +
+         v.sleep_pressure) / 4, 0, 1000));
+
+    // ---- neuromodulators: leak toward targets at distinct rates -------------
+    // shifts = update rate class (smaller = faster). dopa/norepi fast,
+    // sero/gaba/glut intermediate, cortisol slow endocrine (spec §14.1).
+    const std::int64_t stress = panic + grief;
+    const std::int64_t satiety = 1000 - std::max(hunger, thirst);
+    const std::int64_t tgt[kBModCount] = {
+        clampi(v.last_reward * 2, 0, 1000),                    // dopa: RPE
+        clampi(satiety, 0, 1000),                              // sero: satiety
+        clampi(v.last_sigma + (panic + rage) / 2, 0, 1000),    // norepi: arousal
+        clampi(v.last_sigma / 2 + stress / 8, 0, 1000),        // achi: encoding
+        clampi(fatigue, 0, 1000),                              // gaba: fatigue
+        clampi(v.last_sigma, 0, 1000),                         // glut: learning
+        clampi(stress, 0, 1000)                                // cortisol: stress
+    };
+    static const std::uint8_t kModShift[kBModCount] = {3, 5, 3, 4, 5, 4, 6};
+    for (int i = 0; i < kBModCount; ++i) {
+        const std::int64_t d = tgt[i] - v.mod[i];
+        v.mod[i] = static_cast<std::int16_t>(
+            clampi(static_cast<std::int64_t>(v.mod[i]) + (d >> kModShift[i]),
+                   0, 1000));
+    }
+
+    // ---- emotional dimensions (emerge from drives+neuro+memory) --------------
+    std::int64_t fear = panic;
+    const std::uint64_t ctx = me ? fear_ctx_of(me, kNoMaterial) : 0;
+    for (const BrainVital::FearTrace& f : v.fears)
+        if (f.ctx == ctx && f.ctx != 0)
+            fear = std::max(fear,
+                static_cast<std::int64_t>(std::abs(f.valence)) *
+                    f.strength / 1000);
+    const std::int64_t novelty =
+        mind ? static_cast<std::int64_t>(mind->discoveries.size()) * 50 : 0;
+    v.emo[kBEmoFear] = clampi16(fear);
+    v.emo[kBEmoAnger] = clampi16(rage);
+    v.emo[kBEmoCuriosity] =
+        clampi16(std::min<std::int64_t>(1000, novelty + v.last_sigma / 4));
+    v.emo[kBEmoSadness] = clampi16(grief);
+    v.emo[kBEmoJoy] = clampi16(std::max<std::int64_t>(0, v.last_reward));
+    v.emo[kBEmoDisgust] = 0;   // toxin-driven; no toxin valence channel yet
+    v.emo[kBEmoSurprise] = clampi16(v.last_sigma);
+    v.emo[kBEmoTrust] = 0;
+    v.emo[kBEmoAttachment] = 0;
+}
+
+// thalamic gating: attention-weighted sensory gain per modality group (Q8).
+// Arousal (norepi) + attention (achi) amplify everything; fear amplifies
+// visual+somatic (threat monitoring); homeostatic urgency amplifies
+// somatic; social channel boosted under stress.
+void brain_attn_update(BrainVital& v) {
+    const std::int64_t ne = v.mod[kBModNorepi], ac = v.mod[kBModAchi];
+    const std::int64_t fear = std::abs(v.emo[kBEmoFear]);
+    const std::int64_t urg =
+        std::max({v.drive_hunger, v.drive_thirst, v.drive_fatigue,
+                  v.drive_temp, v.drive_stress});
+    const std::int64_t base = 256 + (ne + ac) / 8;
+    const std::int64_t g[kBGrpCount] = {
+        base + fear / 4 + urg / 8,          // visual
+        base + v.drive_stress / 4,          // social/auditory
+        base + fear / 2 + urg / 4,          // somatic
+        base                               // motor (efference copy)
+    };
+    for (int i = 0; i < kBGrpCount; ++i)
+        v.attn_gain[i] = static_cast<std::int16_t>(clampi(g[i], 64, 1024));
+}
+
+// fear conditioning write: aversive event -> context-keyed trace.
+// valence negative; strength saturates at 1000; bounded 8-slot table,
+// evicts the weakest trace when full (deterministic order).
+void brain_fear_upsert(BrainVital& v, std::uint64_t ctx,
+                       std::int64_t aversity, std::uint64_t tick) {
+    if (ctx == 0 || aversity <= 0) return;
+    const std::int16_t val =
+        static_cast<std::int16_t>(-clampi(aversity, 100, 1000));
+    std::int16_t add = static_cast<std::int16_t>(
+        clampi(200 + aversity / 4, 200, 500));
+    int slot = -1, weakest = 0;
+    std::int64_t wscore = -1;
+    for (int i = 0; i < 8; ++i) {
+        BrainVital::FearTrace& f = v.fears[i];
+        if (f.ctx == ctx) { slot = i; break; }
+        if (f.ctx == 0) { slot = i; break; }
+        const std::int64_t sc =
+            static_cast<std::int64_t>(std::abs(f.valence)) * f.strength;
+        if (wscore < 0 || sc < wscore) { wscore = sc; weakest = i; }
+    }
+    if (slot < 0) slot = weakest;
+    BrainVital::FearTrace& f = v.fears[slot];
+    if (f.ctx != ctx) { f.ctx = ctx; f.valence = val; f.strength = 0; }
+    f.valence = static_cast<std::int16_t>(std::min<std::int64_t>(
+        f.valence, val));
+    f.strength = static_cast<std::int16_t>(
+        clampi(f.strength + add, 0, 1000));
+    f.last = tick;
+}
+
+// sleep consolidation (spec §12): replay top-charge transitions back into
+// hippocampus/PFC, strengthen them, apply deterministic forgetting to the
+// rest. Only recombines EXISTING replay entries — never invents facts.
+void brain_consolidate(BrainSlot& s, std::int64_t comp_permille) {
+    comp_permille = std::clamp<std::int64_t>(comp_permille, 0, 1000);
+    if (comp_permille == 0 || s.replay_count == 0) return;
+    BrainNet& net = s.net;
+    // rank replay entries by charge+sigma; top 2 rehearse, rest decay
+    int top[2] = {-1, -1};
+    std::int64_t bsc[2] = {-1, -1};
+    for (int i = 0; i < 16; ++i) {
+        const Transition& t = s.replay[i];
+        if (!t.valid) continue;
+        const std::int64_t sc =
+            static_cast<std::int64_t>(t.charge) + t.sigma;
+        for (int k = 0; k < 2; ++k)
+            if (sc > bsc[k]) {
+                for (int j = 1; j > k; --j) { bsc[j] = bsc[j-1]; top[j] = top[j-1]; }
+                bsc[k] = sc; top[k] = i; break;
+            }
+    }
+    const BrainModuleState& hip =
+        net.modules[static_cast<int>(BrainModule::kHippocampus)];
+    const BrainModuleState& pfc =
+        net.modules[static_cast<int>(BrainModule::kPrefrontal)];
+    auto q = [](std::int8_t v, std::int64_t comp) -> std::int32_t {
+        return static_cast<std::int32_t>(v) * 4 *
+               static_cast<std::int32_t>(comp) / 1000;
+    };
+    for (int k = 0; k < 2; ++k) {
+        const int i = top[k];
+        if (i < 0) continue;
+        Transition& t = s.replay[i];
+        for (std::uint32_t u = 0; u < hip.count && u < 96; ++u)
+            net.inject(static_cast<std::uint8_t>(BrainModule::kHippocampus),
+                       static_cast<std::int32_t>(u), q(t.wh[u], comp_permille));
+        for (std::uint32_t u = 0; u < pfc.count && u < 64; ++u)
+            net.inject(static_cast<std::uint8_t>(BrainModule::kPrefrontal),
+                       static_cast<std::int32_t>(u), q(t.w1h[u], comp_permille));
+        t.charge = static_cast<std::uint16_t>(
+            clampi(static_cast<std::int64_t>(t.charge) + 40, 0, 1000));
+    }
+    for (Transition& t : s.replay) {
+        if (!t.valid) continue;
+        const bool rehearsed =
+            (top[0] >= 0 && &t == &s.replay[top[0]]) ||
+            (top[1] >= 0 && &t == &s.replay[top[1]]);
+        if (!rehearsed) {
+            // deterministic forgetting: unrehearsed traces fade; below
+            // threshold they are pruned (never random deletion)
+            t.charge = static_cast<std::uint16_t>(
+                t.charge > 0 ? t.charge - 1 : 0);
+            if (t.charge < 20 && t.sigma < 100) t.valid = false;
+        }
+    }
+    for (int k = 0; k < 2; ++k) net.step();
+}
+
 // read a brain_* hyper-gene locus (integer allele) with a default
 std::int64_t brain_locus(const World& w, const Entity* e,
                          const char* name, std::int64_t dflt) {
@@ -280,6 +495,8 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
 
     BrainSlot slot;
     slot.genome = g;
+    slot.vital.mod.fill(384);          // baseline tonic modulators
+    slot.vital.attn_gain.fill(256);    // unity thalamic gain (Q8)
     slot.net.init(w.world_seed, npc, p.pops, p.threshold, p.reset,
                   p.leak_shift, p.refractory, p.ei_permille,
                   p.density_permille, p.tract_gain);
@@ -314,6 +531,7 @@ void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
     p.s = sensor_encode(w, npc, &s.last_action);
     p.a = sensor_action(ctx);
     p.pm_a = kNoMaterial; p.pm_b = kNoMaterial;
+    if (const Entity* me = w.find(npc)) p.pm_pos = me->pos;
     for (EntityId tid : ctx.targets) {
         if (tid == ctx.actor) continue;
         const Entity* t = w.find(tid);
@@ -363,6 +581,71 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     t.valid = true;
     push_replay(s, t);
     s.last_action = p.a;
+
+    // ---- Phase 5: phasic teaching signals + amygdala conditioning ------------
+    s.vital.last_reward = static_cast<std::int16_t>(clampi(y[24], -1000, 1000));
+    s.vital.last_sigma = static_cast<std::int16_t>(sigma);
+    s.vital.last_charge = static_cast<std::int16_t>(charge);
+    {
+        const Entity* me = w.find(npc);
+        const bool aversive =
+            ev.failed || sigma >= 600 || charge >= 600;
+        if (aversive && me) {
+            const std::uint64_t ctx = fear_ctx_of(me, p.pm_a);
+            brain_fear_upsert(s.vital, ctx,
+                              sigma + charge / 2, w.clock_.tick());
+            // cortisol surge: slow endocrine stress channel
+            s.vital.mod[kBModCortisol] = static_cast<std::int16_t>(
+                clampi(static_cast<std::int64_t>(s.vital.mod[kBModCortisol]) +
+                           120, 0, 1000));
+        }
+        // cerebellar motor error: move verbs get prediction-error current
+        int verb_idx = -1;
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (p.a[i] == 100) { verb_idx = i; break; }
+        if (verb_idx >= 0 && me) {
+            const char* vn = sensor_verb_table()[verb_idx];
+            if (std::strcmp(vn, "move") == 0) {
+                const std::int32_t dx = me->pos.x - p.pm_pos.x;
+                const std::int32_t dy = me->pos.y - p.pm_pos.y;
+                const std::int64_t moved2 =
+                    static_cast<std::int64_t>(dx) * dx +
+                    static_cast<std::int64_t>(dy) * dy;
+                // prediction error proxy: surprise + collision/failure
+                std::int64_t perr = sigma - 200;
+                if (ev.failed) perr += 300;
+                if (moved2 == 0 && !ev.failed) perr += 150;  // stalled
+                perr = clampi(perr, -400, 800);
+                BrainNet& net = s.net;
+                const BrainModuleState& cb =
+                    net.modules[static_cast<int>(BrainModule::kCerebellum)];
+                const BrainModuleState& mc =
+                    net.modules[static_cast<int>(BrainModule::kMotorCortex)];
+                for (std::uint32_t i = 0; i < cb.count; ++i)
+                    net.inject(static_cast<std::uint8_t>(
+                                   BrainModule::kCerebellum),
+                               static_cast<std::int32_t>(i),
+                               static_cast<std::int32_t>(perr) / 4);
+                for (std::uint32_t i = 0; i < mc.count; ++i)
+                    net.inject(static_cast<std::uint8_t>(
+                                   BrainModule::kMotorCortex),
+                               static_cast<std::int32_t>(i),
+                               static_cast<std::int32_t>(perr) / 8);
+                net.step();
+            }
+            // working memory: last committed action (spec §10.2)
+            s.vital.wm_verb = verb_idx;
+            s.vital.wm_conf = static_cast<std::int16_t>(
+                clampi(1000 - sigma, 0, 1000));
+        }
+        // sleep consolidation on rest (spec §12)
+        if (verb_idx >= 0 &&
+            std::strcmp(sensor_verb_table()[verb_idx], "rest") == 0) {
+            s.vital.sleep_pressure = static_cast<std::int16_t>(std::max(
+                0, static_cast<int>(s.vital.sleep_pressure) - 250));
+            brain_consolidate(s, 500);
+        }
+    }
 
     // ---- outcome teaching signal -------------------------------------------
     // Inject the homeostatic reward (label ch24) as a modulatory current
@@ -441,13 +724,36 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     BrainSlot& s = brain_slot(w, store, npc);
     BrainNet& net = s.net;
 
-    const SensorVec sv = sensor_encode(w, npc, &s.last_action);
+    // ---- Phase 3-5: homeostasis, neuromodulation, attention ------------------
+    brain_vital_tick(w, s, me, mind);
+    brain_attn_update(s.vital);
+
+    SensorVec sv = sensor_encode(w, npc, &s.last_action);
+    // perceptual uncertainty (spec §9.2): low acetylcholine -> deterministic
+    // hash noise on a quarter of active channels. Never reads hidden state.
+    if (s.vital.mod[kBModAchi] < 400) {
+        const std::int32_t noise_span = 400 - s.vital.mod[kBModAchi];
+        for (int c = 0; c < kSensorChannels; ++c) {
+            if (sv[c] == 0) continue;
+            const std::uint64_t h =
+                Rng::hash(w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^
+                          (w.clock_.tick() * 0xBF58476D1CE4E5B9ull) ^
+                          static_cast<std::uint64_t>(c));
+            if ((h & 3) != 0) continue;
+            const std::int32_t j =
+                static_cast<std::int32_t>(h % (2 * noise_span + 1)) -
+                noise_span;
+            sv[c] = static_cast<std::int8_t>(clampi(
+                static_cast<std::int64_t>(sv[c]) + j / 16, -128, 127));
+        }
+    }
 
     // ---- sensory encoding -----------------------------------------------------
     // Channel c -> Sensory Cortex neuron (c*count)/kSensorChannels, current
-    // = channel * 6 (int8 -> ~+-768). Intero channels 0..15 additionally
-    // drive Hypothalamus (homeostatic motivation); last_action re-enters
-    // via Cerebellum (efference copy).
+    // = channel * 6 (int8 -> ~+-768) scaled by the thalamic attention gain
+    // for its modality group (spec §9.1/9.3 — gated, not pass-through).
+    // Intero channels 0..15 additionally drive Hypothalamus (homeostatic
+    // motivation); last_action re-enters via Cerebellum (efference copy).
     {
         const BrainModuleState& sm =
             net.modules[static_cast<int>(BrainModule::kSensoryCortex)];
@@ -457,9 +763,11 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                 static_cast<std::int32_t>(
                     static_cast<std::int64_t>(c) * sm.count /
                     kSensorChannels);
+            const std::int32_t gain =
+                s.vital.attn_gain[chan_group(c)];
             net.inject(static_cast<std::uint8_t>(
                            BrainModule::kSensoryCortex), idx,
-                       static_cast<std::int32_t>(sv[c]) * 6);
+                       static_cast<std::int32_t>(sv[c]) * 6 * gain / 256);
         }
         const BrainModuleState& hm =
             net.modules[static_cast<int>(BrainModule::kHypothalamus)];
@@ -658,6 +966,14 @@ BrainChoice brain_decide(World& w, EntityId npc) {
         total += static_cast<std::int64_t>(jit %
             static_cast<std::uint64_t>(1 + s.genome.mut_scale / 100)) -
             (1 + s.genome.mut_scale / 100) / 2;
+        // amygdala defensive bias: learned fear amplifies fight/flight
+        // verbs (spec §5) — never a hard-coded threat list.
+        if (s.vital.emo[kBEmoFear] > 400) {
+            const char* vn = sensor_verb_table()[cd.verb];
+            if (std::strcmp(vn, "strike") == 0 ||
+                std::strcmp(vn, "move") == 0)
+                total += s.vital.emo[kBEmoFear] / 3;
+        }
         if (total > best_total) { best_total = total; best_c = c; }
     }
 
@@ -783,11 +1099,37 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
         }
         for (std::int8_t v : s.last_action) mix(static_cast<std::uint8_t>(v));
         mix(s.pending.valid ? 1 : 0);
+        mix(static_cast<std::uint32_t>(s.pending.pm_pos.x));
+        mix(static_cast<std::uint32_t>(s.pending.pm_pos.y));
         mix(s.replay_count); mix(s.replay_next);
         mix(static_cast<std::uint64_t>(s.mac_pending));
         mix(static_cast<std::uint64_t>(s.mac_frac));
         mix(static_cast<std::uint32_t>(s.tried_next));
         for (std::uint64_t k : s.tried) mix(k);
+        // Phase 3-5 vital state: modulators, emotion, drives, conditioning
+        const BrainVital& v = s.vital;
+        for (std::int16_t m : v.mod) mix(static_cast<std::uint16_t>(m));
+        for (std::int16_t e : v.emo) mix(static_cast<std::uint16_t>(e));
+        mix(static_cast<std::uint16_t>(v.drive_hunger));
+        mix(static_cast<std::uint16_t>(v.drive_thirst));
+        mix(static_cast<std::uint16_t>(v.drive_fatigue));
+        mix(static_cast<std::uint16_t>(v.drive_temp));
+        mix(static_cast<std::uint16_t>(v.drive_stress));
+        mix(static_cast<std::uint16_t>(v.drive_repro));
+        for (const BrainVital::FearTrace& f : v.fears) {
+            mix(f.ctx); mix(static_cast<std::uint16_t>(f.valence));
+            mix(static_cast<std::uint16_t>(f.strength)); mix(f.last);
+        }
+        for (std::int16_t g : v.attn_gain)
+            mix(static_cast<std::uint16_t>(g));
+        mix(v.attn_last); mix(static_cast<std::uint16_t>(v.sleep_pressure));
+        mix(v.mod_accum);
+        mix(static_cast<std::uint32_t>(v.wm_verb));
+        mix(static_cast<std::uint64_t>(v.wm_target));
+        mix(static_cast<std::uint16_t>(v.wm_conf));
+        mix(static_cast<std::uint16_t>(v.last_reward));
+        mix(static_cast<std::uint16_t>(v.last_sigma));
+        mix(static_cast<std::uint16_t>(v.last_charge));
         for (const Transition& t : s.replay) {
             mix(t.valid ? 1 : 0);
             if (!t.valid) continue;

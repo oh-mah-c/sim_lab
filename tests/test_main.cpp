@@ -10313,6 +10313,216 @@ static void test_anatomical_modules() {
     }
 }
 
+// ==================== CL-1 v29 Phase 3: sensory & motor =======================
+// Thalamic gating, perceptual uncertainty, cerebellar motor feedback.
+static void test_sensory_motor() {
+    // (1) thalamic attention gains: urgency/fear/arousal reshape routing ---
+    {
+        World w(501, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);
+        BrainSlot& s = w.brains_->slots[id];
+        // baseline: gains clamped into [64,1024], unity-ish at rest
+        for (std::int16_t g : s.vital.attn_gain)
+            CHECK(g >= 64 && g <= 1024);
+        // starving agent: somatic (body monitoring) gain exceeds visual
+        tseti(*w.find(id), w, "hunger", 950);
+        (void)brain_decide(w, id);
+        CHECK(s.vital.drive_hunger >= 900);
+        CHECK(s.vital.attn_gain[kBGrpSomatic] >
+              s.vital.attn_gain[kBGrpVisual]);
+        // high panic: somatic threat monitoring dominates further
+        w.mind(id).neuro.panic = 800;
+        (void)brain_decide(w, id);
+        CHECK(s.vital.emo[kBEmoFear] >= 400);
+        CHECK(s.vital.attn_gain[kBGrpSomatic] >
+              s.vital.attn_gain[kBGrpSocial]);
+    }
+
+    // (2) perceptual uncertainty: low ACh -> noisy encoding, deterministic --
+    {
+        World a(502, "data"), b(502, "data");
+        a.brain_shadow = b.brain_shadow = true;
+        const EntityId sa = mk_sapient(a, {50, 50});
+        const EntityId sb = mk_sapient(b, {50, 50});
+        a.mind(sa); b.mind(sb);
+        (void)brain_decide(a, sa); (void)brain_decide(b, sb);
+        // force low acetylcholine on both -> noise path active
+        a.brains_->slots[sa].vital.mod[kBModAchi] = 100;
+        b.brains_->slots[sb].vital.mod[kBModAchi] = 100;
+        const BrainChoice ca = brain_decide(a, sa);
+        const BrainChoice cb = brain_decide(b, sb);
+        CHECK(ca.valid && cb.valid);
+        // identical seed+state -> identical noisy perception -> same choice
+        CHECK(ca.verb == cb.verb);
+        // and the noisy net state differs from a high-ACh twin
+        World c(502, "data");
+        c.brain_shadow = true;
+        const EntityId sc = mk_sapient(c, {50, 50});
+        c.mind(sc);
+        (void)brain_decide(c, sc);
+        c.brains_->slots[sc].vital.mod[kBModAchi] = 900;
+        brain_decide(c, sc);
+        bool diff = false;
+        const BrainNet& na = a.brains_->slots[sa].net;
+        const BrainNet& nc = c.brains_->slots[sc].net;
+        for (std::uint32_t i = 0; i < na.neuron_count; ++i)
+            if (na.st[i].membrane != nc.st[i].membrane) { diff = true; break; }
+        CHECK(diff);   // perceptual noise actually perturbs the network
+    }
+
+    // (3) cerebellar motor feedback: stalled move -> prediction error ------
+    {
+        World w(503, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);          // creates brains_ + slot
+        BrainSlot& s = w.brains_->slots[id];
+        const BrainModuleState& cb =
+            s.net.modules[static_cast<int>(BrainModule::kCerebellum)];
+        auto cb_abs = [&]() {
+            std::int64_t d = 0;
+            for (std::uint32_t i = 0; i < cb.count; ++i)
+                d += std::abs(s.net.st[cb.first + i].membrane);
+            return d;
+        };
+        // pre a move action, then post a stalled (no displacement) outcome
+        brain_pre(w, id, mk_ctx(id, {}, "move", 0));
+        CausalEvent ev;
+        ev.id = 1; ev.action = "move"; ev.tick = w.clock_.tick();
+        const std::int64_t before = cb_abs();
+        brain_post(w, id, ev);
+        CHECK(cb_abs() != before);          // error current reached CB
+        CHECK(s.vital.wm_verb >= 0);        // working memory recorded action
+    }
+}
+
+// ==================== CL-1 v29 Phase 4+5: memory & emotion =====================
+// Neuromodulator dynamics, amygdala conditioning, homeostasis, consolidation.
+static void test_memory_emotion() {
+    // (1) neuromodulator dynamics: distinct rates, bounded 0..1000 ---------
+    {
+        World w(601, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);
+        BrainSlot& s = w.brains_->slots[id];
+        for (std::int16_t m : s.vital.mod)
+            CHECK(m >= 0 && m <= 1000);
+        // rates differ: high surprise + panic — norepi (fast) jumps far
+        // more than cortisol (slow endocrine) over the same single update
+        w.mind(id).neuro.panic = 900;
+        s.vital.mod.fill(384);
+        s.vital.last_sigma = 900;      // phasic surprise feed
+        (void)brain_decide(w, id);
+        CHECK(s.vital.mod[kBModNorepi] - 384 >
+              (s.vital.mod[kBModCortisol] - 384) * 2);
+        CHECK(s.vital.mod[kBModNorepi] > 384);
+        CHECK(s.vital.mod[kBModCortisol] > 384);   // both rise, cortisol slower
+        w.mind(id).neuro.panic = 0;
+        // homeostatic drives mirror body truth
+        tseti(*w.find(id), w, "thirst", 800);
+        (void)brain_decide(w, id);
+        CHECK(s.vital.drive_thirst >= 700);
+        CHECK(s.vital.drive_stress >= 0 && s.vital.drive_stress <= 1000);
+    }
+
+    // (2) amygdala: aversive event -> context-keyed fear trace --------------
+    {
+        World w(602, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);          // slot exists
+        BrainSlot& s = w.brains_->slots[id];
+        int fear_slot = -1;
+        brain_pre(w, id, mk_ctx(id, {}, "strike", 0));
+        CausalEvent ev;
+        ev.id = 7; ev.action = "strike"; ev.failed = true;
+        ev.tick = w.clock_.tick();
+        brain_post(w, id, ev);
+        for (int i = 0; i < 8; ++i)
+            if (s.vital.fears[i].ctx != 0) fear_slot = i;
+        CHECK(fear_slot >= 0);
+        CHECK(s.vital.fears[fear_slot].valence < 0);
+        CHECK(s.vital.fears[fear_slot].strength > 0);
+        // fear emotion now reads the trace on next decide
+        (void)brain_decide(w, id);
+        CHECK(s.vital.emo[kBEmoFear] > 0);
+        // context-dependent: teleport far away -> different bucket -> fear drops
+        const Vec2 np{w.find(id)->pos.x + 640, w.find(id)->pos.y + 640};
+        w.spatial.move(id, np);
+        w.find(id)->pos = np;
+        (void)brain_decide(w, id);
+        CHECK(s.vital.emo[kBEmoFear] <
+              s.vital.fears[fear_slot].strength);  // trace no longer matches
+    }
+
+    // (3) sleep consolidation: rehearsal strengthens, others decay -----------
+    {
+        World w(603, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);          // creates brains_ + slot
+        BrainSlot& s = w.brains_->slots[id];
+        // seed replay: two strong (rehearsed), one weak (decays/prunes)
+        for (int i = 0; i < 3; ++i) {
+            Transition t{};
+            t.valid = true;
+            t.sigma = i == 2 ? 50 : (i == 0 ? 800 : 700);
+            t.charge = i == 2 ? 10 : (i == 0 ? 900 : 800);
+            t.event_id = 100 + i;
+            for (int j = 0; j < 96; ++j) t.wh[j] = static_cast<std::int8_t>(j % 7);
+            for (int j = 0; j < 64; ++j) t.w1h[j] = static_cast<std::int8_t>(j % 5);
+            for (int j = 0; j < kLabelChannels; ++j) t.y[j] = 10;
+            s.replay[i] = t;
+        }
+        s.replay_count = 3; s.replay_next = 3;
+        const std::uint16_t c0 = s.replay[0].charge;
+        const std::uint16_t c2 = s.replay[2].charge;
+        brain_pre(w, id, mk_ctx(id, {}, "rest", 0));
+        CausalEvent ev;
+        ev.id = 9; ev.action = "rest"; ev.tick = w.clock_.tick();
+        brain_post(w, id, ev);
+        // top entries rehearsed (+40); unrehearsed weak trace fades or prunes
+        CHECK(s.replay[0].charge == c0 + 40);
+        CHECK(s.replay[2].charge < c2 || !s.replay[2].valid);
+        CHECK(s.vital.sleep_pressure < 1000);
+    }
+
+    // (4) save v29 round-trip preserves vital + neural state ---------------
+    {
+        World w(604, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);
+        brain_pre(w, id, mk_ctx(id, {}, "strike", 0));
+        CausalEvent ev;
+        ev.id = 3; ev.action = "strike"; ev.failed = true;
+        ev.tick = w.clock_.tick();
+        brain_post(w, id, ev);
+        const std::uint64_t hb = brain_state_hash(*w.brains_);
+        const std::string path = "/tmp/simlab_v29_vital.bin";
+        const std::uint64_t h = w.state_hash();
+        CHECK(w.save(path));
+        World w2(604, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+        CHECK(w2.brains_ && brain_state_hash(*w2.brains_) == hb);
+        const BrainVital& v = w2.brains_->slots[id].vital;
+        CHECK(v.fears[0].ctx != 0 || std::any_of(
+            v.fears.begin(), v.fears.end(),
+            [](const BrainVital::FearTrace& f) { return f.ctx != 0; }));
+        std::filesystem::remove(path);
+    }
+}
+
 static void test_amphibian_evolution() {
     World w(23, "data");
     WorldGenParams gp; gp.seed = 23; gp.grid_w = 64; gp.grid_h = 64;
@@ -11718,6 +11928,8 @@ int main(int argc, char** argv) {
     RUN(test_quantitative_cognition_and_notation);
     RUN(test_neural_core);
     RUN(test_anatomical_modules);
+    RUN(test_sensory_motor);
+    RUN(test_memory_emotion);
     RUN(test_amphibian_evolution);
     RUN(test_narrative_host);
     RUN(test_open_ended_invention);

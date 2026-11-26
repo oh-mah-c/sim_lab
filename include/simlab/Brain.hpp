@@ -145,6 +145,54 @@ struct Transition {
     bool valid = false;
 };
 
+// ---- Phase 3-5 state: neuromodulators, emotion, homeostasis, conditioning ---
+// (brain.txt §§9-12, 14). All integer, all deterministic, all serialized.
+enum BrainModIdx : int {
+    kBModDopa = 0, kBModSero, kBModNorepi, kBModAchi,
+    kBModGaba, kBModGlut, kBModCortisol, kBModCount
+};
+enum BrainEmoIdx : int {
+    kBEmoFear = 0, kBEmoAnger, kBEmoCuriosity, kBEmoSadness,
+    kBEmoJoy, kBEmoDisgust, kBEmoSurprise, kBEmoTrust,
+    kBEmoAttachment, kBEmoCount
+};
+// Sensory modality groups for thalamic gating (channel ranges per
+// Sensor.hpp layout): 0=visual/extero, 1=social/auditory, 2=somatosensory
+// + intero, 3=motor-efference copy.
+enum BrainModGroup : int { kBGrpVisual = 0, kBGrpSocial, kBGrpSomatic,
+                           kBGrpMotor, kBGrpCount };
+struct BrainVital {
+    std::array<std::int16_t, kBModCount> mod{};   // 0..1000
+    std::array<std::int16_t, kBEmoCount> emo{};   // -1000..1000
+    // Hypothalamic drives (spec §4.5): 0..1000, never assign actions.
+    std::int16_t drive_hunger = 0, drive_thirst = 0, drive_fatigue = 0;
+    std::int16_t drive_temp = 0, drive_stress = 0, drive_repro = 0;
+    // Amygdala fear conditioning: bounded context->valence traces.
+    // ctx = hash(material, pos bucket, kind); learned, never hard-coded.
+    struct FearTrace {
+        std::uint64_t ctx = 0;
+        std::int16_t valence = 0;    // -1000..1000
+        std::int16_t strength = 0;  // 0..1000
+        std::uint64_t last = 0;     // tick of last reinforcement
+    };
+    std::array<FearTrace, 8> fears{};
+    // Thalamic attention gains, Q8 (256 = unity) per modality group.
+    std::array<std::int16_t, kBGrpCount> attn_gain{};
+    std::uint64_t attn_last = 0;
+    std::int16_t sleep_pressure = 0;   // 0..1000
+    // Slow neuromodulator accumulator (sub-tick remainder, Euclid-style).
+    std::uint64_t mod_accum = 0;
+    // Working memory (spec §10.2): last committed decision summary.
+    std::int32_t wm_verb = -1;
+    std::int64_t wm_target = 0;
+    std::int16_t wm_conf = 0;
+    // Phasic teaching signals (set by brain_post, consumed by vital_tick):
+    // reward prediction error, surprise magnitude, emotional charge.
+    std::int16_t last_reward = 0;
+    std::int16_t last_sigma = 0;
+    std::int16_t last_charge = 0;
+};
+
 // Pre-commit snapshot filled by brain_pre() and consumed by brain_post().
 struct BrainPending {
     bool valid = false;
@@ -153,6 +201,7 @@ struct BrainPending {
     std::uint64_t tick = 0;
     MaterialId pm_a = kNoMaterial;
     MaterialId pm_b = kNoMaterial;
+    Vec2 pm_pos{0, 0};        // actor position at pre (cerebellar error)
 };
 
 // The inheritable brain. `slow` is the kConnectomeBytes connectome
@@ -170,6 +219,7 @@ struct BrainGenome {
 struct BrainSlot {
     BrainGenome genome;          // heritable connectome params
     BrainNet net;                // spiking state (membranes, synapses, rings)
+    BrainVital vital;            // neuromod/emotion/homeostasis/conditioning
     ActionVec last_action{};     // feeds sensor channels 80..95
     BrainPending pending{};
     std::array<Transition, 16> replay{};

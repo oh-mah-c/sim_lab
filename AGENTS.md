@@ -1312,6 +1312,27 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
 - `brain_pre`/`brain_post` hooks unchanged (World.cpp interact); post
   pushes replay + engram snapshot + tried-mark + surprise stats.
   Plasticity (STDP/reward) is Phase 6 — not yet implemented.
+- Phases 3-5 (`BrainVital` in Brain.hpp, serialized in v29):
+  `brain_vital_tick` mirrors NeuroState/props into homeostatic drives
+  (hunger/thirst/fatigue/temp/stress/repro) + 7 integer neuromodulators
+  `mod[]` (dopa/sero/norepi/achi/gaba/glutamate/cortisol, per-mod
+  shift rates 3..6) + `emo[]` + `attn_gain[]` + `sleep_pressure`.
+  `brain_attn_update` sets per-channel-group gains (visual/auditory/
+  somatosensory/olfactory+gustatory/social) from threat+panic+arousal.
+  `brain_decide`: ACh<400 -> deterministic hash noise on sensor
+  channels; sensory channels injected scaled by attn_gain; intero
+  channels 0-15 also drive Hypothalamus; last_action -> Cerebellum
+  efference copy; emo[fear]>400 boosts strike/move logits by fear/3.
+  `brain_post`: last_reward/sigma/charge; fear upsert on aversive
+  (failed||sigma>=600||charge>=600) via fears[8] context traces +
+  cortisol +120; cerebellar motor-error injection on "move"
+  (perr = sigma-200, +300 failed, +150 stalled; Cerebellum perr/4,
+  MotorCortex perr/8, one step); wm_verb/wm_conf working-memory
+  write; "rest" -> sleep_pressure-250 + brain_consolidate (top-2
+  replay rehearsed +40 charge, rest decay -1, prune sigma<100&&
+  charge<20). fear_ctx_of(me,m) — NO action param (decide/post must
+  produce identical ctx). temp_at guarded by terrain.contains (tests
+  use empty-terrain worlds).
 - GenePool: `entry_sane` requires slow.size()==kConnectomeBytes;
   gene_pool.bin kVersion=2 (v1 weight blobs rejected -> pool resets).
 - Save v29: per-slot genome fields + slow blob + nn/nsyn + net clocks +
