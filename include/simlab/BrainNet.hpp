@@ -137,6 +137,15 @@ struct BrainNet {
     std::int32_t plastic_rate = 400;        // permille STDP step scale
     std::int32_t reward_rate = 400;         // permille reward-mod step scale
     std::int32_t stdp_gate = 512;           // dopamine gate, set per burst
+    // Phase 9 heritable params (genome slow[45..47]):
+    std::int32_t mod_sens_pm = 1000;        // neuromodulator rate sensitivity
+    std::int32_t rollout_budget_pm = 1024;  // planning frequency permille
+    // Age-dependent plasticity scale (permille), set per decide from the
+    // agent's age/adult_age props — transient, re-derived each burst.
+    std::int32_t plastic_scale_pm = 1000;
+    // Phase 11: AVX2 LIF fast path (transient — bit-identical to scalar;
+    // toggled off only by tests to prove equivalence).
+    bool avx2 = true;
 
     // ---- spike groups: ceil(count/64) masks per module run -------------------
     // transient scratch — recomputed each tick, never serialized
@@ -168,7 +177,9 @@ struct BrainNet {
               std::uint8_t ei_permille, std::uint16_t density_permille,
               const std::array<std::int16_t, 24>& tract_gain,
               std::uint8_t stdp_window = 6, std::int32_t plastic_rate = 400,
-              std::int32_t reward_rate = 400);
+              std::int32_t reward_rate = 400,
+              std::int32_t mod_sens_pm = 1000,
+              std::int32_t rollout_budget_pm = 1024);
     // Deterministic re-derivation after load: same args as init; dynamic
     // state (membranes/rings/clocks) is overlaid by deserialize() after.
 
@@ -180,6 +191,10 @@ struct BrainNet {
     // run one neural tick: deliver due kicks, update due modules in
     // module-id order, fire spikes into delay rings. Bounded cascade.
     void step();
+#if defined(__AVX2__)
+    // AVX2 LIF update for one module — bit-identical to the scalar path.
+    void lif_module_avx2(BrainModuleState& ms);
+#endif
 
     // mark a module for event-driven activation next tick (coalesced).
     void request(std::uint8_t mod) { pending_mask |= 1ull << mod; }

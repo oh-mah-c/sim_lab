@@ -1,6 +1,9 @@
 #include "simlab/BrainNet.hpp"
 #include "simlab/Rng.hpp"
 #include <algorithm>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace simlab {
 
@@ -90,12 +93,15 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
                     std::uint8_t ei_permille, std::uint16_t density_permille,
                     const std::array<std::int16_t, kBrainTractCount>& tract_gain,
                     std::uint8_t stdp_window, std::int32_t plastic_rate,
-                    std::int32_t reward_rate) {
+                    std::int32_t reward_rate,
+                    std::int32_t mod_sens_pm, std::int32_t rollout_budget_pm) {
     const std::uint64_t seed =
         world_seed ^ (entity * 0xD1B54A32D192ED03ull);
     this->stdp_window = stdp_window;
     this->plastic_rate = plastic_rate;
     this->reward_rate = reward_rate;
+    this->mod_sens_pm = mod_sens_pm;
+    this->rollout_budget_pm = rollout_budget_pm;
     this->stdp_gate = 512;
 
     // ---- module layout -------------------------------------------------------
@@ -214,12 +220,12 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
         for (std::uint32_t i = 0; i < ms.count; ++i) {
             const std::uint32_t pre = ms.first + i;
             for (std::uint32_t j = 0; j < k_local; ++j) {
-                // hash-picked post within module, avoid self
-                std::uint32_t off;
-                do {
-                    off = static_cast<std::uint32_t>(
-                        nhash(seed, pre, 0x100 + j * 977 + i) % ms.count);
-                } while (off == i && ms.count > 1);
+                // hash-picked post within module, avoid self. Bounded:
+                // a retry with the same salt would loop forever, so the
+                // fallback is a deterministic +1 shift instead.
+                std::uint32_t off = static_cast<std::uint32_t>(
+                    nhash(seed, pre, 0x100 + j * 977 + i) % ms.count);
+                if (off == i) off = (off + 1) % ms.count;
                 const std::uint32_t post = ms.first + off;
                 const std::int32_t w =
                     (40 + njit(seed, pre, 0x200 + j, 40)) * gen[pre].sign;
@@ -281,12 +287,103 @@ void BrainNet::inject(std::uint8_t mod, std::int32_t neuron_in_module,
     s.syn_input = sat_add(s.syn_input, current);
 }
 
+// ---- AVX2 LIF module update (Phase 11) ---------------------------------------
+// Bit-identical to the scalar loop below: same trunc-toward-zero leak
+// division, same clamp16, same refractory/reset semantics. Modules are
+// genome-bounded (<= kAvxMaxNeurons); larger ones fall back to scalar.
+#if defined(__AVX2__)
+static constexpr std::uint32_t kAvxMaxNeurons = 256;
+
+// trunc division by 2^shift, matching C++ integer division exactly:
+// m / 2^s == sign(m) * (|m| >> s) for s in [0,31].
+static inline __m256i avx_trunc_shr(__m256i m, __m256i sh) {
+    const __m256i sign = _mm256_srai_epi32(m, 31);       // 0 or -1
+    const __m256i a = _mm256_sub_epi32(                   // |m|
+        _mm256_xor_si256(m, sign), sign);
+    const __m256i q = _mm256_srlv_epi32(a, sh);            // |m| >> sh
+    return _mm256_sub_epi32(                              // sign(m) * q
+        _mm256_xor_si256(q, sign), sign);
+}
+
+void BrainNet::lif_module_avx2(BrainModuleState& ms) {
+    // Stage SoA (module counts are small; stack buffers, no heap).
+    alignas(32) std::int32_t memb[kAvxMaxNeurons];
+    alignas(32) std::int32_t inp[kAvxMaxNeurons];
+    alignas(32) std::int32_t refr[kAvxMaxNeurons];
+    alignas(32) std::int32_t thr[kAvxMaxNeurons];
+    alignas(32) std::int32_t rst[kAvxMaxNeurons];
+    alignas(32) std::int32_t lsh[kAvxMaxNeurons];
+    alignas(32) std::int32_t rfr[kAvxMaxNeurons];
+    alignas(32) std::int32_t out_m[kAvxMaxNeurons];
+    alignas(32) std::int32_t out_r[kAvxMaxNeurons];
+    alignas(32) std::int32_t out_s[kAvxMaxNeurons];  // 1 = spiked
+    const std::uint32_t n = ms.count;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t u = ms.first + i;
+        memb[i] = st[u].membrane;
+        inp[i]  = st[u].syn_input;
+        refr[i] = st[u].refractory_left;
+        thr[i]  = gen[u].threshold;
+        rst[i]  = gen[u].reset;
+        lsh[i]  = gen[u].leak_shift;
+        rfr[i]  = gen[u].refractory;
+    }
+    const __m256i vmin = _mm256_set1_epi32(-32768);
+    const __m256i vmax = _mm256_set1_epi32(32767);
+    const __m256i zero = _mm256_setzero_si256();
+    for (std::uint32_t i = 0; i < n; i += 8) {
+        const std::uint32_t lane = std::min<std::uint32_t>(8, n - i);
+        __m256i M  = _mm256_load_si256(reinterpret_cast<const __m256i*>(memb + i));
+        __m256i I  = _mm256_load_si256(reinterpret_cast<const __m256i*>(inp + i));
+        __m256i R  = _mm256_load_si256(reinterpret_cast<const __m256i*>(refr + i));
+        __m256i T  = _mm256_load_si256(reinterpret_cast<const __m256i*>(thr + i));
+        __m256i RS = _mm256_load_si256(reinterpret_cast<const __m256i*>(rst + i));
+        __m256i LS = _mm256_load_si256(reinterpret_cast<const __m256i*>(lsh + i));
+        __m256i RF = _mm256_load_si256(reinterpret_cast<const __m256i*>(rfr + i));
+        const __m256i active = _mm256_cmpeq_epi32(R, zero);   // refr==0
+        // leak: m -= trunc(m / 2^leak_shift)   (only meaningful if active)
+        const __m256i leak = avx_trunc_shr(M, LS);
+        __m256i m2 = _mm256_sub_epi32(M, leak);
+        m2 = _mm256_add_epi32(m2, I);
+        m2 = _mm256_max_epi32(vmin, _mm256_min_epi32(vmax, m2)); // clamp16
+        const __m256i spike = _mm256_and_si256(
+            _mm256_cmpgt_epi32(m2, _mm256_sub_epi32(T, _mm256_set1_epi32(1))),
+            active);
+        // membrane: spike -> reset; active non-spike -> m2; inactive -> reset
+        const __m256i m_act = _mm256_blendv_epi8(m2, RS, spike);
+        const __m256i m_out = _mm256_blendv_epi8(RS, m_act, active);
+        // refractory: spike -> gen refractory; inactive -> refr-1; else 0
+        const __m256i r_dec = _mm256_sub_epi32(R, _mm256_set1_epi32(1));
+        const __m256i r_inact = _mm256_max_epi32(zero, r_dec);
+        const __m256i r_act = _mm256_blendv_epi8(zero, RF, spike);
+        const __m256i r_out = _mm256_blendv_epi8(r_inact, r_act, active);
+        // spike flag
+        const __m256i s_out = _mm256_and_si256(spike, _mm256_set1_epi32(1));
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out_m + i), m_out);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out_r + i), r_out);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(out_s + i), s_out);
+        (void)lane;
+    }
+    // scalar writeback: identical observable effects to the scalar loop
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t u = ms.first + i;
+        st[u].membrane = static_cast<std::int16_t>(out_m[i]);
+        st[u].refractory_left = static_cast<std::uint8_t>(out_r[i]);
+        st[u].syn_input = 0;
+        if (out_s[i]) {
+            spike_masks[ms.spike_off + i / 64] |= 1ull << (i % 64);
+            ++spikes;
+        }
+    }
+}
+#endif  // __AVX2__
+
 // run one scheduler pass over a module's neurons; fire into delay rings.
 void BrainNet::step() {
     // dopamine-gated plasticity step (spec §13.2): gate is set by the
     // caller from the agent's dopamine level before each burst.
     const std::int32_t pstep = std::max<std::int32_t>(
-        1, plastic_rate * stdp_gate / 100000);
+        1, plastic_rate * stdp_gate / 100000 * plastic_scale_pm / 1000);
     const std::uint32_t win = stdp_window;
 
     // 1) deliver kicks scheduled for this tick (insertion order preserved).
@@ -327,6 +424,11 @@ void BrainNet::step() {
 
         // LIF update over the module's neuron range.
         std::fill_n(spike_masks.begin() + ms.spike_off, ms.spike_words, 0);
+#if defined(__AVX2__)
+        if (avx2 && ms.count <= 256 && ms.count >= 8) {
+            lif_module_avx2(ms);
+        } else
+#endif
         for (std::uint32_t i = 0; i < ms.count; ++i) {
             const std::uint32_t u = ms.first + i;
             BrainNeuronState& s = st[u];

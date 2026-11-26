@@ -128,6 +128,9 @@ BrainGenome brain_default_genome() {
     g.slow[42] = 6;      // stdp_window ticks
     g.slow[43] = 100;    // plastic_rate 400 permille
     g.slow[44] = 100;    // reward_rate 400 permille
+    g.slow[45] = 125;    // mod_sens 1000 permille (/8)
+    g.slow[46] = 127;    // rollout_budget 1016 permille (/8, ~always)
+    g.slow[47] = 1;      // population profile: 0=min 1=std 2=full
     return g;
 }
 
@@ -148,7 +151,11 @@ void brainnet_sanitize(std::vector<std::int8_t>& slow) {
     cl(slow[42], 0, 16);    // stdp_window (0 -> default 6)
     cl(slow[43], 0, 255);   // plastic_rate /4 permille
     cl(slow[44], 0, 255);   // reward_rate /4 permille
-    // 45..95 reserved: keep raw int8 (future parameters)
+    // Phase 9 developmental params (heritable, spec §23)
+    cl(slow[45], 0, 127);   // mod_sens /8 permille
+    cl(slow[46], 0, 127);   // rollout_budget /8 permille
+    cl(slow[47], 0, 2);     // population profile enum
+    // 48..95 reserved: keep raw int8 (future parameters)
 }
 
 BrainNetParams brainnet_params_of(const BrainGenome& g) {
@@ -160,6 +167,15 @@ BrainNetParams brainnet_params_of(const BrainGenome& g) {
     for (int m = 0; m < kBrainModuleCount; ++m)
         p.pops[m] = static_cast<std::uint16_t>(
             clampi(g.slow[m], 0, 100));
+    // Phase 11: population profile scales module populations
+    // (0 = Minimal 0.5x, 1 = Standard 1x, 2 = Full 1.5x), floor 4.
+    p.profile = static_cast<std::uint8_t>(clampi(g.slow[47], 0, 2));
+    {
+        const std::int32_t sc = p.profile == 0 ? 1 : (p.profile == 2 ? 3 : 2);
+        for (int m = 0; m < kBrainModuleCount; ++m)
+            p.pops[m] = static_cast<std::uint16_t>(
+                clampi(static_cast<std::int64_t>(p.pops[m]) * sc / 2, 4, 200));
+    }
     p.threshold = static_cast<std::int16_t>(
         clampi(g.slow[12], 40, 160) * 8);
     p.reset = static_cast<std::int16_t>(
@@ -177,6 +193,8 @@ BrainNetParams brainnet_params_of(const BrainGenome& g) {
         g.slow[42] == 0 ? 6 : clampi(g.slow[42], 2, 16));
     p.plastic_rate = clampi(g.slow[43], 0, 255) * 4;
     p.reward_rate = clampi(g.slow[44], 0, 255) * 4;
+    p.mod_sens_pm = clampi(g.slow[45], 0, 127) * 8;
+    p.rollout_budget_pm = clampi(g.slow[46], 0, 127) * 8;
     return p;
 }
 
@@ -326,11 +344,15 @@ void brain_vital_tick(World& w, BrainSlot& s, const Entity* me,
         clampi(stress, 0, 1000)                                // cortisol: stress
     };
     static const std::uint8_t kModShift[kBModCount] = {3, 5, 3, 4, 5, 4, 6};
+    // Phase 9: genome-tunable neuromodulator sensitivity scales the
+    // per-tick pull toward each modulator's target (spec §23).
+    const std::int64_t sens = s.net.mod_sens_pm;
     for (int i = 0; i < kBModCount; ++i) {
-        const std::int64_t d = tgt[i] - v.mod[i];
+        const std::int64_t step =
+            (tgt[i] - v.mod[i]) >> kModShift[i];
         v.mod[i] = static_cast<std::int16_t>(
-            clampi(static_cast<std::int64_t>(v.mod[i]) + (d >> kModShift[i]),
-                   0, 1000));
+            clampi(static_cast<std::int64_t>(v.mod[i]) +
+                       step * sens / 1000, 0, 1000));
     }
 
     // ---- emotional dimensions (emerge from drives+neuro+memory) --------------
@@ -475,7 +497,8 @@ void brain_reward_plasticity(BrainSlot& s, std::int64_t rpe,
     std::int64_t eff = rpe;
     if (aversive && eff > -200) eff = -200;
     if (eff == 0) return;
-    const std::int32_t rate = net.reward_rate;
+    const std::int32_t rate =
+        net.reward_rate * net.plastic_scale_pm / 1000;
     const std::int32_t gate = std::max<std::int32_t>(
         64, std::min<std::int32_t>(2500, net.stdp_gate));
     // dw delta: |rpe| 1000 -> ~rate*gate/100000*8 dw units; clamp sane.
@@ -557,7 +580,8 @@ void brain_goals_update(World& w, BrainSlot& s,
         if (nmem > 0) add(12, 350 + std::min<std::int64_t>(nmem, 6) * 60, 3);
     }
     // write top wants into goal slots (stable: refresh by origin+verb)
-    for (Want& wt : wants) {
+    for (int wi = 0; wi < nw; ++wi) {
+        const Want& wt = wants[wi];
         BrainGoal* slot = nullptr;
         for (BrainGoal& g : c.goals)
             if (g.active && g.verb == wt.verb && g.origin == wt.org) {
@@ -674,7 +698,8 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
     slot.net.init(w.world_seed, npc, p.pops, p.threshold, p.reset,
                   p.leak_shift, p.refractory, p.ei_permille,
                   p.density_permille, p.tract_gain,
-                  p.stdp_window, p.plastic_rate, p.reward_rate);
+                  p.stdp_window, p.plastic_rate, p.reward_rate,
+                  p.mod_sens_pm, p.rollout_budget_pm);
     auto [ins, ok] = store.slots.emplace(npc, std::move(slot));
     (void)ok;
     return ins->second;
@@ -999,6 +1024,22 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     // dopamine gate for this burst's STDP (spec §13.2)
     net.stdp_gate = static_cast<std::int32_t>(clampi(
         200 + s.vital.mod[kBModDopa] * 2, 64, 2200));
+
+    // ---- Phase 9: age-dependent development (spec §23) ------------------------
+    // Juveniles (< adult_age) are hyper-plastic but plan less; adults keep
+    // baseline plasticity with full rollout capacity (motor refinement).
+    bool juvenile = false;
+    {
+        static thread_local SeqPidCache ac_;
+        SeqPid ap(ac_, w.props);
+        const PropId age_p = ap("age"), adult_p = ap("adult_age");
+        const std::int64_t age =
+            age_p != kNoProp ? w.prop_int(*me, age_p, 0) : 0;
+        const std::int64_t adult =
+            adult_p != kNoProp ? w.prop_int(*me, adult_p, 200) : 200;
+        juvenile = adult > 0 && age >= 0 && age < adult;
+    }
+    net.plastic_scale_pm = juvenile ? 1300 : 1000;
 
     SensorVec sv = sensor_encode(w, npc, &s.last_action);
     // perceptual uncertainty (spec §9.2): low acetylcholine -> deterministic
@@ -1351,8 +1392,17 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     {
         const bool reflex = ns.panic > 700 || ns.rage > 700;
         const bool uncertain = s.vital.mod[kBModAchi] < 350;
+        // Phase 9: genome rollout budget (permille) gates planning
+        // frequency deterministically per (world, npc, tick); juveniles
+        // get 60% of the budget (spec §23).
+        const std::int64_t rb =
+            net.rollout_budget_pm * (juvenile ? 600 : 1000) / 1000;
+        const bool afford = rb >= 1024 ||
+            (static_cast<std::int64_t>(Rng::hash(
+                 w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^
+                 (w.clock_.tick() * 0xBF58476D1CE4E5B9ull))) % 1024) < rb;
         const bool want_plan =
-            !reflex && ncand > 1 &&
+            !reflex && ncand > 1 && afford &&
             (s.cog.plan_trigger || s.cog.conflict > 0 ||
              s.vital.last_sigma > 750 || uncertain);
         if (want_plan) {

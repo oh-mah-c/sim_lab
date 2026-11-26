@@ -46,7 +46,13 @@ struct BrainGenome;
 //   [16]      ei_permille/8   (0..127 -> 0..1016 inhibitory neurons)
 //   [17]      density_permille/8 (0..127 -> local recurrence density)
 //   [18..41]  per-tract gain/2 (0..127 -> 0..254; 0 = table default)
-//   [42..95]  reserved (future: modulator sensitivities, cognitive biases)
+//   [42]      stdp_window ticks (0 -> default 6)
+//   [43]      plastic_rate /4 permille
+//   [44]      reward_rate /4 permille
+//   [45]      neuromodulator sensitivity /8 permille (0..127 -> 0..1016)
+//   [46]      rollout budget /8 permille (0..127 -> planning frequency)
+//   [47]      population profile (0=min 0.5x, 1=std 1x, 2=full 1.5x)
+//   [48..95]  reserved
 constexpr std::size_t kConnectomeBytes = 96;
 
 // Decoded + sanitized connectome parameters (what BrainNet::init consumes).
@@ -63,6 +69,10 @@ struct BrainNetParams {
     std::uint8_t stdp_window = 6;      // causal window, neural ticks
     std::int32_t plastic_rate = 400;   // permille STDP step scale
     std::int32_t reward_rate = 400;    // permille reward-mod step scale
+    // Phase 9 heritable cognitive/genetic params:
+    std::int32_t mod_sens_pm = 1000;   // neuromodulator rate sensitivity
+    std::int32_t rollout_budget_pm = 1024;  // planning frequency permille
+    std::int32_t profile = 1;          // 0=min,1=std,2=full population
 };
 
 // Decode genome.slow into params, clamping every lane to its domain.

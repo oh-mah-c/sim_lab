@@ -1386,3 +1386,42 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
     BrainSocial.key = hash(entity^const) — not reversible.
   - brain_state_hash mixes exp_rew/last_rpe/dw/cog.*; save v29 writes
     them all (dw as raw blob).
+- Phases 9-11 (genetics/development, serialization/regression, AVX2/scale):
+  - Genome slow[45]=mod_sens (/8 permille -> BrainNetParams.mod_sens_pm,
+    scales per-tick neuromodulator pull in brain_vital_tick),
+    slow[46]=rollout_budget (/8 permille -> rollout_budget_pm; gates
+    planning frequency via deterministic hash(wseed^npc^tick)%1024,
+    juveniles get x0.6), slow[47]=population profile (0=min 0.5x,
+    1=std 1x, 2=full 1.5x pops, floor 4 — decoded in brainnet_params_of).
+    Baldwin separation preserved: dw/memories never enter child genomes.
+  - Age-dependent development (spec §23): brain_decide reads age/
+    adult_age props once per burst; juvenile (<adult_age) sets
+    net.plastic_scale_pm=1300 (hyper-plastic STDP + reward rates, both
+    scaled inside BrainNet::step / brain_reward_plasticity), adults 1000.
+    plastic_scale_pm is transient (re-derived per decide, not serialized).
+  - AVX2: BrainNet::lif_module_avx2 (compiled only under __AVX2__, i.e.
+    MODE=release -march=native) does the per-module LIF update 8-wide via
+    SoA staging; avx_trunc_shr reproduces C++ trunc-toward-zero leak
+    division exactly. Bit-identical to scalar — verified by
+    test_neural_core (8) comparing full state + dw with avx2 on/off.
+    net.avx2 flag toggles the path (transient).
+  - LATENT BUG FIXED: connectome local-recurrence self-avoid used a
+    do-while retrying the SAME hash salt — a self-collision looped
+    forever (found via -O3/-O2 divergence hunt). Now a deterministic
+    +1 shift; only affects the rare collision case.
+  - LATENT BUG FIXED (dev!=release): brain_goals_update iterated ALL 8
+    `Want wants[8]` slots although only `nw` were initialized — garbage
+    verb/pri/org leaked into cog.goals, and the stack garbage differed
+    between -O2 and -O3. Fixed by bounding the loop to `nw`. This was
+    the sole cause of the release/dev brain_state_hash divergence;
+    verified bit-identical state dumps after the fix.
+  - Phase 10 verified: dev(-O2) == release(-O3 -flto -march=native)
+    brain_state_hash, Scalar == AVX2 (BB_SCALAR=1), t1 == t8
+    (parallel_think determinism) — all identical.
+  - Benchmark: tools/brain_bench.cpp measures brain_decide throughput
+    (parallel_think-style partitioning, world frozen so population is
+    stable). Release build, 16 threads: ~14 us/NPC/round, ~72k
+    decisions/s, linear 100->10k NPCs; ~203 KB brain state/NPC
+    (synapses+dw dominate); save ~1ms/10k NPCs serialized, load ~3.8s.
+    NOTE: autonomous_run populations starve ~cycle 19 without food —
+    the bench measures neural throughput, not survival.

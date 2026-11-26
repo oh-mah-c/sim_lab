@@ -10169,6 +10169,63 @@ static void test_neural_core() {
         CHECK(q.threshold == 320);        // 40*8 floor
         CHECK(q.ei_permille == 0);        // -50 -> clamped 0
     }
+
+    // (7) Phase 9 genome params: mod_sens / rollout_budget / profile --------
+    {
+        BrainGenome g = brain_default_genome();
+        BrainNetParams p = brainnet_params_of(g);
+        CHECK(p.mod_sens_pm == 1000);       // slow[45]=125 *8
+        CHECK(p.rollout_budget_pm == 1016); // slow[46]=127 *8
+        CHECK(p.profile == 1);
+        CHECK(p.pops[static_cast<int>(BrainModule::kMotorCortex)] == 64);
+        g.slow[47] = 0;                     // Minimal profile -> 0.5x pops
+        p = brainnet_params_of(g);
+        CHECK(p.pops[static_cast<int>(BrainModule::kMotorCortex)] == 32);
+        CHECK(p.pops[static_cast<int>(BrainModule::kBrainstem)] == 12);
+        g.slow[47] = 2;                     // Full profile -> 1.5x pops
+        p = brainnet_params_of(g);
+        CHECK(p.pops[static_cast<int>(BrainModule::kMotorCortex)] == 96);
+        g.slow[47] = 9;                     // out of range -> sanitized 2? no:
+        brainnet_sanitize(g.slow);          // sanitize clamps to [0,2]
+        CHECK(g.slow[47] == 2);
+        g.slow[45] = -5;                    // negative clamps to 0
+        brainnet_sanitize(g.slow);
+        CHECK(g.slow[45] == 0);
+    }
+
+    // (8) Phase 11: AVX2 LIF path bit-identical to scalar --------------------
+    {
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        for (int m = 0; m < kBrainModuleCount; ++m)
+            pops[m] = static_cast<std::uint16_t>(24 + (m % 3));
+        auto tg = mk_params();
+        BrainNet a, b;
+        a.init(77, 555, pops, 800, -200, 5, 2, 200, 120, tg);
+        b.init(77, 555, pops, 800, -200, 5, 2, 200, 120, tg);
+#if defined(__AVX2__)
+        b.avx2 = false;   // force scalar path; a uses AVX2 where compiled
+#endif
+        // identical input stream: mixed inject + steps + plasticity active.
+        // currents span negative..strongly-positive so real spikes fire.
+        for (int k = 0; k < 60; ++k) {
+            const std::int32_t cur =
+                static_cast<std::int32_t>((k * 37) % 9000) - 1000;
+            a.inject(static_cast<std::uint8_t>(k % 12),
+                     static_cast<std::uint32_t>(k * 7) % 24, cur);
+            b.inject(static_cast<std::uint8_t>(k % 12),
+                     static_cast<std::uint32_t>(k * 7) % 24, cur);
+            a.step(); b.step();
+        }
+        CHECK(a.spikes > 0);   // sanity: the stream actually drives spikes
+        bool same = a.tick == b.tick && a.spikes == b.spikes &&
+                    a.dropped_kicks == b.dropped_kicks;
+        for (std::uint32_t i = 0; same && i < a.neuron_count; ++i)
+            same = a.st[i].membrane == b.st[i].membrane &&
+                   a.st[i].syn_input == b.st[i].syn_input &&
+                   a.st[i].refractory_left == b.st[i].refractory_left;
+        CHECK(same);
+        CHECK(a.dw == b.dw);   // STDP deltas identical too
+    }
 }
 
 // 12-module anatomical connectome: populations, tracts, decide, inheritance.
