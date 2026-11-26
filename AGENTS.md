@@ -1175,3 +1175,55 @@ no engine code changes.
   layer into valw (OOB) and zero_bias/clamp_bias/bias-copy left
   wm2b[25] uninitialized. All wm2 row counts now use kLabelChannels
   (Brain.cpp layout, install, child-genome remap, mac accounting).
+
+## Emergent culture, archaeology & tribal mythology (Engraved Engrams + Oral Doctrine)
+
+- `AgentMind::DoctrineSlot` (max 4, Cognition.hpp): tribal beliefs/taboos —
+  `trig_kind` 0=prop-threshold / 1=material / 2=synth-recipe / 3=kind-name,
+  `verb` (-1 = any), `valence` -1000..+1000 (taboo vs reverence),
+  `depth` = oral generations survived, `seed`/`last_tick`. Agent knowledge
+  only — never World Truth.
+- Seeding (`doctrine_from_event`, hooked into learn_from_event +
+  witness_from_event): `detonation` ledger events -> flammability>=500
+  taboo (valence -700/-900 scaled by integrity->0 deaths in ev.changes);
+  `consume` events that reduced `toxin_load` -> sacred-material +
+  synth-recipe reverence (+900); `self_plague`/`self_famine` fabricated
+  events from drift_needs edge detection (infection_level>=800 /
+  nutrition<=150, `docseed:` belief marker fires once).
+- Oral drift (`doctrine_drift`, once per advance_ticks, period 150,
+  Euclid `doctrine_accum`): calm (panic<200) same-tongue
+  (tongue_kinship>700) kin within earshot share strongest slot;
+  receiver copy gets depth+1 and +-5% hash-seeded valence jitter
+  (telephone game). `doctrine_upsert` dedups on trigger+verb identity,
+  evicts weakest |valence| when full.
+- Behavioral bias (`doctrine_bias_for` in brain_decide): valence/4 scaled
+  by (1000-panic)/1000 per matching (verb,target) candidate — soft additive
+  score, returns 0 when actor hunger>900 (starvation overrides dogma).
+- InscribedArtifact (SocialLaws predict_engrave): the spawned `inscription`
+  entity gets `artifact_engrams` text prop — up to 4 `E|verb|charge|sigma|
+  focus|synth|whHex|w1hHex|yHex` lines distilled from the author's top-4
+  replay transitions (charge*4+sigma ranking, same as dream). Codec:
+  `engram_encode/decode` in Cognition.cpp.
+- Read assimilation (social_from_event read branch): after the existing
+  comprehension gates, `artifact_engrams` decode -> per engram
+  `brain_assimilate` (Brain.cpp): payload enters the replay ring
+  (stratified replace) then `dream_replay_top4(store, slot, comp)` —
+  the extracted dream helper now takes a scale_permille (1000 = natural
+  sleep; dream deltas `d*scale/1000`). Comprehension: same/close tongue
+  (kin>600) = 1000; foreign/dead = 250 + 200 if hidden>=80 + up to 300
+  per prior `study:<insc>` reading (cap 750). Also upserts a
+  comprehension-scaled episodic memory of `focus` and teaches
+  `synth:<id>` DiscoveryRecords for synthesized recipes.
+- Detonation trauma: `World::detonation_drift` now notifies minds like
+  interact does — participants learn_from_event, in-sight minds
+  witness_from_event (sorted sets, deterministic).
+- Save format v27: per-mind `doctrine_accum` + `doctrines[]`
+  (trig_prop by NAME); state_hash mixes both.
+- Viewer: `myth_scan`/`llm_myth_drain` in viewer_main — DoctrineSlots at
+  depth>=3 and artifact_engrams inscriptions get MYTH_TITLE=/SCRIPTURE=
+  prompts; [MYTH] blocks append to saves/tribal_mythology.txt
+  (myth_record_line format) + chronicle fact. Presentation only.
+- Verified: test_culture_archaeology 46 checks — engrave payload round-
+  trip, brain_assimilate dose-response (comp 0/250/1000 weight deltas),
+  oral transmission depth+drift, taboo bias + hunger>900 override,
+  save/load hash equality.

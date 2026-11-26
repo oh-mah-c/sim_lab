@@ -280,6 +280,23 @@ struct Viewer {
     std::deque<std::uint64_t> llm_mat_outstanding;
     std::vector<MatEntry> mat_entries;              // catalog (file-backed)
     std::string mat_path = "saves/discovered_materials.txt";
+    // ---- Tribal mythology: Qwen myth-maker --------------------------------
+    // DoctrineSlots that survive >=3 oral generations (or InscribedArtifact
+    // engram carvings) get a MYTH_TITLE=/SCRIPTURE= prompt; completed pairs
+    // append a [MYTH] block (myth_record_line format) to
+    // saves/tribal_mythology.txt and a chronicle fact. Presentation only.
+    struct MythPending {
+        AgentMind::DoctrineSlot doc;  // the crystallized tradition (artifacts: synthetic focus slot)
+        std::int64_t lang = 0;        // tribe language_id (0 = artifact unknown)
+        bool artifact = false;        // true = inscription translation request
+        EntityId insc = kNoEntity;
+        std::uint64_t tick = 0;
+        Vec2 pos{};
+    };
+    std::unordered_map<std::uint64_t, MythPending> llm_myth_pending;
+    std::deque<std::uint64_t> llm_myth_outstanding;
+    std::set<std::string> myth_seen;                // doctrine dedup keys
+    std::string myth_path = "saves/tribal_mythology.txt";
     // smooth camera fly-to (chapter click)
     bool cam_goal = false;
     float cam_gx = 0, cam_gy = 0, cam_gz = 1;
@@ -496,6 +513,8 @@ struct Viewer {
         llm_pending.clear(); llm_outstanding.clear(); llm_last_tell.clear();
         mat_scanned = 0; llm_mat_pending.clear(); llm_mat_outstanding.clear();
         mat_entries.clear(); mat_load();
+        llm_myth_pending.clear(); llm_myth_outstanding.clear();
+        myth_load();
         cap_scratch = CaptureScratch{};
         snap = RenderSnapshot{}; snap_back = RenderSnapshot{}; snap_gen = 0;
         fog_tex_gen = mini_fog_gen = globe_fog_gen = ~0ull;
@@ -3911,6 +3930,211 @@ struct Viewer {
         llm_mat_outstanding.swap(keep);
     }
 
+    // ---- tribal mythology: scan + drain --------------------------------------
+    // Dedup key mirrors doctrine_key() (Cognition.cpp, anonymous namespace):
+    // "kind:prop:thr:id:text:verb" — rebuilt field-by-field here.
+    static std::string myth_dkey(const AgentMind::DoctrineSlot& d) {
+        std::ostringstream o;
+        o << static_cast<int>(d.trig_kind) << ':' << d.trig_prop << ':'
+          << d.trig_thr << ':' << d.trig_id << ':' << d.trig_text << ':'
+          << d.verb;
+        return o.str();
+    }
+    static std::string myth_focus_text(const World& w,
+                                       const AgentMind::DoctrineSlot& d) {
+        switch (d.trig_kind) {
+        case 0: {
+            std::string pn = "a property";
+            if (d.trig_prop != kNoProp)
+                if (const PropertyDef* pd = w.props.find(d.trig_prop))
+                    pn = pd->name;
+            return pn + " >= " + std::to_string(d.trig_thr);
+        }
+        case 1: {
+            const MaterialDef* md =
+                w.materials.find(static_cast<MaterialId>(d.trig_id));
+            return "the material '" +
+                (md ? md->name : std::string("?")) + "'";
+        }
+        case 2:
+            return "synthesis recipe #" + std::to_string(d.trig_id);
+        case 3:
+            return "the " + d.trig_text + " kind";
+        }
+        return "an unknown focus";
+    }
+    void myth_load() {
+        // repopulate myth_seen from the file so a restarted viewer does not
+        // re-ask Qwen for myths it already scripted (id= + tribe= fields).
+        myth_seen.clear();
+        std::ifstream f(myth_path);
+        if (!f) return;
+        std::string line, id, tribe;
+        auto flush = [&]() {
+            if (!id.empty())
+                myth_seen.insert("d:" + tribe + ":" + id);
+            id.clear(); tribe.clear();
+        };
+        while (std::getline(f, line)) {
+            if (line == "[MYTH]") { flush(); continue; }
+            if (line.rfind("id=doctrine:", 0) == 0)
+                id = line.substr(12);
+            else if (line.rfind("tribe=", 0) == 0)
+                tribe = line.substr(6);
+            else if (line.rfind("id=a", 0) == 0)
+                myth_seen.insert("a:" + line.substr(3));
+        }
+        flush();
+    }
+    void myth_scan(const World& w) {
+        if (!llm_host.active()) return;
+        const PropId p_lang = SIMLAB_PID(w.props, "language_id");
+        const PropId p_art = SIMLAB_PID(w.props, "artifact_engrams");
+        const auto submit = [&](std::uint64_t key, MythPending&& mp,
+                                const std::string& user) {
+            llm_myth_pending.emplace(key, std::move(mp));
+            llm_myth_outstanding.push_back(key);
+            llm_host.submit_prompt(key,
+                "You are the Myth-Keeper of Sunnyworld. Output only the two "
+                "requested lines, nothing else.", user);
+        };
+        // ---- crystallized oral traditions: depth >= 3 retellings ----------
+        for (const auto& [mid, m] : w.minds_) {
+            const Entity* me = w.find(mid);
+            if (!me || !me->alive) continue;
+            const std::int64_t lang = p_lang != kNoProp
+                ? w.prop_int(*me, p_lang, 0) : 0;
+            for (const AgentMind::DoctrineSlot& d : m.doctrines) {
+                if (d.depth < 3) continue;
+                const std::string dkey = myth_dkey(d);
+                if (!myth_seen.insert("d:" + std::to_string(lang) + ":" +
+                                      dkey).second) continue;
+                MythPending mp;
+                mp.doc = d; mp.lang = lang; mp.tick = d.last_tick;
+                mp.pos = me->pos;
+                const std::string conlang =
+                    "speech-community " + std::to_string(lang);
+                const std::string event =
+                    d.valence < -500 ? "a catastrophe" :
+                    d.valence > 500 ? "a salvation" : "an event";
+                const std::string focus = myth_focus_text(w, d);
+                const std::string vword = d.valence < 0
+                    ? "taboo" : "reverence";
+                std::ostringstream u;
+                u << "A tribe speaking " << conlang << " has passed down an "
+                  << "oral tradition for " << d.depth
+                  << " generations following " << event << " tied to "
+                  << focus << ", resulting in a cultural " << vword
+                  << " toward " << focus << ".\n\n"
+                  << "Write a short mythic title (max 4 words) and a "
+                  << "1-sentence sacred proverb or taboo law.\n"
+                  << "MYTH_TITLE=\nSCRIPTURE=";
+                const std::uint64_t key = Rng::hash(
+                    w.world_seed ^ (mid * 0x9E3779B97F4A7C15ull) ^
+                    (static_cast<std::uint64_t>(d.depth) << 8) ^
+                    std::hash<std::string>{}(dkey));
+                submit(key, std::move(mp), u.str());
+            }
+        }
+        // ---- InscribedArtifact translations --------------------------------
+        for (EntityId iid : w.entities_of_kind(SIMLAB_KIND("inscription"))) {
+            const Entity* ie = w.find(iid);
+            if (!ie || !ie->alive || !myth_seen.insert(
+                    "a:" + std::to_string(iid)).second) continue;
+            if (p_art == kNoProp) continue;
+            const Value* av = w.prop_of(*ie, p_art);
+            if (!av || av->type != ValType::Text || av->s.empty()) continue;
+            MythPending mp;
+            mp.artifact = true; mp.insc = iid; mp.tick = w.clock_.tick();
+            mp.pos = ie->pos;
+            if (p_lang != kNoProp) {
+                const Value* lv = w.prop_of(*ie, p_lang);
+                if (lv && lv->type == ValType::Integer) mp.lang = lv->i;
+            }
+            // synthetic focus slot so myth_record_line still emits [MYTH]
+            mp.doc.trig_kind = 3;
+            mp.doc.trig_text = "artifact";
+            mp.doc.trig_id = static_cast<std::uint64_t>(iid);
+            mp.doc.last_tick = w.clock_.tick();
+            const std::string conlang =
+                "speech-community " + std::to_string(mp.lang);
+            std::size_t n_eng = 0;
+            {
+                std::istringstream ls(av->s); std::string ln;
+                while (std::getline(ls, ln))
+                    if (ln.rfind("E|", 0) == 0) ++n_eng;
+            }
+            std::ostringstream u;
+            u << "An ancient inscription carved by a " << conlang
+              << " speaker holds " << n_eng
+              << " engraved neural memories — distilled experience of a "
+              << "dead or living tribe. Translate its sacred meaning.\n\n"
+              << "Write a short mythic title (max 4 words) and a "
+              << "1-sentence sacred proverb or taboo law.\n"
+              << "MYTH_TITLE=\nSCRIPTURE=";
+            const std::uint64_t key = Rng::hash(
+                w.world_seed ^ (iid * 0xD1B54A32D192ED03ull) ^
+                0x4D595448ull);
+            submit(key, std::move(mp), u.str());
+        }
+    }
+    void llm_myth_drain() {
+        if (llm_myth_outstanding.empty()) return;
+        std::deque<std::uint64_t> keep;
+        for (std::uint64_t key : llm_myth_outstanding) {
+            std::string text;
+            if (!llm_host.poll(key, text)) { keep.push_back(key); continue; }
+            auto it = llm_myth_pending.find(key);
+            if (it == llm_myth_pending.end()) continue;
+            MythPending mp = std::move(it->second);
+            llm_myth_pending.erase(it);
+            // parse MYTH_TITLE= / SCRIPTURE= (tolerant, like mat_clean)
+            std::string title, scripture;
+            std::istringstream ls(text);
+            std::string line;
+            while (std::getline(ls, line)) {
+                std::string t = mat_clean(line, 400);
+                if (t.empty()) continue;
+                std::string up = t;
+                for (char& ch : up) ch = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(ch)));
+                auto strip_key = [&](const char* k) -> bool {
+                    std::string p = k; p += "=";
+                    if (t.rfind(p, 0) == 0) { t = t.substr(p.size()); return true; }
+                    p = k; p += ":";
+                    if (t.rfind(p, 0) == 0) { t = t.substr(p.size()); return true; }
+                    return false;
+                };
+                if (up.rfind("MYTH_TITLE", 0) == 0 && strip_key("MYTH_TITLE")) {
+                    title = mat_clean(t, 80); continue;
+                }
+                if (up.rfind("SCRIPTURE", 0) == 0 && strip_key("SCRIPTURE")) {
+                    if (!scripture.empty()) scripture += " ";
+                    scripture += mat_clean(t, 300); continue;
+                }
+                if (title.empty()) title = mat_clean(t, 80);
+                else { if (!scripture.empty()) scripture += " ";
+                       scripture += mat_clean(t, 300); }
+            }
+            title = mat_clean(title, 80);
+            scripture = mat_clean(scripture, 300);
+            if (title.empty()) continue;
+            const std::string rec =
+                myth_record_line(mp.doc, mp.lang, title, scripture);
+            {
+                std::error_code ec;
+                std::filesystem::create_directories("saves", ec);
+                std::ofstream f(myth_path, std::ios::app);
+                if (f) f << rec << "\n";
+            }
+            if (chron_facts.size() < kChronFactCap)
+                chron_facts.push_back({mp.tick,
+                    "the tribe keeps the myth '" + title + "'",
+                    mp.pos});
+        }
+        llm_myth_outstanding.swap(keep);
+    }
+
     void llm_scan(const World& w) {
         // Chapter facts are collected whether or not the model is loaded —
         // chron_tick() persists them as raw "Records" chapters, so the
@@ -4185,7 +4409,7 @@ struct Viewer {
                 }
                 // LLM chronicler: same incremental ledger scan, salient events
                 // only; results re-enter cfeed tagged llm=true.
-                if (frames % 4 == 2) { llm_scan(w); llm_drain(); mat_scan(w); llm_mat_drain(); chron_tick(w); llm_ch_drain(); }
+                if (frames % 4 == 2) { llm_scan(w); llm_drain(); mat_scan(w); llm_mat_drain(); myth_scan(w); llm_myth_drain(); chron_tick(w); llm_ch_drain(); }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
                     c_av_verbs.clear(); c_av_line.clear();

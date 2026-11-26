@@ -1756,6 +1756,7 @@ void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
         }
     }
     learn_harm_taboo(w, npc, *ev);
+    doctrine_from_event(w, npc, *ev);
     // Ebbinghaus encoding: the actor's memory of every other participant
     // is charged by what the event meant to them (death, harm, crisis meal).
     if (const Entity* me = w.find(npc)) {
@@ -1826,6 +1827,7 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
     learn_outcomes(w, mind, ev, 8, /*self=*/false, /*mark_observed=*/false);
     learn_yields(w, mind, ev, 8, /*self=*/false);
     learn_harm_taboo(w, npc, ev);
+    doctrine_from_event(w, npc, ev);
     // The witness also forms (or refreshes) engrams of who was involved.
     if (const Entity* me = w.find(npc)) {
         const MindParams mp = mind_params(w, *me);
@@ -3187,6 +3189,99 @@ void social_from_event(World& w, EntityId actor,
                             std::min<std::int64_t>(1000, lv2->i));
                         nb.status = BeliefStatus::Observed;
                         nb.last_tick = ev.tick;
+                    }
+                }
+            }
+            // ---- InscribedArtifact: engraved neural engrams -----------------
+            // Top-charge CL-1 transitions carved by an ancestor replay through
+            // the reader's own world model at `comprehension` strength:
+            // same tongue -> full dose; dead language -> 25%, growing with
+            // hidden size (>=80 scholar) and repeated study cycles.
+            if (insc_e && comprehensible) {
+                const PropId p_art = s_pid(w, "artifact_engrams");
+                const Value* av = p_art != kNoProp
+                    ? w.prop_of(*insc_e, p_art) : nullptr;
+                if (av && av->type == ValType::Text && !av->s.empty()) {
+                    std::int64_t comp = 1000;
+                    std::int64_t rlang = 0, ilang = insc_lang;
+                    {
+                        const PropId pl3 = s_pid(w, "language_id");
+                        const Entity* re = w.find(actor);
+                        if (pl3 != kNoProp && re)
+                            rlang = w.prop_int(*re, pl3, 0);
+                    }
+                    const std::int64_t kin = tongue_kinship(rlang, ilang);
+                    if (kin <= 600) {
+                        // dead/foreign tongue: quarter dose, scholars and
+                        // repeat readers decipher more (study:<id> counts)
+                        std::int64_t studies = 0;
+                        const Belief* sb = w.mind(actor).find_belief(
+                            "study:" + std::to_string(insc_id));
+                        if (sb) studies = sb->confidence / 100;
+                        comp = 250;
+                        if (w.brains_) {
+                            const auto bit = w.brains_->slots.find(actor);
+                            if (bit != w.brains_->slots.end() &&
+                                bit->second.hidden >= 80) comp += 200;
+                        }
+                        comp = std::min<std::int64_t>(750,
+                            comp + std::min<std::int64_t>(300, studies * 100));
+                    }
+                    // count this reading for next time's decipherment
+                    {
+                        Belief& sb = w.mind(actor).belief(
+                            "study:" + std::to_string(insc_id));
+                        sb.confidence = std::min<std::int64_t>(1000,
+                            sb.confidence + 100);
+                        sb.last_tick = ev.tick;
+                    }
+                    const std::vector<EngramPayload> eps =
+                        engram_decode(av->s);
+                    AgentMind& rm = w.mind(actor);
+                    const MindParams rmp = mind_params(w, *w.find(actor));
+                    for (std::size_t ei = 0; ei < eps.size(); ++ei) {
+                        const EngramPayload& ep = eps[ei];
+                        brain_assimilate(w, actor, ep.verb,
+                            static_cast<std::int64_t>(ep.charge),
+                            static_cast<std::int64_t>(ep.sigma),
+                            static_cast<std::uint64_t>(insc_id) ^
+                                (static_cast<std::uint64_t>(ei) << 40),
+                            ep.wh.data(), ep.w1h.data(), ep.y.data(), comp);
+                        // episodic echo: the focused entity enters memory
+                        // at comprehension-scaled charge
+                        if (ep.focus != 0 && w.find(
+                                static_cast<EntityId>(ep.focus))) {
+                            AgentMind::MemorySnapshot snap =
+                                snapshot_now(w,
+                                    static_cast<EntityId>(ep.focus),
+                                    ev.tick);
+                            const std::int64_t chg = std::min<std::int64_t>(
+                                1000, static_cast<std::int64_t>(ep.charge)
+                                * comp / 1000);
+                            upsert_memory_g(w, rm,
+                                static_cast<EntityId>(ep.focus),
+                                std::move(snap), chg, rmp,
+                                sight_radius_of(w, *w.find(actor)));
+                        }
+                        // synthesized recipe -> a teachable claim so the
+                        // formula spreads mouth-to-ear like any discovery
+                        if (ep.synth != 0) {
+                            for (const World::SynthRecord& sr :
+                                    w.synthesized_) {
+                                if (sr.synth_id != ep.synth) continue;
+                                DiscoveryRecord d;
+                                d.key = "synth:" + std::to_string(ep.synth);
+                                d.claim = "synthesis " + sr.verb + " " +
+                                    std::to_string(sr.parent_a) + "+" +
+                                    std::to_string(sr.parent_b);
+                                d.status = DiscoveryStatus::Supported;
+                                d.evidence_for = 60;
+                                d.supporting_laws = {"synthesis"};
+                                d.last_tick = ev.tick;
+                                teach_record(rm, d, ev.tick);
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -4915,6 +5010,363 @@ std::int64_t arms_race_bonus(const World& w, const AgentMind& m,
     if (a == "treat") return bel("weapon_counter:toxin") / 2;
     if (a == "launch") return bel("weapon_counter:projectile") / 3;
     return 0;
+}
+
+// ================= Emergent culture, archaeology & tribal mythology =========
+// Everything below is agent knowledge (AgentMind) or artifact props — the
+// only World-Truth writes are the Inscription entity's own props, committed
+// through the normal interact -> causal event path.
+
+namespace {
+
+std::string hex_encode(const std::int8_t* p, std::size_t n) {
+    static const char* d = "0123456789abcdef";
+    std::string s; s.reserve(n * 2);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t b = static_cast<std::uint8_t>(p[i]);
+        s.push_back(d[b >> 4]); s.push_back(d[b & 15]);
+    }
+    return s;
+}
+int hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+bool hex_decode(const std::string& s, std::size_t off, std::int8_t* out,
+                std::size_t n) {
+    if (s.size() < off + n * 2) return false;
+    for (std::size_t i = 0; i < n; ++i) {
+        const int hi = hex_val(s[off + i * 2]), lo = hex_val(s[off + i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::int8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+// (parse_u64 comes from Types.hpp — simlab::parse_u64)
+
+// doctrine slot identity for dedup/drift — two slots are "the same myth"
+// when trigger + verb agree (valence/depth may differ).
+bool doctrine_same(const AgentMind::DoctrineSlot& a,
+                   const AgentMind::DoctrineSlot& b) {
+    return a.trig_kind == b.trig_kind && a.trig_prop == b.trig_prop &&
+           a.trig_thr == b.trig_thr && a.trig_id == b.trig_id &&
+           a.trig_text == b.trig_text && a.verb == b.verb;
+}
+std::string doctrine_key(const AgentMind::DoctrineSlot& d) {
+    std::ostringstream o;
+    o << static_cast<int>(d.trig_kind) << ':' << d.trig_prop << ':'
+      << d.trig_thr << ':' << d.trig_id << ':' << d.trig_text << ':' << d.verb;
+    return o.str();
+}
+// insert-or-refresh: full slot table replaces the weakest |valence| entry
+// when the newcomer is stronger; an existing identical myth refreshes
+// depth/valence only when the incoming telling is deeper.
+void doctrine_upsert(AgentMind& m, const AgentMind::DoctrineSlot& in) {
+    for (auto& d : m.doctrines)
+        if (doctrine_same(d, in)) {
+            if (in.depth > d.depth) { d.depth = in.depth; d.seed = in.seed; }
+            d.valence = in.valence;
+            d.last_tick = in.last_tick;
+            return;
+        }
+    if (m.doctrines.size() < AgentMind::kMaxDoctrines) {
+        m.doctrines.push_back(in);
+        return;
+    }
+    std::size_t weak = 0;
+    for (std::size_t i = 1; i < m.doctrines.size(); ++i) {
+        const std::int64_t ai = m.doctrines[i].valence < 0
+            ? -m.doctrines[i].valence : m.doctrines[i].valence;
+        const std::int64_t aw = m.doctrines[weak].valence < 0
+            ? -m.doctrines[weak].valence : m.doctrines[weak].valence;
+        if (ai < aw) weak = i;
+    }
+    const std::int64_t inw = in.valence < 0 ? -in.valence : in.valence;
+    const std::int64_t ww = m.doctrines[weak].valence < 0
+        ? -m.doctrines[weak].valence : m.doctrines[weak].valence;
+    if (inw > ww) m.doctrines[weak] = in;
+}
+
+}  // namespace
+
+std::string engram_encode(const EngramPayload& p) {
+    std::ostringstream o;
+    o << "E|" << p.verb << '|' << p.charge << '|' << p.sigma << '|'
+      << p.focus << '|' << p.synth << '|'
+      << hex_encode(p.wh.data(), p.wh.size()) << '|'
+      << hex_encode(p.w1h.data(), p.w1h.size()) << '|'
+      << hex_encode(p.y.data(), p.y.size());
+    return o.str();
+}
+
+std::vector<EngramPayload> engram_decode(const std::string& blob) {
+    std::vector<EngramPayload> out;
+    std::istringstream ls(blob);
+    std::string line;
+    while (std::getline(ls, line) && out.size() < 4) {
+        if (line.rfind("E|", 0) != 0) continue;
+        std::vector<std::string> f;
+        std::string cur;
+        std::istringstream fs(line.substr(2));
+        while (std::getline(fs, cur, '|')) f.push_back(cur);
+        if (f.size() != 8) continue;
+        EngramPayload p;
+        p.verb = std::atoi(f[0].c_str());
+        p.charge = simlab::parse_u64(f[1]);
+        p.sigma = simlab::parse_u64(f[2]);
+        p.focus = simlab::parse_u64(f[3]);
+        p.synth = simlab::parse_u64(f[4]);
+        if (p.verb < 0 || p.verb >= kActionVerbs) continue;
+        if (!hex_decode(f[5], 0, p.wh.data(), p.wh.size()) ||
+            !hex_decode(f[6], 0, p.w1h.data(), p.w1h.size()) ||
+            !hex_decode(f[7], 0, p.y.data(), p.y.size()))
+            continue;
+        out.push_back(p);
+    }
+    return out;
+}
+
+std::int64_t tongue_kinship(std::int64_t lang_a, std::int64_t lang_b) {
+    if (lang_a <= 0 || lang_b <= 0) return 0;
+    const std::uint64_t x =
+        static_cast<std::uint64_t>(lang_a) ^ static_cast<std::uint64_t>(lang_b);
+    return std::max<std::int64_t>(
+        0, 1000 - static_cast<std::int64_t>(__builtin_popcountll(x)) * 34);
+}
+
+bool doctrine_trigger_hits(const World& w, const Entity& e,
+                           const AgentMind::DoctrineSlot& d) {
+    switch (d.trig_kind) {
+    case 0: {   // property threshold — entity prop, else material default
+        if (d.trig_prop == kNoProp) return false;
+        return w.prop_int(e, d.trig_prop, 0) >= d.trig_thr;
+    }
+    case 1:     // specific material
+        return static_cast<std::uint64_t>(e.material) == d.trig_id;
+    case 2: {   // synthesized recipe: entity's material must be that synth
+        if (e.material == kNoMaterial) return false;
+        for (const World::SynthRecord& r : w.synthesized_)
+            if (r.synth_id == d.trig_id &&
+                static_cast<std::uint64_t>(r.material) ==
+                    static_cast<std::uint64_t>(e.material))
+                return true;
+        return false;
+    }
+    case 3:     // entity kind name (interned compare, runtime string OK)
+        return e.kind_name == KindName(d.trig_text);
+    }
+    return false;
+}
+
+std::int64_t doctrine_bias_for(const World& w, const AgentMind& mind,
+                               const Entity& actor, int verb,
+                               const Entity* target) {
+    if (mind.doctrines.empty() || !target) return 0;
+    const PropId hp = SIMLAB_PID(w.props, "hunger");
+    if (hp != kNoProp && w.prop_int(actor, hp, 0) > 900) return 0;  // starving
+    std::int64_t bias = 0;
+    for (const AgentMind::DoctrineSlot& d : mind.doctrines) {
+        if (d.verb >= 0 && d.verb != verb) continue;
+        if (!doctrine_trigger_hits(w, *target, d)) continue;
+        // valence -1000..+1000 -> +-250 score; panic dampens the pull of
+        // dogma (calm/social minds obey taboos, terrified ones don't).
+        const std::int64_t panic = mind.neuro.panic;
+        const std::int64_t calm = 1000 - std::min<std::int64_t>(panic, 1000);
+        bias += d.valence * calm / 4000;
+    }
+    return bias;
+}
+
+void doctrine_from_event(World& w, EntityId npc, const CausalEvent& ev) {
+    if (npc == kNoEntity || ev.failed || !w.find_mind(npc)) return;
+    AgentMind* mp = nullptr;
+    auto seed = [&](std::uint8_t kind, PropId prop, std::int64_t thr,
+                    std::uint64_t id, const std::string& text, int verb,
+                    std::int64_t valence) {
+        AgentMind& m = w.mind(npc);
+        if (!mp) mp = &m;
+        // already carrying this myth? deepen it instead of duplicating
+        for (auto& d : m.doctrines)
+            if (d.trig_kind == kind && d.trig_prop == prop &&
+                d.trig_thr == thr && d.trig_id == id &&
+                d.trig_text == text && d.verb == verb) {
+                d.valence = std::clamp<std::int64_t>(
+                    d.valence + valence / 4, -1000, 1000);
+                d.last_tick = ev.tick;
+                return;
+            }
+        AgentMind::DoctrineSlot d;
+        d.trig_kind = kind; d.trig_prop = prop; d.trig_thr = thr;
+        d.trig_id = id; d.trig_text = text; d.verb = verb;
+        d.valence = std::clamp<std::int64_t>(valence, -1000, 1000);
+        d.depth = 0;
+        d.seed = Rng::hash(ev.id ^ (static_cast<std::uint64_t>(npc) << 20) ^
+                           static_cast<std::uint64_t>(valence));
+        d.last_tick = ev.tick;
+        doctrine_upsert(m, d);
+    };
+
+    // ---- catastrophe seeds --------------------------------------------------
+    if (ev.action == "detonation") {
+        // a blast teaches fire-aversion: anything remotely flammable is
+        // taboo until proven otherwise (valence scales with deaths seen)
+        const PropId p_int = SIMLAB_PID(w.props, "integrity");
+        std::int64_t dead = 0;
+        for (const StateChange& c : ev.changes)
+            if (c.prop == p_int && c.after.type == ValType::Integer &&
+                c.after.i == 0 && c.had_before &&
+                c.before.type == ValType::Integer && c.before.i > 0)
+                ++dead;
+        const PropId p_fl = SIMLAB_PID(w.props, "flammability");
+        if (p_fl != kNoProp)
+            seed(0, p_fl, 500, 0, "", -1, dead > 0 ? -900 : -700);
+        return;
+    }
+    // self-seeded survivals (drift_needs fabricates these events at the
+    // moment a need crosses its catastrophe threshold)
+    if (ev.action == "self_plague") {
+        const PropId p_inf = SIMLAB_PID(w.props, "infection_level");
+        if (p_inf != kNoProp) seed(0, p_inf, 400, 0, "", -1, -700);
+        return;
+    }
+    if (ev.action == "self_famine") {
+        const PropId p_nut = SIMLAB_PID(w.props, "nutrition");
+        if (p_nut != kNoProp) seed(0, p_nut, 200, 0, "", 0, 400);
+        return;
+    }
+    // miracle cure: a consume that scrubbed toxin_load (antidote draught)
+    // — the material that saved them becomes reverent, especially if it
+    // was a synthesis nobody else has tasted yet.
+    if (ev.action == "consume") {
+        const PropId p_tox = SIMLAB_PID(w.props, "toxin_load");
+        bool cured = false;
+        for (const StateChange& c : ev.changes)
+            if (c.prop == p_tox && c.after.type == ValType::Integer &&
+                c.before.type == ValType::Integer &&
+                c.after.i < c.before.i) { cured = true; break; }
+        if (!cured) return;
+        // target = first non-actor participant entity carrying a material
+        for (EntityId pid_ : ev.participants) {
+            if (pid_ == npc) continue;
+            const Entity* te = w.find(pid_);
+            if (!te || !te->alive || te->material == kNoMaterial) continue;
+            seed(1, kNoProp, 0, te->material, "", 0, 900);   // consume=0
+            // and the recipe itself, when the cure was synthesized
+            for (const World::SynthRecord& r : w.synthesized_)
+                if (static_cast<std::uint64_t>(r.material) ==
+                    static_cast<std::uint64_t>(te->material))
+                    seed(2, kNoProp, 0, r.synth_id, "", 0, 900);
+            return;
+        }
+        return;
+    }
+}
+
+void doctrine_drift(std::int64_t n, World& w) {
+    if (n <= 0) return;
+    constexpr std::int64_t kPeriod = 150;      // oral cadence ~ myth period
+    constexpr std::int64_t kEarshot = 96;     // "adjacent" in world units
+    const std::uint64_t now = w.clock_.tick();
+    const PropId p_lang = SIMLAB_PID(w.props, "language_id");
+    const PropId p_sight = SIMLAB_PID(w.props, "sight_range");
+
+    // accumulator-exact like decay_minds: fires land on absolute ticks so
+    // dt=1 xN and dt=N produce identical tellings.
+    struct Due { EntityId id; std::int64_t fires; std::int64_t rem; };
+    std::vector<Due> due;
+    for (auto& [eid, m] : w.minds_) {
+        const Entity* le = w.find(eid);
+        if (!le || !le->alive || m.doctrines.empty()) continue;
+        m.doctrine_accum += n;
+        const std::int64_t fires = m.doctrine_accum / kPeriod;
+        m.doctrine_accum %= kPeriod;
+        if (fires > 0) due.push_back({eid, fires, m.doctrine_accum});
+    }
+    if (due.empty()) return;
+
+    const PropId p_hunger = SIMLAB_PID(w.props, "hunger");
+    for (const Due& d : due) {
+        AgentMind& sender = w.minds_[d.id];
+        const Entity* se = w.find(d.id);
+        if (!se || !se->alive || sender.doctrines.empty()) continue;
+        const std::int64_t slang = p_lang != kNoProp
+            ? w.prop_int(*se, p_lang, 0) : 0;
+        if (slang <= 0) continue;
+        if (sender.neuro.panic >= 200) continue;   // only calm mouths speak
+        // strongest slot = max |valence| (first wins ties — vector order)
+        std::size_t bi = 0;
+        for (std::size_t i = 1; i < sender.doctrines.size(); ++i) {
+            const std::int64_t ai = sender.doctrines[i].valence < 0
+                ? -sender.doctrines[i].valence : sender.doctrines[i].valence;
+            const std::int64_t aw = sender.doctrines[bi].valence < 0
+                ? -sender.doctrines[bi].valence : sender.doctrines[bi].valence;
+            if (ai > aw) bi = i;
+        }
+        const AgentMind::DoctrineSlot& src = sender.doctrines[bi];
+        // nearest eligible listener: alive mind, kin tongue, calm, in earshot
+        EntityId best = kNoEntity; std::int64_t bd2 = 0;
+        const std::int64_t ear = p_sight != kNoProp
+            ? std::max<std::int64_t>(kEarshot,
+                  w.prop_int(*se, p_sight, 0)) : kEarshot;
+        const std::int64_t ear2 = ear * ear;
+        for (const auto& [eid, rm] : w.minds_) {
+            if (eid == d.id) continue;
+            const Entity* re = w.find(eid);
+            if (!re || !re->alive || rm.neuro.panic >= 200) continue;
+            const std::int64_t rlang = p_lang != kNoProp
+                ? w.prop_int(*re, p_lang, 0) : 0;
+            if (tongue_kinship(slang, rlang) <= 700) continue;
+            const std::int64_t dx = re->pos.x - se->pos.x;
+            const std::int64_t dy = re->pos.y - se->pos.y;
+            const std::int64_t dd = dx * dx + dy * dy;
+            if (dd > ear2) continue;
+            if (best == kNoEntity || dd < bd2 ||
+                (dd == bd2 && eid < best)) { best = eid; bd2 = dd; }
+        }
+        if (best == kNoEntity) continue;
+        AgentMind& recv = w.minds_[best];
+        AgentMind::DoctrineSlot cp = src;
+        cp.depth = src.depth + 1;                    // one more retelling
+        // telephone drift: +-5% valence perturbation, hash-seeded per
+        // (sender, listener, slot, fire-index) — deterministic, content-free
+        const std::uint64_t h = Rng::hash(
+            src.seed ^ (static_cast<std::uint64_t>(d.id) << 24) ^
+            (static_cast<std::uint64_t>(best) << 40) ^
+            static_cast<std::uint64_t>(now) ^
+            static_cast<std::uint64_t>(bi) * 0x9E3779B97F4A7C15ull);
+        const std::int64_t jit = static_cast<std::int64_t>(h % 11) - 5;  // -5..5
+        cp.valence = std::clamp<std::int64_t>(
+            cp.valence * (100 + jit) / 100, -1000, 1000);
+        cp.seed = h;
+        cp.last_tick = now;
+        // a full table only accepts a STRONGER myth (weakest-slot rule
+        // inside doctrine_upsert already enforces that)
+        doctrine_upsert(recv, cp);
+        (void)p_hunger;
+    }
+}
+
+std::string myth_record_line(const AgentMind::DoctrineSlot& d,
+                             std::int64_t lang, const std::string& title,
+                             const std::string& scripture) {
+    auto san = [](std::string s) {
+        for (char& c : s)
+            if (c == '|' || c == '\n' || c == '\r' || c == '=') c = ' ';
+        return s;
+    };
+    std::ostringstream o;
+    o << "[MYTH]\n"
+      << "id=doctrine:" << doctrine_key(d) << '\n'
+      << "tribe=" << lang << '\n'
+      << "generation=" << d.depth << '\n'
+      << "focus=" << d.trig_kind << ':' << d.trig_prop << ':'
+      << d.trig_thr << ':' << d.trig_id << ':' << d.trig_text << ':'
+      << d.verb << '\n'
+      << "valence=" << d.valence << '\n'
+      << "title=" << san(title) << '\n'
+      << "scripture=\"" << san(scripture) << "\"\n";
+    return o.str();
 }
 
 }  // namespace simlab

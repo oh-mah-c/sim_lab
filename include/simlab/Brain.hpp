@@ -314,6 +314,15 @@ void brain_gc(World& w, BrainStore& store);
 void brain_pre(World& w, EntityId npc, const InteractionContext& ctx);
 void brain_post(World& w, EntityId npc, const CausalEvent& ev);
 
+// Engraved-artifact knowledge transfer: replay one inscribed neural
+// engram (ancestor's WM hidden + outcome labels) through the reader's
+// world model at `comp_permille` strength — see Cognition read branch.
+void brain_assimilate(World& w, EntityId npc, int verb,
+                      std::int64_t charge, std::int64_t sigma,
+                      std::uint64_t salt,
+                      const std::int8_t* wh, const std::int8_t* w1h,
+                      const std::int8_t* y, std::int64_t comp_permille);
+
 // Deterministic fingerprint of ALL brain state (weights + h + replay) —
 // the Phase-1 replay check. FNV-1a over sorted slots.
 std::uint64_t brain_state_hash(const BrainStore& store);

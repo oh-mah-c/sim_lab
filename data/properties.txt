@@ -368,6 +368,7 @@ clause_atoms          text     none       domain=social     # inscription: ';'-j
 language_id2          integer  units        range 0 1000000000 domain=social  # inscription: second language_id for bilingual (Rosetta) carvings
 portable_surface      integer  permille     range 0 1000    domain=physical   # material/entity: may be carried as a mobile inscription medium (clay tablet, bone)
 inscription_author   integer  units                     domain=social  # inscription: entity id of the carver (kNoEntity=0 when unknown)
+artifact_engrams      text     none       domain=social     # inscription: up to 4 "E|verb|charge|sigma|focus|synth|wh|w1h|y" neural-engram lines carved from the author's top-charge replay transitions
 inscription_tick     integer  ticks        range 0 1000000000 domain=social  # inscription: world tick the carving was made
 dialect_drift_threshold integer milli-units range 1 100000000 domain=social # language: accum per phoneme-shift roll
 

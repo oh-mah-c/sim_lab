@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -8,6 +9,7 @@
 #include <vector>
 #include "Causal.hpp"
 #include "Types.hpp"
+#include "Sensor.hpp"
 
 namespace simlab {
 
@@ -279,6 +281,25 @@ struct AgentMind {
     std::int64_t ostracism_accum = 0;             // Euclid remainder (LOD)
     std::int64_t political_accum = 0;             // defer/grievance Euclid remainder (LOD)
     std::int64_t myth_accum = 0;                  // mythogenesis Euclid remainder (LOD)
+    std::int64_t doctrine_accum = 0;              // oral-tradition Euclid remainder (LOD)
+    // Tribal doctrines/taboos (oral tradition): up to kMaxDoctrines slots
+    // seeded by witnessed catastrophes and shared mouth-to-ear across
+    // generations. generation depth = retellings survived; valence sign =
+    // taboo (-) vs reverence (+). Agent knowledge only — never World Truth.
+    struct DoctrineSlot {
+        std::uint8_t trig_kind = 0;   // 0 prop-threshold | 1 material | 2 synth | 3 kind-name
+        PropId trig_prop = kNoProp;  // kind 0: entity/material prop to test
+        std::int64_t trig_thr = 0;    // kind 0: minimum prop value that triggers
+        std::uint64_t trig_id = 0;    // kind 1: MaterialId | kind 2: synth_id | kind 3: fnv(kind_name)
+        std::string trig_text;        // kind 3 only: raw kind_name (audit/display)
+        int verb = -1;                // biased verb index (-1 = any verb on the target)
+        std::int64_t valence = 0;     // -1000 taboo .. +1000 reverence
+        std::int64_t depth = 0;       // oral generations survived
+        std::uint64_t seed = 0;       // origin hash (drift perturbation salt)
+        std::uint64_t last_tick = 0;
+    };
+    static constexpr std::size_t kMaxDoctrines = 4;
+    std::vector<DoctrineSlot> doctrines;
     std::deque<Observation> observations;          // FIFO, capped
     std::map<std::string, Belief> beliefs;
     std::map<std::string, DiscoveryRecord> discoveries;  // §11.5 records
@@ -553,6 +574,49 @@ void war_from_event(World& w, EntityId actor, const std::vector<EntityId>& targe
 // counter-ranged (launch, elastic assemblies). 0 for a mind never hurt.
 std::int64_t arms_race_bonus(const World& w, const AgentMind& m,
                              const InteractionContext& c);
+
+// ---- Emergent culture, archaeology & tribal mythology -----------------------
+// EngravedEngram: one distilled high-charge brain transition carved onto an
+// InscribedArtifact. wh/w1h/y are the CL-1 replay payload (WM hidden,
+// worker hidden, label vector) — enough for brain_assimilate() to replay
+// the ancestor's experience through the reader's own world model.
+struct EngramPayload {
+    int verb = -1;                                    // sensor_verb_table index
+    std::uint64_t charge = 0, sigma = 0;              // valence / surprise 0..1000
+    std::uint64_t focus = 0;                          // EntityId the act targeted (0 = none)
+    std::uint64_t synth = 0;                          // synthesized_id recipe (0 = none)
+    std::array<std::int8_t, 96> wh{};                 // WM layer-1 activation
+    std::array<std::int8_t, 64> w1h{};                // worker hidden
+    std::array<std::int8_t, kLabelChannels> y{};      // outcome label vector
+};
+// Codec for the `artifact_engrams` text prop on Inscription entities:
+// up to 4 lines "E|verb|charge|sigma|focus|synth|whHex|w1hHex|yHex".
+std::string engram_encode(const EngramPayload& p);
+std::vector<EngramPayload> engram_decode(const std::string& blob);
+// Language kinship in permille (same popcount-xor rule as sensor ch66):
+// 1000 identical tongue .. 0 fully foreign / speechless.
+std::int64_t tongue_kinship(std::int64_t lang_a, std::int64_t lang_b);
+// Does `e` satisfy a doctrine trigger? Pure World-Truth read.
+bool doctrine_trigger_hits(const World& w, const Entity& e,
+                           const AgentMind::DoctrineSlot& d);
+// Soft additive score bias for one (verb,target) candidate inside
+// brain_decide — valence/4 scaled down by panic; 0 when hunger > 900
+// (acute starvation overrides taboo and reverence alike).
+std::int64_t doctrine_bias_for(const World& w, const AgentMind& mind,
+                               const Entity& actor, int verb,
+                               const Entity* target);
+// Post-commit hook: massive witnessed events seed DoctrineSlots
+// (detonation -> fire taboo, toxin cure -> sacred elixir, ...).
+void doctrine_from_event(World& w, EntityId npc, const CausalEvent& ev);
+// Batch-exact oral transmission: calm kin within earshot share their
+// strongest DoctrineSlot; the copy gains generation_depth and a
+// deterministic +-5% valence perturbation (telephone-game drift).
+void doctrine_drift(std::int64_t n, World& w);
+// Deterministic myth-record line for tribal_mythology.txt (viewer-side
+// Qwen cataloger consumes the same fields for its prompt).
+std::string myth_record_line(const AgentMind::DoctrineSlot& d,
+                             std::int64_t lang, const std::string& title,
+                             const std::string& scripture);
 
 }  // namespace simlab
 

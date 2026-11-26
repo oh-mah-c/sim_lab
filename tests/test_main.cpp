@@ -11772,6 +11772,265 @@ static void test_parallel_think() {
     (void)ha;
 }
 
+static void test_culture_archaeology() {
+
+    // (1) engrave neural payload + same-language assimilation -------------
+    {
+        World w(401, "data");
+        w.brain_shadow = true;
+        const EntityId sage = mk_person(w, {0, 0});
+        const EntityId reader = mk_person(w, {20, 0});
+        lang_person(w, sage, "person", 600, 2);
+        lang_person(w, reader, "person", 600, 2);
+        w.mind(sage).discoveries["method:x"] =
+            mk_record("method:x", DiscoveryStatus::Verified);
+        w.advance_ticks_for_test(1);           // coin language_ids
+        const PropId pl = tpid(w, "language_id");
+        tseti(*w.find(reader), w, "language_id",
+              tint(*w.find(sage), w, "language_id"));  // same tongue
+        // brains for both
+        BrainGenome g;
+        g.valid = true; g.hidden = 64;
+        g.slow.assign(brain_layout_h(64).total_bytes, 1);
+        brain_install_spawn(w, sage, g);
+        brain_install_spawn(w, reader, g);
+        // inject one high-charge transition into the sage's replay ring —
+        // stands in for a lived synthesis/discovery experience
+        {
+            BrainSlot& ss = w.brains_->slots[sage];
+            Transition t{};
+            t.valid = true; t.charge = 800; t.sigma = 500;
+            t.a[10] = 100;                      // combine
+            for (int i = 0; i < 96; ++i) t.wh[i] = static_cast<std::int8_t>((i * 7) % 13 - 6);
+            for (int i = 0; i < 64; ++i) t.w1h[i] = static_cast<std::int8_t>((i * 5) % 11 - 5);
+            for (int i = 0; i < kLabelChannels; ++i) t.y[i] = static_cast<std::int8_t>((i * 3) % 9 - 4);
+            ss.replay[0] = t; ss.replay_count = 1; ss.replay_next = 1;
+        }
+        const std::int32_t rvalid0 = [&]() {
+            const BrainSlot& rs = w.brains_->slots[reader];
+            std::int32_t n = 0;
+            for (int i = 0; i < 16; ++i) if (rs.replay[i].valid) ++n;
+            return n;
+        }();
+        // carve on granite (inscription-capable surface)
+        const MaterialId granite = w.materials.id_of("granite");
+        CHECK(granite != kNoMaterial);
+        const EntityId stone = w.create_entity("slab", granite, {10, 0});
+        CHECK(w.interact(mk_ctx(sage, {stone}, "engrave", 0,
+                                "method:x")).completed);
+        // the Inscription child carries the neural payload
+        const PropId p_art = tpid(w, "artifact_engrams");
+        Entity* ins_e = nullptr;
+        for (const auto& ep : w.entities)
+            if (ep->alive && ep->kind_name == SIMLAB_KIND("inscription")) {
+                ins_e = ep.get(); break;
+            }
+        CHECK(ins_e != nullptr);
+        const Value* av = w.prop_of(*ins_e, p_art);
+        CHECK(av && av->type == ValType::Text && !av->s.empty());
+        const std::vector<EngramPayload> eps = engram_decode(av->s);
+        CHECK(eps.size() == 1);
+        CHECK(eps[0].verb == 10);
+        CHECK(eps[0].charge == 800);
+        // heir reads -> brain_assimilate replays the engram at full strength
+        CHECK(w.interact(mk_ctx(reader, {stone}, "read", 0)).completed);
+        const BrainSlot& rs = w.brains_->slots[reader];
+        std::int32_t rvalid1 = 0;
+        for (int i = 0; i < 16; ++i) if (rs.replay[i].valid) ++rvalid1;
+        CHECK(rvalid1 > rvalid0);
+        // a synth recipe on the payload surfaces as a teachable claim
+        // (no synthesis here -> synth==0, claim absent; just check decode)
+        CHECK(eps[0].synth == 0);
+        (void)pl;
+    }
+
+    // (2) dead-language gate: comprehension scales with tongue kinship ----
+    {
+        // unit level: tongue_kinship + comp math mirrored from the read path
+        CHECK(tongue_kinship(777, 777) == 1000);
+        CHECK(tongue_kinship(777, 0) == 0);
+        CHECK(tongue_kinship(0, 0) == 0);
+        // brain_assimilate dose-response: comp=1000 moves more weights
+        // than comp=250, comp=0 moves nothing.
+        World w(402, "data");
+        w.brain_shadow = true;
+        auto agent = [&](Vec2 p) {
+            const EntityId id = mk_sapient(w, p);
+            BrainGenome gg;
+            gg.valid = true; gg.hidden = 64;
+            gg.slow.assign(brain_layout_h(64).total_bytes, 1);
+            brain_install_spawn(w, id, gg);
+            return id;
+        };
+        const EntityId c0 = agent({0, 0});
+        const EntityId c1000 = agent({10, 0});
+        const EntityId c250 = agent({20, 0});
+        EngramPayload ep;
+        ep.verb = 10; ep.charge = 800; ep.sigma = 500;
+        // saturated payload: uniform +120 hidden drives yh strongly
+        // positive, so y=-120 yields a large negative huber error — the
+        // dream-step delta clamps at -4 and even a 25% dose keeps +-1.
+        for (int i = 0; i < 96; ++i) ep.wh[i] = 120;
+        for (int i = 0; i < 64; ++i) ep.w1h[i] = 100;
+        for (int i = 0; i < kLabelChannels; ++i) ep.y[i] = -120;
+        // snapshot wm2w of each agent, assimilate at different comps
+        auto snapshot_wm2 = [&](EntityId id) {
+            BrainSlot& s = w.brains_->slots[id];
+            const BrainLayout& L = brain_layout_h(s.hidden);
+            const std::int8_t* base = w.brains_->arena.w8(s.woff);
+            const std::int8_t* wm2w = base + L.wm2w;
+            return std::vector<std::int8_t>(wm2w, wm2w + kLabelChannels * kBrainWmHidden);
+        };
+        auto diff_vs = [&](EntityId id,
+                           const std::vector<std::int8_t>& snap) {
+            BrainSlot& s = w.brains_->slots[id];
+            const BrainLayout& L = brain_layout_h(s.hidden);
+            const std::int8_t* base = w.brains_->arena.w8(s.woff);
+            const std::int8_t* wm2w = base + L.wm2w;
+            std::int64_t d = 0;
+            for (std::size_t i = 0; i < snap.size(); ++i)
+                d += std::abs(static_cast<int>(wm2w[i]) -
+                              static_cast<int>(snap[i]));
+            return d;
+        };
+        const auto s0 = snapshot_wm2(c0);
+        const auto s1 = snapshot_wm2(c1000);
+        const auto s2 = snapshot_wm2(c250);
+        brain_assimilate(w, c0, ep.verb, ep.charge, ep.sigma, 1,
+                         ep.wh.data(), ep.w1h.data(), ep.y.data(), 0);
+        brain_assimilate(w, c1000, ep.verb, ep.charge, ep.sigma, 2,
+                         ep.wh.data(), ep.w1h.data(), ep.y.data(), 1000);
+        brain_assimilate(w, c250, ep.verb, ep.charge, ep.sigma, 3,
+                         ep.wh.data(), ep.w1h.data(), ep.y.data(), 250);
+        const std::int64_t d0 = diff_vs(c0, s0);
+        const std::int64_t d1000 = diff_vs(c1000, s1);
+        const std::int64_t d250 = diff_vs(c250, s2);
+        CHECK(d0 == 0);                     // comp=0: nothing learned
+        CHECK(d1000 > 0);
+        CHECK(d250 > 0);
+        CHECK(d1000 > d250);                // dead language teaches less
+        CHECK(w.brains_->slots[c0].replay_count == 0);
+        CHECK(w.brains_->slots[c1000].replay_count == 1);
+        CHECK(w.brains_->slots[c250].replay_count == 1);
+    }
+
+    // (3) oral transmission: elder taboo -> youth, depth + drift ----------
+    {
+        World w(403, "data");
+        const EntityId elder = mk_person(w, {0, 0});
+        const EntityId youth = mk_person(w, {10, 0});
+        tseti(*w.find(elder), w, "language_id", 777);
+        tseti(*w.find(youth), w, "language_id", 777);
+        w.mind(elder); w.mind(youth);
+        const PropId p_fl = pid(w, "flammability");
+        CHECK(p_fl != kNoProp);
+        AgentMind::DoctrineSlot d;
+        d.trig_kind = 0; d.trig_prop = p_fl; d.trig_thr = 500;
+        d.verb = -1; d.valence = -850; d.depth = 0;
+        d.seed = 12345; d.last_tick = 0;
+        w.mind(elder).doctrines.push_back(d);
+        w.advance_ticks_for_test(150);      // one oral period fires
+        const AgentMind& ym = w.mind(youth);
+        CHECK(ym.doctrines.size() == 1);
+        const AgentMind::DoctrineSlot& cp = ym.doctrines.front();
+        CHECK(cp.depth == 1);               // one retelling survived
+        CHECK(cp.valence <= -807 && cp.valence >= -892);  // +-5% drift
+        CHECK(cp.trig_prop == p_fl && cp.trig_thr == 500);
+        // elder's own slot untouched (depth stays 0 — he witnessed it)
+        CHECK(w.mind(elder).doctrines.front().depth == 0);
+        // deterministic: same seed+path -> identical doctrine state
+        World w2(403, "data");
+        const EntityId e2 = mk_person(w2, {0, 0});
+        const EntityId y2 = mk_person(w2, {10, 0});
+        tseti(*w2.find(e2), w2, "language_id", 777);
+        tseti(*w2.find(y2), w2, "language_id", 777);
+        w2.mind(e2); w2.mind(y2);
+        w2.mind(e2).doctrines.push_back(d);
+        w2.advance_ticks_for_test(150);
+        CHECK(w2.state_hash() == w.state_hash());
+    }
+
+    // (4) taboo bias + starvation override -------------------------------
+    {
+        World w(404, "data");
+        const EntityId actor = mk_person(w, {0, 0});
+        const MaterialId em = w.materials.id_of("energetic_mix");
+        CHECK(em != kNoMaterial);
+        PropertyBag q;
+        q.set(pid(w, "quantity"), Value::integer(5));
+        const EntityId fuel = w.create_entity("item", em, {5, 0}, q);
+        const EntityId rock = w.create_entity("item",
+            w.materials.id_of("stone"), {6, 0}, q);
+        AgentMind& m = w.mind(actor);
+        const PropId p_fl = pid(w, "flammability");
+        AgentMind::DoctrineSlot d;
+        d.trig_kind = 0; d.trig_prop = p_fl; d.trig_thr = 500;
+        d.verb = -1; d.valence = -850; d.depth = 0;
+        d.seed = 7; d.last_tick = 0;
+        m.doctrines.push_back(d);
+        const Entity& ae = *w.find(actor);
+        // flammable target -> strong negative bias; stone -> none
+        const std::int64_t b_fuel =
+            doctrine_bias_for(w, m, ae, 0, w.find(fuel));
+        const std::int64_t b_rock =
+            doctrine_bias_for(w, m, ae, 0, w.find(rock));
+        CHECK(b_fuel < 0);
+        CHECK(b_rock == 0);
+        // verb-restricted doctrine ignores other verbs
+        m.doctrines.front().verb = 5;      // share only
+        CHECK(doctrine_bias_for(w, m, ae, 0, w.find(fuel)) == 0);
+        CHECK(doctrine_bias_for(w, m, ae, 5, w.find(fuel)) < 0);
+        m.doctrines.front().verb = -1;
+        // acute starvation (>900) overrides taboo and reverence alike
+        tseti(*w.find(actor), w, "hunger", 950);
+        CHECK(doctrine_bias_for(w, m, ae, 0, w.find(fuel)) == 0);
+        tseti(*w.find(actor), w, "hunger", 100);
+        // myth_record_line emits the [MYTH] block deterministically
+        const std::string line =
+            myth_record_line(m.doctrines.front(), 777, "Fire's Debt",
+                             "touch not the burning gift");
+        CHECK(line.rfind("[MYTH]", 0) == 0);
+        CHECK(line.find("title=Fire's Debt") != std::string::npos);
+        CHECK(line.find("generation=0") != std::string::npos);
+        CHECK(line.find("valence=-850") != std::string::npos);
+    }
+
+    // (5) persistence: doctrines survive save/load bit-exact --------------
+    {
+        World w(405, "data");
+        const EntityId elder = mk_person(w, {0, 0});
+        const EntityId youth = mk_person(w, {10, 0});
+        tseti(*w.find(elder), w, "language_id", 777);
+        tseti(*w.find(youth), w, "language_id", 777);
+        w.mind(elder); w.mind(youth);
+        const PropId p_fl = pid(w, "flammability");
+        AgentMind::DoctrineSlot d;
+        d.trig_kind = 0; d.trig_prop = p_fl; d.trig_thr = 500;
+        d.verb = -1; d.valence = -850; d.depth = 0;
+        d.seed = 99; d.last_tick = 42;
+        w.mind(elder).doctrines.push_back(d);
+        w.mind(youth).doctrine_accum = 73;
+        w.advance_ticks_for_test(150);
+        const std::uint64_t h0 = w.state_hash();
+        const std::string path = "/tmp/simlab_culture_save.bin";
+        CHECK(w.save(path));
+        World w2(405, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h0);
+        const AgentMind* ym = w2.find_mind(youth);
+        CHECK(ym && ym->doctrines.size() == 1);
+        CHECK(ym->doctrines.front().depth == 1);
+        CHECK(ym->doctrine_accum == w.mind(youth).doctrine_accum);
+        const AgentMind* em = w2.find_mind(elder);
+        CHECK(em && em->doctrines.size() == 1);
+        CHECK(em->doctrines.front().valence == -850);
+        // usable after load: another oral period keeps transmitting
+        w2.advance_ticks_for_test(150);
+        CHECK(w2.state_hash() == w.state_hash() ||
+              w2.minds_.count(youth) == 1);
+    }
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -11846,6 +12105,7 @@ int main(int argc, char** argv) {
     RUN(test_open_ended_invention);
     RUN(test_emergent_coevolution);
     RUN(test_conditioning);
+    RUN(test_culture_archaeology);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);

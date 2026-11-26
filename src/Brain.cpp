@@ -599,6 +599,90 @@ void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
     p.valid = true;
 }
 
+// Dream replay: the 4 most emotional replay samples (charge-led, sigma
+// tiebreak) re-run WM1->WM2 on their stored hidden state — surprise/value
+// delta consolidates into SLOW wm2 AND the w2w policy row of the dreamed
+// verb. `scale_permille` is 1000 for natural sleep; brain_assimilate
+// passes the reader's comprehension so an inscribed engram teaches at
+// partial strength (dead-language decipherment).
+static void dream_replay_top4(BrainStore& store, BrainSlot& s,
+                              std::int64_t scale_permille) {
+    const BrainLayout& L = brain_layout_h(s.hidden);
+    std::int8_t* base = store.arena.w8(s.woff);
+    std::int8_t* wm2w = base + L.wm2w;
+    std::int16_t* wm2b =
+        reinterpret_cast<std::int16_t*>(base + L.wm2b);
+    const std::int64_t eta_c = std::max<std::int64_t>(16, s.lr_permille / 2);
+    // pick top-4 replay entries by emotional charge (sigma tiebreak)
+    std::array<std::int32_t, 4> top{-1, -1, -1, -1};
+    std::array<std::int64_t, 4> topsc{-1, -1, -1, -1};
+    for (int i = 0; i < 16 && i < s.replay_count; ++i) {
+        if (!s.replay[i].valid) continue;
+        const std::int64_t sc =
+            static_cast<std::int64_t>(s.replay[i].charge) * 4 +
+            s.replay[i].sigma;
+        for (int k = 0; k < 4; ++k) {
+            if (sc > topsc[k]) {
+                for (int j = 3; j > k; --j) { topsc[j] = topsc[j-1]; top[j] = top[j-1]; }
+                topsc[k] = sc; top[k] = i; break;
+            }
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        const int ri = top[k];
+        if (ri < 0) continue;
+        const Transition& rt = s.replay[ri];
+        LabelVec yh{};
+        wm2_forward(wm2w, s.fast.data(), wm2b, rt.wh.data(), yh.data());
+        for (int o = 0; o < kLabelChannels; ++o) {
+            const std::int32_t err = huber_i32(
+                static_cast<std::int32_t>(rt.y[o]) - yh[o]);
+            if (err == 0) continue;
+            for (int i = 0; i < kWmHidden; ++i) {
+                const std::int64_t dw = (eta_c * err * rt.wh[i]) >> 18;
+                std::int64_t d = std::max<std::int64_t>(-4,
+                                           std::min<std::int64_t>(4, dw));
+                d = d * scale_permille / 1000;
+                if (d == 0) continue;
+                const std::int64_t v =
+                    static_cast<std::int64_t>(wm2w[o * kWmHidden + i]) + d;
+                wm2w[o * kWmHidden + i] = brain_clamp_i8(v);
+            }
+        }
+        // dream policy step: re-drive the executed verb's w2w row with
+        // the stored worker hidden. Advantage = homeostatic outcome +
+        // a charged-outcome term — actions that paid off under high
+        // emotional charge consolidate (coping), charged failures are
+        // suppressed (avoidance). Small rate: sleep is gentle.
+        int dverb = -1;
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (rt.a[i] == 100) { dverb = i; break; }
+        if (dverb >= 0) {
+            std::int64_t adv =
+                static_cast<std::int64_t>(rt.y[24]) * 8 - 64 +
+                (rt.sigma >= 400 ? 48 : 0);
+            if (rt.charge >= 600)
+                adv += rt.y[24] > 0 ? 96 : -192;
+            if (adv != 0) {
+                const std::int64_t eta_d =
+                    std::max<std::int64_t>(8, s.lr_permille / 16);
+                std::int8_t* w2w_pol = base + L.w2w;   // worker policy
+                for (int i = 0; i < 64; ++i) {
+                    const std::int64_t dw =
+                        (eta_d * adv * rt.w1h[i]) >> 17;
+                    std::int64_t d = std::max<std::int64_t>(-3,
+                                               std::min<std::int64_t>(3, dw));
+                    d = d * scale_permille / 1000;
+                    if (d == 0) continue;
+                    const std::int64_t v =
+                        static_cast<std::int64_t>(w2w_pol[dverb * 64 + i]) + d;
+                    w2w_pol[dverb * 64 + i] = brain_clamp_i8(v);
+                }
+            }
+        }
+    }
+}
+
 void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     if (!w.brain_shadow || w.speculative) return;
     BrainStore* store = w.brains_.get();
@@ -809,73 +893,7 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     // 3) L2-SP pull toward the birth anchor (>>4) — anti-forgetting.
     if (p.a[4] && s.replay_count > 0 &&                       // verb "rest"
         s.fast.size() == static_cast<std::size_t>(kLabelChannels * kWmHidden)) {
-        const std::int64_t eta_c = std::max<std::int64_t>(16, s.lr_permille / 2);
-        // pick top-4 replay entries by emotional charge (sigma tiebreak)
-        std::array<std::int32_t, 4> top{-1, -1, -1, -1};
-        std::array<std::int64_t, 4> topsc{-1, -1, -1, -1};
-        for (int i = 0; i < 16 && i < s.replay_count; ++i) {
-            if (!s.replay[i].valid) continue;
-            const std::int64_t sc =
-                static_cast<std::int64_t>(s.replay[i].charge) * 4 +
-                s.replay[i].sigma;
-            for (int k = 0; k < 4; ++k) {
-                if (sc > topsc[k]) {
-                    for (int j = 3; j > k; --j) { topsc[j] = topsc[j-1]; top[j] = top[j-1]; }
-                    topsc[k] = sc; top[k] = i; break;
-                }
-            }
-        }
-        for (int k = 0; k < 4; ++k) {
-            const int ri = top[k];
-            if (ri < 0) continue;
-            const Transition& rt = s.replay[ri];
-            LabelVec yh{};
-            wm2_forward(wm2w, s.fast.data(), wm2b, rt.wh.data(), yh.data());
-            for (int o = 0; o < kLabelChannels; ++o) {
-                const std::int32_t err = huber_i32(
-                    static_cast<std::int32_t>(rt.y[o]) - yh[o]);
-                if (err == 0) continue;
-                for (int i = 0; i < kWmHidden; ++i) {
-                    const std::int64_t dw = (eta_c * err * rt.wh[i]) >> 18;
-                    const std::int64_t d = std::max<std::int64_t>(-4,
-                                                       std::min<std::int64_t>(4, dw));
-                    if (d == 0) continue;
-                    const std::int64_t v =
-                        static_cast<std::int64_t>(wm2w[o * kWmHidden + i]) + d;
-                    wm2w[o * kWmHidden + i] = brain_clamp_i8(v);
-                }
-            }
-            // dream policy step: re-drive the executed verb's w2w row with
-            // the stored worker hidden. Advantage = homeostatic outcome +
-            // a charged-outcome term — actions that paid off under high
-            // emotional charge consolidate (coping), charged failures are
-            // suppressed (avoidance). Small rate: sleep is gentle.
-            int dverb = -1;
-            for (int i = 0; i < kActionVerbs; ++i)
-                if (rt.a[i] == 100) { dverb = i; break; }
-            if (dverb >= 0) {
-                std::int64_t adv =
-                    static_cast<std::int64_t>(rt.y[24]) * 8 - 64 +
-                    (rt.sigma >= 400 ? 48 : 0);
-                if (rt.charge >= 600)
-                    adv += rt.y[24] > 0 ? 96 : -192;
-                if (adv != 0) {
-                    const std::int64_t eta_d =
-                        std::max<std::int64_t>(8, s.lr_permille / 16);
-                    std::int8_t* w2w_pol = base + L.w2w;   // worker policy
-                    for (int i = 0; i < 64; ++i) {
-                        const std::int64_t dw =
-                            (eta_d * adv * rt.w1h[i]) >> 17;
-                        const std::int64_t d = std::max<std::int64_t>(-3,
-                                                   std::min<std::int64_t>(3, dw));
-                        if (d == 0) continue;
-                        const std::int64_t v =
-                            static_cast<std::int64_t>(w2w_pol[dverb * 64 + i]) + d;
-                        w2w_pol[dverb * 64 + i] = brain_clamp_i8(v);
-                    }
-                }
-            }
-        }
+        dream_replay_top4(*store, s, 1000);
         // synaptic forgetting: fast weights shed ~1/16 per rest unless
         // re-reinforced by fresh surprise — prevents saturation drift when
         // the environment shifts (integer /16 truncates toward 0).
@@ -1461,6 +1479,16 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                     total += 192;
             }
         }
+        // tribal doctrine: taboo/reverence bias on (verb, target) —
+        // doctrine_bias_for returns 0 under acute starvation (hunger>900)
+        // or when the mind carries no doctrines, so the hot path stays
+        // a couple of prop reads for doctrine-free agents.
+        {
+            const Entity* tgt_e = nullptr;
+            if (cd.tgt >= 0 && cd.tgt < nnear)
+                tgt_e = w.find(near[cd.tgt].id);
+            total += doctrine_bias_for(w, *mind, *me, cd.verb, tgt_e);
+        }
         // small deterministic exploration jitter (genome-scaled)
         const std::uint64_t jit =
             Rng::hash(w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^
@@ -1507,6 +1535,56 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     }
     out.valid = true;
     return out;
+}
+
+// Cultural knowledge transfer: an InscribedArtifact's engraved neural
+// engram replays once through the reader's own world model at
+// `comp_permille` strength. The payload lands in the replay ring (same
+// stratified replacement as brain_post) and dream_replay_top4 consolidates
+// it immediately — high-charge engrams are exactly what top-4 selects, so
+// the ancestor's recipe teaches in one reading. Deterministic: salt keys
+// the replay slot/event id; no RNG, no wall clock.
+void brain_assimilate(World& w, EntityId npc, int verb,
+                      std::int64_t charge, std::int64_t sigma,
+                      std::uint64_t salt,
+                      const std::int8_t* wh, const std::int8_t* w1h,
+                      const std::int8_t* y, std::int64_t comp_permille) {
+    if (w.speculative || !w.brain_shadow || !w.brains_) return;
+    BrainStore& store = *w.brains_;
+    BrainSlot& s = brain_slot(w, store, npc);
+    if (s.fast.size() !=
+        static_cast<std::size_t>(kLabelChannels * kWmHidden)) return;
+    comp_permille = std::clamp<std::int64_t>(comp_permille, 0, 1000);
+    if (comp_permille == 0) return;
+
+    Transition t{};
+    if (verb >= 0 && verb < kActionVerbs) t.a[verb] = 100;
+    t.sigma = static_cast<std::uint16_t>(
+        std::clamp<std::int64_t>(sigma, 0, 1000));
+    t.charge = static_cast<std::uint16_t>(
+        std::clamp<std::int64_t>(charge, 0, 1000));
+    std::copy(wh, wh + t.wh.size(), t.wh.begin());
+    std::copy(w1h, w1h + t.w1h.size(), t.w1h.begin());
+    std::copy(y, y + t.y.size(), t.y.begin());
+    t.event_id = salt;
+    t.valid = true;
+
+    if (s.replay_count < 16) {
+        s.replay[s.replay_next] = t;
+        s.replay_next = (s.replay_next + 1) & 15;
+        s.replay_count += 1;
+    } else {
+        std::int64_t best = -1;
+        std::int32_t worst = 0;
+        for (int i = 0; i < 16; ++i) {
+            const std::int64_t sc =
+                static_cast<std::int64_t>(s.replay[i].charge) +
+                s.replay[i].sigma;
+            if (best < 0 || sc < best) { best = sc; worst = i; }
+        }
+        s.replay[worst] = t;
+    }
+    dream_replay_top4(store, s, comp_permille);
 }
 
 }  // namespace simlab

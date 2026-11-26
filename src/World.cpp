@@ -577,6 +577,7 @@ void World::advance_ticks(std::int64_t n) {
     }
     metabolize(n); dissipate_heat(n); ecology_tick(n);
     language_tick(clock_.tick()); decay_minds(n); political_drift(n); myth_drift(n);
+    doctrine_drift(n, *this);
     terrain_wear_decay(n); pollution_decay(n);
     detonation_drift(n);
 }
@@ -867,6 +868,39 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                         touched = true;
                     }
                 }
+            }
+        }
+        // tribal doctrine self-seed: crossing a catastrophe threshold
+        // (sepsis, famine) writes a personal taboo immediately — the
+        // survivor carries the myth without needing a witness. Edge-
+        // triggered via a `docseed:` belief marker so it fires once.
+        {
+            auto mi = minds_.find(e.id);
+            if (mi != minds_.end()) {
+                AgentMind& dm = mi->second;
+                auto self_seed = [&](const char* tag, const char* action,
+                                     PropId probe, std::int64_t thr) {
+                    if (probe == kNoProp) return;
+                    const std::string key = std::string("docseed:") + tag;
+                    if (dm.find_belief(key)) return;
+                    if (prop_int(e, probe, 0) < thr) return;
+                    Belief& mb = dm.belief(key);
+                    mb.status = BeliefStatus::Observed;
+                    mb.confidence = 1000;
+                    mb.last_tick = now;
+                    CausalEvent sev;
+                    sev.id = 0;
+                    sev.tick = now;
+                    sev.action = action;
+                    sev.failed = false;
+                    doctrine_from_event(*this, e.id, sev);
+                };
+                static thread_local SeqPidCache ds_c_;
+                SeqPid dsp(ds_c_, props);
+                self_seed("plague", "self_plague",
+                          dsp("infection_level"), 800);
+                self_seed("famine", "self_famine",
+                          dsp("nutrition"), 150);
             }
         }
         if (np.integrity != kNoProp) {
@@ -6295,6 +6329,22 @@ std::uint64_t World::state_hash() const {
         mix(static_cast<std::uint64_t>(m.ostracism_accum));
         mix(static_cast<std::uint64_t>(m.political_accum));
         mix(static_cast<std::uint64_t>(m.myth_accum));
+        // v27: tribal doctrines (oral tradition) + drift accumulator
+        mix(static_cast<std::uint64_t>(m.doctrine_accum));
+        mix(m.doctrines.size());
+        for (const AgentMind::DoctrineSlot& d : m.doctrines) {
+            mix(static_cast<std::uint64_t>(d.trig_kind));
+            mix(static_cast<std::uint64_t>(d.trig_prop));
+            mix(static_cast<std::uint64_t>(d.trig_thr));
+            mix(d.trig_id);
+            mixs(d.trig_text);
+            mix(static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(d.verb) + 2));
+            mix(static_cast<std::uint64_t>(d.valence + 1000));
+            mix(static_cast<std::uint64_t>(d.depth));
+            mix(d.seed);
+            mix(d.last_tick);
+        }
     }
     return h;
 }
@@ -6306,7 +6356,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 26;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail)
+constexpr std::uint32_t kSaveFormat = 27;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail); v27: mind doctrines + doctrine_accum (oral tradition)
 
 struct Writer {
     std::ofstream f;
@@ -6613,6 +6663,27 @@ bool World::save(const std::string& path, std::string* err) const {
         w.put(static_cast<std::int64_t>(m.ostracism_accum));
         w.put(static_cast<std::int64_t>(m.political_accum));
         w.put(static_cast<std::int64_t>(m.myth_accum));
+        // v27: tribal doctrines (oral tradition) + drift accumulator —
+        // trig_prop stored by NAME like every other content reference
+        w.put(static_cast<std::int64_t>(m.doctrine_accum));
+        w.put(static_cast<std::uint32_t>(m.doctrines.size()));
+        for (const AgentMind::DoctrineSlot& d : m.doctrines) {
+            w.put(static_cast<std::uint8_t>(d.trig_kind));
+            if (d.trig_prop != kNoProp) {
+                const PropertyDef* pd = props.find(d.trig_prop);
+                w.str(pd ? pd->name : std::string());
+            } else {
+                w.str(std::string());
+            }
+            w.put(d.trig_thr);
+            w.put(d.trig_id);
+            w.str(d.trig_text);
+            w.put(static_cast<std::int32_t>(d.verb));
+            w.put(d.valence);
+            w.put(d.depth);
+            w.put(d.seed);
+            w.put(d.last_tick);
+        }
     }
     // rng stream counters; v5: event failed/failure/conditions (v4): stochastic laws must replay after load
     w.put(seed);
@@ -7128,6 +7199,36 @@ bool World::load(const std::string& path, std::string* err) {
                     std::int64_t ma2 = 0;
                     if (!r.get(ma2)) return fail("truncated myth_accum");
                     m.myth_accum = ma2;
+                }
+                if (fmt >= 27) {
+                    std::int64_t da2 = 0;
+                    if (!r.get(da2)) return fail("truncated doctrine_accum");
+                    m.doctrine_accum = da2;
+                    std::uint32_t dn = 0;
+                    if (!r.get(dn) || dn > 64)
+                        return fail("bad doctrines");
+                    for (std::uint32_t j = 0; j < dn; ++j) {
+                        AgentMind::DoctrineSlot d;
+                        std::uint8_t tk = 0;
+                        if (!r.get(tk)) return fail("truncated doctrine");
+                        d.trig_kind = tk;
+                        std::string pname;
+                        if (!r.str(pname))
+                            return fail("truncated doctrine prop");
+                        if (!pname.empty()) {
+                            const PropertyDef* pd =
+                                props.find_name(pname);
+                            d.trig_prop = pd ? pd->id : kNoProp;
+                        }
+                        std::int32_t vv = 0;
+                        if (!r.get(d.trig_thr) || !r.get(d.trig_id) ||
+                            !r.str(d.trig_text) || !r.get(vv) ||
+                            !r.get(d.valence) || !r.get(d.depth) ||
+                            !r.get(d.seed) || !r.get(d.last_tick))
+                            return fail("truncated doctrine");
+                        d.verb = vv;
+                        m.doctrines.push_back(d);
+                    }
                 }
             }
             minds_[nid] = std::move(m);
@@ -8549,7 +8650,37 @@ void World::detonation_drift(std::int64_t n) {
         }
         if (any_blast) {
             ev.evidence = "volatile charge detonated; " + ev.evidence;
-            ledger.append(std::move(ev));
+            const EventId evid = ledger.append(std::move(ev));
+            // tribal trauma: blast participants lived it (learner path),
+            // minds in sight of any victim observed it (witness path) —
+            // same split World::interact uses, so doctrines and engrams
+            // form exactly as if the catastrophe were an action.
+            if (const CausalEvent* pev = ledger.find(evid)) {
+                std::set<EntityId> learners, seers;
+                for (EntityId pid_ : pev->participants)
+                    if (minds_.count(pid_)) learners.insert(pid_);
+                const PropId sight = SIMLAB_PID(props, "sight_range");
+                for (const auto& [wid, wm] : minds_) {
+                    (void)wm;
+                    if (learners.count(wid)) continue;
+                    const Entity* we = find(wid);
+                    if (!we || !we->alive) continue;
+                    const std::int64_t range = sight != kNoProp
+                        ? prop_int(*we, sight, 0) : 0;
+                    if (range <= 0) continue;
+                    for (EntityId pid_ : pev->participants) {
+                        const Entity* pe = find(pid_);
+                        if (!pe) continue;
+                        if (dist2(we->pos, pe->pos) <= range * range) {
+                            seers.insert(wid);
+                            break;
+                        }
+                    }
+                }
+                for (EntityId lid : learners) learn_from_event(lid, evid);
+                for (EntityId wid : seers)
+                    witness_from_event(*this, wid, *pev);
+            }
         }
     }
 }

@@ -1113,6 +1113,66 @@ PredictionResult predict_engrave(const World& w, const InteractionContext& ctx) 
                 is.props.set(p_lv, Value::integer(lav));
             }
         }
+        // InscribedArtifact neural payload: the author's 4 highest-charge
+        // replay transitions distilled into EngramPayload lines. Same-
+        // language readers assimilate them at full strength; foreign or
+        // dead tongues decipher at 25-75% (see Cognition read branch).
+        {
+            const PropId p_art = pid(w, "artifact_engrams");
+            if (p_art != kNoProp && w.brains_) {
+                const auto bit = w.brains_->slots.find(ctx.actor);
+                if (bit != w.brains_->slots.end()) {
+                    const BrainSlot& bs = bit->second;
+                    // top-4 replay entries by charge*4+sigma — the same
+                    // selection dream_replay_top4 uses for sleep.
+                    std::array<std::int32_t, 4> top{-1, -1, -1, -1};
+                    std::array<std::int64_t, 4> topsc{-1, -1, -1, -1};
+                    for (int i = 0; i < 16 && i < bs.replay_count; ++i) {
+                        const Transition& rt = bs.replay[i];
+                        if (!rt.valid) continue;
+                        const std::int64_t sc =
+                            static_cast<std::int64_t>(rt.charge) * 4 +
+                            rt.sigma;
+                        for (int k = 0; k < 4; ++k) {
+                            if (sc > topsc[k]) {
+                                for (int j = 3; j > k; --j) {
+                                    topsc[j] = topsc[j - 1];
+                                    top[j] = top[j - 1];
+                                }
+                                topsc[k] = sc; top[k] = i; break;
+                            }
+                        }
+                    }
+                    std::string blob;
+                    for (int k = 0; k < 4; ++k) {
+                        if (top[k] < 0) continue;
+                        const Transition& rt = bs.replay[top[k]];
+                        int verb = -1;
+                        for (int i = 0; i < kActionVerbs; ++i)
+                            if (rt.a[i] == 100) { verb = i; break; }
+                        if (verb < 0) continue;
+                        EngramPayload ep;
+                        ep.verb = verb;
+                        ep.charge = rt.charge;
+                        ep.sigma = rt.sigma;
+                        ep.wh = rt.wh;
+                        ep.w1h = rt.w1h;
+                        ep.y = rt.y;
+                        // attach the author's own latest synthesis on this
+                        // verb, when one exists — the recipe travels with
+                        // the memory that discovered it.
+                        const char* vn = sensor_verb_table()[verb];
+                        for (const World::SynthRecord& sr : w.synthesized_)
+                            if (sr.actor == ctx.actor && sr.verb == vn)
+                                ep.synth = sr.synth_id;
+                        if (!blob.empty()) blob.push_back('\n');
+                        blob += engram_encode(ep);
+                    }
+                    if (!blob.empty())
+                        is.props.set(p_art, Value::text(blob));
+                }
+            }
+        }
         is.rel_from.push_back({"inscribed_on", t->id});
         r.spawns.push_back(is);
     }
