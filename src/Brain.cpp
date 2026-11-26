@@ -125,6 +125,9 @@ BrainGenome brain_default_genome() {
     g.slow[16] = 25;     // ei 200 permille
     g.slow[17] = 15;     // density 120 permille
     // tract gains stay 0 -> kBrainTracts table defaults
+    g.slow[42] = 6;      // stdp_window ticks
+    g.slow[43] = 100;    // plastic_rate 400 permille
+    g.slow[44] = 100;    // reward_rate 400 permille
     return g;
 }
 
@@ -141,7 +144,11 @@ void brainnet_sanitize(std::vector<std::int8_t>& slow) {
     cl(slow[16], 0, 127);    // ei
     cl(slow[17], 0, 127);    // density
     for (std::size_t t = 18; t < 42; ++t) cl(slow[t], 0, 127);
-    // 42..95 reserved: keep raw int8 (future parameters)
+    // Phase 6 plasticity params (heritable, spec §13.1)
+    cl(slow[42], 0, 16);    // stdp_window (0 -> default 6)
+    cl(slow[43], 0, 255);   // plastic_rate /4 permille
+    cl(slow[44], 0, 255);   // reward_rate /4 permille
+    // 45..95 reserved: keep raw int8 (future parameters)
 }
 
 BrainNetParams brainnet_params_of(const BrainGenome& g) {
@@ -166,6 +173,10 @@ BrainNetParams brainnet_params_of(const BrainGenome& g) {
         p.tract_gain[t] = g.slow[18 + t] > 0
                               ? static_cast<std::int16_t>(g.slow[18 + t] * 2)
                               : 0;
+    p.stdp_window = static_cast<std::uint8_t>(
+        g.slow[42] == 0 ? 6 : clampi(g.slow[42], 2, 16));
+    p.plastic_rate = clampi(g.slow[43], 0, 255) * 4;
+    p.reward_rate = clampi(g.slow[44], 0, 255) * 4;
     return p;
 }
 
@@ -306,7 +317,7 @@ void brain_vital_tick(World& w, BrainSlot& s, const Entity* me,
     const std::int64_t stress = panic + grief;
     const std::int64_t satiety = 1000 - std::max(hunger, thirst);
     const std::int64_t tgt[kBModCount] = {
-        clampi(v.last_reward * 2, 0, 1000),                    // dopa: RPE
+        clampi(384 + v.last_rpe / 2, 0, 1000),               // dopa: RPE
         clampi(satiety, 0, 1000),                              // sero: satiety
         clampi(v.last_sigma + (panic + rage) / 2, 0, 1000),    // norepi: arousal
         clampi(v.last_sigma / 2 + stress / 8, 0, 1000),        // achi: encoding
@@ -453,6 +464,169 @@ void brain_consolidate(BrainSlot& s, std::int64_t comp_permille) {
     for (int k = 0; k < 2; ++k) net.step();
 }
 
+// ---- Phase 6: reward-modulated plasticity -------------------------------------
+// Eligibility = recently delivered plastic kicks still inside the reward
+// window. RPE sign decides direction: positive -> potentiate eligible
+// synapses, negative -> depress. Aversive events force a negative floor so
+// failure always teaches (spec §13.3).
+void brain_reward_plasticity(BrainSlot& s, std::int64_t rpe,
+                             bool aversive) {
+    BrainNet& net = s.net;
+    std::int64_t eff = rpe;
+    if (aversive && eff > -200) eff = -200;
+    if (eff == 0) return;
+    const std::int32_t rate = net.reward_rate;
+    const std::int32_t gate = std::max<std::int32_t>(
+        64, std::min<std::int32_t>(2500, net.stdp_gate));
+    // dw delta: |rpe| 1000 -> ~rate*gate/100000*8 dw units; clamp sane.
+    std::int32_t delta = static_cast<std::int32_t>(
+        std::max<std::int64_t>(1, std::abs(eff) * rate * gate /
+                                     (1000 * 100000) * 8));
+    delta = std::min(delta, 24);
+    if (eff < 0) delta = -delta;
+    const std::uint32_t ewin = net.stdp_window * 6;  // reward window wider
+    for (std::uint32_t u = 0; u < net.neuron_count; ++u) {
+        for (std::uint64_t e : net.kick_hist[u]) {
+            if (e == ~0ull) continue;
+            if (net.tick - (e >> 24) > ewin) continue;
+            const std::uint32_t k =
+                static_cast<std::uint32_t>(e & 0xFFFFFFull);
+            if (k >= net.syn_count || !(net.syn[k].flags & 1)) continue;
+            std::int32_t d = net.dw[k] + delta;
+            net.dw[k] = static_cast<std::int8_t>(
+                std::max(-BrainNet::kDwMax, std::min(BrainNet::kDwMax, d)));
+        }
+    }
+}
+
+// ---- Phase 7: goal management -------------------------------------------------
+// Goals derive from homeostatic drives + emotional state each decide — they
+// bias candidates but NEVER become actions by themselves (spec §17).
+// origin codes: 0=homeostatic, 1=survival, 2=exploration, 3=social,
+//               4=resource, 5=learned, 6=long-term.
+std::uint64_t social_key_of(EntityId id) {
+    return Rng::hash(static_cast<std::uint64_t>(id) ^
+                     0x5DEECE66DULL);
+}
+BrainSocial* social_find(BrainCognition& c, std::uint64_t key) {
+    BrainSocial* empty = nullptr;
+    for (BrainSocial& s : c.social) {
+        if (s.key == key) return &s;
+        if (s.key == 0 && !empty) empty = &s;
+    }
+    return empty;
+}
+void social_upsert(BrainCognition& c, std::uint64_t key, std::int64_t dtrust,
+                   std::int64_t tick) {
+    BrainSocial* s = social_find(c, key);
+    if (!s) return;
+    if (s->key == 0) s->key = key;
+    s->trust = static_cast<std::int16_t>(clampi(
+        static_cast<std::int64_t>(s->trust) + dtrust, -1000, 1000));
+    s->familiarity = static_cast<std::int16_t>(clampi(
+        static_cast<std::int64_t>(s->familiarity) + 40, 0, 1000));
+    s->last = static_cast<std::uint64_t>(tick);
+}
+void brain_goals_update(World& w, BrainSlot& s,
+                        const AgentMind* mind) {
+    BrainVital& v = s.vital;
+    BrainCognition& c = s.cog;
+    const std::uint64_t tick = w.clock_.tick();
+    struct Want { std::int32_t verb; std::int16_t pri; std::uint8_t org; };
+    Want wants[8]; int nw = 0;
+    auto add = [&](int verb, std::int64_t pri, int org) {
+        if (nw < 8 && pri > 200) wants[nw++] = {
+            verb, static_cast<std::int16_t>(clampi(pri, 0, 1000)),
+            static_cast<std::uint8_t>(org)};
+    };
+    if (v.drive_hunger > 550)  add(0, v.drive_hunger, 0);   // consume
+    if (v.drive_thirst > 550)  add(0, v.drive_thirst, 0);
+    if (v.drive_fatigue > 550 || v.sleep_pressure > 500)
+        add(4, std::max<std::int64_t>(v.drive_fatigue, v.sleep_pressure), 0);
+    if (v.drive_stress > 600)  add(4, v.drive_stress, 1);   // rest/flee
+    if (v.emo[kBEmoCuriosity] > 600) {
+        // exploration: untried invention verbs
+        add(9, v.emo[kBEmoCuriosity], 2);
+        add(10, v.emo[kBEmoCuriosity] * 3 / 4, 2);
+    }
+    if (mind && !mind->known_actions.empty()) {
+        // social goal when conspecifics are remembered (live engrams)
+        std::size_t nmem = 0;
+        for (const auto& [kid, snap] : mind->memory)
+            if (kid != kNoEntity && snap.engram.clarity > 0) ++nmem;
+        if (nmem > 0) add(12, 350 + std::min<std::int64_t>(nmem, 6) * 60, 3);
+    }
+    // write top wants into goal slots (stable: refresh by origin+verb)
+    for (Want& wt : wants) {
+        BrainGoal* slot = nullptr;
+        for (BrainGoal& g : c.goals)
+            if (g.active && g.verb == wt.verb && g.origin == wt.org) {
+                slot = &g; break;
+            }
+        if (!slot) {
+            for (BrainGoal& g : c.goals)
+                if (!g.active) { slot = &g; break; }
+            if (!slot) {
+                // evict lowest priority
+                slot = &c.goals[0];
+                for (BrainGoal& g : c.goals)
+                    if (g.priority < slot->priority) slot = &g;
+            }
+            slot->verb = wt.verb; slot->origin = wt.org; slot->target = 0;
+        }
+        slot->priority = wt.pri; slot->last = tick; slot->active = true;
+    }
+    // deactivate stale goals (not refreshed for 4000 ticks)
+    for (BrainGoal& g : c.goals)
+        if (g.active && tick - g.last > 4000) g.active = false;
+    // conflict: two active goals with close priority -> PFC must arbitrate
+    std::int64_t best = -1, second = -1;
+    for (const BrainGoal& g : c.goals) {
+        if (!g.active) continue;
+        if (g.priority > best) { second = best; best = g.priority; }
+        else if (g.priority > second) second = g.priority;
+    }
+    c.conflict = (best > 0 && second > 0 && best - second < 120)
+                     ? static_cast<std::int16_t>(
+                           120 - (best - second)) : 0;
+}
+
+// ---- Phase 7: bounded mental rollout (spec §19) --------------------------------
+// Neural simulation, NOT a world clone: inject the candidate's efference
+// copy, run `depth` ticks, measure the Motor Cortex readout delta +
+// Hypothalamic relief as the predicted value. Read-only w.r.t. the world;
+// mutates only this agent's net (deterministic, billed as MACs).
+std::int64_t brain_rollout_score(BrainSlot& s, int verb,
+                                 std::int64_t depth) {
+    BrainNet& net = s.net;
+    const BrainModuleState& mc =
+        net.modules[static_cast<int>(BrainModule::kMotorCortex)];
+    const BrainModuleState& hm =
+        net.modules[static_cast<int>(BrainModule::kHypothalamus)];
+    std::int64_t before = 0;
+    for (std::uint32_t i = 0; i < mc.count && i < kActionVerbs; ++i)
+        before += net.st[mc.first + i].membrane;
+    // efference copy: candidate verb injects into Motor + Cerebellum
+    for (std::uint32_t i = 0; i < mc.count; ++i)
+        net.inject(static_cast<std::uint8_t>(BrainModule::kMotorCortex),
+                   static_cast<std::int32_t>(i), 60);
+    const BrainModuleState& cb =
+        net.modules[static_cast<int>(BrainModule::kCerebellum)];
+    for (std::uint32_t i = 0; i < cb.count; ++i)
+        net.inject(static_cast<std::uint8_t>(BrainModule::kCerebellum),
+                   static_cast<std::int32_t>(i), 30);
+    for (std::int64_t d = 0; d < depth; ++d) net.step();
+    std::int64_t after = 0;
+    for (std::uint32_t i = 0; i < mc.count && i < kActionVerbs; ++i)
+        after += net.st[mc.first + i].membrane;
+    // predicted value: motor engagement delta + homeostatic scalar drift
+    std::int64_t hm_d = 0;
+    for (std::uint32_t i = 0; i < hm.count; ++i)
+        hm_d += net.st[hm.first + i].membrane;
+    return (after - before) / 8 + hm_d / 64 +
+           s.vital.exp_rew[verb < kActionVerbs ? verb : 0] / 8;
+}
+
 // read a brain_* hyper-gene locus (integer allele) with a default
 std::int64_t brain_locus(const World& w, const Entity* e,
                          const char* name, std::int64_t dflt) {
@@ -499,7 +673,8 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
     slot.vital.attn_gain.fill(256);    // unity thalamic gain (Q8)
     slot.net.init(w.world_seed, npc, p.pops, p.threshold, p.reset,
                   p.leak_shift, p.refractory, p.ei_permille,
-                  p.density_permille, p.tract_gain);
+                  p.density_permille, p.tract_gain,
+                  p.stdp_window, p.plastic_rate, p.reward_rate);
     auto [ins, ok] = store.slots.emplace(npc, std::move(slot));
     (void)ok;
     return ins->second;
@@ -531,9 +706,11 @@ void brain_pre(World& w, EntityId npc, const InteractionContext& ctx) {
     p.s = sensor_encode(w, npc, &s.last_action);
     p.a = sensor_action(ctx);
     p.pm_a = kNoMaterial; p.pm_b = kNoMaterial;
+    p.pm_target = kNoEntity;
     if (const Entity* me = w.find(npc)) p.pm_pos = me->pos;
     for (EntityId tid : ctx.targets) {
         if (tid == ctx.actor) continue;
+        if (p.pm_target == kNoEntity) p.pm_target = tid;
         const Entity* t = w.find(tid);
         if (!t || !t->alive || t->material == kNoMaterial) continue;
         if (p.pm_a == kNoMaterial) p.pm_a = t->material;
@@ -586,10 +763,12 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     s.vital.last_reward = static_cast<std::int16_t>(clampi(y[24], -1000, 1000));
     s.vital.last_sigma = static_cast<std::int16_t>(sigma);
     s.vital.last_charge = static_cast<std::int16_t>(charge);
+    int verb_idx = -1;
+    for (int i = 0; i < kActionVerbs; ++i)
+        if (p.a[i] == 100) { verb_idx = i; break; }
+    const bool aversive = ev.failed || sigma >= 600 || charge >= 600;
     {
         const Entity* me = w.find(npc);
-        const bool aversive =
-            ev.failed || sigma >= 600 || charge >= 600;
         if (aversive && me) {
             const std::uint64_t ctx = fear_ctx_of(me, p.pm_a);
             brain_fear_upsert(s.vital, ctx,
@@ -600,9 +779,6 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                            120, 0, 1000));
         }
         // cerebellar motor error: move verbs get prediction-error current
-        int verb_idx = -1;
-        for (int i = 0; i < kActionVerbs; ++i)
-            if (p.a[i] == 100) { verb_idx = i; break; }
         if (verb_idx >= 0 && me) {
             const char* vn = sensor_verb_table()[verb_idx];
             if (std::strcmp(vn, "move") == 0) {
@@ -647,11 +823,102 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
         }
     }
 
+    // ---- Phase 6: reward prediction error + plasticity + social ---------------
+    // RPE = actual outcome - expected outcome for THIS verb (EMA per-verb,
+    // spec §13.2). The RPE sets last_rpe (dopamine target next vital_tick)
+    // and gates synaptic plasticity on currently-eligible synapses.
+    {
+        const std::int64_t actual = clampi(y[24], -1000, 1000);
+        if (verb_idx >= 0) {
+            std::int16_t& exp = s.vital.exp_rew[verb_idx];
+            const std::int64_t rpe = actual - exp;
+            s.vital.last_rpe = static_cast<std::int16_t>(
+                clampi(rpe, -2000, 2000));
+            // EMA update: exp += rpe/8 (defined division, deterministic)
+            exp = static_cast<std::int16_t>(clampi(
+                static_cast<std::int64_t>(exp) + rpe / 8, -1000, 1000));
+            // dopamine gate for all plasticity this post
+            s.net.stdp_gate = static_cast<std::int32_t>(clampi(
+                200 + s.vital.mod[kBModDopa] * 2, 64, 2200));
+            brain_reward_plasticity(s, rpe, aversive);
+        }
+        // failure / high-surprise -> next decide triggers bounded planning
+        if (aversive || sigma >= 700)
+            s.cog.plan_trigger = 1;
+        else if (sigma < 300 && !ev.failed)
+            s.cog.plan_trigger = 0;
+
+        // ---- Phase 8: social cognition -------------------------------------
+        // Own experience with a conspecific target: familiarity + trust.
+        // Communicated claims update trust at half rate (hearsay discount).
+        if (p.pm_target != kNoEntity) {
+            const Entity* tgt = w.find(p.pm_target);
+            if (tgt && tgt->alive && w.find_mind(p.pm_target)) {
+                const std::uint64_t key = social_key_of(p.pm_target);
+                // outcome valence: reward-positive -> trust+, aversive -> trust-
+                std::int64_t dv = 0;
+                if (!ev.failed) {
+                    if (actual > 200) dv = 10;
+                    else if (actual < -200) dv = -12;
+                    else if (sigma < 300) dv = 4;
+                } else dv = -15;
+                if (verb_idx >= 0 &&
+                    std::strcmp(sensor_verb_table()[verb_idx],
+                                "communicate") == 0) {
+                    // communication reliability ledger
+                    s.cog.comm_rel = static_cast<std::int16_t>(clampi(
+                        static_cast<std::int64_t>(s.cog.comm_rel) +
+                            (sigma < 500 && !ev.failed ? 12 : -15),
+                        -1000, 1000));
+                    dv /= 2;   // hearsay discount on trust move
+                }
+                social_upsert(s.cog, key, dv, w.clock_.tick());
+            }
+        }
+        // language production success -> strengthen language tracts a touch
+        // (vocabulary/sequence associations, spec §20): Assoc->Lang and
+        // Lang->MotorCortex plastic synapses get a small LTP bump.
+        if (verb_idx >= 0 && !ev.failed &&
+            std::strcmp(sensor_verb_table()[verb_idx],
+                        "communicate") == 0) {
+            BrainNet& net = s.net;
+            for (std::uint32_t k = 0; k < net.syn_count; ++k) {
+                if (!(net.syn[k].flags & 1)) continue;
+                // plastic synapses targeting Language = lexical integration
+                const std::uint8_t tm =
+                    net.module_of[net.syn[k].target];
+                if (tm == static_cast<std::uint8_t>(
+                        BrainModule::kLanguage)) {
+                    std::int32_t d = net.dw[k] + 1;
+                    net.dw[k] = static_cast<std::int8_t>(std::min(
+                        BrainNet::kDwMax, d));
+                }
+            }
+            // Lang->MC: source in Language module — find pre via CSR scan is
+            // costly; approximate by scanning rows of language neurons.
+            const BrainModuleState& lm =
+                net.modules[static_cast<int>(BrainModule::kLanguage)];
+            const std::uint8_t mc_idx =
+                static_cast<std::uint8_t>(BrainModule::kMotorCortex);
+            for (std::uint32_t u = lm.first; u < lm.first + lm.count; ++u) {
+                for (std::uint32_t k = net.row_ptr[u];
+                     k < net.row_ptr[u + 1]; ++k) {
+                    if (!(net.syn[k].flags & 1)) continue;
+                    if (net.module_of[net.syn[k].target] != mc_idx)
+                        continue;
+                    std::int32_t d = net.dw[k] + 1;
+                    net.dw[k] = static_cast<std::int8_t>(std::min(
+                        BrainNet::kDwMax, d));
+                }
+            }
+        }
+    }
+
     // ---- outcome teaching signal -------------------------------------------
     // Inject the homeostatic reward (label ch24) as a modulatory current
     // into Hypothalamus (drive) and Basal Ganglia (action valuation), then
-    // let the network settle for a few ticks. Phase 6 replaces this with
-    // proper dopamine/eligibility plasticity.
+    // let the network settle for a few ticks under the dopamine gate set
+    // above — STDP + reward eligibility do the actual weight updates.
     {
         BrainNet& net = s.net;
         const std::int32_t rew = static_cast<std::int32_t>(y[24]);
@@ -727,6 +994,11 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     // ---- Phase 3-5: homeostasis, neuromodulation, attention ------------------
     brain_vital_tick(w, s, me, mind);
     brain_attn_update(s.vital);
+    // Phase 7: hierarchical goal management + conflict detection (spec §17)
+    brain_goals_update(w, s, mind);
+    // dopamine gate for this burst's STDP (spec §13.2)
+    net.stdp_gate = static_cast<std::int32_t>(clampi(
+        200 + s.vital.mod[kBModDopa] * 2, 64, 2200));
 
     SensorVec sv = sensor_encode(w, npc, &s.last_action);
     // perceptual uncertainty (spec §9.2): low acetylcholine -> deterministic
@@ -821,6 +1093,39 @@ BrainChoice brain_decide(World& w, EntityId npc) {
             const std::uint32_t idx =
                 am.count - navail + t;
             entsal[t] = net.st[am.first + idx].membrane;
+        }
+    }
+    // PFC functional subdivisions (spec §4.7): dlPFC = first third
+    // (working memory / rule maintenance), vmPFC = middle (value
+    // integration), OFC = last third (expected outcome / switching).
+    std::int32_t pfc_dlp = 0, pfc_vmp = 0, pfc_ofc = 0;
+    {
+        const BrainModuleState& pm =
+            net.modules[static_cast<int>(BrainModule::kPrefrontal)];
+        const std::uint32_t third = std::max<std::uint32_t>(1, pm.count / 3);
+        for (std::uint32_t i = 0; i < pm.count; ++i) {
+            const std::int32_t m = net.st[pm.first + i].membrane;
+            if (i < third) pfc_dlp += m;
+            else if (i < 2 * third) pfc_vmp += m;
+            else pfc_ofc += m;
+        }
+        pfc_dlp /= static_cast<std::int32_t>(third);
+        pfc_vmp /= static_cast<std::int32_t>(third);
+        pfc_ofc /= static_cast<std::int32_t>(std::max<std::uint32_t>(
+            1, pm.count - 2 * third));
+    }
+    // Language Network readout: mean of last 8 Language neurons =
+    // communicative intent (spec §4.11/§20).
+    std::int32_t lang_intent = 0;
+    {
+        const BrainModuleState& lm =
+            net.modules[static_cast<int>(BrainModule::kLanguage)];
+        const std::uint32_t n =
+            std::min<std::uint32_t>(8, lm.count);
+        if (n) {
+            for (std::uint32_t i = lm.count - n; i < lm.count; ++i)
+                lang_intent += net.st[lm.first + i].membrane;
+            lang_intent /= static_cast<std::int32_t>(n);
         }
     }
 
@@ -924,6 +1229,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
 
     std::int64_t best_total = INT64_MIN;
     int best_c = 0;
+    std::int64_t totals[kC] = {};
     for (int c = 0; c < ncand; ++c) {
         const Cand& cd = cands[c];
         std::int64_t total = cd.score;
@@ -974,7 +1280,114 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                 std::strcmp(vn, "move") == 0)
                 total += s.vital.emo[kBEmoFear] / 3;
         }
+        // ---- Phase 7: goal relevance + PFC subdivision integration ----------
+        // Active goals bias their suggested verb (goals never auto-act).
+        for (const BrainGoal& g : s.cog.goals)
+            if (g.active && g.verb == cd.verb)
+                total += g.priority / 8;
+        // dlPFC working-memory maintenance: confident recent action repeats
+        if (s.vital.wm_conf > 500 && cd.verb == s.vital.wm_verb)
+            total += 24;
+        // vmPFC value integration: expected outcome for this verb
+        total += s.vital.exp_rew[cd.verb] / 16;
+        // OFC behavioral switching: high |OFC| + conflict -> novelty-seeking
+        if (s.cog.conflict > 0 && pfc_ofc > 300 && curious &&
+            invent_verb(cd.verb) && cd.tgt < 0)
+            total += 48;
+        // ---- Phase 8: social cognition -------------------------------------
+        // trust/familiarity bias on social verbs toward remembered
+        // conspecifics; comm intent from Language readout.
+        if (cd.tgt >= 0 && cd.tgt < nnear) {
+            const EntityId tid = near[cd.tgt].id;
+            if (tid != npc && w.find_mind(tid)) {
+                const BrainSocial* soc = nullptr;
+                const std::uint64_t key = social_key_of(tid);
+                for (const BrainSocial& x : s.cog.social)
+                    if (x.key == key) { soc = &x; break; }
+                const std::int64_t trust =
+                    soc ? soc->trust : w.tie_weight(npc, "trust", tid);
+                const char* vn = sensor_verb_table()[cd.verb];
+                const bool social_v =
+                    std::strcmp(vn, "share") == 0 ||
+                    std::strcmp(vn, "communicate") == 0 ||
+                    std::strcmp(vn, "trade") == 0 ||
+                    std::strcmp(vn, "strike") == 0 ||
+                    std::strcmp(vn, "steal") == 0;
+                if (social_v) {
+                    // trusted partners: pro-social verbs up, harm down
+                    if (trust > 0 &&
+                        (std::strcmp(vn, "share") == 0 ||
+                         std::strcmp(vn, "communicate") == 0 ||
+                         std::strcmp(vn, "trade") == 0))
+                        total += trust / 12;
+                    if (trust < 0 &&
+                        (std::strcmp(vn, "strike") == 0 ||
+                         std::strcmp(vn, "steal") == 0))
+                        total += trust / 12;   // trust<0 -> negative
+                    if (trust < 0 &&
+                        (std::strcmp(vn, "share") == 0 ||
+                         std::strcmp(vn, "communicate") == 0))
+                        total -= trust / 12;   // distrusted -> avoid help
+                    // heard-say suspicion: low comm_rel discounts incoming
+                    // social verbs (source-tagged reliability, spec §21)
+                    if (s.cog.comm_rel < -200 &&
+                        std::strcmp(vn, "communicate") == 0)
+                        total -= 64;
+                }
+                // communicative intent -> communicate bonus
+                if (lang_intent > 200 &&
+                    std::strcmp(vn, "communicate") == 0)
+                    total += lang_intent / 16;
+            }
+        }
+        totals[c] = total;
         if (total > best_total) { best_total = total; best_c = c; }
+    }
+
+    // ---- Phase 7: bounded mental rollout (spec §19) ---------------------------
+    // Triggered by goal conflict, post failure/surprise, or high uncertainty.
+    // Simple reflexes (panic/rage override) bypass planning entirely.
+    // Read-only w.r.t. the world; mutates only this agent's net.
+    {
+        const bool reflex = ns.panic > 700 || ns.rage > 700;
+        const bool uncertain = s.vital.mod[kBModAchi] < 350;
+        const bool want_plan =
+            !reflex && ncand > 1 &&
+            (s.cog.plan_trigger || s.cog.conflict > 0 ||
+             s.vital.last_sigma > 750 || uncertain);
+        if (want_plan) {
+            // configurable depth (mind aptitude) & candidate budget (2)
+            const std::int64_t horizon =
+                mind_params(w, *me).plan_horizon;
+            const std::int64_t depth = std::max<std::int64_t>(
+                1, std::min<std::int64_t>(4, horizon));
+            const int budget = std::min(ncand, 2);
+            std::int64_t rscore[kC] = {};
+            for (int c = 0; c < budget; ++c) {
+                rscore[c] = brain_rollout_score(
+                    s, cands[c].verb, depth);
+                s.cog.plan_ops +=
+                    static_cast<std::uint64_t>(net.neuron_count) * depth;
+            }
+            s.cog.plan_trigger = 0;   // consumed
+            // PFC arbitration: if a rollout predicts a clearly better
+            // outcome for a non-greedy candidate, it overrides BG habit.
+            // (only when the greedy candidate itself was simulated)
+            if (best_c < budget) {
+                const std::int64_t ref = rscore[best_c];
+                for (int c = 0; c < budget; ++c) {
+                    if (c == best_c) continue;
+                    if (rscore[c] - ref > 400)
+                        totals[c] += 160;   // bounded override bonus
+                }
+            }
+            // re-pick argmax over adjusted totals
+            best_total = INT64_MIN;
+            for (int c = 0; c < ncand; ++c)
+                if (totals[c] > best_total) {
+                    best_total = totals[c]; best_c = c;
+                }
+        }
     }
 
     // ---- metabolism: bill neural work -------------------------------------------
@@ -1062,6 +1475,67 @@ void brain_assimilate(World& w, EntityId npc, int verb,
     for (int k = 0; k < 4; ++k) net.step();
 }
 
+// ================= observational learning + social cognition ==================
+
+void brain_observe(World& w, EntityId observer, EntityId actor, int verb,
+                   std::int64_t outcome_valence, bool via_comm) {
+    if (w.speculative || !w.brains_) return;
+    auto it = w.brains_->slots.find(observer);
+    if (it == w.brains_->slots.end()) return;   // no brain -> no neural learn
+    BrainSlot& s = it->second;
+    BrainNet& net = s.net;
+    if (verb < 0 || verb >= kActionVerbs) return;
+
+    // Phase 8 social bookkeeping: familiarity always; trust moves at full
+    // rate for direct observation, half rate for communicated hearsay.
+    {
+        const std::uint64_t key = social_key_of(actor);
+        std::int64_t dv = 0;
+        if (outcome_valence > 200) dv = via_comm ? 5 : 10;
+        else if (outcome_valence < -200) dv = via_comm ? -6 : -12;
+        else dv = via_comm ? 1 : 3;
+        social_upsert(s.cog, key, dv, w.clock_.tick());
+        if (via_comm) {
+            // source-tagged reliability: the observer tracks how much to
+            // trust THIS source's claims (spec §21 hearsay discount)
+            s.cog.comm_rel = static_cast<std::int16_t>(clampi(
+                static_cast<std::int64_t>(s.cog.comm_rel) +
+                    (outcome_valence >= 0 ? 6 : -10), -1000, 1000));
+        }
+    }
+
+    // Phase 6 observational learning (spec §13.4): inject the observed
+    // (actor-context, verb) pattern into Hippocampus + Association under a
+    // dopamine gate scaled by valence — associations form, but the small
+    // current means observation alone never grants skill mastery.
+    const BrainModuleState& hip =
+        net.modules[static_cast<int>(BrainModule::kHippocampus)];
+    const BrainModuleState& asc =
+        net.modules[static_cast<int>(BrainModule::kAssociation)];
+    const std::uint64_t h = Rng::hash(
+        w.world_seed ^ (actor * 0x9E3779B97F4A7C15ull) ^
+        (static_cast<std::uint64_t>(verb) << 32));
+    const std::int32_t amp = static_cast<std::int32_t>(clampi(
+        40 + outcome_valence / 8, 20, 120));
+    for (std::uint32_t i = 0; i < hip.count && i < 48; ++i)
+        net.inject(static_cast<std::uint8_t>(BrainModule::kHippocampus),
+                   static_cast<std::int32_t>(i),
+                   amp * static_cast<std::int32_t>(
+                       ((h >> (i % 24)) & 1) ? 1 : -1) / 4);
+    for (std::uint32_t i = 0; i < asc.count && i < 48; ++i)
+        net.inject(static_cast<std::uint8_t>(BrainModule::kAssociation),
+                   static_cast<std::int32_t>(i),
+                   amp * static_cast<std::int32_t>(
+                       ((h >> ((i + 13) % 24)) & 1) ? 1 : -1) / 4);
+    // dopamine bump: salient observations are remembered better
+    s.vital.mod[kBModDopa] = static_cast<std::int16_t>(clampi(
+        static_cast<std::int64_t>(s.vital.mod[kBModDopa]) +
+            (outcome_valence >= 0 ? 60 : 20), 0, 1000));
+    net.stdp_gate = static_cast<std::int32_t>(clampi(
+        200 + s.vital.mod[kBModDopa] * 2, 64, 2200));
+    for (int k = 0; k < 2; ++k) net.step();
+}
+
 // ================= fingerprint ==================================================
 
 std::uint64_t brain_state_hash(const BrainStore& store) {
@@ -1130,6 +1604,28 @@ std::uint64_t brain_state_hash(const BrainStore& store) {
         mix(static_cast<std::uint16_t>(v.last_reward));
         mix(static_cast<std::uint16_t>(v.last_sigma));
         mix(static_cast<std::uint16_t>(v.last_charge));
+        // Phase 6: per-verb expected outcomes + last RPE
+        for (std::int16_t e : v.exp_rew)
+            mix(static_cast<std::uint16_t>(e));
+        mix(static_cast<std::uint16_t>(v.last_rpe));
+        // Phase 6: learned synaptic deltas ARE state (persist + hash)
+        for (std::int8_t d : n.dw) mix(static_cast<std::uint8_t>(d));
+        // Phase 7-8 cognition: goals, social memory, comm reliability
+        const BrainCognition& cg = s.cog;
+        for (const BrainGoal& g : cg.goals) {
+            mix(static_cast<std::uint32_t>(g.verb));
+            mix(static_cast<std::uint64_t>(g.target));
+            mix(static_cast<std::uint16_t>(g.priority));
+            mix(g.origin); mix(g.last); mix(g.active ? 1 : 0);
+        }
+        for (const BrainSocial& so : cg.social) {
+            mix(so.key); mix(static_cast<std::uint16_t>(so.trust));
+            mix(static_cast<std::uint16_t>(so.familiarity)); mix(so.last);
+        }
+        mix(static_cast<std::uint16_t>(cg.comm_rel));
+        mix(static_cast<std::uint16_t>(cg.conflict));
+        mix(static_cast<std::uint16_t>(cg.plan_trigger));
+        mix(cg.plan_ops);
         for (const Transition& t : s.replay) {
             mix(t.valid ? 1 : 0);
             if (!t.valid) continue;

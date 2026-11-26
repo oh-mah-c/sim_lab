@@ -1349,3 +1349,40 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
 - Capstone hash is UNCHANGED (846c6d3eb0152463): autonomous_run does not
   enable brain_control, so world dynamics are untouched. Re-baseline only
   if a brain_control civilization baseline is added later.
+- Phases 6-8 (`BrainCognition` + `dw` plasticity, serialized in v29):
+  - Plasticity: `BrainNet::dw` int8 per synapse (effective weight =
+    weight + dw*8, clamp +-kDwMax=96); plastic flags on local recurrence
+    (except Brainstem/Hypothalamus) + tracts (except idx 7,8 autonomic).
+    STDP in step(): causal LTP on kick_hist deliveries, anti-causal LTD
+    on last_fire; eligibility = kick_hist[4] (tick<<24|syn_idx) +
+    last_fire[], all transient. Params heritable via genome slow[42..44]
+    (stdp_window/plastic_rate/reward_rate; int8 lanes cap rates at 508
+    permille). Reward plasticity in brain_post: RPE = y[24] -
+    exp_rew[verb] (per-verb EMA exp += rpe/8), aversive floor -200,
+    dopamine gate stdp_gate = clamp(200+2*dopa). NOTE: reward and
+    aversive hits land on the SAME eligibility trace — order matters in
+    tests (potentiate before depress or they cancel).
+  - Cognition: `brain_goals_update` each decide derives BrainGoal[8]
+    from drives/emotion (hunger/thirst->consume, fatigue->rest,
+    curiosity->invention verbs, social->verb12); goals bias verb totals
+    (priority/8) but never auto-act; conflict = top-2 priority gap <120.
+    PFC subdivisions = third-slices of PFC module membranes (dlPFC/vmPFC/
+    OFC); OFC+conflict+curiosity boosts invention verbs.
+  - Planning: `brain_rollout_score` = neural rollout (efference inject
+    Motor+Cerebellum -> depth<=4 net.step -> membrane delta + exp_rew/8),
+    read-only w.r.t. world; triggered by plan_trigger (set on
+    aversive/sigma>=700 in post) OR conflict OR last_sigma>750 OR
+    ACh<350; BYPASSED when panic>700||rage>700 (reflex). plan_ops bills
+    neuron_count*depth MACs.
+  - Language/social: `brain_observe(w,observer,actor,verb,valence,
+    via_comm)` called from World witness path (in-range observers);
+    familiarity +40/exposure, trust full-rate direct / half-rate
+    hearsay, comm_rel ledger on via_comm. brain_post social_upsert on
+    conspecific pm_target (trust by valence, communicate -> comm_rel +
+    half-rate trust). Successful communicate bumps dw on
+    plastic->Language and Language->MotorCortex synapses. decide biases
+    social verbs by trust (w.tie_weight fallback), comm_rel<-200
+    discounts communicate, lang_intent>200 boosts communicate.
+    BrainSocial.key = hash(entity^const) — not reversible.
+  - brain_state_hash mixes exp_rew/last_rpe/dw/cog.*; save v29 writes
+    them all (dw as raw blob).

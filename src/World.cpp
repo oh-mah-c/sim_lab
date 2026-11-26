@@ -5826,6 +5826,18 @@ InteractionResult World::interact(const InteractionContext& ctx) {
                 if (range <= 0) continue;
                 if (dist2(we->pos, ae->pos) > range * range) continue;
                 witness_from_event(*this, wid, *pev);
+                // Phase 6/8: observational learning — witnessed action +
+                // outcome biases the observer's brain (no skill mastery).
+                if (brains_) {
+                    int verb = -1;
+                    for (int vi = 0; vi < kActionVerbs; ++vi)
+                        if (pev->action == sensor_verb_table()[vi]) {
+                            verb = vi; break;
+                        }
+                    brain_observe(*this, wid, ctx.actor, verb,
+                                  pev->failed ? -300 : 150,
+                                  pev->action == "communicate");
+                }
             }
         }
     }
@@ -6784,6 +6796,7 @@ bool World::save(const std::string& path, std::string* err) const {
             w.put(s.pending.tick);
             w.put(s.pending.pm_a); w.put(s.pending.pm_b);
             w.put(s.pending.pm_pos.x); w.put(s.pending.pm_pos.y);  // v29
+            w.put(s.pending.pm_target);                            // v29
             w.put(s.replay_next); w.put(s.replay_count);
             w.put(s.mac_pending); w.put(s.mac_frac);
             for (const Transition& t : s.replay) {
@@ -6812,6 +6825,24 @@ bool World::save(const std::string& path, std::string* err) const {
             w.put(v.attn_last); w.put(v.sleep_pressure); w.put(v.mod_accum);
             w.put(v.wm_verb); w.put(v.wm_target); w.put(v.wm_conf);
             w.put(v.last_reward); w.put(v.last_sigma); w.put(v.last_charge);
+            // Phase 6: RPE expected outcomes + learned synaptic deltas
+            for (std::int16_t e : v.exp_rew) w.put(e);
+            w.put(v.last_rpe);
+            w.str(std::string(reinterpret_cast<const char*>(n.dw.data()),
+                              n.dw.size()));
+            // Phase 7-8: goals, social memory, comm reliability, planning
+            const BrainCognition& cg = s.cog;
+            for (const BrainGoal& g : cg.goals) {
+                w.put(g.verb); w.put(g.target); w.put(g.priority);
+                w.put(g.origin); w.put(g.last);
+                w.boolean(g.active);
+            }
+            for (const BrainSocial& so : cg.social) {
+                w.put(so.key); w.put(so.trust); w.put(so.familiarity);
+                w.put(so.last);
+            }
+            w.put(cg.comm_rel); w.put(cg.conflict);
+            w.put(cg.plan_trigger); w.put(cg.plan_ops);
         }
         w.put(bs.wm_err_sum); w.put(bs.wm_n);
         w.put(bs.sigma_sum); w.put(bs.sigma_n);
@@ -7481,7 +7512,8 @@ bool World::load(const std::string& path, std::string* err) {
                         !r.get(s.pending.tick) ||
                         !r.get(s.pending.pm_a) || !r.get(s.pending.pm_b) ||
                         !r.get(s.pending.pm_pos.x) ||
-                        !r.get(s.pending.pm_pos.y))
+                        !r.get(s.pending.pm_pos.y) ||
+                        !r.get(s.pending.pm_target))
                         return fail("truncated brain pending");
                     s.pending.valid = pv != 0;
                     std::memcpy(s.last_action.data(), ablob.data(), ablob.size());
@@ -7534,6 +7566,32 @@ bool World::load(const std::string& path, std::string* err) {
                         !r.get(v.last_reward) || !r.get(v.last_sigma) ||
                         !r.get(v.last_charge))
                         return fail("truncated brain vital");
+                    // Phase 6-8 state
+                    for (std::int16_t& e : v.exp_rew)
+                        if (!r.get(e)) return fail("truncated brain exp_rew");
+                    if (!r.get(v.last_rpe))
+                        return fail("truncated brain rpe");
+                    std::string dwblob;
+                    if (!r.str(dwblob) || dwblob.size() != s.net.dw.size())
+                        return fail("truncated brain dw");
+                    std::memcpy(s.net.dw.data(), dwblob.data(),
+                                dwblob.size());
+                    BrainCognition& cg = s.cog;
+                    for (BrainGoal& g : cg.goals) {
+                        std::uint8_t ga = 0;
+                        if (!r.get(g.verb) || !r.get(g.target) ||
+                            !r.get(g.priority) || !r.get(g.origin) ||
+                            !r.get(g.last) || !r.get(ga))
+                            return fail("truncated brain goals");
+                        g.active = ga != 0;
+                    }
+                    for (BrainSocial& so : cg.social)
+                        if (!r.get(so.key) || !r.get(so.trust) ||
+                            !r.get(so.familiarity) || !r.get(so.last))
+                            return fail("truncated brain social");
+                    if (!r.get(cg.comm_rel) || !r.get(cg.conflict) ||
+                        !r.get(cg.plan_trigger) || !r.get(cg.plan_ops))
+                        return fail("truncated brain cognition");
                     bs->slots.emplace(nid, std::move(s));
                 } else {
                     // ---- v20..v28 legacy monolithic brain: parse-and-discard --

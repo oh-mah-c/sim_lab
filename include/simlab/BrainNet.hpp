@@ -118,6 +118,25 @@ struct BrainNet {
     // ---- CSR synapses --------------------------------------------------------
     std::vector<std::uint32_t> row_ptr;     // [neuron_count + 1]
     std::vector<BrainSynapse> syn;          // [syn_count]
+    // Phase 6 plasticity: per-synapse learned weight delta (int8, applied
+    // as weight + dw*8, clamped to [-kDwMax,kDwMax]). Parallel to syn[];
+    // dw==0 on non-plastic synapses. Serialized (learned state persists).
+    static constexpr std::int32_t kDwMax = 96;
+    std::vector<std::int8_t> dw;            // [syn_count]
+
+    // ---- STDP eligibility (transient — never serialized) ---------------------
+    // last_fire[u] = net.tick+1 of u's last spike (0 = never).
+    // kick_hist[u] = last 4 delivered plastic kicks: (tick<<24)|syn_idx.
+    // recent_pos[u] = next write slot (0..3).
+    std::vector<std::uint64_t> last_fire;   // [neuron_count]
+    std::vector<std::array<std::uint64_t, 4>> kick_hist;
+    std::vector<std::uint8_t> recent_pos;   // [neuron_count]
+
+    // ---- plasticity parameters (genome slow[42..44], heritable §13.1) -------
+    std::uint8_t stdp_window = 6;           // causal window, neural ticks
+    std::int32_t plastic_rate = 400;        // permille STDP step scale
+    std::int32_t reward_rate = 400;         // permille reward-mod step scale
+    std::int32_t stdp_gate = 512;           // dopamine gate, set per burst
 
     // ---- spike groups: ceil(count/64) masks per module run -------------------
     // transient scratch — recomputed each tick, never serialized
@@ -147,7 +166,9 @@ struct BrainNet {
               std::int16_t threshold, std::int16_t reset,
               std::uint8_t leak_shift, std::uint8_t refractory,
               std::uint8_t ei_permille, std::uint16_t density_permille,
-              const std::array<std::int16_t, 24>& tract_gain);
+              const std::array<std::int16_t, 24>& tract_gain,
+              std::uint8_t stdp_window = 6, std::int32_t plastic_rate = 400,
+              std::int32_t reward_rate = 400);
     // Deterministic re-derivation after load: same args as init; dynamic
     // state (membranes/rings/clocks) is overlaid by deserialize() after.
 

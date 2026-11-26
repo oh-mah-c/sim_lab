@@ -59,6 +59,10 @@ struct BrainNetParams {
     std::uint8_t ei_permille = 200;
     std::uint16_t density_permille = 120;
     std::array<std::int16_t, kBrainTractCount> tract_gain{};
+    // Phase 6 plasticity (genome slow[42..44], heritable):
+    std::uint8_t stdp_window = 6;      // causal window, neural ticks
+    std::int32_t plastic_rate = 400;   // permille STDP step scale
+    std::int32_t reward_rate = 400;    // permille reward-mod step scale
 };
 
 // Decode genome.slow into params, clamping every lane to its domain.
@@ -191,6 +195,35 @@ struct BrainVital {
     std::int16_t last_reward = 0;
     std::int16_t last_sigma = 0;
     std::int16_t last_charge = 0;
+    // Phase 6 reward prediction error (spec §13.2): per-verb expected
+    // outcome (EMA of label ch24) + last computed RPE = actual - expected.
+    std::array<std::int16_t, kActionVerbs> exp_rew{};
+    std::int16_t last_rpe = 0;
+};
+
+// ---- Phase 7-8 state: goals, social cognition, planning ----------------------
+// (brain.txt §§15-21). Integer, deterministic, serialized in v29.
+struct BrainGoal {
+    std::int32_t verb = -1;        // suggested verb index (-1 = none)
+    std::int64_t target = 0;       // remembered entity or 0
+    std::int16_t priority = 0;     // 0..1000
+    std::uint8_t origin = 0;       // drive category code
+    std::uint64_t last = 0;        // tick last refreshed
+    bool active = false;
+};
+struct BrainSocial {
+    std::uint64_t key = 0;         // hash of conspecific entity id
+    std::int16_t trust = 0;        // -1000..1000 (own experience only)
+    std::int16_t familiarity = 0;  // 0..1000 exposure count (saturating)
+    std::uint64_t last = 0;
+};
+struct BrainCognition {
+    std::array<BrainGoal, 8> goals{};
+    std::array<BrainSocial, 8> social{};
+    std::int16_t comm_rel = 0;      // communication reliability -1000..1000
+    std::int16_t conflict = 0;      // last goal-conflict magnitude 0..1000
+    std::int16_t plan_trigger = 0;  // set by brain_post, consumed by decide
+    std::uint64_t plan_ops = 0;     // rollout ops spent (diagnostic)
 };
 
 // Pre-commit snapshot filled by brain_pre() and consumed by brain_post().
@@ -202,6 +235,7 @@ struct BrainPending {
     MaterialId pm_a = kNoMaterial;
     MaterialId pm_b = kNoMaterial;
     Vec2 pm_pos{0, 0};        // actor position at pre (cerebellar error)
+    EntityId pm_target = kNoEntity;  // first interact target (social learning)
 };
 
 // The inheritable brain. `slow` is the kConnectomeBytes connectome
@@ -220,6 +254,7 @@ struct BrainSlot {
     BrainGenome genome;          // heritable connectome params
     BrainNet net;                // spiking state (membranes, synapses, rings)
     BrainVital vital;            // neuromod/emotion/homeostasis/conditioning
+    BrainCognition cog;          // goals/social/planning (Phase 7-8)
     ActionVec last_action{};     // feeds sensor channels 80..95
     BrainPending pending{};
     std::array<Transition, 16> replay{};
@@ -312,6 +347,15 @@ struct BrainChoice {
     std::int64_t score = 0;
 };
 BrainChoice brain_decide(World& w, EntityId npc);
+
+// Phase 6 observational learning (spec §13.4) + Phase 8 social cognition:
+// a witnessed (actor,verb,outcome) event biases the observer's associations
+// WITHOUT guaranteeing skill — small dopamine-gated current injection plus
+// familiarity/trust bookkeeping. `via_comm` marks hearsay (communicated
+// claim): trust moves at half rate and low comm_rel breeds suspicion.
+// No-op when the observer has no brain slot yet.
+void brain_observe(World& w, EntityId observer, EntityId actor, int verb,
+                   std::int64_t outcome_valence, bool via_comm);
 
 void brain_install_spawn(World& w, EntityId nid, const BrainGenome& g);
 

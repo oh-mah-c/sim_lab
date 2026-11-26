@@ -10523,6 +10523,320 @@ static void test_memory_emotion() {
     }
 }
 
+// ================= Phase 6-8: plasticity / cognition / language+social =========
+
+static void test_plasticity() {
+    // (1) integer STDP at net level: causal pairing potentiates, anti-causal
+    // depresses, dw stays bounded (spec §13.1)
+    {
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[static_cast<int>(BrainModule::kSensoryCortex)] = 4;
+        std::array<std::int16_t, kBrainTractCount> tg{};
+        BrainNet n;
+        n.init(7, 42, pops, 800, -200, 5, 2, 200, 120, tg,
+               6, 400, 400);
+        CHECK(n.neuron_count == 4 && n.syn_count > 0);
+        const BrainModuleState& sm =
+            n.modules[static_cast<int>(BrainModule::kSensoryCortex)];
+        CHECK(sm.count == 4 && sm.period == 1);
+        // pick synapse 0->target from neuron 0's row
+        const std::uint32_t k0 = n.row_ptr[0];
+        CHECK(k0 < n.syn_count);
+        const std::uint32_t tgt = n.syn[k0].target;
+        CHECK((n.syn[k0].flags & 1) != 0);   // SC local recurrence is plastic
+        const std::int32_t tgt_local =
+            static_cast<std::int32_t>(tgt - sm.first);
+        CHECK(tgt_local >= 0 && tgt_local < 4);
+
+        // --- causal LTP: pre fires, kick delivers, post fires within window --
+        n.inject(static_cast<std::uint8_t>(
+                     BrainModule::kSensoryCortex), 0, 3000);
+        n.step();                                   // u0 spikes
+        n.step();                                   // kick -> kick_hist
+        n.inject(static_cast<std::uint8_t>(
+                     BrainModule::kSensoryCortex), tgt_local, 3000);
+        n.step();                                   // post spikes -> LTP
+        CHECK(n.dw[k0] > 0);
+
+        // --- anti-causal LTD on a fresh net: post fires first ---------------
+        BrainNet m;
+        m.init(7, 42, pops, 800, -200, 5, 2, 200, 120, tg,
+               6, 400, 400);
+        const std::uint32_t mk0 = m.row_ptr[0];
+        const std::uint32_t mtgt = m.syn[mk0].target;
+        const std::int32_t mtgt_local =
+            static_cast<std::int32_t>(mtgt - sm.first);
+        m.inject(static_cast<std::uint8_t>(
+                     BrainModule::kSensoryCortex), mtgt_local, 3000);
+        m.step();                                   // post spikes first
+        m.step();
+        m.inject(static_cast<std::uint8_t>(
+                     BrainModule::kSensoryCortex), 0, 3000);
+        m.step();                                   // pre spikes -> LTD
+        CHECK(m.dw[mk0] < 0);
+
+        // --- bounds: hammer LTP, dw clamps at kDwMax -------------------------
+        for (int i = 0; i < 40; ++i) {
+            n.dw[k0] = BrainNet::kDwMax;            // preset ceiling
+            n.inject(static_cast<std::uint8_t>(
+                         BrainModule::kSensoryCortex), tgt_local, 3000);
+            n.step(); n.step();
+        }
+        CHECK(n.dw[k0] <= BrainNet::kDwMax);
+        CHECK(n.dw[k0] >= -BrainNet::kDwMax);
+    }
+
+    // (2) heritable plasticity params decode from genome slow[42..44] -------
+    // NOTE: slow[] lanes are int8 -> encoded rates cap at 127*4=508 permille.
+    {
+        BrainGenome g = brain_default_genome();
+        g.slow[42] = 10; g.slow[43] = 50; g.slow[44] = 100;
+        const BrainNetParams p = brainnet_params_of(g);
+        CHECK(p.stdp_window == 10);
+        CHECK(p.plastic_rate == 200);
+        CHECK(p.reward_rate == 400);
+        g.slow[42] = 99; g.slow[43] = -5; g.slow[44] = 127;
+        brainnet_sanitize(g.slow);
+        const BrainNetParams p2 = brainnet_params_of(g);
+        CHECK(p2.stdp_window <= 16);
+        CHECK(p2.plastic_rate >= 0 && p2.plastic_rate <= 508);
+        CHECK(p2.reward_rate == 508);
+    }
+
+    // (3) reward-modulated plasticity + RPE via brain_post -------------------
+    {
+        World w(777, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);          // creates slot + neural activity
+        BrainSlot& s = w.brains_->slots[id];
+        // positive homeostatic reward FIRST: hunger 800->0 -> y[24] > 0,
+        // RPE potentiates eligible synapses before any aversive event.
+        tseti(*w.find(id), w, "hunger", 800);
+        brain_pre(w, id, mk_ctx(id, {}, "consume", 0));
+        CausalEvent ev2;
+        ev2.id = 2; ev2.action = "consume"; ev2.tick = w.clock_.tick();
+        StateChange ch;
+        ch.entity = id; ch.prop = tpid(w, "hunger");
+        ch.had_before = true;
+        ch.before = Value::integer(800); ch.after = Value::integer(0);
+        ev2.changes.push_back(ch);
+        brain_post(w, id, ev2);
+        int verb_consume = -1;
+        for (int i = 0; i < kActionVerbs; ++i)
+            if (std::strcmp(sensor_verb_table()[i], "consume") == 0)
+                { verb_consume = i; break; }
+        CHECK(verb_consume >= 0);
+        CHECK(s.vital.exp_rew[verb_consume] != 0);
+        CHECK(s.vital.last_rpe > 0);
+        int nz_dw = 0; std::int64_t dw_sum = 0;
+        for (std::int8_t d : s.net.dw) { if (d) ++nz_dw; dw_sum += d; }
+        CHECK(nz_dw > 0);
+        CHECK(dw_sum > 0);
+        // repeated identical outcome -> RPE shrinks (learning converges)
+        const std::int16_t rpe1 = s.vital.last_rpe;
+        brain_pre(w, id, mk_ctx(id, {}, "consume", 0));
+        CausalEvent ev3 = ev2; ev3.id = 3;
+        brain_post(w, id, ev3);
+        CHECK(std::abs(s.vital.last_rpe) <= std::abs(rpe1) + 1);
+        // aversive failure now DEpresses the same eligibility trace
+        dw_sum = 0;
+        for (std::int8_t d : s.net.dw) dw_sum += d;
+        brain_pre(w, id, mk_ctx(id, {}, "strike", 0));
+        CausalEvent ev;
+        ev.id = 1; ev.action = "strike"; ev.failed = true;
+        ev.tick = w.clock_.tick();
+        brain_post(w, id, ev);
+        CHECK(s.cog.plan_trigger == 1);      // failure -> planning armed
+        std::int64_t dw_sum2 = 0;
+        for (std::int8_t d : s.net.dw) dw_sum2 += d;
+        CHECK(dw_sum2 < dw_sum);             // negative RPE floor taught
+    }
+
+    // (4) dw survives save v29 round-trip ------------------------------------
+    {
+        World w(778, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);
+        BrainSlot& s = w.brains_->slots[id];
+        // force a learned delta directly (deterministic state)
+        for (std::size_t k = 0; k < s.net.dw.size(); k += 97)
+            s.net.dw[k] = static_cast<std::int8_t>(k % 5 - 2);
+        const std::string path = "/tmp/simlab_v29_dw.bin";
+        CHECK(w.save(path));
+        World w2(778, "data");
+        CHECK(w2.load(path));
+        const BrainSlot& s2 = w2.brains_->slots[id];
+        CHECK(s2.net.dw == s.net.dw);
+        std::filesystem::remove(path);
+    }
+}
+
+static void test_cognition_planning() {
+    // (1) homeostatic goals emerge from drives; goals bias but never act ----
+    {
+        World w(888, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        tseti(*w.find(id), w, "hunger", 900);
+        tseti(*w.find(id), w, "thirst", 850);
+        tseti(*w.find(id), w, "fatigue", 800);
+        BrainChoice ch = brain_decide(w, id);
+        CHECK(ch.valid);
+        const BrainSlot& s = w.brains_->slots[id];
+        int active_goals = 0;
+        for (const BrainGoal& g : s.cog.goals) if (g.active) ++active_goals;
+        CHECK(active_goals >= 2);              // hunger+thirst(+fatigue)
+        // conflict: close priorities -> PFC arbitration flag or planning ran
+        CHECK(s.cog.conflict > 0 || s.cog.plan_ops > 0 ||
+              ch.verb == "consume" || ch.verb == "rest");
+    }
+
+    // (2) bounded rollout triggers on failure, bypassed by reflex -----------
+    {
+        World w(889, "data");
+        w.brain_shadow = true;
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        (void)brain_decide(w, id);
+        BrainSlot& s = w.brains_->slots[id];
+        // simulate a failed action -> plan_trigger set by brain_post
+        s.cog.plan_trigger = 1;
+        const std::uint64_t ops0 = s.cog.plan_ops;
+        // calm mind -> planning allowed
+        w.mind(id).neuro.panic = 0; w.mind(id).neuro.rage = 0;
+        (void)brain_decide(w, id);
+        CHECK(s.cog.plan_ops > ops0);          // rollout ops were spent
+        CHECK(s.cog.plan_trigger == 0);        // trigger consumed
+        // reflex override: extreme panic bypasses planning entirely
+        w.mind(id).neuro.panic = 950;
+        s.cog.plan_trigger = 1;
+        const std::uint64_t ops1 = s.cog.plan_ops;
+        (void)brain_decide(w, id);
+        CHECK(s.cog.plan_ops == ops1);         // no rollout under panic
+        CHECK(s.cog.plan_trigger == 1);        // trigger preserved
+        w.mind(id).neuro.panic = 0;
+    }
+
+    // (3) rollout is bounded + deterministic ---------------------------------
+    {
+        auto run = [](std::uint64_t seed) {
+            World w(seed, "data");
+            w.brain_shadow = true;
+            const EntityId id = mk_sapient(w, {50, 50});
+            w.mind(id);
+            tseti(*w.find(id), w, "hunger", 700);
+            tseti(*w.find(id), w, "thirst", 690);
+            (void)brain_decide(w, id);      // creates brains_ + slot
+            BrainSlot& s = w.brains_->slots[id];
+            s.cog.plan_trigger = 1;
+            BrainChoice a = brain_decide(w, id);
+            return std::pair{a.verb, s.cog.plan_ops};
+        };
+        auto r1 = run(890), r2 = run(890), r3 = run(891);
+        CHECK(r1.first == r2.first);           // deterministic
+        CHECK(r1.second == r2.second);
+        CHECK(r1.second > 0);                  // planning actually ran
+        CHECK(r1.first != "");                 // produced an action
+    }
+}
+
+static void test_language_social() {
+    // (1) observational learning + familiarity/trust via brain_observe ------
+    {
+        World w(999, "data");
+        w.brain_shadow = true;
+        const EntityId obs = mk_sapient(w, {50, 50});
+        const EntityId act = mk_sapient(w, {60, 50});
+        w.mind(obs); w.mind(act);
+        (void)brain_decide(w, obs);            // observer gets a slot
+        BrainSlot& s = w.brains_->slots[obs];
+        // no slot for actor -> observe still works (observer-side only)
+        brain_observe(w, obs, act, 5, 400, false);   // direct, positive
+        int fam = 0; std::int64_t trust = 0;
+        for (const BrainSocial& so : s.cog.social)
+            if (so.key != 0) { fam = so.familiarity; trust = so.trust; }
+        CHECK(fam > 0);
+        CHECK(trust > 0);
+        // hearsay discount: communicated claim moves trust less
+        const std::int64_t t1 = trust;
+        brain_observe(w, obs, act, 5, 400, true);    // via_comm
+        std::int64_t t2 = 0;
+        for (const BrainSocial& so : s.cog.social)
+            if (so.key != 0) t2 = so.trust;
+        CHECK(t2 - t1 < 10);                   // half-rate move
+        CHECK(s.cog.comm_rel > 0);              // reliability ledger up
+        // negative observation -> trust falls, familiarity still grows
+        brain_observe(w, obs, act, 2, -400, false);
+        std::int64_t t3 = 0; int f3 = 0;
+        for (const BrainSocial& so : s.cog.social)
+            if (so.key != 0) { t3 = so.trust; f3 = so.familiarity; }
+        CHECK(t3 < t2);
+        CHECK(f3 >= fam);
+    }
+
+    // (2) own conspecific interaction updates trust + comm reliability -----
+    {
+        World w(1000, "data");
+        w.brain_shadow = true;
+        const EntityId a = mk_sapient(w, {50, 50});
+        const EntityId b = mk_sapient(w, {55, 50});
+        w.mind(a); w.mind(b);
+        (void)brain_decide(w, a);
+        BrainSlot& s = w.brains_->slots[a];
+        // share with conspecific, mildly positive outcome
+        brain_pre(w, a, mk_ctx(a, {b}, "share", 0));
+        CausalEvent ev;
+        ev.id = 5; ev.action = "share"; ev.tick = w.clock_.tick();
+        StateChange ch;
+        ch.entity = a; ch.prop = tpid(w, "energy");
+        ch.had_before = true;
+        ch.before = Value::integer(100000); ch.after = Value::integer(99000);
+        ev.changes.push_back(ch);
+        brain_post(w, a, ev);
+        int fam = 0; std::int64_t trust = 0;
+        for (const BrainSocial& so : s.cog.social)
+            if (so.key != 0) { fam = so.familiarity; trust = so.trust; }
+        CHECK(fam > 0);                          // recognized the agent
+        // communicate success -> comm_rel rises, trust at half rate
+        brain_pre(w, a, mk_ctx(a, {b}, "communicate", 0));
+        CausalEvent ev2;
+        ev2.id = 6; ev2.action = "communicate"; ev2.tick = w.clock_.tick();
+        brain_post(w, a, ev2);
+        CHECK(s.cog.comm_rel > 0);
+        // language tracts strengthened: some dw on Language-target synapses
+        int lang_dw = 0;
+        for (std::uint32_t k = 0; k < s.net.syn_count; ++k) {
+            if (!(s.net.syn[k].flags & 1)) continue;
+            if (s.net.module_of[s.net.syn[k].target] ==
+                static_cast<std::uint8_t>(BrainModule::kLanguage) &&
+                s.net.dw[k] > 0) ++lang_dw;
+        }
+        CHECK(lang_dw > 0);
+    }
+
+    // (3) source-tagged distinction: direct > hearsay for same valence -----
+    {
+        auto obs_trust = [](bool via_comm) -> std::int64_t {
+            World w(1001, "data");
+            w.brain_shadow = true;
+            const EntityId obs = mk_sapient(w, {50, 50});
+            const EntityId act = mk_sapient(w, {60, 50});
+            w.mind(obs); w.mind(act);
+            (void)brain_decide(w, obs);
+            brain_observe(w, obs, act, 5, 500, via_comm);
+            for (const BrainSocial& so : w.brains_->slots[obs].cog.social)
+                if (so.key != 0) return so.trust;
+            return std::int64_t{0};
+        };
+        CHECK(obs_trust(false) > obs_trust(true));
+    }
+}
+
 static void test_amphibian_evolution() {
     World w(23, "data");
     WorldGenParams gp; gp.seed = 23; gp.grid_w = 64; gp.grid_h = 64;
@@ -11930,6 +12244,9 @@ int main(int argc, char** argv) {
     RUN(test_anatomical_modules);
     RUN(test_sensory_motor);
     RUN(test_memory_emotion);
+    RUN(test_plasticity);
+    RUN(test_cognition_planning);
+    RUN(test_language_social);
     RUN(test_amphibian_evolution);
     RUN(test_narrative_host);
     RUN(test_open_ended_invention);

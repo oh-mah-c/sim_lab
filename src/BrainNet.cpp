@@ -88,9 +88,15 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
                     std::int16_t threshold, std::int16_t reset,
                     std::uint8_t leak_shift, std::uint8_t refractory,
                     std::uint8_t ei_permille, std::uint16_t density_permille,
-                    const std::array<std::int16_t, kBrainTractCount>& tract_gain) {
+                    const std::array<std::int16_t, kBrainTractCount>& tract_gain,
+                    std::uint8_t stdp_window, std::int32_t plastic_rate,
+                    std::int32_t reward_rate) {
     const std::uint64_t seed =
         world_seed ^ (entity * 0xD1B54A32D192ED03ull);
+    this->stdp_window = stdp_window;
+    this->plastic_rate = plastic_rate;
+    this->reward_rate = reward_rate;
+    this->stdp_gate = 512;
 
     // ---- module layout -------------------------------------------------------
     neuron_count = 0;
@@ -111,6 +117,9 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
     gen.resize(neuron_count);
     st.assign(neuron_count, BrainNeuronState{});
     module_of.resize(neuron_count);
+    last_fire.assign(neuron_count, 0);
+    kick_hist.assign(neuron_count, {~0ull, ~0ull, ~0ull, ~0ull});
+    recent_pos.assign(neuron_count, 0);
 
     // ---- neuron parameters: genome baseline + per-neuron hash jitter ---------
     for (int m = 0; m < kBrainModuleCount; ++m) {
@@ -177,16 +186,22 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
         row_ptr[u + 1] = row_ptr[u] + outdeg[u];
     syn_count = row_ptr[neuron_count];
     syn.resize(syn_count);
+    dw.assign(syn_count, 0);
     std::vector<std::uint32_t> cursor(row_ptr.begin(), row_ptr.end() - 1);
 
+    // Plasticity (spec §13): local recurrence is plastic everywhere except
+    // the hard-wired autonomic cores (Brainstem, Hypothalamus); tract
+    // synapses are plastic except the two autonomic brainstem loops
+    // (indices 7,8 in kBrainTracts). flags bit0 = STDP-eligible.
     auto emit = [&](std::uint32_t pre, std::uint32_t post,
-                    std::int32_t weight, std::uint8_t delay) {
+                    std::int32_t weight, std::uint8_t delay,
+                    bool plastic) {
         const std::uint32_t p = cursor[pre]++;
         syn[p].target = post;
         syn[p].weight = static_cast<std::int16_t>(
             clamp16(weight));
         syn[p].delay = delay;
-        syn[p].flags = 0;
+        syn[p].flags = plastic ? 1 : 0;
     };
 
     // (a) local recurrence
@@ -208,7 +223,7 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
                 const std::uint32_t post = ms.first + off;
                 const std::int32_t w =
                     (40 + njit(seed, pre, 0x200 + j, 40)) * gen[pre].sign;
-                emit(pre, post, w, 1);
+                emit(pre, post, w, 1, m != 0 && m != 2);
             }
         }
     }
@@ -242,7 +257,8 @@ void BrainNet::init(std::uint64_t world_seed, std::uint64_t entity,
                 const std::uint8_t d = static_cast<std::uint8_t>(
                     tr.delay + njit(seed, pre, 0x6000 + t, 1) / 2 +
                     (njit(seed, pre, 0x6100 + t, 1) > 0 ? 1 : 0));
-                emit(pre, post, w, std::max<std::uint8_t>(1, d));
+                emit(pre, post, w, std::max<std::uint8_t>(1, d),
+                     t != 7 && t != 8);
             }
         }
     }
@@ -267,13 +283,33 @@ void BrainNet::inject(std::uint8_t mod, std::int32_t neuron_in_module,
 
 // run one scheduler pass over a module's neurons; fire into delay rings.
 void BrainNet::step() {
+    // dopamine-gated plasticity step (spec §13.2): gate is set by the
+    // caller from the agent's dopamine level before each burst.
+    const std::int32_t pstep = std::max<std::int32_t>(
+        1, plastic_rate * stdp_gate / 100000);
+    const std::uint32_t win = stdp_window;
+
     // 1) deliver kicks scheduled for this tick (insertion order preserved).
     const std::uint32_t slot =
         static_cast<std::uint32_t>(tick % kRingLen);
     for (const std::uint32_t idx : ring[slot]) {
         const BrainSynapse& s = syn[idx];
-        st[s.target].syn_input = sat_add(st[s.target].syn_input,
-                                         static_cast<std::int32_t>(s.weight));
+        // effective weight = baseline + learned delta (clamped §13.1)
+        std::int32_t w = s.weight;
+        if (dw[idx]) {
+            w = clamp16(static_cast<std::int64_t>(w) +
+                        static_cast<std::int64_t>(dw[idx]) * 8);
+        }
+        BrainNeuronState& ts = st[s.target];
+        ts.syn_input = sat_add(ts.syn_input, w);
+        // eligibility: record this delivered kick on the post neuron so a
+        // near-future post spike can potentiate it (causal STDP).
+        if (s.flags & 1) {
+            const std::uint32_t pos = recent_pos[s.target];
+            kick_hist[s.target][pos] =
+                (tick << 24) | static_cast<std::uint64_t>(idx);
+            recent_pos[s.target] = static_cast<std::uint8_t>((pos + 1) & 3);
+        }
     }
     ring[slot].clear();
 
@@ -316,14 +352,38 @@ void BrainNet::step() {
                 s.membrane = static_cast<std::int16_t>(m32);
             }
         }
-        // 3) propagate spikes through CSR rows into delay rings.
+        // 3) propagate spikes through CSR rows into delay rings + STDP.
         for (std::uint32_t w = 0; w < ms.spike_words; ++w) {
             const std::uint64_t word = spike_masks[ms.spike_off + w];
             if (!word) continue;
             const std::uint32_t base = ms.first + w * 64;
             for_each_spike(word, base, [&](std::uint32_t u) {
+                last_fire[u] = tick + 1;
+                // causal LTP: kicks this neuron just received within the
+                // STDP window get potentiated (pre-before-post).
+                for (std::uint64_t e : kick_hist[u]) {
+                    if (e == ~0ull) continue;
+                    if (tick - (e >> 24) > win) continue;
+                    const std::uint32_t k =
+                        static_cast<std::uint32_t>(e & 0xFFFFFFull);
+                    if (k < syn_count && (syn[k].flags & 1)) {
+                        std::int32_t d = dw[k] + pstep;
+                        dw[k] = static_cast<std::int8_t>(
+                            std::max(-kDwMax, std::min(kDwMax, d)));
+                    }
+                }
                 const std::uint32_t b = row_ptr[u], e = row_ptr[u + 1];
                 for (std::uint32_t k = b; k < e; ++k) {
+                    // anti-causal LTD: post fired within the window BEFORE
+                    // this pre spike -> depress (post-before-pre).
+                    if ((syn[k].flags & 1)) {
+                        const std::uint64_t lf = last_fire[syn[k].target];
+                        if (lf != 0 && tick + 1 - lf <= win) {
+                            std::int32_t d = dw[k] - pstep;
+                            dw[k] = static_cast<std::int8_t>(
+                                std::max(-kDwMax, std::min(kDwMax, d)));
+                        }
+                    }
                     const std::uint8_t d = syn[k].delay;
                     const std::uint32_t at =
                         static_cast<std::uint32_t>(tick + d) % kRingLen;
