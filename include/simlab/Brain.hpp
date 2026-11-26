@@ -278,6 +278,18 @@ struct BrainSlot {
     // Lifetime-only (Baldwin), never inherited.
     std::array<std::uint64_t, 64> tried{};
     std::int32_t tried_next = 0;
+    // Forage cache (transient — re-derived from memory, never serialized):
+    // nearest remembered edible entity while a homeostatic drive is high.
+    // The 4-slot neural entity readout can't see past a crowd, so hungry
+    // agents get one explicit food-directed candidate per decide.
+    EntityId forage_id = kNoEntity;
+    Vec2 forage_pos{0, 0};
+    std::uint64_t forage_tick = 0;
+    // Home anchor (transient): first-seen position — the camp a founder
+    // woke up in. Desperate agents with nothing edible remembered walk
+    // back toward it (place-cell homing, spec §4.5 survival behavior).
+    Vec2 home_pos{0, 0};
+    bool home_valid = false;
 };
 
 // Canonical default connectome genome (Standard profile).

@@ -125,6 +125,109 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
         }
     }
 
+    // ---- camp provisioning (founder survival floor) -------------------------
+    // Every home gets a deterministic forage ring of real species (berry
+    // bushes / wild grain — fruit_count regrows via ecology drift, so this
+    // is habitat, not a ration) plus guaranteed drinking water at the
+    // nearest shore. Without this, brain-controlled founders starve before
+    // the connectome learns what "consume" means. Positions are hash-
+    // derived per (seed, home, slot); cells already holding flora are
+    // skipped so worldgen density is never doubled up.
+    {
+        const SpeciesDef* kProvisions[] = {
+            w.species.find_name("berry_bush"),
+            w.species.find_name("wild_grain")};
+        const MaterialDef* wm = w.materials.find_name("water");
+        const PropertyDef* qd = w.props.find_name("quantity");
+        const PropertyDef* fd = w.props.find_name("flow_rate");
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        // snapshot existing flora positions once (deterministic id order)
+        std::vector<Vec2> flora;
+        for (const SpeciesDef* sp : kProvisions)
+            if (sp)
+                for (EntityId fid : w.entities_of_kind(KindName(sp->name.c_str())))
+                    if (const Entity* fe = w.find(fid); fe && fe->alive)
+                        flora.push_back(fe->pos);
+        auto flora_near = [&](Vec2 p) {
+            for (const Vec2& q : flora) {
+                const std::int64_t dx = q.x - p.x, dy = q.y - p.y;
+                if (dx * dx + dy * dy < cell * cell) return true;
+            }
+            return false;
+        };
+        // deterministic integer offsets in an annulus around the camp —
+        // no floats anywhere (state_hash must be platform-identical)
+        auto ring_pos = [&](std::uint64_t seed, int ring,
+                            std::uint64_t salt, int& dx, int& dy) {
+            const int span = ring * cell * 2;
+            const std::uint64_t hh = ghash(seed, salt, 0xF00D0000ull + ring);
+            dx = static_cast<int>((hh >> 8) % static_cast<std::uint64_t>(2 * span + 1)) - span;
+            dy = static_cast<int>((hh >> 28) % static_cast<std::uint64_t>(2 * span + 1)) - span;
+            const std::int64_t d2 = static_cast<std::int64_t>(dx) * dx + dy * dy;
+            const std::int64_t lo = static_cast<std::int64_t>(ring * cell) * ring * cell / 2;
+            const std::int64_t hi = static_cast<std::int64_t>(ring * cell) * ring * cell * 2;
+            return d2 >= lo && d2 <= hi;
+        };
+        for (std::size_t hi = 0; hi < out.homes.size(); ++hi) {
+            const Vec2& h = out.homes[hi];
+            int placed = 0;
+            for (int ring = 1; ring <= 6 && placed < 12; ++ring)
+                for (int a = 0; a < 8 && placed < 12; ++a) {
+                    int dx, dy;
+                    if (!ring_pos(pp.seed, ring,
+                                  hi * 977 + placed * 31 + a, dx, dy))
+                        continue;
+                    const std::uint64_t hh = ghash(
+                        pp.seed, hi * 977 + placed * 31 + ring * 7 + a,
+                        0xF00D0000ull + ring);
+                    const Vec2 p{h.x + dx, h.y + dy};
+                    if (!t.contains(p) || t.is_water(p) || flora_near(p))
+                        continue;
+                    const SpeciesDef* sp =
+                        kProvisions[(hh >> 8) & 1] ? kProvisions[(hh >> 8) & 1]
+                                                  : kProvisions[0];
+                    if (!sp) continue;
+                    if (w.create_entity(sp->name, sp->material, p, sp->props)
+                            != kNoEntity) {
+                        flora.push_back(p);
+                        ++placed;
+                    }
+                }
+            // drinking water: up to 3 stock entities on shore cells nearest
+            // the camp (terrain water adjacent to land), deterministic pick.
+            if (wm) {
+                int got = 0;
+                for (int ring = 1; ring <= 14 && got < 3; ++ring)
+                    for (int a = 0; a < 16 && got < 3; ++a) {
+                        int dx, dy;
+                        if (!ring_pos(pp.seed, ring,
+                                      hi * 331 + got * 17 + a, dx, dy))
+                            continue;
+                        const Vec2 p{h.x + dx, h.y + dy};
+                        if (!t.contains(p) || !t.is_water(p)) continue;
+                        bool shore = false;
+                        for (const auto& d :
+                             {std::pair{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                            const Vec2 q = t.cell_center(
+                                TerrainGrid::cell_of(p.x + d.first * cell, cell),
+                                TerrainGrid::cell_of(p.y + d.second * cell, cell));
+                            if (t.contains(q) && !t.is_water(q)) {
+                                shore = true; break;
+                            }
+                        }
+                        if (!shore) continue;
+                        PropertyBag pb;
+                        if (qd) pb.set(qd->id, Value::integer(1000000));
+                        if (fd) pb.set(fd->id, Value::integer(1000));
+                        if (w.create_entity("water", wm->id, p, pb)
+                                != kNoEntity)
+                            ++got;
+                    }
+            }
+        }
+    }
+
     // living water: shoreline cells of rivers/lakes expose drinkable water
     // as `water`-material stock entities (flowing: flow_rate 1000 -> never
     // stagnates). This is terrain made graspable, not culture.

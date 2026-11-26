@@ -531,6 +531,51 @@ std::uint64_t social_key_of(EntityId id) {
     return Rng::hash(static_cast<std::uint64_t>(id) ^
                      0x5DEECE66DULL);
 }
+// Edibility of a remembered snapshot — mirrors Driver's snapshot_food:
+// a fruiting plant feeds through `fruit_material` while `fruit_count` > 0
+// (bare branch = not food); everything else feeds through its own
+// material's nutrition/hydration World-Truth props. Returns {nutrition,
+// hydration} permille (0,0 = inedible). Reads ONLY the mind's memory
+// snapshot — never live world state — so recall blur and forgetting
+// apply honestly.
+std::pair<std::int64_t, std::int64_t>
+snapshot_food_nh(const World& w, const AgentMind::MemorySnapshot& s) {
+    MaterialId mat = s.material;
+    bool fruiting = false;
+    const PropId fmp = SIMLAB_PID(w.props, "fruit_material");
+    if (fmp != kNoProp) {
+        const auto fit = s.props.find(fmp);
+        if (fit != s.props.end() && fit->second.type == ValType::Text &&
+            !fit->second.s.empty()) {
+            const MaterialId fm = w.materials.id_of(fit->second.s);
+            if (fm != kNoMaterial) { mat = fm; fruiting = true; }
+        }
+    }
+    if (fruiting) {
+        const PropId fcp = SIMLAB_PID(w.props, "fruit_count");
+        const auto cit = s.props.find(fcp);
+        if (cit != s.props.end() && cit->second.type == ValType::Integer &&
+            cit->second.i <= 0)
+            return {0, 0};                     // bare branch — nothing to eat
+    }
+    const MaterialDef* md = w.materials.find(mat);
+    if (!md) return {0, 0};
+    const PropId nut = SIMLAB_PID(w.props, "nutrition");
+    const PropId hyd = SIMLAB_PID(w.props, "hydration");
+    auto mp = [&](PropId p) -> std::int64_t {
+        if (p == kNoProp) return 0;
+        const auto it = md->props.find(p);
+        return it == md->props.end() ? 0 : it->second.i;
+    };
+    return {mp(nut), mp(hyd)};
+}
+// integer sqrt (Newton) — deterministic, no floats
+std::int64_t isqrt64(std::int64_t x) {
+    if (x <= 0) return 0;
+    std::int64_t r = x, b = (r + 1) / 2;
+    while (b < r) { r = b; b = (r + x / r) / 2; }
+    return r;
+}
 BrainSocial* social_find(BrainCognition& c, std::uint64_t key) {
     BrainSocial* empty = nullptr;
     for (BrainSocial& s : c.social) {
@@ -803,6 +848,12 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                 clampi(static_cast<std::int64_t>(s.vital.mod[kBModCortisol]) +
                            120, 0, 1000));
         }
+        // feeding site becomes the home anchor: homing returns the agent
+        // to where resources actually are, not where it first spawned
+        if (verb_idx == 0 && !ev.failed) {
+            const Entity* me2 = w.find(npc);
+            if (me2) { s.home_pos = me2->pos; s.home_valid = true; }
+        }
         // cerebellar motor error: move verbs get prediction-error current
         if (verb_idx >= 0 && me) {
             const char* vn = sensor_verb_table()[verb_idx];
@@ -1005,6 +1056,13 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
 
 // ================= decision =====================================================
 
+static const bool brain_debug =
+    std::getenv("SIMLAB_BRAIN_DEBUG") != nullptr;
+static EntityId debug_npc = [] {
+    const char* e = std::getenv("SIMLAB_BRAIN_DEBUG_NPC");
+    return e ? static_cast<EntityId>(std::strtoull(e, nullptr, 10))
+             : static_cast<EntityId>(0);
+}();
 BrainChoice brain_decide(World& w, EntityId npc) {
     BrainChoice out;
     if (w.speculative) return out;
@@ -1207,7 +1265,7 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     }
 
     // ---- candidate generation ---------------------------------------------------
-    constexpr int kC = 5;
+    constexpr int kC = 7;
     struct Cand { std::int32_t score; int verb; int tgt; };
     std::array<Cand, kC> cands{};
     int ncand = 0;
@@ -1229,10 +1287,92 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     };
     for (int v = 0; v < kActionVerbs; ++v) {
         if (!allowed[v]) continue;
-        consider(vlogit[v] / 16, v, -1);
+        // consume with no target is a guaranteed no-op (the law iterates
+        // ctx.targets) — never worth a candidacy slot
+        if (v != 0) consider(vlogit[v] / 16, v, -1);
         for (int t = 0; t < nnear; ++t)
             consider(vlogit[v] / 16 + entsal[t] / 16, v, t);
     }
+
+    // ---- forage cache (spec §4.5 drives -> §9 foraging) -----------------------
+    // Nearest remembered edible entity, refreshed ~every 32 decides while a
+    // homeostatic drive is high. Amortizes the O(memory) edibility scan;
+    // tgt == -3 marks the cached target in the candidate list.
+    const std::int64_t forage_drive = std::max<std::int64_t>(
+        s.vital.drive_hunger, s.vital.drive_thirst);
+    const std::int64_t wh =
+        std::max<std::int64_t>(0, s.vital.drive_hunger - 300);
+    const std::int64_t wt =
+        std::max<std::int64_t>(0, s.vital.drive_thirst - 300);
+    if (forage_drive > 400 &&
+        net.tick - s.forage_tick >= (forage_drive > 700 ? 64 : 256)) {
+        s.forage_tick = net.tick;
+        // Need-weighted target: a thirsty agent prefers water even when a
+        // nearer bush scores higher on raw edibility; distance discounts
+        // targets too far to reach before the drive peaks.
+        std::int64_t best_v = 0, best_d2 = INT64_MAX;
+        EntityId best_id = kNoEntity;
+        Vec2 best_pos{0, 0};
+        for (const auto& [kid, snap] : mind->memory) {
+            if (kid == npc) continue;
+            const auto nh = snapshot_food_nh(w, snap);
+            if (nh.first + nh.second <= 0) continue;
+            const std::int64_t v = nh.first * wh + nh.second * wt;
+            if (v <= 0) continue;
+            const std::int64_t dx = snap.pos.x - me->pos.x;
+            const std::int64_t dy = snap.pos.y - me->pos.y;
+            const std::int64_t d2 = dx * dx + dy * dy;
+            const std::int64_t score =
+                v * 1000 / (1000 + isqrt64(d2) / 4);
+            if (score > best_v || (score == best_v && d2 < best_d2)) {
+                best_v = score; best_d2 = d2;
+                best_id = kid; best_pos = snap.pos;
+            }
+        }
+        s.forage_id = best_id;
+        s.forage_pos = best_pos;
+    }
+    if (s.forage_id != kNoEntity && forage_drive > 400) {
+        // base-score bump so the directed candidates survive candidacy;
+        // the foraging bonus in scoring decides whether they win. The bump
+        // scales with drive — at crisis levels the hypothalamic imperative
+        // must beat suppressed neural logits (a starving brain that never
+        // considers `consume` dies standing on food).
+        const std::int32_t bump =
+            static_cast<std::int32_t>(48 + forage_drive / 4);
+        consider(vlogit[0] / 16 + bump, 0, -3);   // consume the remembered food
+        consider(vlogit[1] / 16 + bump, 1, -3);   // or walk to it first
+    }
+    // Homing (spec §4.5): at crisis drives with no remembered food, walk
+    // back toward the camp anchor — thirst kills faster than hunger and
+    // water only exists where the band settled.
+    if (!s.home_valid) { s.home_pos = me->pos; s.home_valid = true; }
+    if (forage_drive > 550)
+        consider(vlogit[1] / 16 + 40 +
+                     static_cast<std::int32_t>((forage_drive - 550) / 2),
+                 1, -4);   // move toward home_pos
+    // Homeostatic imperatives get a guaranteed candidacy slot: neural
+    // logits can suppress `consume` so hard (learned failure, stress) that
+    // even a drive-scaled bump loses the top-kC cut — and the agent then
+    // starves standing on food. force() replaces the weakest candidate.
+    auto force = [&](int verb, int tgt, std::int32_t score) {
+        for (int i = 0; i < ncand; ++i)
+            if (cands[i].verb == verb && cands[i].tgt == tgt) return;
+        if (ncand < kC) { cands[ncand++] = {score, verb, tgt}; return; }
+        int w = 0;
+        for (int i = 1; i < kC; ++i)
+            if (cands[i].score < cands[w].score) w = i;
+        cands[w] = {score, verb, tgt};
+    };
+    if (s.forage_id != kNoEntity && forage_drive > 400) {
+        const std::int32_t bump =
+            static_cast<std::int32_t>(48 + forage_drive / 4);
+        force(0, -3, vlogit[0] / 16 + bump);
+        force(1, -3, vlogit[1] / 16 + bump);
+    }
+    if (forage_drive > 550)
+        force(1, -4, vlogit[1] / 16 + 40 +
+              static_cast<std::int32_t>((forage_drive - 550) / 2));
     if (ncand == 0) return out;
 
     // ---- score candidates: neural base + mind-level biases ----------------------
@@ -1381,6 +1521,76 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                     total += lang_intent / 16;
             }
         }
+        // ---- interoceptive foraging (spec §4.5 drives -> §9 action) --------
+        // Edible remembered targets attract `consume` — but only within
+        // reach (a remembered bush down the valley is a MOVE target, not a
+        // bite; unreachable consumes just burn cycles on "out of reach").
+        // `move` toward remembered food engages when a drive is high.
+        // Bonus scales with the actual hypothalamic drive — a sated brain
+        // ignores the bush. Two target forms: near[] slots (top-4 neural
+        // readout) and tgt == -3 (cached nearest edible, forage_id).
+        {
+            EntityId ftarget = kNoEntity;
+            Vec2 fpos{0, 0};
+            std::int64_t fs = 0, rel = 0;
+            bool fs_done = false;
+            if (cd.tgt == -3) {
+                ftarget = s.forage_id; fpos = s.forage_pos;
+            } else if ((cd.verb == 0 || cd.verb == 1) && cd.tgt >= 0 &&
+                       cd.tgt < nnear) {
+                ftarget = near[cd.tgt].id; fpos = near[cd.tgt].pos;
+            } else {
+                ftarget = kNoEntity;
+            }
+            if (ftarget != kNoEntity &&
+                (cd.verb == 0 || cd.verb == 1)) {
+                const auto mit = mind->memory.find(ftarget);
+                if (mit != mind->memory.end()) {
+                    const auto nh = snapshot_food_nh(w, mit->second);
+                    fs = nh.first + nh.second;
+                    // need-matched value: hydration counts only as much as
+                    // the thirst drive demands (and vice versa)
+                    rel = nh.first * wh + nh.second * wt;
+                    fs_done = true;
+                }
+            }
+            if (fs_done && fs > 0) {
+                const std::int64_t dx = fpos.x - me->pos.x;
+                const std::int64_t dy = fpos.y - me->pos.y;
+                const PropId reach_p = SIMLAB_PID(w.props, "reach");
+                const std::int64_t rr =
+                    reach_p != kNoProp
+                        ? w.prop_int(*me, reach_p, 250) : 250;
+                const bool in_reach =
+                    dx * dx + dy * dy <= rr * rr;
+                const std::int64_t drive = std::max<std::int64_t>(
+                    std::max<std::int64_t>(s.vital.drive_hunger,
+                                           s.vital.drive_thirst),
+                    s.vital.sleep_pressure);
+                if (cd.verb == 0) {
+                    if (in_reach)
+                        // homeostatic override: edible in reach + high
+                        // hunger/thirst drive -> consume, period. Neural
+                        // suppression of `consume` (learned failures) must
+                        // not veto survival.
+                        total += 96 + rel / 2000 + forage_drive;
+                    else
+                        total -= 48;   // chase it with move, not bite
+                } else if (drive > 400) {
+                    // already in reach: standing on food, no reason to keep
+                    // walking — consume must outscore this easily
+                    total += in_reach ? rel / 16000
+                                      : drive / 4 + rel / 8000;
+                }
+            }
+        }
+        // homing candidate (tgt == -4): crisis-drive bonus toward the camp
+        // anchor — strong enough to beat stale-food chases at the brink,
+        // but halved when a real remembered food target exists (walking to
+        // known water beats wandering home blindly)
+        if (cd.tgt == -4 && forage_drive > 550)
+            total += (forage_drive - 500) /
+                     (s.forage_id != kNoEntity ? 2 : 1);
         totals[c] = total;
         if (total > best_total) { best_total = total; best_c = c; }
     }
@@ -1449,15 +1659,30 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     }
 
     const Cand& chosen = cands[best_c];
+    if (brain_debug && npc == debug_npc) {
+        fprintf(stderr, "[braindbg] npc=%llu ncand=%d chosen v=%d t=%d tot=%lld\n",
+                (unsigned long long)npc, ncand, chosen.verb, chosen.tgt,
+                (long long)best_total);
+        for (int c = 0; c < ncand; ++c)
+            fprintf(stderr, "  cand%d v=%d t=%d base=%d tot=%lld\n", c,
+                    cands[c].verb, cands[c].tgt, cands[c].score,
+                    (long long)totals[c]);
+    }
     const char* verb = sensor_verb_table()[chosen.verb];
     out.verb = verb;
     out.score = best_total;
-    out.target = (chosen.tgt >= 0 && chosen.tgt < nnear)
-                     ? near[chosen.tgt].id : kNoEntity;
+    const bool forage_pick = chosen.tgt == -3;
+    const bool home_pick = chosen.tgt == -4;
+    out.target = forage_pick ? s.forage_id
+                   : (chosen.tgt >= 0 && chosen.tgt < nnear)
+                         ? near[chosen.tgt].id : kNoEntity;
     if (std::strcmp(verb, "move") == 0) {
         out.has_move = true;
         if (out.target != kNoEntity)
-            out.move_to = near[chosen.tgt].pos;
+            out.move_to = forage_pick ? s.forage_pos
+                                      : near[chosen.tgt].pos;
+        else if (home_pick)
+            out.move_to = s.home_pos;
         else {
             const std::uint64_t j =
                 Rng::hash(w.world_seed ^ (npc * 0x2545F4914F6CDD1Dull) ^

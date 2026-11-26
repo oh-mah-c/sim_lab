@@ -1423,5 +1423,23 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
     stable). Release build, 16 threads: ~14 us/NPC/round, ~72k
     decisions/s, linear 100->10k NPCs; ~203 KB brain state/NPC
     (synapses+dw dominate); save ~1ms/10k NPCs serialized, load ~3.8s.
-    NOTE: autonomous_run populations starve ~cycle 19 without food —
-    the bench measures neural throughput, not survival.
+  - Survival layer (viewer default on): `BrainSlot` transient fields
+    `forage_id/pos/tick` + `home_pos/valid` (never serialized/hashed —
+    re-derived). `brain_decide`: when max(drive_hunger,drive_thirst)>400,
+    a need-weighted scan of AgentMind memory (`snapshot_food_nh` ->
+    {nutrition,hydration} permille, water counts) picks the best edible
+    by value*1000/(1000+isqrt(d2)/4); tgt==-3 marks consume/move
+    candidates toward it, refreshed every 64 ticks at drive>700 else
+    256. Scoring: consume in-reach gets `96 + rel/2000 + forage_drive`
+    (homeostatic override — neural suppression of `consume` must not
+    veto survival), out-of-reach -48; move toward food `drive/4 +
+    rel/8000`, near-zero when already in reach. `force()` guarantees the
+    -3/-4 candidates a top-kC slot (learned-failure logits can reach
+    ~-12000). Homing (tgt==-4) at drive>550 walks to home_pos (first-seen
+    pos, re-anchored to the feeding site on every successful consume in
+    brain_post); bonus halved when a real forage target exists.
+    `build_primordial` camp provisioning: per home, up to 12
+    berry_bush/wild_grain on hash-derived annulus rings (skipping
+    occupied cells) + up to 3 `water` stock entities on shore cells —
+    deterministic integer offsets, no floats. Result: 11/12 founders
+    alive at cycle 300 (was ~4/12 before; thirst=1000 was the killer).
