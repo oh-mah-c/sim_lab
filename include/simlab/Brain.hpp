@@ -290,6 +290,20 @@ struct BrainSlot {
     // back toward it (place-cell homing, spec §4.5 survival behavior).
     Vec2 home_pos{0, 0};
     bool home_valid = false;
+    // Exploration/social scouting (transient): recent-position ring feeds
+    // a novelty signal — lingering in one spot inflates the exploration
+    // drive so satiated agents keep patrolling instead of idling.
+    std::array<Vec2, 16> visit{};
+    std::int32_t visit_n = 0;          // entries filled (<=16, then wraps)
+    Vec2 scout_pos{0, 0};
+    std::uint64_t scout_tick = 0;
+    bool scout_valid = false;
+    Vec2 probe_pos{0, 0};        // forage-probe ring target around home_pos
+    std::uint64_t probe_tick = 0;
+    EntityId soc_id = kNoEntity;       // nearest remembered conspecific
+    Vec2 soc_pos{0, 0};
+    std::uint64_t soc_tick = 0;
+    std::int16_t social_drive = 0;     // attachment+familiarity, 0..1000
 };
 
 // Canonical default connectome genome (Standard profile).

@@ -1440,6 +1440,21 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
     brain_post); bonus halved when a real forage target exists.
     `build_primordial` camp provisioning: per home, up to 12
     berry_bush/wild_grain on hash-derived annulus rings (skipping
-    occupied cells) + up to 3 `water` stock entities on shore cells —
-    deterministic integer offsets, no floats. Result: 11/12 founders
-    alive at cycle 300 (was ~4/12 before; thirst=1000 was the killer).
+    occupied cells) + up to 5 `water` stock entities on shore cells —
+    deterministic integer offsets, no floats. Result: ~10-11/12 founders
+    alive at cycle 300.
+  - Mobility drives (same transient slot fields): `visit[16]` ring of
+    recent decide positions -> staleness (entries within 24u) x satiety
+    = explore_drive; scout candidate tgt==-5 aims ~340u away from the
+    ring centroid, clamped to 450u of home_pos, gated by
+    explore>350 && forage_drive<350 (roaming yields to ANY need).
+    Forage probe tgt==-7: forage_drive>400 with NO remembered edible ->
+    deterministic expanding ring (kProbeDirs, radius 96..288) around
+    home_pos. Social approach tgt==-6: emo[kBEmoAttachment] (now derived
+    from mean familiarity+trust in vital_tick) + familiarity mass =
+    social_drive; nearest remembered conspecific (find_mind scan, 64-tick
+    cache) pulls move when none in near[] and 200<d<800.
+  - LATENT BUG FIXED: snapshot_food_nh treated anatomy parts
+    ("grazer/torso", contained=true) as food — predict_consume skips
+    contained entities so consume failed forever while thirst climbed.
+    Now excluded via contained prop (or "species/part" kind fallback).

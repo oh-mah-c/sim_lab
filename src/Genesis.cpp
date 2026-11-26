@@ -198,8 +198,8 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
             // the camp (terrain water adjacent to land), deterministic pick.
             if (wm) {
                 int got = 0;
-                for (int ring = 1; ring <= 14 && got < 3; ++ring)
-                    for (int a = 0; a < 16 && got < 3; ++a) {
+                for (int ring = 1; ring <= 14 && got < 5; ++ring)
+                    for (int a = 0; a < 16 && got < 5; ++a) {
                         int dx, dy;
                         if (!ring_pos(pp.seed, ring,
                                       hi * 331 + got * 17 + a, dx, dy))
