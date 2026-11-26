@@ -30,6 +30,11 @@ struct TerrainGrid {
     std::vector<std::int32_t> water_table;  // metres below surface to groundwater
     std::vector<std::int32_t> traffic_wear; // 0..1000 — footfall compaction (trails)
     std::vector<std::int32_t> pollution;    // 0..1000 — soot/filth; suppresses flora regrowth
+    // Structural/conduction fields (save v28), derived from entities resting
+    // on the cell — refreshed lazily over dirty cells only:
+    std::vector<std::int32_t> support_strength;  // 0..1000 load-bearing capacity
+    std::vector<std::int32_t> overburden_load;   // 0..1000 roof stress (240 = covered)
+    std::vector<std::int32_t> conductivity;      // 0..1000 max material conductivity >200
 
     bool empty() const { return w == 0 || h == 0; }
     // Position -> global cell (floor division, safe for negative coords).

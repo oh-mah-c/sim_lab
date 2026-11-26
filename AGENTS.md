@@ -1227,3 +1227,44 @@ no engine code changes.
   trip, brain_assimilate dose-response (comp 0/250/1000 weight deltas),
   oral transmission depth+drift, taboo bias + hunger>900 override,
   save/load hash equality.
+
+## Phase 19 — structural engineering, siege collapse & terrain conduction (save v28)
+
+The engine has no excavation/wall grid, so load-bearing physics is adapted
+onto `TerrainGrid` per-cell derived fields + enclosure footprints:
+
+- Terrain fields (serialized v28, between `pollution` and `water`):
+  `support_strength`/`overburden_load`/`conductivity` (i32, 0..1000).
+  `World::refresh_one_cell` recomputes a cell from entities standing in it
+  (Chebyshev cell membership, NOT proximity): support = max over
+  `clamp((hardness*3 + density/2000)>>2, 100, 1000)` for materials with
+  hardness>=600 (density is a FIXED prop — read `.i` accepting
+  Integer|Fixed), rubble kind pins 350, entities with integrity<=0 and
+  rubble are excluded from material support; conductivity = max material
+  conductivity clamped <=1000 (only props >200 count). Enclosure
+  `footprint_radius` marks covered cells -> overburden_load=240
+  (`cover_cells_`, rebuilt lazily; `cover_sig_` detects enclosure death).
+- Dirty sets are `std::map<key,tick>` — PENDING evaluations are live state
+  (metabolize marks cells for the NEXT advance) so BOTH maps serialize in
+  v28 after gen_cells_; on load they restore verbatim and `field_seeded_`
+  is set true (fields already derived — no re-seed).
+- `structural_drift`/`thermal_conduct_drift` run inside advance_ticks
+  (batch-exact: per-sub-tick eval ordering identical to dt=1 xN).
+  Collapse eval: excavated cell (sup==0) with ob>0 sums neighbor support
+  `ss >> (d-1)` for Chebyshev d in 1..3, cap 1000; `total < ob` ->
+  `cave_in` event: crush `(ob-total)*2` integrity + fatigue+150 +
+  panic+300 to occupants, rubble entity (support 350), mark neighbours.
+- `conduct_surge(p, volts)` (lightning/high-energy): deterministic BFS
+  N,E,S,W <=16 hops over cells with conductivity>=400,
+  `V_next=(V*cond)>>10`; victims take shock `V>>2` (+50% wet),
+  fatigue `V>>1`, conductor heats `V>>4`; emits `conduct_surge` event.
+- Detonation marks structural radius-4 + conductive marks per heated
+  conductive cell, then executes queued surges post-event.
+- Sensors: ch115 = structural_margin (`(total-ob)>>2` clamp +-127),
+  ch116 = floor_conductivity (`cond>>3`); labels y[26]/y[27] same values
+  so WM learns margin<0 -> catastrophe. kSensorChannels=117,
+  kLabelChannels=28.
+- Verified: test_structural_siege_physics 39 checks — unsupported roof
+  collapse + rubble re-support, pillar grid stability, siege pillar kill
+  -> secondary collapse, 6-cell heat chain vs stone control, 8-cell surge
+  shock, save v28 round-trip + post-load advance hash equality.

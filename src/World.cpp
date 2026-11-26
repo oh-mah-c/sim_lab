@@ -217,6 +217,9 @@ EntityId World::create_entity(const std::string& kind_name, MaterialId material,
     by_kind_[e->kind_name.interned()].push_back(id);
     entities.push_back(std::move(e));
     spatial.insert(id, pos);
+    // structural/conduction fields: a relevant entity on a cell can change
+    // its support_strength/conductivity and neighbours' support totals
+    note_entity_cells(*entities.back(), pos, pos);
     return id;
 }
 
@@ -502,6 +505,15 @@ World World::clone_local(Vec2 center, std::int64_t radius, EntityId focus) const
         if (src.pollution.size() == src.elevation.size())
             cp(src.pollution, dst.pollution);
         else dst.pollution.assign(n, 0);
+        if (src.support_strength.size() == src.elevation.size())
+            cp(src.support_strength, dst.support_strength);
+        else dst.support_strength.assign(n, 0);
+        if (src.overburden_load.size() == src.elevation.size())
+            cp(src.overburden_load, dst.overburden_load);
+        else dst.overburden_load.assign(n, 0);
+        if (src.conductivity.size() == src.elevation.size())
+            cp(src.conductivity, dst.conductivity);
+        else dst.conductivity.assign(n, 0);
         dst.water.assign(n, 0);
         for (int ly = 0; ly < dst.h; ++ly)
             for (int lx = 0; lx < dst.w; ++lx) {
@@ -580,6 +592,7 @@ void World::advance_ticks(std::int64_t n) {
     doctrine_drift(n, *this);
     terrain_wear_decay(n); pollution_decay(n);
     detonation_drift(n);
+    structural_drift(n); thermal_conduct_drift(n);
 }
 
 // Need drift (TODO §10.1): hunger/thirst/fatigue grow with `metabolism`.
@@ -5660,6 +5673,7 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         const Vec2 from = me->pos;
         me->pos = mv.to;
         spatial.move(mv.entity, mv.to);
+        note_entity_cells(*me, from, mv.to);
         // Phase 12.4: footfall compacts the ground — every cell the step
         // crosses gains traffic_wear (trails emerge from use, fade linearly).
         if (!terrain.traffic_wear.empty() && terrain.cell > 0) {
@@ -5766,6 +5780,15 @@ InteractionResult World::interact(const InteractionContext& ctx) {
                 pp = te->pos; have = true;
             }
         if (have) add_pollution(pp, 20);
+    }
+    // Excavation (dig) can uncover unsupported roof cells: mark the
+    // spec's 4-cell structural radius around every dug target so the
+    // next advance re-evaluates cave-in support.
+    if (ctx.parameters.action == "dig" &&
+        terrain.support_strength.size() == terrain.elevation.size()) {
+        for (EntityId tid : ctx.targets)
+            if (const Entity* te = find(tid))
+                mark_structural(te->pos, 4);
     }
     ev.spawned = res.spawned;
     if (defer_time) deferred_dt = std::max(deferred_dt, dt);
@@ -6065,6 +6088,8 @@ std::uint64_t World::content_hash() const {
     vec(terrain.elevation); vec(terrain.moisture); vec(terrain.temperature);
     vec(terrain.vegetation); vec(terrain.slope); vec(terrain.water_table);
     vec(terrain.traffic_wear); vec(terrain.pollution);
+    vec(terrain.support_strength); vec(terrain.overburden_load);
+    vec(terrain.conductivity);
     for (std::uint8_t x : terrain.water) h = fnv(h, x);
     for (const auto& col : subsurface.cells)
         for (const Stratum& s : col) { h = fnv(h, s.material); h = fnv(h, static_cast<std::uint32_t>(s.top)); h = fnv(h, static_cast<std::uint32_t>(s.bottom)); }
@@ -6159,6 +6184,8 @@ std::uint64_t World::state_hash() const {
         mixv(terrain.vegetation); mixv(terrain.slope); mixv(terrain.wind_x); mixv(terrain.wind_y);
         mixv(terrain.water_table); mixv(terrain.traffic_wear);
         mixv(terrain.pollution);
+        mixv(terrain.support_strength); mixv(terrain.overburden_load);
+        mixv(terrain.conductivity);
         for (std::uint8_t x : terrain.water) mix(x);
     }
     if (!subsurface.empty()) {
@@ -6356,7 +6383,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 27;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail); v27: mind doctrines + doctrine_accum (oral tradition)
+constexpr std::uint32_t kSaveFormat = 28;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail); v27: mind doctrines + doctrine_accum (oral tradition); v28: terrain support_strength/overburden_load/conductivity + sensor 117ch / label 28ch
 
 struct Writer {
     std::ofstream f;
@@ -6491,6 +6518,9 @@ bool World::save(const std::string& path, std::string* err) const {
     write_i32vec(w, terrain.wind_y); write_i32vec(w, terrain.water_table);
     write_i32vec(w, terrain.traffic_wear);
     write_i32vec(w, terrain.pollution);
+    write_i32vec(w, terrain.support_strength);
+    write_i32vec(w, terrain.overburden_load);
+    write_i32vec(w, terrain.conductivity);
     write_u8vec(w, terrain.water);
     // subsurface
     w.put(subsurface.w); w.put(subsurface.h); w.put(subsurface.ox); w.put(subsurface.oy);
@@ -6511,6 +6541,13 @@ bool World::save(const std::string& path, std::string* err) const {
     // materialized-cell bookkeeping (lazy region generation, v11)
     w.put(static_cast<std::uint64_t>(gen_cells_.size()));
     for (const auto& [gx, gy] : gen_cells_) { w.put(gx); w.put(gy); }
+    // v28: pending structural/conduction evaluations are live state —
+    // metabolize moves mark cells for the NEXT advance, so the maps are
+    // non-empty at save time and must round-trip or post-load diverges.
+    w.put(static_cast<std::uint64_t>(structural_dirty_.size()));
+    for (const auto& [k, t] : structural_dirty_) { w.put(k); w.put(t); }
+    w.put(static_cast<std::uint64_t>(conductive_dirty_.size()));
+    for (const auto& [k, t] : conductive_dirty_) { w.put(k); w.put(t); }
     // relations
     w.put(static_cast<std::uint64_t>(relations.edges().size()));
     for (const Relation& r : relations.edges()) { w.put(r.a); w.str(r.type); w.put(r.b); }
@@ -6857,8 +6894,20 @@ bool World::load(const std::string& path, std::string* err) {
         !read_i32vec(r, terrain.slope) || !read_i32vec(r, terrain.wind_x) ||
         !read_i32vec(r, terrain.wind_y) || !read_i32vec(r, terrain.water_table) ||
         !read_i32vec(r, terrain.traffic_wear) ||
-        !read_i32vec(r, terrain.pollution) ||
-        !read_u8vec(r, terrain.water)) return fail("truncated terrain");
+        !read_i32vec(r, terrain.pollution)) return fail("truncated terrain");
+    // v28 structural/conduction fields sit between pollution and water
+    if (fmt >= 28) {
+        if (!read_i32vec(r, terrain.support_strength) ||
+            !read_i32vec(r, terrain.overburden_load) ||
+            !read_i32vec(r, terrain.conductivity))
+            return fail("truncated terrain fields");
+    } else {
+        const std::size_t nf = terrain.elevation.size();
+        terrain.support_strength.assign(nf, 0);
+        terrain.overburden_load.assign(nf, 0);
+        terrain.conductivity.assign(nf, 0);
+    }
+    if (!read_u8vec(r, terrain.water)) return fail("truncated terrain");
 
     int sw = 0, sh = 0, sox = 0, soy = 0, sdepth = 0; std::uint32_t scc = 0;
     if (!r.get(sw) || !r.get(sh) || !r.get(sox) || !r.get(soy) ||
@@ -6899,6 +6948,27 @@ bool World::load(const std::string& path, std::string* err) {
             int gx = 0, gy = 0;
             if (!r.get(gx) || !r.get(gy)) return fail("truncated gen cell");
             gen_cells_.emplace(gx, gy);
+        }
+    }
+    if (fmt >= 28) {
+        structural_dirty_.clear(); conductive_dirty_.clear();
+        std::uint64_t sd2 = 0;
+        if (!r.get(sd2) || sd2 > (1ull << 32))
+            return fail("bad structural-dirty count");
+        for (std::uint64_t i = 0; i < sd2; ++i) {
+            std::uint64_t k = 0; std::uint32_t t = 0;
+            if (!r.get(k) || !r.get(t))
+                return fail("truncated structural-dirty entry");
+            structural_dirty_[k] = t;
+        }
+        std::uint64_t cd2 = 0;
+        if (!r.get(cd2) || cd2 > (1ull << 32))
+            return fail("bad conductive-dirty count");
+        for (std::uint64_t i = 0; i < cd2; ++i) {
+            std::uint64_t k = 0; std::uint32_t t = 0;
+            if (!r.get(k) || !r.get(t))
+                return fail("truncated conductive-dirty entry");
+            conductive_dirty_[k] = t;
         }
     }
 
@@ -7248,6 +7318,31 @@ bool World::load(const std::string& path, std::string* err) {
                                      gx + terrain.ox)) << 32) |
                             static_cast<std::uint32_t>(gy + terrain.oy));
                 }
+        }
+        // v28: rebuild the structural field-cell set from loaded terrain —
+        // dirty maps round-trip explicitly; for v28 the fields are already
+        // derived so skip the first-advance seed (fmt<28 keeps lazy seed).
+        field_cells_.clear();
+        field_seeded_ = (fmt >= 28);
+        cover_dirty_ = true; cover_sig_ = -1;
+        if (!terrain.support_strength.empty()) {
+            const std::size_t nf = terrain.elevation.size();
+            for (std::size_t ci = 0; ci < nf; ++ci) {
+                if (terrain.support_strength[ci] > 0 ||
+                    (!terrain.overburden_load.empty() &&
+                     terrain.overburden_load[ci] > 0) ||
+                    (!terrain.conductivity.empty() &&
+                     terrain.conductivity[ci] > 0)) {
+                    const int lgx = static_cast<int>(ci % terrain.w);
+                    const int lgy = static_cast<int>(ci / terrain.w);
+                    const int ggx = lgx + terrain.ox;
+                    const int ggy = lgy + terrain.oy;
+                    field_cells_.insert(
+                        (static_cast<std::uint64_t>(
+                             static_cast<std::uint32_t>(ggx)) << 32) |
+                        static_cast<std::uint32_t>(ggy));
+                }
+            }
         }
     }
     if (fmt >= 4) {
@@ -8482,6 +8577,627 @@ void World::pollution_decay(std::int64_t n) {
     }
 }
 
+// ---- structural engineering / conduction (save v28) -----------------------
+// Per-cell derived fields (terrain.support_strength / overburden_load /
+// conductivity) are refreshed lazily over dirty cells only — never a
+// full-map scan per tick. Dirty maps store the tick each cell was marked
+// so batched advance_ticks(n) resolves collapses and conduction at the
+// same historical sub-tick a dt=1 xN replay would.
+static std::uint64_t field_key(int gx, int gy) {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(gx)) << 32) |
+           static_cast<std::uint32_t>(gy);
+}
+
+// An entity contributes to cell fields when its material is structurally
+// significant (hardness >= 600: rock/ore/metal) or very conductive
+// (> 200), or it is collapse debris / a roofed enclosure.
+bool World::entity_structural_relevance(const Entity& e) const {
+    if (!e.alive) return false;
+    if (e.kind_name == SIMLAB_KIND("rubble") ||
+        e.kind_name == SIMLAB_KIND("enclosure")) return true;
+    if (e.material == kNoMaterial) return false;
+    const MaterialDef* md = materials.find(e.material);
+    if (!md) return false;
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_hard = pid("hardness"), p_cond = pid("conductivity");
+    auto mp = [&](PropId p, std::int64_t dflt) -> std::int64_t {
+        const auto it = p != kNoProp ? md->props.find(p) : md->props.end();
+        return (it != md->props.end() &&
+                it->second.type == ValType::Integer) ? it->second.i : dflt;
+    };
+    return mp(p_hard, 0) >= 600 || mp(p_cond, 0) > 200;
+}
+
+void World::mark_structural_tick(Vec2 p, int radius_cells, std::uint32_t tick) {
+    if (terrain.empty() || terrain.cell <= 0 || !terrain.contains(p)) return;
+    const int cgx = TerrainGrid::cell_of(p.x, terrain.cell);
+    const int cgy = TerrainGrid::cell_of(p.y, terrain.cell);
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy)
+        for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+            const std::uint64_t k = field_key(cgx + dx, cgy + dy);
+            auto [it, ins] = structural_dirty_.try_emplace(k, tick);
+            if (!ins && tick < it->second) it->second = tick;
+        }
+}
+void World::mark_structural(Vec2 p, int radius_cells) {
+    mark_structural_tick(p, radius_cells,
+                         static_cast<std::uint32_t>(clock_.tick()));
+}
+void World::mark_conductive_tick(Vec2 p, int radius_cells, std::uint32_t tick) {
+    if (terrain.empty() || terrain.cell <= 0 || !terrain.contains(p)) return;
+    const int cgx = TerrainGrid::cell_of(p.x, terrain.cell);
+    const int cgy = TerrainGrid::cell_of(p.y, terrain.cell);
+    for (int dy = -radius_cells; dy <= radius_cells; ++dy)
+        for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+            const std::uint64_t k = field_key(cgx + dx, cgy + dy);
+            auto [it, ins] = conductive_dirty_.try_emplace(k, tick);
+            if (!ins && tick < it->second) it->second = tick;
+        }
+}
+void World::mark_conductive(Vec2 p, int radius_cells) {
+    mark_conductive_tick(p, radius_cells,
+                         static_cast<std::uint32_t>(clock_.tick()));
+}
+
+// Enclosure footprints define which cells carry roof overburden. Rebuilt
+// only when an enclosure spawned/moved/died (cover_dirty_).
+void World::rebuild_cover_cells() {
+    cover_cells_.clear();
+    if (terrain.empty() || terrain.cell <= 0) { cover_dirty_ = false; return; }
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_rad = pid("footprint_radius");
+    if (p_rad == kNoProp) { cover_dirty_ = false; return; }
+    for (const EntityId eid : entities_of_kind(SIMLAB_KIND("enclosure"))) {
+        const Entity* e = find(eid);
+        if (!e || !e->alive) continue;
+        const std::int64_t r = prop_int(*e, p_rad, 0);
+        if (r <= 0) continue;
+        const int cgx = TerrainGrid::cell_of(e->pos.x, terrain.cell);
+        const int cgy = TerrainGrid::cell_of(e->pos.y, terrain.cell);
+        const int rc = static_cast<int>(r / terrain.cell) + 1;
+        for (int dy = -rc; dy <= rc; ++dy)
+            for (int dx = -rc; dx <= rc; ++dx) {
+                const Vec2 cp = terrain.cell_center(cgx + dx, cgy + dy);
+                const std::int64_t ddx = cp.x - e->pos.x;
+                const std::int64_t ddy = cp.y - e->pos.y;
+                if (ddx * ddx + ddy * ddy <= r * r)
+                    cover_cells_.insert(field_key(cgx + dx, cgy + dy));
+            }
+    }
+    cover_dirty_ = false;
+}
+
+// Recompute the three derived fields of one global cell from live entity
+// truth. Marks neighbours when a field actually changed so dependent
+// cells re-evaluate (support propagates Chebyshev-3, conduction re-diffuses).
+void World::refresh_one_cell(int gx, int gy) {
+    if (terrain.support_strength.size() != terrain.elevation.size()) return;
+    int lx = 0, ly = 0;
+    if (!terrain.local_cell(gx, gy, lx, ly)) return;
+    const std::size_t ci = static_cast<std::size_t>(ly) * terrain.w + lx;
+    const Vec2 center = terrain.cell_center(gx, gy);
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_hard = pid("hardness"), p_dens = pid("density"),
+                 p_cond = pid("conductivity"), p_integ = pid("integrity");
+    std::int64_t sup = 0, cond = 0;
+    spatial.for_each_within(center, terrain.cell * 2, [&](EntityId id) {
+        Entity* e = find(id);
+        if (!e || !e->alive || !terrain.contains(e->pos)) return;
+        if (terrain.index(e->pos) != ci) return;
+        // a blast-shattered body (integrity 0) no longer carries load
+        if (const Value* iv = p_integ != kNoProp
+                ? e->props.get(p_integ) : nullptr;
+            iv && (iv->type == ValType::Integer ||
+                   iv->type == ValType::Fixed) && iv->i <= 0)
+            return;
+        if (e->kind_name == SIMLAB_KIND("rubble")) {
+            sup = std::max<std::int64_t>(sup, 350);
+            return;                      // loose debris: fixed support, no conduction
+        }
+        if (e->material == kNoMaterial) return;
+        const MaterialDef* md = materials.find(e->material);
+        if (!md) return;
+        auto mp = [&](PropId p, std::int64_t dflt) -> std::int64_t {
+            const auto it = p != kNoProp ? md->props.find(p) : md->props.end();
+            return (it != md->props.end() &&
+                    (it->second.type == ValType::Integer ||
+                     it->second.type == ValType::Fixed)) ? it->second.i : dflt;
+        };
+        const std::int64_t hard = mp(p_hard, 0);
+        if (hard >= 600) {
+            const std::int64_t cand = std::clamp<std::int64_t>(
+                (hard * 3 + mp(p_dens, 0) / 2000) >> 2, 100, 1000);
+            sup = std::max(sup, cand);
+        }
+        const std::int64_t mc = mp(p_cond, 0);
+        if (mc > 200) cond = std::max(cond, std::min<std::int64_t>(mc, 1000));
+    });
+    const std::int64_t ob = cover_cells_.count(field_key(gx, gy)) ? 240 : 0;
+    const std::uint64_t key = field_key(gx, gy);
+    const std::uint32_t now =
+        static_cast<std::uint32_t>(clock_.tick());
+    bool changed = false;
+    if (terrain.support_strength[ci] != sup) {
+        terrain.support_strength[ci] = static_cast<std::int32_t>(sup);
+        changed = true;
+        // neighbours within Chebyshev-3 sum this cell's support
+        mark_structural_tick(center, 3, now);
+    }
+    if (terrain.overburden_load[ci] != ob) {
+        terrain.overburden_load[ci] = static_cast<std::int32_t>(ob);
+        changed = true;
+    }
+    if (terrain.conductivity[ci] != cond) {
+        terrain.conductivity[ci] = static_cast<std::int32_t>(cond);
+        changed = true;
+        mark_conductive_tick(center, 0, now);
+    }
+    if (changed) {
+        if (sup > 0 || ob > 0 || cond > 0) field_cells_.insert(key);
+        else field_cells_.erase(key);
+    }
+}
+
+// One-time seed: cells containing relevant entities (and enclosure
+// footprints) join the refresh set so pre-existing world state is picked
+// up without a full-map scan on every advance.
+void World::refresh_field_cells() {
+    if (terrain.empty() || terrain.cell <= 0 ||
+        terrain.support_strength.size() != terrain.elevation.size()) return;
+    // enclosure coverage also changes on death (no spawn/move hook fires):
+    // a cheap signature over alive enclosures triggers a rebuild.
+    {
+        static thread_local SeqPidCache pid_c_;
+        SeqPid pid(pid_c_, props);
+        const PropId p_rad = pid("footprint_radius");
+        std::int64_t csig = 0;
+        for (const EntityId eid :
+             entities_of_kind(SIMLAB_KIND("enclosure"))) {
+            const Entity* e = find(eid);
+            if (!e || !e->alive) continue;
+            csig += static_cast<std::int64_t>(eid) * 31 + e->pos.x +
+                    e->pos.y * 7 +
+                    (p_rad != kNoProp ? prop_int(*e, p_rad, 0) : 0);
+        }
+        if (csig != cover_sig_) { cover_sig_ = csig; cover_dirty_ = true; }
+    }
+    if (cover_dirty_) rebuild_cover_cells();
+    if (!field_seeded_) {
+        field_seeded_ = true;
+        for (const auto& ep : entities) {
+            const Entity& e = *ep;
+            if (!e.alive || !terrain.contains(e.pos)) continue;
+            if (!entity_structural_relevance(e)) continue;
+            const int cgx = TerrainGrid::cell_of(e.pos.x, terrain.cell);
+            const int cgy = TerrainGrid::cell_of(e.pos.y, terrain.cell);
+            const std::uint64_t k = field_key(cgx, cgy);
+            structural_dirty_.try_emplace(k,
+                static_cast<std::uint32_t>(clock_.tick()));
+            conductive_dirty_.try_emplace(k,
+                static_cast<std::uint32_t>(clock_.tick()));
+            if (e.kind_name == SIMLAB_KIND("enclosure")) {
+                static thread_local SeqPidCache pid_c_;
+                SeqPid pid(pid_c_, props);
+                const PropId p_rad = pid("footprint_radius");
+                const std::int64_t r =
+                    p_rad != kNoProp ? prop_int(e, p_rad, 0) : 0;
+                if (r > 0) {
+                    const int rc =
+                        static_cast<int>(r / terrain.cell) + 1;
+                    for (int dy = -rc; dy <= rc; ++dy)
+                        for (int dx = -rc; dx <= rc; ++dx)
+                            structural_dirty_.try_emplace(
+                                field_key(cgx + dx, cgy + dy),
+                                static_cast<std::uint32_t>(clock_.tick()));
+                }
+            }
+        }
+        // enclosure-covered cells need overburden even with no entity on them
+        for (const std::uint64_t k : cover_cells_)
+            structural_dirty_.try_emplace(k,
+                static_cast<std::uint32_t>(clock_.tick()));
+    }
+    // refresh candidates: dirty cells + cells with live non-zero fields
+    // (catches deaths/moves that cleared a pillar without an explicit mark)
+    std::set<std::uint64_t> todo = field_cells_;
+    for (const auto& [k, t] : structural_dirty_) todo.insert(k);
+    for (const auto& [k, t] : conductive_dirty_) todo.insert(k);
+    for (const std::uint64_t k : todo) {
+        const int gx = static_cast<std::int32_t>(k >> 32);
+        const int gy = static_cast<std::int32_t>(k & 0xFFFFFFFFull);
+        refresh_one_cell(gx, gy);
+    }
+}
+
+// Cave-in evaluation for one roofed open cell: sum delivered support from
+// load-bearing cells within Chebyshev distance 3; collapse when the total
+// falls below overburden_load. Rubble spawned by a collapse re-supports
+// the cell (support_strength 350) so each cell collapses at most once.
+void World::eval_collapse_cell(int gx, int gy, std::uint64_t tick) {
+    int lx = 0, ly = 0;
+    if (!terrain.local_cell(gx, gy, lx, ly)) return;
+    const std::size_t ci = static_cast<std::size_t>(ly) * terrain.w + lx;
+    const std::int64_t ob = terrain.overburden_load[ci];
+    if (ob <= 0 || terrain.support_strength[ci] > 0) return;
+    std::int64_t total = 0;
+    int best_gx = 0, best_gy = 0;
+    std::int64_t best_del = 0;
+    for (int dy = -3; dy <= 3; ++dy)
+        for (int dx = -3; dx <= 3; ++dx) {
+            const int d = std::max(std::abs(dx), std::abs(dy));
+            if (d < 1) continue;
+            int nlx = 0, nly = 0;
+            if (!terrain.local_cell(gx + dx, gy + dy, nlx, nly)) continue;
+            const std::size_t nci =
+                static_cast<std::size_t>(nly) * terrain.w + nlx;
+            const std::int64_t ss = terrain.support_strength[nci];
+            if (ss <= 0) continue;
+            const std::int64_t del = ss >> (d - 1);
+            total += del;
+            if (del > best_del) { best_del = del; best_gx = gx + dx;
+                                  best_gy = gy + dy; }
+        }
+    total = std::min<std::int64_t>(total, 1000);
+    if (total >= ob) return;                     // sufficiently supported
+
+    // ---- collapse: crush occupants, drop rubble, emit catastrophe ---------
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_integ = pid("integrity"), p_fat = pid("fatigue");
+    const Vec2 center = terrain.cell_center(gx, gy);
+    const std::int64_t crush = (ob - total) * 2;
+    CausalEvent ev;
+    ev.tick = tick;
+    ev.action = "cave_in";
+    std::int64_t crushed = 0;
+    spatial.for_each_within(center, terrain.cell, [&](EntityId id) {
+        Entity* e = find(id);
+        if (!e || !e->alive || !terrain.contains(e->pos) ||
+            terrain.index(e->pos) != ci) return;
+        ++crushed;
+        ev.participants.push_back(id);
+        if (p_integ != kNoProp) {
+            const std::int64_t vi = prop_int(*e, p_integ, 500);
+            const std::int64_t vn = std::max<std::int64_t>(0, vi - crush);
+            if (vn != vi) {
+                StateChange ch;
+                ch.entity = id; ch.prop = p_integ; ch.had_before = true;
+                ch.before = Value::integer(vi);
+                ch.after = Value::integer(vn);
+                e->props.set(p_integ, ch.after);
+                ev.changes.push_back(ch);
+            }
+        }
+        if (p_fat != kNoProp) {
+            const std::int64_t vf = prop_int(*e, p_fat, 0);
+            const std::int64_t nf = std::min<std::int64_t>(1000, vf + 150);
+            if (nf != vf) {
+                StateChange ch;
+                ch.entity = id; ch.prop = p_fat; ch.had_before = true;
+                ch.before = Value::integer(vf);
+                ch.after = Value::integer(nf);
+                e->props.set(p_fat, ch.after);
+                ev.changes.push_back(ch);
+            }
+        }
+        if (auto mi = minds_.find(id); mi != minds_.end())
+            mi->second.neuro.panic = std::min<std::int64_t>(
+                1000, mi->second.neuro.panic + 300);
+    });
+    // debris inherits the strongest neighbouring pillar's material
+    MaterialId rmat = kNoMaterial;
+    {
+        int nlx = 0, nly = 0;
+        if (terrain.local_cell(best_gx, best_gy, nlx, nly)) {
+            const Vec2 bcenter = terrain.cell_center(best_gx, best_gy);
+            spatial.for_each_within(bcenter, terrain.cell, [&](EntityId id) {
+                if (rmat != kNoMaterial) return;
+                const Entity* e = find(id);
+                if (e && e->alive && e->material != kNoMaterial &&
+                    terrain.contains(e->pos) &&
+                    terrain.index(e->pos) ==
+                        static_cast<std::size_t>(nly) * terrain.w + nlx)
+                    rmat = e->material;
+            });
+        }
+    }
+    PropertyBag pb;
+    const PropId p_qty = pid("quantity");
+    if (p_qty != kNoProp)
+        pb.set(p_qty, Value::integer(std::max<std::int64_t>(1, ob / 100)));
+    create_entity("rubble", rmat, center, pb);
+    // the rubble re-supports the cell: support_strength 350 (spec)
+    terrain.support_strength[ci] = 350;
+    field_cells_.insert(field_key(gx, gy));
+    mark_structural_tick(center, 3,
+        static_cast<std::uint32_t>(tick));
+    std::ostringstream nt;
+    nt << "cave_in gx=" << gx << " gy=" << gy << " ob=" << ob
+       << " support=" << total << " crush=" << crush
+       << " occupants=" << crushed;
+    ev.evidence = nt.str();
+    ledger.append(std::move(ev));
+}
+
+// Per-tick dirty-set pass: refresh derived fields once (entity truth is
+// frozen during advance_ticks), then drain collapse evaluations at their
+// historical sub-ticks — identical ordering to dt=1 xN.
+void World::structural_drift(std::int64_t n) {
+    if (n <= 0 || terrain.empty() ||
+        terrain.support_strength.size() != terrain.elevation.size()) return;
+    refresh_field_cells();
+    if (structural_dirty_.empty()) return;
+    const std::uint64_t now0 = clock_.tick();
+    const std::uint64_t t0 = now0 >= static_cast<std::uint64_t>(n)
+        ? now0 - static_cast<std::uint64_t>(n) : 0;
+    for (std::int64_t k = 0; k < n; ++k) {
+        const std::uint64_t eval_tick = t0 + static_cast<std::uint64_t>(k) + 1;
+        while (!structural_dirty_.empty()) {
+            auto it = structural_dirty_.begin();
+            if (it->second > eval_tick) break;
+            const std::uint64_t key = it->first;
+            structural_dirty_.erase(it);
+            eval_collapse_cell(
+                static_cast<std::int32_t>(key >> 32),
+                static_cast<std::int32_t>(key & 0xFFFFFFFFull), eval_tick);
+        }
+        if (structural_dirty_.empty()) break;
+    }
+    // stragglers marked "now" (end of batch) resolve on the last sub-tick
+    while (!structural_dirty_.empty()) {
+        auto it = structural_dirty_.begin();
+        const std::uint64_t key = it->first;
+        const std::uint32_t mt = it->second;
+        structural_dirty_.erase(it);
+        eval_collapse_cell(
+            static_cast<std::int32_t>(key >> 32),
+            static_cast<std::int32_t>(key & 0xFFFFFFFFull), mt);
+    }
+}
+
+// Heat diffusion across conductive cells: one 4-neighbour step per dirty
+// cell per sub-tick, hot->cold only, integer-exact. Recipients are re-marked
+// so the wave propagates until temperatures equalise (transfer 0 => no
+// re-mark => the dirty set drains).
+void World::thermal_conduct_drift(std::int64_t n) {
+    if (n <= 0 || terrain.empty() ||
+        terrain.conductivity.size() != terrain.elevation.size()) return;
+    refresh_field_cells();          // conductivity fields stay current
+    if (conductive_dirty_.empty()) return;
+    const std::uint64_t now0 = clock_.tick();
+    const std::uint64_t t0 = now0 >= static_cast<std::uint64_t>(n)
+        ? now0 - static_cast<std::uint64_t>(n) : 0;
+    static const int kDir[4][2] = {{0,-1},{1,0},{0,1},{-1,0}};  // N,E,S,W
+    auto diffuse_cell = [&](int gx, int gy, std::uint32_t mark_tick) {
+        int lx = 0, ly = 0;
+        if (!terrain.local_cell(gx, gy, lx, ly)) return;
+        const std::size_t ci = static_cast<std::size_t>(ly) * terrain.w + lx;
+        if (terrain.conductivity[ci] < 300) return;
+        for (const auto& d : kDir) {
+            int nlx = 0, nly = 0;
+            if (!terrain.local_cell(gx + d[0], gy + d[1], nlx, nly))
+                continue;
+            const std::size_t nci =
+                static_cast<std::size_t>(nly) * terrain.w + nlx;
+            if (terrain.conductivity[nci] < 300) continue;
+            const std::int64_t cur = terrain.temperature[ci];
+            const std::int64_t dst = terrain.temperature[nci];
+            if (cur <= dst) continue;
+            const std::int64_t ht =
+                ((cur - dst) * std::min<std::int64_t>(
+                    terrain.conductivity[ci],
+                    terrain.conductivity[nci])) >> 11;
+            if (ht <= 0) continue;
+            terrain.temperature[ci] = static_cast<std::int32_t>(cur - ht);
+            terrain.temperature[nci] = static_cast<std::int32_t>(dst + ht);
+            mark_conductive_tick(
+                terrain.cell_center(gx + d[0], gy + d[1]), 0, mark_tick);
+        }
+    };
+    for (std::int64_t k = 0; k < n; ++k) {
+        const std::uint64_t eval_tick = t0 + static_cast<std::uint64_t>(k) + 1;
+        for (auto it = conductive_dirty_.begin();
+             it != conductive_dirty_.end();) {
+            if (it->second > eval_tick) { ++it; continue; }
+            const std::uint64_t key = it->first;
+            it = conductive_dirty_.erase(it);
+            diffuse_cell(
+                static_cast<std::int32_t>(key >> 32),
+                static_cast<std::int32_t>(key & 0xFFFFFFFFull),
+                static_cast<std::uint32_t>(eval_tick));
+        }
+        if (conductive_dirty_.empty()) break;
+    }
+    // drain stragglers marked at/after the batch end (deterministic order)
+    while (!conductive_dirty_.empty()) {
+        auto it = conductive_dirty_.begin();
+        const std::uint64_t key = it->first;
+        conductive_dirty_.erase(it);
+        diffuse_cell(
+            static_cast<std::int32_t>(key >> 32),
+            static_cast<std::int32_t>(key & 0xFFFFFFFFull),
+            static_cast<std::uint32_t>(now0));
+    }
+}
+
+// Deterministic integer BFS surge flood along cells with conductivity >= 400:
+// N,E,S,W order, <=16 hops, V_next = (V * cond) >> 10 per hop. Entities on
+// energised cells take shock = V>>2 (+50% when wet/standing in water) and
+// fatigue += V>>1; conductors heat by V>>4.
+void World::conduct_surge_tick(Vec2 p, std::int64_t volts, std::uint32_t tick) {
+    if (terrain.empty() || terrain.conductivity.size() !=
+            terrain.elevation.size() || volts <= 0 ||
+        !terrain.contains(p)) return;
+    refresh_field_cells();          // conductivity fields may be stale
+    if (terrain.conductivity.empty()) return;
+    static thread_local SeqPidCache pid_c_;
+    SeqPid pid(pid_c_, props);
+    const PropId p_integ = pid("integrity"), p_fat = pid("fatigue");
+    const int sx = TerrainGrid::cell_of(p.x, terrain.cell);
+    const int sy = TerrainGrid::cell_of(p.y, terrain.cell);
+    int slx = 0, sly = 0;
+    if (!terrain.local_cell(sx, sy, slx, sly)) return;
+    const std::size_t sci =
+        static_cast<std::size_t>(sly) * terrain.w + slx;
+    if (terrain.conductivity[sci] < 400) return;
+    static const int kDir[4][2] = {{0,-1},{1,0},{0,1},{-1,0}};  // N,E,S,W
+    struct Node { int gx, gy, depth; std::int64_t v; };
+    std::vector<Node> q;
+    std::set<std::uint64_t> seen;
+    q.push_back({sx, sy, 0, volts});
+    seen.insert(field_key(sx, sy));
+    CausalEvent ev;
+    ev.tick = tick;
+    ev.action = "conduct_surge";
+    std::size_t head = 0;
+    while (head < q.size()) {
+        const Node nd = q[head++];
+        int lx = 0, ly = 0;
+        if (!terrain.local_cell(nd.gx, nd.gy, lx, ly)) continue;
+        const std::size_t ci =
+            static_cast<std::size_t>(ly) * terrain.w + lx;
+        if (terrain.conductivity[ci] < 400) continue;
+        const Vec2 center = terrain.cell_center(nd.gx, nd.gy);
+        // energised tile heats; occupants take shock + stun
+        terrain.temperature[ci] = static_cast<std::int32_t>(std::min<
+            std::int64_t>(100000,
+                static_cast<std::int64_t>(terrain.temperature[ci]) +
+                (nd.v >> 4)));
+        const bool wet = terrain.water[ci] != 0;
+        const std::int64_t shock0 = nd.v >> 2;
+        const std::int64_t shock =
+            wet ? shock0 + shock0 / 2 : shock0;
+        const std::int64_t stun = nd.v >> 1;
+        spatial.for_each_within(center, terrain.cell, [&](EntityId id) {
+            Entity* e = find(id);
+            if (!e || !e->alive || !terrain.contains(e->pos) ||
+                terrain.index(e->pos) != ci) return;
+            ev.participants.push_back(id);
+            if (p_integ != kNoProp && shock > 0) {
+                const std::int64_t vi = prop_int(*e, p_integ, 500);
+                const std::int64_t vn = std::max<std::int64_t>(0, vi - shock);
+                if (vn != vi) {
+                    StateChange ch;
+                    ch.entity = id; ch.prop = p_integ; ch.had_before = true;
+                    ch.before = Value::integer(vi);
+                    ch.after = Value::integer(vn);
+                    e->props.set(p_integ, ch.after);
+                    ev.changes.push_back(ch);
+                }
+            }
+            if (p_fat != kNoProp && stun > 0) {
+                const std::int64_t vf = prop_int(*e, p_fat, 0);
+                const std::int64_t nf = std::min<std::int64_t>(1000, vf + stun);
+                if (nf != vf) {
+                    StateChange ch;
+                    ch.entity = id; ch.prop = p_fat; ch.had_before = true;
+                    ch.before = Value::integer(vf);
+                    ch.after = Value::integer(nf);
+                    e->props.set(p_fat, ch.after);
+                    ev.changes.push_back(ch);
+                }
+            }
+        });
+        if (nd.depth >= 16) continue;
+        for (const auto& d : kDir) {
+            const int ng = nd.gx + d[0], ny = nd.gy + d[1];
+            const std::uint64_t nk = field_key(ng, ny);
+            if (seen.count(nk)) continue;
+            int nlx = 0, nly = 0;
+            if (!terrain.local_cell(ng, ny, nlx, nly)) continue;
+            const std::size_t nci =
+                static_cast<std::size_t>(nly) * terrain.w + nlx;
+            if (terrain.conductivity[nci] < 400) continue;
+            const std::int64_t vn =
+                (nd.v * terrain.conductivity[ci]) >> 10;
+            if (vn <= 0) continue;
+            seen.insert(nk);
+            q.push_back({ng, ny, nd.depth + 1, vn});
+        }
+    }
+    if (!ev.changes.empty() || !ev.participants.empty()) {
+        ev.evidence = "conductive surge V=" + std::to_string(volts) +
+                      " cells=" + std::to_string(q.size());
+        ledger.append(std::move(ev));
+    }
+}
+void World::conduct_surge(Vec2 p, std::int64_t volts) {
+    conduct_surge_tick(p, volts, static_cast<std::uint32_t>(clock_.tick()));
+}
+
+// Sensor ch115: margin = clamp((total_support - overburden) >> 2, -127,127)
+// computed live over the same Chebyshev-3 support rule as collapse eval.
+std::int64_t World::structural_margin_at(Vec2 p) const {
+    if (terrain.empty() || terrain.support_strength.size() !=
+            terrain.elevation.size() || !terrain.contains(p)) return 0;
+    const int cgx = TerrainGrid::cell_of(p.x, terrain.cell);
+    const int cgy = TerrainGrid::cell_of(p.y, terrain.cell);
+    int lx = 0, ly = 0;
+    if (!terrain.local_cell(cgx, cgy, lx, ly)) return 0;
+    const std::size_t ci = static_cast<std::size_t>(ly) * terrain.w + lx;
+    const std::int64_t ob = terrain.overburden_load.empty() ? 0 :
+        terrain.overburden_load[ci];
+    std::int64_t total = 0;
+    if (terrain.support_strength[ci] == 0) {
+        for (int dy = -3; dy <= 3; ++dy)
+            for (int dx = -3; dx <= 3; ++dx) {
+                const int d = std::max(std::abs(dx), std::abs(dy));
+                if (d < 1) continue;
+                int nlx = 0, nly = 0;
+                if (!terrain.local_cell(cgx + dx, cgy + dy, nlx, nly))
+                    continue;
+                const std::size_t nci =
+                    static_cast<std::size_t>(nly) * terrain.w + nlx;
+                const std::int64_t ss = terrain.support_strength[nci];
+                if (ss > 0) total += ss >> (d - 1);
+            }
+        total = std::min<std::int64_t>(total, 1000);
+    } else {
+        total = 1000;                    // self-supporting cell
+    }
+    return std::clamp<std::int64_t>((total - ob) >> 2, -127, 127);
+}
+
+// Spawn/move bookkeeping: a relevant entity appearing on a cell can change
+// that cell's fields AND its neighbours' support totals. Enclosures mark
+// their whole footprint (overburden), everything else just its own cell.
+void World::note_entity_cells(const Entity& e, Vec2 from, Vec2 to) {
+    if (terrain.empty() || terrain.cell <= 0) return;
+    const bool moved = (from.x != to.x || from.y != to.y);
+    if (e.kind_name == SIMLAB_KIND("enclosure")) {
+        cover_dirty_ = true;
+        static thread_local SeqPidCache pid_c_;
+        SeqPid pid(pid_c_, props);
+        const PropId p_rad = pid("footprint_radius");
+        const std::int64_t r =
+            p_rad != kNoProp ? prop_int(e, p_rad, 0) : 0;
+        auto mark_cover = [&](Vec2 c) {
+            if (!terrain.contains(c)) return;
+            const int cgx = TerrainGrid::cell_of(c.x, terrain.cell);
+            const int cgy = TerrainGrid::cell_of(c.y, terrain.cell);
+            const int rc = r > 0 ? static_cast<int>(r / terrain.cell) + 1 : 0;
+            for (int dy = -rc; dy <= rc; ++dy)
+                for (int dx = -rc; dx <= rc; ++dx)
+                    mark_structural_tick(
+                        terrain.cell_center(cgx + dx, cgy + dy), 0,
+                        static_cast<std::uint32_t>(clock_.tick()));
+        };
+        if (moved) mark_cover(from);
+        mark_cover(to);
+        return;
+    }
+    if (!entity_structural_relevance(e)) return;
+    const std::uint32_t now = static_cast<std::uint32_t>(clock_.tick());
+    if (moved && terrain.contains(from))
+        mark_structural_tick(from, 3, now);
+    if (!terrain.contains(to)) return;
+    mark_structural_tick(to, 3, now);
+    mark_conductive_tick(to, 0, now);
+}
+
 // Volatile-charge detonation. A material is a candidate when its `stability`
 // prop (permille; absent = 1000 inert) is low AND `flammability` is high.
 // Priming: entity temperature > 70C (700 deciC), the terrain cell hotter
@@ -8521,7 +9237,8 @@ void World::detonation_drift(std::int64_t n) {
         auto mp = [&](PropId p, std::int64_t dflt) -> std::int64_t {
             const auto it = p != kNoProp ? md->props.find(p) : md->props.end();
             return (it != md->props.end() &&
-                    it->second.type == ValType::Integer) ? it->second.i : dflt;
+                    (it->second.type == ValType::Integer ||
+                     it->second.type == ValType::Fixed)) ? it->second.i : dflt;
         };
         const std::int64_t fl = mp(p_flamm, 0), st = mp(p_stab, 1000);
         if (fl >= 600 && st < 300)
@@ -8533,8 +9250,12 @@ void World::detonation_drift(std::int64_t n) {
     const std::uint64_t now0 = clock_.tick();
     const std::uint64_t t0 = now0 >= static_cast<std::uint64_t>(n)
         ? now0 - static_cast<std::uint64_t>(n) : 0;
+    // conductive-surge origins collected per sub-tick (heat >= 400 on a
+    // >=400-conductivity cell), executed after the blast event commits
+    std::vector<std::pair<Vec2, std::int64_t>> surges;
     for (std::int64_t k = 0; k < n; ++k) {
         const std::uint64_t now = t0 + static_cast<std::uint64_t>(k) + 1;
+        surges.clear();
         bool any_blast = false;
         CausalEvent ev;
         ev.tick = now;
@@ -8623,7 +9344,23 @@ void World::detonation_drift(std::int64_t n) {
                                     static_cast<std::int64_t>(
                                         terrain.temperature[ci]) + heat));
                         add_pollution(cp, E / 8);
+                        // conduction: heated conductive cells join the
+                        // diffusion dirty-set; a violent spike on a >=400
+                        // conductor triggers a surge flood
+                        if (terrain.conductivity.size() ==
+                                terrain.elevation.size() &&
+                            terrain.conductivity[ci] >= 300)
+                            mark_conductive_tick(cp, 0,
+                                static_cast<std::uint32_t>(now));
+                        if (terrain.conductivity.size() ==
+                                terrain.elevation.size() &&
+                            terrain.conductivity[ci] >= 400 && heat >= 400)
+                            surges.emplace_back(cp, heat);
                     }
+                // blasts can destroy load-bearing cells: re-evaluate
+                // structural support in the spec's 4-cell radius
+                mark_structural_tick(src->pos, 4,
+                    static_cast<std::uint32_t>(now));
             }
             // the charge itself is consumed — kill it outright (same reap
             // convention as integrity<=0) so a multi-tick drift call cannot
@@ -8682,6 +9419,10 @@ void World::detonation_drift(std::int64_t n) {
                     witness_from_event(*this, wid, *pev);
             }
         }
+        // conductive surges triggered by this sub-tick's blasts run after
+        // the detonation event so the ledger keeps causal order
+        for (const auto& [sp, sv] : surges)
+            conduct_surge_tick(sp, sv, static_cast<std::uint32_t>(now));
     }
 }
 

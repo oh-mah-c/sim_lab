@@ -10828,7 +10828,7 @@ static void test_gene_pool_evolution() {
 static void test_brain_free_will() {
     // (a) 32-verb action space: table, one-hot encoding, decide validity ----
     CHECK(kActionVerbs == 32);
-    CHECK(kSensorChannels == 115);   // +3 conditioning tail (112-114)
+    CHECK(kSensorChannels == 117);   // +3 conditioning tail (112-114) + structural/conduction (115-116)
     CHECK(kActChannels == 32);
     {
         const char* const* vt = sensor_verb_table();
@@ -12031,6 +12031,229 @@ static void test_culture_archaeology() {
     }
 }
 
+// ---- Structural Engineering, Siege Collapse & Terrain Conduction (v28) ----
+static void test_structural_siege_physics() {
+    WorldGenParams gp;
+    gp.seed = 909; gp.grid_w = 48; gp.grid_h = 48; gp.cell_size = 16;
+    gp.sea_level = -5000;               // keep the test plot dry
+    WorldGenerator gen;
+    const Vec2 CEN = {24 * 16 + 8, 24 * 16 + 8};   // global cell (24,24)
+
+    auto make_world = [&](std::uint64_t seed) {
+        World w(seed, "data");
+        WorldGenParams p = gp; p.seed = seed;
+        CHECK(gen.generate(w, p));
+        return w;
+    };
+    auto caveins = [](World& w) {
+        int n = 0;
+        for (const CausalEvent& ev : w.ledger.history())
+            if (ev.action == "cave_in") ++n;
+        return n;
+    };
+    auto surges = [](World& w) {
+        int n = 0;
+        for (const CausalEvent& ev : w.ledger.history())
+            if (ev.action == "conduct_surge") ++n;
+        return n;
+    };
+    auto cell_field = [](World& w, Vec2 p, int which) -> std::int64_t {
+        if (!w.terrain.contains(p) ||
+            w.terrain.support_strength.size() != w.terrain.elevation.size())
+            return -1;
+        const std::size_t ci = w.terrain.index(p);
+        if (which == 0) return w.terrain.support_strength[ci];
+        if (which == 1) return w.terrain.overburden_load[ci];
+        return w.terrain.conductivity[ci];
+    };
+    auto mk_enclosure = [&](World& w, Vec2 pos, std::int64_t rad) {
+        PropertyBag pb;
+        const PropId pr = tpid(w, "footprint_radius");
+        const PropId pi = tpid(w, "integrity");
+        const PropId pw = tpid(w, "weather_resistance");
+        if (pr != kNoProp) pb.set(pr, Value::integer(rad));
+        if (pi != kNoProp) pb.set(pi, Value::integer(1000));
+        if (pw != kNoProp) pb.set(pw, Value::integer(1000));
+        return w.create_entity("enclosure", w.materials.id_of("stone"),
+                               pos, pb);
+    };
+    auto mk_pillar = [&](World& w, Vec2 pos, std::int64_t integ = -1) {
+        PropertyBag pb;
+        if (integ >= 0) {
+            const PropId pi = tpid(w, "integrity");
+            if (pi != kNoProp) pb.set(pi, Value::integer(integ));
+        }
+        return w.create_entity("pillar", w.materials.id_of("granite"),
+                               pos, pb);
+    };
+    auto mk_victim = [&](World& w, Vec2 pos) {
+        EntityId v = w.create_entity("test_victim",
+            w.materials.id_of("flesh"), pos, {});
+        Entity* e = w.find(v);
+        tseti(*e, w, "integrity", 500);
+        tseti(*e, w, "fatigue", 0);
+        return v;
+    };
+
+    // (1) Unsupported roof edge collapses; pillar grid holds the same roof -
+    {
+        World w = make_world(909);
+        mk_enclosure(w, CEN, 48);           // covers ~ +/-3 cells
+        // victim stands on a d=3 edge cell: only 231 support < 240 roof
+        const EntityId vic = mk_victim(w, {CEN.x + 48, CEN.y});
+        w.advance_ticks_for_test(4);
+        CHECK(caveins(w) >= 1);                    // roof gave way
+        bool saw_rubble_cell = false;
+        for (int gy = -5; gy <= 5 && !saw_rubble_cell; ++gy)
+            for (int gx = -5; gx <= 5 && !saw_rubble_cell; ++gx) {
+                const Vec2 p{CEN.x + gx * 16, CEN.y + gy * 16};
+                if (cell_field(w, p, 1) == 240 &&
+                    cell_field(w, p, 0) == 350)
+                    saw_rubble_cell = true;
+            }
+        CHECK(saw_rubble_cell);                   // tile re-supported by rubble
+        Entity* v2 = w.find(vic);
+        CHECK(!v2 || !v2->alive ||
+              tint(*v2, w, "integrity", 500) < 500 ||
+              tint(*v2, w, "fatigue", 0) > 0);
+    }
+    {
+        // same chamber with granite pillars on a 2-cell grid -> stable
+        World w = make_world(910);
+        mk_enclosure(w, CEN, 48);
+        for (int gy = -4; gy <= 4; gy += 2)
+            for (int gx = -4; gx <= 4; gx += 2)
+                mk_pillar(w, {CEN.x + gx * 16, CEN.y + gy * 16});
+        w.advance_ticks_for_test(6);
+        CHECK(caveins(w) == 0);                    // pillars hold the roof
+        CHECK(w.structural_margin_at(CEN) >= 0);
+        CHECK(cell_field(w, CEN, 0) > 0);          // pillars register
+    }
+
+    // (2) Siege demolition: blast kills a critical pillar -> cave-in --------
+    {
+        World w = make_world(911);
+        mk_enclosure(w, CEN, 96);           // wide roof, ~ +/-6 cells
+        // 8 pillars: N/S/E/W at r=96 + 4 diagonals at r~90 — every covered
+        // cell stays within Chebyshev-3 of a pillar (baseline stable)
+        for (int s = -1; s <= 1; s += 2) {
+            mk_pillar(w, {CEN.x + s * 96, CEN.y});
+            mk_pillar(w, {CEN.x, CEN.y + s * 96});
+            mk_pillar(w, {CEN.x + s * 64, CEN.y + s * 64});
+            mk_pillar(w, {CEN.x + s * 64, CEN.y - s * 64});
+        }
+        const EntityId vic = mk_victim(w, {CEN.x + 80, CEN.y});  // cell (5,0)
+        w.advance_ticks_for_test(3);
+        CHECK(caveins(w) == 0);                    // baseline stable
+        // fragile charge beside the east pillar, pre-heated to prime
+        const EntityId charge = w.create_entity("charge",
+            w.materials.id_of("energetic_mix"),
+            {CEN.x + 100, CEN.y}, {});
+        CHECK(charge != kNoEntity);
+        Entity* ce = w.find(charge);
+        tseti(*ce, w, "temperature", 800);          // >700 deciC primes it
+        // weaken the east pillar so the blast finishes it
+        for (EntityId pid2 : w.entities_of_kind(SIMLAB_KIND("pillar"))) {
+            Entity* pe = w.find(pid2);
+            if (!pe || !pe->alive) continue;
+            if (pe->pos.x == CEN.x + 96 && pe->pos.y == CEN.y)
+                tseti(*pe, w, "integrity", 60);
+        }
+        w.advance_ticks_for_test(10);
+        CHECK(caveins(w) >= 1);                    // roof followed the pillar
+        Entity* v2 = w.find(vic);
+        CHECK(!v2 || !v2->alive ||
+              tint(*v2, w, "integrity", 500) < 500 ||
+              tint(*v2, w, "fatigue", 0) > 0);
+    }
+
+    // (3) Thermal conduction along a metal chain vs stone control ---------
+    {
+        auto build = [&](std::uint64_t seed, const char* mat, World& w) {
+            WorldGenParams p = gp; p.seed = seed;
+            CHECK(gen.generate(w, p));
+            const MaterialId m = w.materials.id_of(mat);
+            for (int i = 0; i < 6; ++i)
+                w.create_entity("ingot", m, {CEN.x + i * 16, CEN.y}, {});
+        };
+        auto temp_at = [](World& w, int gx) {
+            int lx = 0, ly = 0;
+            CHECK(w.terrain.local_cell(gx, 24, lx, ly));
+            return w.terrain.temperature[
+                static_cast<std::size_t>(ly) * w.terrain.w + lx];
+        };
+        World wc(912, "data"), ws(912, "data");   // same seed: identical terrain
+        build(912, "iron_ingot", wc);              // conductivity 800
+        build(912, "stone", ws);                  // conductivity 200 (<300)
+        // heat the west end to 900 deciC, capture cold-end baseline
+        for (World* wp : {&wc, &ws}) {
+            int lx = 0, ly = 0;
+            CHECK(wp->terrain.local_cell(24, 24, lx, ly));
+            wp->terrain.temperature[
+                static_cast<std::size_t>(ly) * wp->terrain.w + lx] = 900;
+        }
+        const std::int32_t ws29_0 = temp_at(ws, 29);
+        wc.advance_ticks_for_test(14);
+        ws.advance_ticks_for_test(14);
+        CHECK(temp_at(wc, 29) > temp_at(ws, 29)); // heat crossed 5 cells
+        CHECK(temp_at(wc, 29) < 900);
+        CHECK(temp_at(ws, 29) == ws29_0);          // stone: no conduction
+    }
+
+    // (4) Surge conduction: 8-cell iron path, victim on the last cell -----
+    {
+        World w = make_world(914);
+        const MaterialId iron = w.materials.id_of("iron_ingot"); // cond 800
+        for (int i = 0; i < 8; ++i)
+            w.create_entity("ingot", iron,
+                {CEN.x + i * 16, CEN.y}, {});
+        const Vec2 far{CEN.x + 7 * 16, CEN.y};    // ON the last conductor
+        const EntityId vic = mk_victim(w, far);
+        w.conduct_surge(CEN, 2000);
+        CHECK(surges(w) == 1);
+        Entity* v2 = w.find(vic);
+        CHECK(v2 && v2->alive);
+        CHECK(tint(*v2, w, "integrity", 500) < 500);   // shocked
+        CHECK(tint(*v2, w, "fatigue", 0) > 0);         // stunned
+        int lx = 0, ly = 0;
+        CHECK(w.terrain.local_cell(24 + 7, 24, lx, ly));
+        CHECK(w.terrain.temperature[
+            static_cast<std::size_t>(ly) * w.terrain.w + lx] > 0);
+        // identical replay -> identical hash (determinism)
+        World w2 = make_world(914);
+        for (int i = 0; i < 8; ++i)
+            w2.create_entity("ingot", iron,
+                {CEN.x + i * 16, CEN.y}, {});
+        const EntityId vic2 = mk_victim(w2, far);
+        (void)vic2;
+        w2.conduct_surge(CEN, 2000);
+        CHECK(w2.state_hash() == w.state_hash());
+    }
+
+    // (5) Save v28 round-trip + post-load determinism ----------------------
+    {
+        World w = make_world(915);
+        mk_enclosure(w, CEN, 48);
+        for (int gy = -4; gy <= 4; gy += 2)
+            for (int gx = -4; gx <= 4; gx += 2)
+                mk_pillar(w, {CEN.x + gx * 16, CEN.y + gy * 16});
+        for (int i = 0; i < 6; ++i)
+            w.create_entity("ingot", w.materials.id_of("iron_ingot"),
+                {CEN.x + i * 16, CEN.y + 64}, {});
+        w.advance_ticks_for_test(6);
+        const std::uint64_t h1 = w.state_hash();
+        const char* path = "/tmp/simlab_struct_v28.bin";
+        CHECK(w.save(path));
+        World w2(1, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h1);
+        w.advance_ticks_for_test(4);
+        w2.advance_ticks_for_test(4);
+        CHECK(w2.state_hash() == w.state_hash());
+        std::remove(path);
+    }
+}
+
 int main(int argc, char** argv) {
     // optional filter: ./tests <name> runs a single suite for fast iteration
     const char* only = argc > 1 ? argv[1] : nullptr;
@@ -12106,6 +12329,7 @@ int main(int argc, char** argv) {
     RUN(test_emergent_coevolution);
     RUN(test_conditioning);
     RUN(test_culture_archaeology);
+    RUN(test_structural_siege_physics);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);

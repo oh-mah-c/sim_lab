@@ -156,6 +156,11 @@ public:
     void advance_ticks_for_test(std::int64_t n) { advance_ticks(n); }
     // Soot/filth write on a terrain cell (dirty-set tracked for decay).
     void add_pollution(Vec2 p, std::int64_t delta);
+    // Read-only structural margin at p's cell (Sensor ch115):
+    // clamp((total_support - overburden_load) >> 2, -127, 127).
+    std::int64_t structural_margin_at(Vec2 p) const;
+    // Deterministic integer BFS conductive surge (tests/lightning hooks).
+    void conduct_surge(Vec2 p, std::int64_t volts);
     std::uint64_t state_hash() const;      // FNV-1a over all persistent state
     // Phase 12.1d: deterministic lexicon codex export (public API).
     std::string export_lexicon_codex() const;
@@ -511,6 +516,19 @@ private:
     void detonation_drift(std::int64_t n);
     // Soot decay over dirty pollution cells (same contract as wear fade).
     void pollution_decay(std::int64_t n);
+    // ---- structural engineering / conduction (save v28) ------------------
+    // Per-tick dirty-set passes inside advance_ticks: refresh derived
+    // terrain fields for affected cells, then resolve cave-ins whose
+    // Chebyshev-3 support sum falls below overburden_load, and diffuse
+    // heat across conductive cells. Integer-only, event-driven — dt=1xN
+    // == dt=N because every sub-step is quantized to a tick.
+    void structural_drift(std::int64_t n);
+    void thermal_conduct_drift(std::int64_t n);
+    void conduct_surge_tick(Vec2 p, std::int64_t volts, std::uint32_t tick);
+    void mark_structural(Vec2 p, int radius_cells);
+    void mark_conductive(Vec2 p, int radius_cells);
+    void mark_structural_tick(Vec2 p, int radius_cells, std::uint32_t tick);
+    void mark_conductive_tick(Vec2 p, int radius_cells, std::uint32_t tick);
     // Causal parents of an interaction: caller-supplied + the last event that
     // touched each target / wielded tool (automatic provenance chain).
     std::vector<EventId> auto_parents(const InteractionContext& ctx) const;
@@ -532,6 +550,30 @@ private:
     // Same dirty-cell contract for terrain.pollution (soot from fires,
     // smelts and blasts; decays linearly, suppresses flora regrowth).
     std::set<std::uint64_t> pollution_cells_;
+    // Structural engineering (save v28): per-cell support_strength /
+    // overburden_load / conductivity are DERIVED fields refreshed lazily —
+    // structural_dirty_ marks cells needing re-evaluation after dig,
+    // detonation or load-bearing entity change; conductive_dirty_ marks
+    // cells whose temperature must diffuse to conductive neighbours.
+    // value = tick the mark was made (historical sub-tick inside batched
+    // advance_ticks, so collapse/surge events stamp identically to dt=1xN).
+    std::map<std::uint64_t, std::uint32_t> structural_dirty_;
+    std::map<std::uint64_t, std::uint32_t> conductive_dirty_;
+    bool field_seeded_ = false;   // one-time entity scan seeds field_cells_
+    // Cells whose derived fields are currently non-zero — re-scanned every
+    // advance so entity death/move clears stale support/conductivity.
+    std::set<std::uint64_t> field_cells_;
+    // Enclosure coverage cache: cells with overburden_load=240. Rebuilt
+    // lazily when an enclosure spawns/moves/dies (cover_dirty_).
+    bool cover_dirty_ = true;
+    std::int64_t cover_sig_ = -1;   // alive-enclosure signature -> rebuild
+    std::set<std::uint64_t> cover_cells_;
+    void refresh_field_cells();
+    void rebuild_cover_cells();
+    void refresh_one_cell(int gx, int gy);
+    void eval_collapse_cell(int gx, int gy, std::uint64_t tick);
+    bool entity_structural_relevance(const Entity& e) const;
+    void note_entity_cells(const Entity& e, Vec2 from, Vec2 to);
 };
 
 }  // namespace simlab

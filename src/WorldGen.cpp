@@ -471,6 +471,9 @@ bool WorldGenerator::generate(World& w, const WorldGenParams& p, std::string* er
     t.water_table.assign(n, 0);
     t.traffic_wear.assign(n, 0);
     t.pollution.assign(n, 0);
+    t.support_strength.assign(n, 0);
+    t.overburden_load.assign(n, 0);
+    t.conductivity.assign(n, 0);
 
     SubsurfaceGrid& s = w.subsurface;
     s.w = t.w; s.h = t.h; s.ox = t.ox; s.oy = t.oy; s.max_depth = 300;

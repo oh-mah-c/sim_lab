@@ -28,7 +28,7 @@ struct InteractionContext;
 struct CausalEvent;
 struct Entity;
 
-constexpr int kSensorChannels = 115;
+constexpr int kSensorChannels = 117;
 constexpr int kInteroChannels = 16;    // sensor channels 0..15
 constexpr int kNeuroChannels   = 8;    // channels 16..23
 constexpr int kEntitySlots     = 4;    // channels 24..51 (4 x 7)
@@ -48,8 +48,10 @@ constexpr int kChanScarcityPhase  = 71;  // cycle_scarcity_phase -127..127
 constexpr int kChanEndurance       = 112; // conditioning_endurance 0..127
 constexpr int kChanWaterPeril      = 113; // peril:deep_water belief 0..127
 constexpr int kChanCrossWish       = 114; // want_cross belief 0..127
+constexpr int kChanStructMargin    = 115; // structural_margin -127..127 (v28)
+constexpr int kChanFloorConduct    = 116; // floor_conductivity 0..127 (v28)
 constexpr int kActionVerbs     = 32;
-constexpr int kLabelChannels   = 26;   // 16 deltas | 8 outcomes | reward | endurance delta
+constexpr int kLabelChannels   = 28;   // 16 deltas | 8 outcomes | reward | endurance delta | struct margin | floor conduct
 
 using SensorVec = std::array<std::int8_t, kSensorChannels>;
 using ActionVec = std::array<std::int8_t, kActionVerbs>;

@@ -379,6 +379,22 @@ SensorVec sensor_encode(const World& w, EntityId npc,
                 s[kChanCrossWish] = sensor_norm(b->confidence, 1000);
         }
     }
+    // ---- channels 115..116: structural margin & floor conduction (v28) ------
+    // CL-1 needs these to price mining under unsupported roofs and to feel
+    // heated conductive floors — same honest-self-knowledge tail contract.
+    {
+        s[kChanStructMargin] = static_cast<std::int8_t>(
+            std::clamp<std::int64_t>(w.structural_margin_at(me->pos),
+                                     -127, 127));
+        if (!w.terrain.conductivity.empty() &&
+            w.terrain.support_strength.size() ==
+                w.terrain.elevation.size() && w.terrain.contains(me->pos)) {
+            const std::size_t ci = w.terrain.index(me->pos);
+            s[kChanFloorConduct] = static_cast<std::int8_t>(
+                std::clamp<std::int64_t>(
+                    w.terrain.conductivity[ci] >> 3, 0, 127));
+        }
+    }
     // ---- channels 80..111: last action one-hot ---------------------------------
     if (last_action)
         std::copy(last_action->begin(), last_action->end(), s.begin() + 80);
@@ -458,6 +474,22 @@ LabelVec sensor_label(const World& w, const CausalEvent& ev, EntityId actor,
                     -128, std::min<std::int64_t>(127, d)));
                 break;
             }
+    }
+    // ---- channels 26..27: structural margin & floor conduction (v28) ---------
+    // Absolute-level labels (same convention as y[19..22]): the world model
+    // learns margin<0 -> catastrophe outcomes and conduction -> thermal
+    // comfort directly from these targets.
+    if (const Entity* ae = w.find(actor)) {
+        y[26] = static_cast<std::int8_t>(
+            std::clamp<std::int64_t>(w.structural_margin_at(ae->pos),
+                                     -127, 127));
+        if (!w.terrain.conductivity.empty() &&
+            w.terrain.support_strength.size() ==
+                w.terrain.elevation.size() && w.terrain.contains(ae->pos)) {
+            const std::size_t ci = w.terrain.index(ae->pos);
+            y[27] = static_cast<std::int8_t>(std::clamp<std::int64_t>(
+                w.terrain.conductivity[ci] >> 3, 0, 127));
+        }
     }
     return y;
 }
