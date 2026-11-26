@@ -35,6 +35,9 @@ influx_zone northern_pass
     prop hunger 0
     prop thirst 0
     prop fatigue 0
+    prop endurance_base 500
+    prop plasticity 1000
+    prop endurance 500
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
@@ -58,6 +61,8 @@ influx_zone northern_pass
     gene sight_range 800
     gene fertility 120
     gene mutation_rate 50
+    gene endurance_base 500
+    gene plasticity 1000
     innate consume
     innate reproduce
     innate rest
@@ -87,6 +92,9 @@ influx_zone northern_pass
     prop hunger 0
     prop thirst 0
     prop fatigue 0
+    prop endurance_base 450
+    prop plasticity 1300
+    prop endurance 450
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
@@ -110,6 +118,8 @@ influx_zone northern_pass
     gene sight_range 800
     gene fertility 120
     gene mutation_rate 50
+    gene endurance_base 450
+    gene plasticity 1300
     innate consume
     innate reproduce
     innate rest
@@ -126,6 +136,9 @@ influx_zone inland_band
     prop hunger 0
     prop thirst 0
     prop fatigue 0
+    prop endurance_base 500
+    prop plasticity 1000
+    prop endurance 500
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
@@ -149,6 +162,8 @@ influx_zone inland_band
     gene sight_range 800
     gene fertility 120
     gene mutation_rate 50
+    gene endurance_base 500
+    gene plasticity 1000
     innate consume
     innate reproduce
     innate rest
@@ -173,6 +188,9 @@ influx_zone inland_band
     prop hunger 0
     prop thirst 0
     prop fatigue 0
+    prop endurance_base 450
+    prop plasticity 1300
+    prop endurance 450
     prop metabolism 2000
     prop speed 8000
     prop sight_range 800
@@ -196,6 +214,8 @@ influx_zone inland_band
     gene sight_range 800
     gene fertility 120
     gene mutation_rate 50
+    gene endurance_base 450
+    gene plasticity 1300
     innate consume
     innate reproduce
     innate rest

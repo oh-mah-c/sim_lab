@@ -1119,3 +1119,59 @@ no engine code changes.
   Capstone fingerprint changed (new laws alter dynamics) —
   state_hash=a99f86ff9e38fac2 at cycles=1200. seq==t1==t8 and
   dev==release bit-identical (parallel_think a7ff3016888ea075).
+
+## Endurance / conditioning & Baldwin-effect genes (open-ended training)
+
+- Model: any physical effort accrues `exertion` strain (milli-units);
+  a FED `rest` converts it into `endurance` (permille 0..1000)
+  supercompensation scaled by heritable `plasticity`. Disuse decays
+  endurance toward the genetic `endurance_base` floor. NO swim/training
+  verb exists — CL-1 must discover "train then rest" itself.
+- `lawutil::charge_effort(w, entity, energy_pid, cost, result)` wraps
+  `charge_energy`: energy cost is discounted by
+  `effort_permille(e) = 1000 - endurance*350/1000` (up to -35% at
+  endurance 1000), while `exertion += cost*8` accrues on the GROSS cost
+  (unfit bodies train as hard as fit ones). Swapped into all physical
+  call sites (Locomotion move/swim/dig, PhysiologyLaws exertion verbs,
+  ResourceLaws gather/process, WarfareLaws combat/throw); social and
+  cognitive costs keep plain `charge_energy`.
+- `swim_stroke_cost` multiplies the final stroke cost by
+  `effort_permille/1000` — conditioned bodies swim cheaper for free.
+- `drift_needs`: baseline `fatigue` accrual rate `met/2000` is scaled
+  by `(1000 - endurance*35/100)/1000` (up to -35%). Conditioning drift
+  is batch-exact: `exertion` dissipates 400 milli-units/tick;
+  `idle_ticks = dt - min(dt, ceil(ex0/400))` keeps dt=1xN identical to
+  dt=N (strain shields disuse decay only while fresh); disuse uses
+  `endurance_daccum` milli-permille (+20/idle tick -> 2 permille/100
+  idle ticks) floored at `endurance_base`.
+- `predict_rest` supercompensation: `gain_mp = ex*plasticity/10000`
+  (milli-permille; plasticity clamped 0..3000, 1000 typical), quartered
+  when hunger or thirst >=700 ("fed" gate); `endurance_credit` carries
+  the sub-permille remainder; permille past the 1000 cap is discarded
+  (a bout is absorbed, not banked). `exertion` zeroed on rest.
+  `rest_recovery` fatigue relief scales `(1000 + endurance/2)/1000`
+  (+50% at endurance 1000).
+- Baldwin heredity: `endurance_base` and `plasticity` are `gene`
+  loci in every species block (species.txt) and migrant template
+  (influx.txt) — they recombine/mutate through the normal genome path.
+  Trained `endurance` is a PROP, never a locus: offspring spawn at
+  `endurance = clamp(endurance_base allele)` (BiologyLaws reproduce),
+  so selection must re-earn conditioning each generation — the
+  Baldwin bridge is genetic, not Lamarckian.
+- Sensors (save v26): channels 112-114 appended (layout 0..111 frozen
+  for brain-weight compatibility): ch112 = endurance permille,
+  ch113 = `peril:deep_water` belief confidence, ch114 = `want_cross`
+  belief confidence. kSensorChannels=115. Label channel 25 =
+  endurance delta (permille * 127/1000). kLabelChannels=26.
+- Verified: 91080 checks, 0 failures; test_conditioning 35 checks —
+  effort discount + gross strain, fed/unfed rest gains + credit tail,
+  plasticity scaling, disuse decay + strain-shielded idle, swim
+  discount (~65%), Baldwin spawn-at-base, sensor tail, label ch25,
+  save/load hash. seq==t1==t8=71add14b97b94f9c; dev==release capstone
+  state_hash=d33ae5fcfa2e43b0 (brain input/output dims changed -> all
+  brain weights re-seeded, fingerprint expected to move).
+- GOTCHA fixed: BrainLayout's wm2 layer was hardcoded `25` rows while
+  kLabelChannels grew to 26 — wm2_forward read/wrote 96 int8 PAST the
+  layer into valw (OOB) and zero_bias/clamp_bias/bias-copy left
+  wm2b[25] uninitialized. All wm2 row counts now use kLabelChannels
+  (Brain.cpp layout, install, child-genome remap, mac accounting).

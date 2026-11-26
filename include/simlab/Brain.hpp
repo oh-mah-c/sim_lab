@@ -35,7 +35,7 @@ class World;
 enum class BrainAct : std::int32_t { kLinear = 0, kTanh = 1, kSigmoid = 2 };
 const std::int8_t* brain_act_lut(BrainAct act);   // never null, 256 entries
 
-// Phase 3: the world-model output layer is fixed at 25 x 96 regardless of
+// Phase 3: the world-model output layer is fixed at kLabelChannels x 96 regardless of
 // the genome-chosen hidden size H. fast/anchor vectors always have this
 // length (BrainSlot invariant, also used by save/load).
 constexpr std::int32_t kBrainWmHidden = 96;
@@ -291,7 +291,7 @@ struct BrainLayout {
     std::uint32_t zw, zb, hw, hb;              // minGRU gates
     std::uint32_t m1w, m1b, m2w, m2b;          // manager 64->32->8
     std::uint32_t w1w, w1b, w2w, w2b, aqw, aqb;// worker (64+8)->64->16 + attn
-    std::uint32_t wm1w, wm1b, wm2w, wm2b;      // world model 80->96->25
+    std::uint32_t wm1w, wm1b, wm2w, wm2b;      // world model 80->96->kLabelChannels
     std::uint32_t valw, valb;                  // value 64->1
     std::uint64_t total_bytes = 0;
 };

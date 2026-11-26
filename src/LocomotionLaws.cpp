@@ -108,7 +108,11 @@ std::int64_t swim_stroke_cost(const World& w, const Entity& e, Vec2 p) {
     }
     const std::int64_t base = 15 + depth / 10 + wave / 50 + tempterm;
     const std::int64_t loadf = 1000 + (sinking_load(w, e) - 1000) * 1000 / body;   // 1000 = bare body
-    return std::max<std::int64_t>(1, base * loadf / 1000 * 1000 / (500 + skill));
+    const std::int64_t cost =
+        std::max<std::int64_t>(1, base * loadf / 1000 * 1000 / (500 + skill));
+    // conditioning: a trained body strokes cheaper (same factor as effort)
+    return std::max<std::int64_t>(1,
+        cost * effort_permille(w, e) / 1000);
 }
 
 std::int64_t craft_capacity_left(const World& w, EntityId craft) {
@@ -265,7 +269,7 @@ PredictionResult LocomotionModel::predict(const World& w,
                     r.notes.push_back("capsized in swell " + std::to_string(wave));
                 } else r.notes.push_back("craft strained by swell " + std::to_string(wave));
             } else r.notes.push_back("sail");
-            if (!lawutil::charge_energy(*actor, energy_p, covered * 10, r)) return r;   // paddling
+            if (!lawutil::charge_effort(w, *actor, energy_p, covered * 10, r)) return r;   // paddling
             r.moves.push_back({ctx.actor, np});
             r.possible = true; r.ticks = 1;
             return r;
@@ -279,6 +283,19 @@ PredictionResult LocomotionModel::predict(const World& w,
             const std::int64_t f1 = std::min<std::int64_t>(1000, f0 + cost);
             lawutil::add_cond(r, "fatigue_headroom", 1000 - f0, cost);
             if (fat_p != kNoProp) lawutil::set_change(r, ctx.actor, fat_p, f0, f1);
+            // conditioning: each stroke is sustained work — accrue exertion
+            // strain proportional to the fatigue it costs (rest absorbs it).
+            {
+                const PropId ex_p = lawutil::pid(w, "exertion");
+                if (ex_p != kNoProp) {
+                    const bool had_ex = w.prop_of(*actor, ex_p) != nullptr;
+                    const std::int64_t ex0 = w.prop_int(*actor, ex_p, 0);
+                    const std::int64_t ex1 = std::min<std::int64_t>(
+                        100000000, ex0 + cost * 150);
+                    if (ex1 != ex0 || !had_ex)
+                        lawutil::set_change(r, ctx.actor, ex_p, ex0, ex1);
+                }
+            }
             if (sk_p != kNoProp) {                              // practice makes a swimmer
                 const std::int64_t s0 = w.prop_int(*actor, sk_p, 0);
                 if (s0 < 1000) lawutil::set_change(r, ctx.actor, sk_p, s0, s0 + 1);
@@ -394,7 +411,7 @@ PredictionResult LocomotionModel::predict(const World& w,
                 static_cast<std::int64_t>(np.y - from.y) * (np.y - from.y))));
     const std::int64_t unit_cost =
         50 * (1000 - std::min<std::int64_t>(wear_bonus, 800) / 2) / 1000;
-    if (!lawutil::charge_energy(*actor, energy_p,
+    if (!lawutil::charge_effort(w, *actor, energy_p,
                                 dist_covered * unit_cost, r))
         return r;
 

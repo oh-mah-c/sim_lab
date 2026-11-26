@@ -584,7 +584,7 @@ PredictionResult PhysicsModel::predict(const World& w, const InteractionContext&
         wear_total = wear_total *
             std::clamp<std::int64_t>(3000 - motor, 0, 3000) / 2000;
     if (r.possible && wear_total > 0) apply_tool_wear(w, striker, wear_total, r);
-    if (r.possible && !charge_energy(*actor, energy_pid, E0, r)) {
+    if (r.possible && !charge_effort(w, *actor, energy_pid, E0, r)) {
         r.possible = false; r.changes.clear(); r.spawns.clear(); r.notes.clear();
         return r;
     }

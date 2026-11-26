@@ -197,7 +197,7 @@ PredictionResult ExtractionModel::predict(const World& w, const InteractionConte
         wear_total = wear_total *
             std::clamp<std::int64_t>(3000 - motor, 0, 3000) / 2000;
     if (r.possible && wear_total > 0) apply_tool_wear(w, striker, wear_total, r);
-    if (r.possible && !charge_energy(*actor, energy_pid, E0, r)) {
+    if (r.possible && !charge_effort(w, *actor, energy_pid, E0, r)) {
         r.possible = false; r.changes.clear(); r.spawns.clear(); r.notes.clear();
         return r;
     }
@@ -343,7 +343,7 @@ PredictionResult ProcessingModel::predict(const World& w, const InteractionConte
 
     // energy cost: process duration drives it (1 J per 10 ticks, floor 1)
     const std::int64_t cost = std::max<std::int64_t>(1, proc->ticks / 10);
-    if (!charge_energy(*actor, energy_pid, cost, r)) return r;
+    if (!charge_effort(w, *actor, energy_pid, cost, r)) return r;
 
     r.possible = true;
     r.ticks = proc->ticks;
@@ -707,7 +707,7 @@ PredictionResult ThermalModel::predict(const World& w, const InteractionContext&
         n << "heat E=" << E << " tmass=" << tmass << " temp " << cur << "->" << nw;
         r.notes.push_back(n.str());
     }
-    if (r.possible && !charge_energy(*actor, energy_pid, E, r)) {
+    if (r.possible && !charge_effort(w, *actor, energy_pid, E, r)) {
         r.possible = false; r.changes.clear(); r.spawns.clear(); r.notes.clear();
         return r;
     }
@@ -971,7 +971,7 @@ bool finish_synth(const World& w, PredictionResult& r, EntityId actor,
     if (quantity_p != kNoProp && product_qty > 0)
         s.props.set(quantity_p, Value::integer(product_qty));
     r.spawns.push_back(s);
-    if (!charge_energy(*actor_e, SIMLAB_PID(w.props, "energy"), energy, r))
+    if (!charge_effort(w, *actor_e, SIMLAB_PID(w.props, "energy"), energy, r))
         return false;
     std::ostringstream n;
     n << verb << " synthesize sid=" << std::hex << sid << std::dec

@@ -361,6 +361,24 @@ SensorVec sensor_encode(const World& w, EntityId npc,
         s[78] = sensor_norm(w.terrain.wear_at(me->pos), 8);
         s[79] = sensor_norm(w.terrain.water_table_at(me->pos), 100);
     }
+    // ---- channels 112..114: conditioning & water-drive -----------------------
+    // Appended tail (layout 0..111 frozen): the CL-1 rollout needs the
+    // training signal and the crossing stakes to discover "short swims +
+    // rest" tactics on its own — endurance is own-body proprioception,
+    // peril/want_cross are the agent's own beliefs (honest self-knowledge,
+    // same precedent as the intero block).
+    {
+        const PropId p_en = SIMLAB_PID(w.props, "endurance");
+        if (p_en != kNoProp)
+            s[kChanEndurance] =
+                sensor_norm(w.prop_int(*me, p_en, 0), 1000);
+        if (mind) {
+            if (const Belief* b = mind->find_belief("peril:deep_water"))
+                s[kChanWaterPeril] = sensor_norm(b->confidence, 1000);
+            if (const Belief* b = mind->find_belief("want_cross"))
+                s[kChanCrossWish] = sensor_norm(b->confidence, 1000);
+        }
+    }
     // ---- channels 80..111: last action one-hot ---------------------------------
     if (last_action)
         std::copy(last_action->begin(), last_action->end(), s.begin() + 80);
@@ -424,6 +442,23 @@ LabelVec sensor_label(const World& w, const CausalEvent& ev, EntityId actor,
     std::int64_t r = (cost_pre - cost_post) / 8;
     y[24] = static_cast<std::int8_t>(std::max<std::int64_t>(
         -128, std::min<std::int64_t>(127, r)));
+    // ---- channel 25: endurance delta -------------------------------------------
+    // Conditioning is a first-class outcome so the world model credits
+    // rest->training and feels disuse decay (prop units -> channel units).
+    {
+        const PropId p_en = SIMLAB_PID(w.props, "endurance");
+        if (p_en != kNoProp)
+            for (const StateChange& ch : ev.changes) {
+                if (ch.entity != actor || ch.prop != p_en) continue;
+                if (ch.before.type != ValType::Integer ||
+                    ch.after.type != ValType::Integer) break;
+                const std::int64_t d =
+                    (ch.after.i - ch.before.i) * 127 / 1000;
+                y[25] = static_cast<std::int8_t>(std::max<std::int64_t>(
+                    -128, std::min<std::int64_t>(127, d)));
+                break;
+            }
+    }
     return y;
 }
 

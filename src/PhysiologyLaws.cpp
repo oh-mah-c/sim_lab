@@ -368,8 +368,54 @@ static PredictionResult predict_rest(const World& w,
         : kDefaultRestRecovery);
     const std::int64_t ticks = ctx.parameters.ticks > 0 ? ctx.parameters.ticks : 1;
     const std::int64_t cur = w.prop_int(*actor, fatigue, 0);
-    const std::int64_t relief = rec * ticks;
+    // conditioning: a trained body recovers up to +50% faster at
+    // endurance 1000 (rec * (1000 + endurance/2) / 1000).
+    const PropId en_p = prop_id(w, "endurance");
+    const std::int64_t en = en_p != kNoProp
+        ? std::min<std::int64_t>(1000, w.prop_int(*actor, en_p, 0)) : 0;
+    const std::int64_t relief =
+        rec * ticks * (1000 + en / 2) / 1000;
     set_change(r, ctx.actor, fatigue, cur, std::max<std::int64_t>(0, cur - relief));
+    // supercompensation: accumulated `exertion` strain converts into
+    // `endurance` — but only while rested AND fed (hunger/thirst < 700);
+    // an unfed body rebuilds at a quarter rate. Gain scales with the
+    // heritable `plasticity` locus; the sub-permille remainder rides in
+    // `endurance_credit` so small bouts still accumulate exactly.
+    {
+        const PropId ex_p = prop_id(w, "exertion"),
+                   cr_p = prop_id(w, "endurance_credit"),
+                   pl_p = prop_id(w, "plasticity"),
+                   hu_p = prop_id(w, "hunger"), th_p = prop_id(w, "thirst");
+        const std::int64_t ex = ex_p != kNoProp ? w.prop_int(*actor, ex_p, 0) : 0;
+        if (en_p != kNoProp && w.prop_of(*actor, en_p) && ex > 0) {
+            const bool has_hu = hu_p != kNoProp && w.prop_of(*actor, hu_p);
+            const bool has_th = th_p != kNoProp && w.prop_of(*actor, th_p);
+            const bool fed = (!has_hu || w.prop_int(*actor, hu_p, 0) < 700) &&
+                             (!has_th || w.prop_int(*actor, th_p, 0) < 700);
+            const std::int64_t plas = pl_p != kNoProp
+                ? std::clamp<std::int64_t>(w.prop_int(*actor, pl_p, 1000), 0, 3000)
+                : 1000;
+            std::int64_t gain_mp = ex * plas / 10000;    // milli-permille
+            if (!fed) gain_mp /= 4;
+            const std::int64_t cr0 = cr_p != kNoProp
+                ? w.prop_int(*actor, cr_p, 0) : 0;
+            const std::int64_t en0 = w.prop_int(*actor, en_p, 0);
+            const std::int64_t head = 1000 - en0;
+            const std::int64_t total = cr0 + gain_mp;   // >= 0 always
+            // permille past the 1000 cap is discarded (a bout is absorbed,
+            // it cannot be banked); only the sub-permille remainder rides on.
+            const std::int64_t add = std::min(head, total / 1000);
+            const std::int64_t en1 = en0 + add;
+            const std::int64_t cr1 = total % 1000;      // sub-permille rides on
+            if (en1 != en0) set_change(r, ctx.actor, en_p, en0, en1);
+            if (cr_p != kNoProp && cr1 != cr0)
+                set_change(r, ctx.actor, cr_p, cr0, cr1);
+            if (ex_p != kNoProp)
+                set_change(r, ctx.actor, ex_p, ex, 0);   // bout absorbed
+            r.notes.push_back("condition +" + std::to_string(add) +
+                              (fed ? "" : " (unfed)"));
+        }
+    }
     r.possible = true;
     r.ticks = ticks;
     std::ostringstream n;
@@ -426,7 +472,7 @@ static PredictionResult predict_evacuate(const World& w,
     const bool painful = !obstructed &&
         ((visc >= contract - 200 && visc <= contract) || pinf > 200);
 
-    if (!lawutil::charge_energy(*actor, energy, 300, r)) {
+    if (!lawutil::charge_effort(w, *actor, energy, 300, r)) {
         r.possible = false; r.changes.clear(); r.spawns.clear(); r.notes.clear();
         return r;
     }
@@ -658,7 +704,7 @@ PredictionResult TreatModel::predict(const World& w,
     setp(worst, integ_p, p_integ, n_integ);
     if (med_wear > 0 && med_id != patient_id)
         setp(med_id, integ_p, mat_integ, std::max<std::int64_t>(1, mat_integ - med_wear));
-    if (!lawutil::charge_energy(*actor, energy_p, 500, r)) {
+    if (!lawutil::charge_effort(w, *actor, energy_p, 500, r)) {
         r.possible = false; r.changes.clear(); r.notes.clear();
         return r;
     }

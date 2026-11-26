@@ -562,6 +562,19 @@ PredictionResult BiologyModel::predict(const World& w,
     if (hunger2 != kNoProp) s.props.set(hunger2, Value::integer(0));
     if (thirst2 != kNoProp) s.props.set(thirst2, Value::integer(0));
     if (fatigue2 != kNoProp) s.props.set(fatigue2, Value::integer(0));
+    // conditioning: the newborn starts at its own genetic `endurance_base`
+    // allele — trained `endurance` is NOT copied (Baldwin runs through
+    // selection on the loci, not through prop inheritance).
+    {
+        const PropId p_en = prop_id(w, "endurance"),
+                   p_eb = prop_id(w, "endurance_base");
+        if (p_en != kNoProp && p_eb != kNoProp && !s.props.get(p_en)) {
+            const Value* bv = s.props.get(p_eb);
+            const std::int64_t base = bv ? bv->i : 0;
+            s.props.set(p_en, Value::integer(
+                std::clamp<std::int64_t>(base, 0, 1000)));
+        }
+    }
     // The newborn's energy reserve is carved out of what BOTH parents
     // paid — without this prop the child was unbounded (missing energy
     // used to mean "free actions forever").

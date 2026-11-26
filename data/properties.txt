@@ -473,6 +473,20 @@ float_capacity    integer grams     range 0 100000000  domain=physical   # compo
 wave_rating       integer permille  range 0 1000       domain=physical   # composite: swell (wave_at) it survives undamaged
 waterproofing     integer permille  range 0 1000       domain=physical   # material: seals seams/hulls against water
 
+# ---- conditioning / endurance (open-ended training) ---------------------------
+# Any fatiguing work accrues `exertion` strain; a FED rest converts it into
+# `endurance` (supercompensation) scaled by the heritable `plasticity` locus.
+# Endurance discounts the energy cost of physical effort, slows fatigue
+# accrual and speeds rest recovery; disuse decays it back toward the
+# genetic `endurance_base` floor. Baldwin: base/plasticity are gene loci —
+# high-strain populations evolve them through ordinary selection.
+endurance          integer permille     range 0 1000    domain=biological # current conditioning (trained phenotype)
+endurance_base     integer permille     range 0 1000    domain=biological # genetic vigor: spawn value + disuse floor (heritable)
+plasticity         integer permille     range 0 3000    domain=biological # heritable gain rate of conditioning per strain (1000 = typical)
+exertion           integer milli-units  range 0 100000000 domain=physical  # unabsorbed training strain (internal; rest consumes it)
+endurance_credit   integer milli-permille range -1000000000 1000000000 domain=physical # sub-permille conditioning accumulator (internal)
+endurance_daccum   integer milli-permille range 0 1000000000 domain=physical # disuse-decay remainder (internal)
+
 # ---- trophic web & seasonal ranges (Phase 17) -------------------------------
 # Data-driven food-chain structure. trophic_tier orders who eats whom
 # (0 producer/flora, 1 primary consumer, 2 mesopredator, 3 predator,

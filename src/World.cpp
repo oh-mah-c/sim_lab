@@ -786,7 +786,89 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             }
         }
         bump(np.thirst, met / 500);
-        bump(np.fatigue, met / 2000);
+        // conditioning: a trained body accrues baseline fatigue slower
+        // (same effort factor as charge_effort / swim strokes).
+        std::int64_t fat_rate = met / 2000;
+        if (fat_rate > 0) {
+            const PropId p_en = SIMLAB_PID(props, "endurance");
+            if (p_en != kNoProp && prop_of(e, p_en))
+                fat_rate = fat_rate *
+                    (1000 - std::min<std::int64_t>(prop_int(e, p_en, 0), 1000)
+                            * 35 / 100) / 1000;
+        }
+        bump(np.fatigue, fat_rate);
+        // conditioning drift: unabsorbed `exertion` strain dissipates
+        // linearly (batch-exact); with no fresh strain left, `endurance`
+        // fades back toward the genetic `endurance_base` floor through a
+        // milli-permille accumulator — use it or lose it.
+        {
+            static thread_local SeqPidCache cd_c_;
+            SeqPid cdp(cd_c_, props);
+            const PropId p_ex = cdp("exertion");
+            // Ticks of this window still covered by fresh strain: strain
+            // exhausts at 400 milli-units/tick, so only the remainder of
+            // the window counts as idle for disuse decay — this keeps
+            // dt=1 x N bit-identical to dt=N.
+            std::int64_t idle_ticks = dt;
+            if (p_ex != kNoProp) {
+                const bool had_ex = prop_of(e, p_ex) != nullptr;
+                const std::int64_t ex0 = prop_int(e, p_ex, 0);
+                const std::int64_t ex1 =
+                    std::max<std::int64_t>(0, ex0 - 400 * dt);
+                const std::int64_t fresh = ex0 > 0
+                    ? std::min(dt, (ex0 + 399) / 400) : 0;
+                idle_ticks = dt - fresh;
+                if (ex1 != ex0) {
+                    StateChange ch;
+                    ch.entity = e.id; ch.prop = p_ex;
+                    ch.had_before = had_ex;
+                    ch.before = had_ex ? Value::integer(ex0)
+                                       : Value::integer(0);
+                    ch.after = Value::integer(ex1);
+                    e.props.set(p_ex, ch.after);
+                    ev.changes.push_back(ch);
+                    touched = true;
+                }
+            }
+            const PropId p_en2 = cdp("endurance");
+            if (p_en2 != kNoProp && prop_of(e, p_en2) && idle_ticks > 0) {
+                const PropId p_da = cdp("endurance_daccum");
+                if (p_da != kNoProp) {
+                    const bool had_da = prop_of(e, p_da) != nullptr;
+                    const std::int64_t da0 = prop_int(e, p_da, 0);
+                    const std::int64_t da1 = da0 + 20 * idle_ticks;  // 2/100t
+                    const std::int64_t drop = da1 / 1000;
+                    const PropId p_eb = cdp("endurance_base");
+                    const std::int64_t floor_v =
+                        p_eb != kNoProp ? std::min<std::int64_t>(
+                            prop_int(e, p_eb, 0), 1000) : 0;
+                    const std::int64_t en0 = prop_int(e, p_en2, 0);
+                    const std::int64_t en1 = std::max(floor_v, en0 - drop);
+                    const std::int64_t da2 = da1 - drop * 1000;
+                    if (en1 != en0) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = p_en2;
+                        ch.had_before = true;
+                        ch.before = Value::integer(en0);
+                        ch.after = Value::integer(en1);
+                        e.props.set(p_en2, ch.after);
+                        ev.changes.push_back(ch);
+                        touched = true;
+                    }
+                    if (da2 != da0 || !had_da) {
+                        StateChange ch;
+                        ch.entity = e.id; ch.prop = p_da;
+                        ch.had_before = had_da;
+                        ch.before = had_da ? Value::integer(da0)
+                                           : Value::integer(0);
+                        ch.after = Value::integer(da2);
+                        e.props.set(p_da, ch.after);
+                        ev.changes.push_back(ch);
+                        touched = true;
+                    }
+                }
+            }
+        }
         if (np.integrity != kNoProp) {
             const std::int64_t rh = h_rate, rt = met / 500;
             auto first_starving = [&](bool has, std::int64_t cur,
@@ -6224,7 +6306,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 25;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128)
+constexpr std::uint32_t kSaveFormat = 26;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail)
 
 struct Writer {
     std::ofstream f;

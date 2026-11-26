@@ -100,6 +100,43 @@ inline bool charge_energy(const Entity& actor, PropId energy_pid, std::int64_t c
     return true;
 }
 
+// ---- conditioning (endurance) ----------------------------------------------
+// `endurance` (permille 0..1000) is the trained phenotype: it discounts the
+// energy price of physical effort, slows metabolic fatigue accrual and
+// speeds rest recovery (see drift_needs / predict_rest / swim_stroke_cost).
+// Entities without the prop are unconditioned (factor 1000, no discount).
+inline std::int64_t endurance_of(const World& w, const Entity& e) {
+    const PropId p = pid(w, "endurance");
+    return p != kNoProp ? w.prop_int(e, p, 0) : 0;
+}
+// Effort energy factor in permille: 1000 untrained -> 650 at endurance 1000
+// (a fit body does the same work for ~35% less energy).
+inline std::int64_t effort_permille(const World& w, const Entity& e) {
+    return 1000 - std::min<std::int64_t>(endurance_of(w, e), 1000) * 35 / 100;
+}
+// Physical-work energy charge: pays `cost` discounted by endurance but
+// accrues `exertion` strain on the GROSS cost — training stimulus is the
+// work done, not the energy saved. Rest converts strain to endurance.
+// Use for locomotion/extraction/combat/labor verbs; social-mental verbs
+// keep plain charge_energy (no conditioning from talking).
+inline bool charge_effort(const World& w, const Entity& actor,
+                          PropId energy_pid, std::int64_t cost,
+                          PredictionResult& r) {
+    if (cost <= 0) return true;
+    if (!charge_energy(actor, energy_pid,
+                       cost * effort_permille(w, actor) / 1000, r))
+        return false;
+    const PropId ex_p = pid(w, "exertion");
+    if (ex_p != kNoProp) {
+        const bool had = w.prop_of(actor, ex_p) != nullptr;
+        const std::int64_t cur = w.prop_int(actor, ex_p, 0);
+        const std::int64_t nxt =
+            std::min<std::int64_t>(100000000, cur + cost * 8);
+        if (nxt != cur || !had) set_change(r, actor.id, ex_p, cur, nxt);
+    }
+    return true;
+}
+
 // First wielded, alive, non-contained entity of `actor` (deterministic: the
 // relation set is sorted). The striker that takes the reaction force.
 inline EntityId wielded_tool(const World& w, EntityId actor) {

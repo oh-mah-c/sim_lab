@@ -109,6 +109,11 @@ species grazer
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 500
   adult_age 200
   mutation_rate 30
@@ -252,6 +257,11 @@ species reservoir_beast
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 500
   adult_age 200
   mutation_rate 30
@@ -334,6 +344,11 @@ species vector_midge
   hunger 300
   thirst 300
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 800
   adult_age 60
   mutation_rate 40
@@ -415,6 +430,11 @@ species sapient
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 400
   adult_age 250
   mutation_rate 40
@@ -497,6 +517,11 @@ species migrant_herd
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 600
   adult_age 150
   mutation_rate 30
@@ -565,6 +590,11 @@ species pack_stalker
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 300
   adult_age 300
   mutation_rate 30
@@ -633,6 +663,11 @@ species ridge_apex
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 120
   adult_age 600
   mutation_rate 25
@@ -702,6 +737,11 @@ species shore_reaver
   hunger 200
   thirst 200
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 200
   adult_age 400
   mutation_rate 25
@@ -766,6 +806,11 @@ species commensal_rat
   hunger 300
   thirst 300
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 900
   adult_age 60
   mutation_rate 60
@@ -828,6 +873,11 @@ species trail_hound
   hunger 250
   thirst 300
   fatigue 150
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 600
   adult_age 120
   mutation_rate 50
@@ -939,6 +989,11 @@ species dairy_beast
   hunger 300
   thirst 350
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 400
   adult_age 300
   mutation_rate 25
@@ -1047,6 +1102,11 @@ species fiber_beast
   hunger 350
   thirst 300
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 350
   adult_age 320
   mutation_rate 20
@@ -1155,6 +1215,11 @@ species draft_beast
   hunger 400
   thirst 400
   fatigue 100
+  endurance_base 500
+  plasticity 1000
+  endurance 500
+  gene endurance_base
+  gene plasticity
   fertility 250
   adult_age 400
   mutation_rate 15

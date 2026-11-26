@@ -189,7 +189,7 @@ PredictionResult predict_launch(const World& w, const InteractionContext& ctx, L
     { const std::int64_t d2 = dist2(actor->pos, tgt->pos); while (d * d < d2) ++d; }
     add_cond(r, "range", range, d);
     if (d > range) { r.failure = "target beyond launch range"; return r; }
-    if (!charge_energy(*actor, energy_p, 2000 + impulse * 10, r)) return r;
+    if (!charge_effort(w, *actor, energy_p, 2000 + impulse * 10, r)) return r;
     // one stored-energy budget, two scales: flesh takes a blow of E_body
     // (comparable to a strong hand strike), masonry the full momentum E_wall
     const std::int64_t E_body = impulse * motor / 1000;
@@ -262,7 +262,7 @@ PredictionResult predict_coat(const World& w, const InteractionContext& ctx, Law
         setc(r, src->id, q_p, w.prop_int(*src, q_p, 0), w.prop_int(*src, q_p, 0) - 1);
     else
         setc(r, src->id, integ_p, w.prop_int(*src, integ_p, 500), 0);
-    if (!charge_energy(*actor, SIMLAB_PID(w.props, "energy"), 300, r)) return r;
+    if (!charge_effort(w, *actor, SIMLAB_PID(w.props, "energy"), 300, r)) return r;
     r.possible = true; r.ticks = 2;
     r.notes.push_back("coated weapon " + std::to_string(weapon) + " tox=" +
                       std::to_string(tox) + " strain=" + std::to_string(strain));

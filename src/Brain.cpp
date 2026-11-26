@@ -280,7 +280,7 @@ static BrainLayout layout_for(std::int32_t H) {
     layer(kActionVerbs, 64, l.w2w, l.w2b);  // worker 64 -> 32 verbs
     layer(16, Hu,  l.aqw,    l.aqb);        // worker attention queries
     layer(96, mc,  l.wm1w,   l.wm1b);       // WM (H+32) -> 96
-    layer(25, 96,  l.wm2w,   l.wm2b);       // WM 96 -> 25 outputs
+    layer(kLabelChannels, 96, l.wm2w, l.wm2b); // WM 96 -> label outputs
     layer(1,  Hu,  l.valw,   l.valb);       // value H -> 1
     l.total_bytes = o;
     return l;
@@ -404,7 +404,7 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
         clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
         clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
         clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, kActionVerbs); clamp_bias(L.aqb, 16);
-        clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
+        clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, kLabelChannels); clamp_bias(L.valb, 1);
     } else {
         for (std::uint64_t i = 0; i < bytes; ++i)
             base[i] = brain_rand_weight(w.seed, static_cast<std::uint64_t>(npc),
@@ -415,7 +415,7 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
         zero_bias(L.embed_b, H); zero_bias(L.zb, H); zero_bias(L.hb, H);
         zero_bias(L.m1b, 32);    zero_bias(L.m2b, 8);
         zero_bias(L.w1b, 64);    zero_bias(L.w2b, kActionVerbs); zero_bias(L.aqb, 16);
-        zero_bias(L.wm1b, 96);   zero_bias(L.wm2b, 25); zero_bias(L.valb, 1);
+        zero_bias(L.wm1b, 96);   zero_bias(L.wm2b, kLabelChannels); zero_bias(L.valb, 1);
     }
     // Phase 3 plasticity: fast weights start at ZERO (Baldwin — never
     // inherited); anchor snapshots the birth slow-WM2 block for the
@@ -545,7 +545,7 @@ static void brain_forward(World& w, BrainStore& store, EntityId npc,
     // WM layer 1: (H+16) -> 96, tanh (kept for the output-layer gradient)
     dense16(wm1w, kWmHidden, wm_in, win.data(), wm1b,
             kShWm1, BrainAct::kTanh, p.wm_hidden.data());
-    // WM output: 96 -> 25, linear (slow wm2w + fast delta, clamped int8)
+    // WM output: 96 -> kLabelChannels, linear (slow wm2w + fast delta, clamped int8)
     wm2_forward(wm2w, s.fast.data(), wm2b, p.wm_hidden.data(), p.yhat.data());
 }
 
@@ -1089,7 +1089,7 @@ static std::vector<std::int8_t> remap_slow_hidden(
     layer(lo.w2w,    ln.w2w,    kActionVerbs, kActionVerbs, 64, 64);
     layer(lo.aqw,    ln.aqw,    16,    16,    H_old, H_new);
     layer(lo.wm1w,   ln.wm1w,   96,    96,    mco,   mcn);
-    layer(lo.wm2w,   ln.wm2w,   25,    25,    96,    96);
+    layer(lo.wm2w,   ln.wm2w,   kLabelChannels, kLabelChannels, 96, 96);
     layer(lo.valw,   ln.valw,   1,     1,     H_old, H_new);
     // bias tails are int16: copy the shared prefix, zero-fill the rest
     auto bias = [&](std::uint32_t so, std::uint32_t dn,
@@ -1107,7 +1107,7 @@ static std::vector<std::int8_t> remap_slow_hidden(
     bias(lo.w2b,    ln.w2b,    kActionVerbs, kActionVerbs);
     bias(lo.aqb,    ln.aqb,    16,    16);
     bias(lo.wm1b,   ln.wm1b,   96,    96);
-    bias(lo.wm2b,   ln.wm2b,   25,    25);
+    bias(lo.wm2b,   ln.wm2b,   kLabelChannels, kLabelChannels);
     bias(lo.valb,   ln.valb,   1,     1);
     return dst;
 }
@@ -1175,7 +1175,7 @@ BrainGenome brain_child_genome(const World& w, EntityId a, EntityId b,
     clamp_bias(L.embed_b, H); clamp_bias(L.zb, H); clamp_bias(L.hb, H);
     clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
     clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, kActionVerbs); clamp_bias(L.aqb, 16);
-    clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
+    clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, kLabelChannels); clamp_bias(L.valb, 1);
     return g;
 }
 
@@ -1476,13 +1476,13 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     const Cand& chosen = cands[best_c];
     // Phase 3 metabolism: bill the MACs this decision actually spent.
     // embed 96*H + GRU 2*H*H + manager H*32+32*8 + worker wc*64+64*16+
-    // H*16(attn) + WM per imagined step mc*96+96*25 (x C x N) + value H.
+    // H*16(attn) + WM per imagined step mc*96+96*kLabelChannels (x C x N) + value H.
     {
         const std::int64_t macs =
             96LL * H + 2LL * H * H + H * 32 + 32 * 8 +
             static_cast<std::int64_t>(wc) * 64 + 64 * 16 + H * 16 +
             static_cast<std::int64_t>(ncand > 0 ? ncand : 1) * N *
-                (static_cast<std::int64_t>(mc) * 96 + 96 * 25) + H;
+                (static_cast<std::int64_t>(mc) * 96 + 96 * kLabelChannels) + H;
         s.mac_pending += macs;
     }
     const char* verb = sensor_verb_table()[chosen.verb];

@@ -7,9 +7,9 @@
 // PERCEIVED world into fixed-width integer vectors — never reads World
 // Truth beyond what AgentMind::memory/perceive() already recorded.
 //
-//   sensor vec : 112 x int8  (intero 16 | neuro 8 | entities 28 | material 16 | social 4 | env 8 | act 32)
+//   sensor vec : 115 x int8  (intero 16 | neuro 8 | entities 28 | material 16 | social 4 | env 8 | act 32 | conditioning 3)
 //   action vec : 32 x int8   (verb one-hot over the law vocabulary)
-//   label vec  : 25 x int8   (16 intero deltas | 8 outcome classes | reward)
+//   label vec  : 26 x int8   (16 intero deltas | 8 outcome classes | reward | endurance delta)
 //
 // All quantization is integer permille->int8; no floats anywhere.
 //
@@ -28,7 +28,7 @@ struct InteractionContext;
 struct CausalEvent;
 struct Entity;
 
-constexpr int kSensorChannels = 112;
+constexpr int kSensorChannels = 115;
 constexpr int kInteroChannels = 16;    // sensor channels 0..15
 constexpr int kNeuroChannels   = 8;    // channels 16..23
 constexpr int kEntitySlots     = 4;    // channels 24..51 (4 x 7)
@@ -45,8 +45,11 @@ constexpr int kChanKinship        = 68;  // tribal_kinship  -127..127
 constexpr int kChanNeighborAffect = 69;  // neighbor_affect -127..127
 constexpr int kChanInvSecurity    = 70;  // inventory_security 0..127
 constexpr int kChanScarcityPhase  = 71;  // cycle_scarcity_phase -127..127
+constexpr int kChanEndurance       = 112; // conditioning_endurance 0..127
+constexpr int kChanWaterPeril      = 113; // peril:deep_water belief 0..127
+constexpr int kChanCrossWish       = 114; // want_cross belief 0..127
 constexpr int kActionVerbs     = 32;
-constexpr int kLabelChannels   = 25;   // 16 deltas | 8 outcomes | reward
+constexpr int kLabelChannels   = 26;   // 16 deltas | 8 outcomes | reward | endurance delta
 
 using SensorVec = std::array<std::int8_t, kSensorChannels>;
 using ActionVec = std::array<std::int8_t, kActionVerbs>;

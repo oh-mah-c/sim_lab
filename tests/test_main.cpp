@@ -10828,7 +10828,7 @@ static void test_gene_pool_evolution() {
 static void test_brain_free_will() {
     // (a) 32-verb action space: table, one-hot encoding, decide validity ----
     CHECK(kActionVerbs == 32);
-    CHECK(kSensorChannels == 112);
+    CHECK(kSensorChannels == 115);   // +3 conditioning tail (112-114)
     CHECK(kActChannels == 32);
     {
         const char* const* vt = sensor_verb_table();
@@ -11545,6 +11545,202 @@ static void test_emergent_coevolution() {
     }
 }
 
+static void test_conditioning() {
+
+    // (1) physical effort: endurance discounts energy, strain accrues gross -
+    {
+        World w(311, "data");
+        const EntityId fit = mk_sapient(w, {50, 50});
+        const EntityId unfit = mk_sapient(w, {50, 200});
+        for (EntityId a : {fit, unfit}) {
+            tseti(*w.find(a), w, "energy", 100000);
+            tseti(*w.find(a), w, "endurance_base", 0);
+            tseti(*w.find(a), w, "metabolism", 0);    // drift off: exact props
+        }
+        tseti(*w.find(fit), w, "endurance", 1000);
+        tseti(*w.find(unfit), w, "endurance", 0);
+        auto mv = [&](EntityId a, int y) {
+            InteractionContext c;
+            c.actor = a; c.parameters.action = "move";
+            c.parameters.ticks = 1;
+            c.parameters.destination = {90, y};
+            c.parameters.has_destination = true;
+            return w.interact(c);
+        };
+        CHECK(mv(fit, 50).completed);
+        CHECK(mv(unfit, 200).completed);
+        const std::int64_t ef = tint(*w.find(fit), w, "energy");
+        const std::int64_t eu = tint(*w.find(unfit), w, "energy");
+        CHECK(eu < ef);                    // fit body paid less for same stride
+        // exertion accrued on the GROSS cost — identical strain both
+        const std::int64_t xf = tint(*w.find(fit), w, "exertion");
+        const std::int64_t xu = tint(*w.find(unfit), w, "exertion");
+        CHECK(xf > 0 && xu == xf);
+    }
+
+    // (2) rest supercompensation: fed rest converts strain to endurance ----
+    {
+        World w(312, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "endurance", 500);
+        tseti(*w.find(a), w, "endurance_base", 400);
+        tseti(*w.find(a), w, "plasticity", 1000);
+        tseti(*w.find(a), w, "exertion", 500000);
+        tseti(*w.find(a), w, "hunger", 0);
+        tseti(*w.find(a), w, "thirst", 0);
+        tseti(*w.find(a), w, "fatigue", 500);
+        InteractionResult r = w.interact(mk_ctx(a, {}, "rest", 0));
+        CHECK(r.completed);
+        // gain = 500000 * 1000 / 10000 = 50000 mp = 50 permille (fed)
+        CHECK(tint(*w.find(a), w, "endurance") == 550);
+        CHECK(tint(*w.find(a), w, "exertion") == 0);       // bout absorbed
+        // recovery boosted by conditioning: 20 * (1000 + 500/2)/1000 = 25
+        CHECK(tint(*w.find(a), w, "fatigue") == 475);
+
+        // unfed rest: gain quartered, credit keeps the sub-permille tail
+        const EntityId b = mk_sapient(w, {60, 50});
+        tseti(*w.find(b), w, "endurance", 500);
+        tseti(*w.find(b), w, "endurance_base", 400);
+        tseti(*w.find(b), w, "plasticity", 1000);
+        tseti(*w.find(b), w, "exertion", 500000);
+        tseti(*w.find(b), w, "hunger", 900);
+        tseti(*w.find(b), w, "thirst", 0);
+        CHECK(w.interact(mk_ctx(b, {}, "rest", 0)).completed);
+        // 50000/4 = 12500 mp -> +12 permille, 500 mp rides in credit
+        CHECK(tint(*w.find(b), w, "endurance") == 512);
+        CHECK(tint(*w.find(b), w, "endurance_credit") == 500);
+
+        // plasticity doubles the gain rate (heritable locus)
+        const EntityId c = mk_sapient(w, {70, 50});
+        tseti(*w.find(c), w, "endurance", 500);
+        tseti(*w.find(c), w, "endurance_base", 400);
+        tseti(*w.find(c), w, "plasticity", 2000);
+        tseti(*w.find(c), w, "exertion", 500000);
+        tseti(*w.find(c), w, "hunger", 0);
+        tseti(*w.find(c), w, "thirst", 0);
+        CHECK(w.interact(mk_ctx(c, {}, "rest", 0)).completed);
+        CHECK(tint(*w.find(c), w, "endurance") == 600);
+    }
+
+    // (3) disuse decay toward the genetic floor + strain shields decay ------
+    {
+        World w(313, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "endurance", 700);
+        tseti(*w.find(a), w, "endurance_base", 500);
+        tseti(*w.find(a), w, "metabolism", 200);   // drift runs, no starvation
+        w.advance_ticks_for_test(500);
+        // 2 permille / 100 idle ticks -> 500 ticks = -10 -> 690 (> floor 500)
+        CHECK(tint(*w.find(a), w, "endurance") == 690);
+        w.advance_ticks_for_test(9500);
+        // total idle 10000 ticks -> -200 permille decay, the 500 floor binds
+        CHECK(tint(*w.find(a), w, "endurance") == 500);
+
+        // fresh strain pauses disuse: strain must cover the whole window
+        const EntityId b = mk_sapient(w, {60, 50});
+        tseti(*w.find(b), w, "endurance", 800);
+        tseti(*w.find(b), w, "endurance_base", 500);
+        tseti(*w.find(b), w, "metabolism", 200);
+        tseti(*w.find(b), w, "exertion", 80000);   // exactly 200 ticks of strain
+        w.advance_ticks_for_test(200);
+        // strain covered the whole window -> zero disuse decay
+        CHECK(tint(*w.find(b), w, "endurance") == 800);
+        CHECK(tint(*w.find(b), w, "exertion") == 0);
+    }
+
+    // (4) swim strokes cheaper when conditioned ------------------------------
+    {
+        World w = maritime_world(314, 4, 100);
+        const EntityId fit = mk_sapient(w, {9 * 16 + 8, 6 * 16 + 8});
+        const EntityId unfit = mk_sapient(w, {9 * 16 + 8, 8 * 16 + 8});
+        tseti(*w.find(fit), w, "endurance", 1000);
+        tseti(*w.find(unfit), w, "endurance", 0);
+        const Vec2 deep{11 * 16, 6 * 16};
+        const std::int64_t cf = lawutil::swim_stroke_cost(w, *w.find(fit), deep);
+        const std::int64_t cu = lawutil::swim_stroke_cost(w, *w.find(unfit), deep);
+        CHECK(cf > 0 && cu > cf);
+        CHECK(cf * 1000 / cu >= 640 && cf * 1000 / cu <= 660);  // ~65%
+    }
+
+    // (5) Baldwin heredity: child starts at its own endurance_base allele --
+    {
+        World w(315, "data");
+        const EntityId pa = mk_sapient(w, {50, 50});
+        const EntityId pb = mk_sapient(w, {52, 50});
+        for (EntityId e : {pa, pb}) {
+            tseti(*w.find(e), w, "age", 300);
+            tseti(*w.find(e), w, "endurance_base", 500);
+            tseti(*w.find(e), w, "plasticity", 1000);
+        }
+        tseti(*w.find(pa), w, "endurance", 800);   // trained parent
+        const PropId peb = tpid(w, "endurance_base"),
+                   ppl = tpid(w, "plasticity");
+        // identical locus sets (sorted by PropId) -> compatible genomes
+        std::vector<std::pair<PropId, std::int64_t>> loci = {
+            {std::min(peb, ppl), peb == std::min(peb, ppl) ? 500 : 1000},
+            {std::max(peb, ppl), peb == std::min(peb, ppl) ? 1000 : 500}};
+        for (EntityId e : {pa, pb}) w.find(e)->genome.loci = loci;
+        InteractionResult r = w.interact(mk_ctx(pa, {pb}, "reproduce", 0));
+        CHECK(r.completed);
+        CHECK(r.spawned.size() == 1);
+        Entity* child = w.find(r.spawned[0]);
+        CHECK(child != nullptr);
+        // child endurance == its own (recombined) endurance_base allele —
+        // the parent's trained 800 does NOT pass through props
+        CHECK(tint(*child, w, "endurance") == tint(*child, w, "endurance_base"));
+        CHECK(tint(*child, w, "endurance") < 800);
+        CHECK(tint(*child, w, "plasticity") > 0);
+    }
+
+    // (6) sensor tail: endurance + peril + want_cross channels ---------------
+    {
+        World w(316, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "endurance", 640);
+        w.mind(a);
+        SensorVec s = sensor_encode(w, a);
+        CHECK(s[kChanEndurance] == sensor_norm(640, 1000));
+        CHECK(s[kChanWaterPeril] == 0 && s[kChanCrossWish] == 0);
+        AgentMind& m = w.mind(a);
+        m.belief("peril:deep_water").confidence = 800;
+        m.belief("want_cross").confidence = 400;
+        s = sensor_encode(w, a);
+        CHECK(s[kChanWaterPeril] == sensor_norm(800, 1000));
+        CHECK(s[kChanCrossWish] == sensor_norm(400, 1000));
+    }
+
+    // (7) label channel 25 reports endurance deltas --------------------------
+    {
+        World w(317, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        const PropId p_en = tpid(w, "endurance");
+        SensorVec pre{};
+        CausalEvent ev;
+        ev.changes.push_back({a, p_en, Value::integer(500),
+                              Value::integer(560), true});
+        LabelVec y = sensor_label(w, ev, a, pre);
+        CHECK(y[25] == static_cast<std::int8_t>(60 * 127 / 1000));
+    }
+
+    // (8) save/load roundtrip preserves conditioning state -------------------
+    {
+        World w(318, "data");
+        const EntityId a = mk_sapient(w, {50, 50});
+        tseti(*w.find(a), w, "endurance", 777);
+        tseti(*w.find(a), w, "endurance_base", 600);
+        tseti(*w.find(a), w, "plasticity", 1400);
+        tseti(*w.find(a), w, "exertion", 12345);
+        const std::uint64_t h = w.state_hash();
+        const std::string path = "/tmp/simlab_conditioning_save.bin";
+        CHECK(w.save(path));
+        World w2(1, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+        CHECK(tint(*w2.find(a), w2, "endurance") == 777);
+        CHECK(tint(*w2.find(a), w2, "exertion") == 12345);
+    }
+}
+
 static void test_parallel_think() {
     auto build = [](std::uint64_t seed) {
         World w(seed, "data");
@@ -11649,6 +11845,7 @@ int main(int argc, char** argv) {
     RUN(test_brain_deep_cognition);
     RUN(test_open_ended_invention);
     RUN(test_emergent_coevolution);
+    RUN(test_conditioning);
     RUN(test_gene_pool_evolution);
     RUN(test_parallel_think);
     RUN(test_infection_and_primitive_medicine);
