@@ -3222,7 +3222,8 @@ void social_from_event(World& w, EntityId actor,
                         if (w.brains_) {
                             const auto bit = w.brains_->slots.find(actor);
                             if (bit != w.brains_->slots.end() &&
-                                bit->second.hidden >= 80) comp += 200;
+                                bit->second.net.neuron_count >= 400)
+                                comp += 200;
                         }
                         comp = std::min<std::int64_t>(750,
                             comp + std::min<std::int64_t>(300, studies * 100));

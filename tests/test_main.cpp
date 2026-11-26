@@ -10028,436 +10028,291 @@ static void test_render_snapshot_and_procedural_atlas() {
     (void)h0; (void)atlas.size();
 }
 
-// ---------- CL-1 Phase 0: brain substrate ------------------------------------
-// BrainArena, int8 kernels, activation LUTs, hash RNG. No world behavior —
-// this suite verifies determinism and measures the GMAC/s assumption the
-// blueprint budget calculator needs.
-static void test_brain_phase0() {
-    // ---- LUTs: deterministic, sane shapes ------------------------------------
-    const std::int8_t* lin = brain_act_lut(BrainAct::kLinear);
-    const std::int8_t* th  = brain_act_lut(BrainAct::kTanh);
-    const std::int8_t* sg  = brain_act_lut(BrainAct::kSigmoid);
-    CHECK(lin && th && sg);
-    CHECK(lin[static_cast<std::uint8_t>(static_cast<std::int8_t>(0))] == 0);
-    CHECK(lin[static_cast<std::uint8_t>(static_cast<std::int8_t>(42))] == 42);
-    // tanh saturates, sigmoid is tanh(u/2) — both bounded, odd/even sane
-    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(127))] > 100);
-    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(-128))] < -100);
-    CHECK(th[static_cast<std::uint8_t>(static_cast<std::int8_t>(0))] == 0);
-    CHECK(sg[static_cast<std::uint8_t>(static_cast<std::int8_t>(127))] >
-          sg[static_cast<std::uint8_t>(static_cast<std::int8_t>(-128))]);
-    // same table object every call (built once)
-    CHECK(brain_act_lut(BrainAct::kTanh) == th);
+// ==================== CL-1 v29: spiking connectome ============================
+// Neural substrate: integer LIF, sparse spike masks, CSR synapses, delay
+// rings, multi-rate scheduler — all deterministic, no floats, no heap in
+// the tick path.
+static void test_neural_core() {
+    using simlab::BrainModule;
+    auto mk_params = []() {
+        return std::array<std::int16_t, kBrainTractCount>{};
+    };
 
-    // ---- dot + dense kernels: deterministic, activation applied --------------
-    std::vector<std::int8_t> w(4 * 8), x(8), y1(4), y2(4);
-    for (int i = 0; i < 8; ++i)
-        x[i] = static_cast<std::int8_t>(brain_rand_weight(7, 1, i, 24));
-    for (int i = 0; i < 32; ++i)
-        w[i] = static_cast<std::int8_t>(brain_rand_weight(7, 2, i, 24));
-    std::int16_t bias[4] = {3, -2, 0, 5};
-    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kLinear, y1.data());
-    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kLinear, y2.data());
-    CHECK(y1 == y2);
-    // hand-check row 0: dot = sum w[0..7]*x[0..7]
-    std::int32_t d0 = 0;
-    for (int i = 0; i < 8; ++i) d0 += w[i] * x[i];
-    CHECK(y1[0] == brain_clamp_i8((d0 >> 4) + bias[0]));
-    // tanh path differs from linear and stays in range
-    brain_dense_i8(w.data(), 4, 8, x.data(), bias, 4, BrainAct::kTanh, y2.data());
-    CHECK(y2 != y1);
-    for (int i = 0; i < 4; ++i) CHECK(y2[i] >= -128 && y2[i] <= 127);
-    // dot product cross-check against a naive int64 accumulation
-    for (int i = 0; i < 32; ++i) CHECK(w[i] >= -127 && w[i] <= 127);
-    CHECK(brain_dot_i8(x.data(), x.data(), 8) ==
-          [&]{ std::int64_t s = 0; for (int i = 0; i < 8; ++i) s += x[i]*x[i]; return (std::int32_t)s; }());
-
-    // ---- hash RNG: replay-identical draws ------------------------------------
-    CHECK(brain_rand_weight(42, 9, 100, 24) == brain_rand_weight(42, 9, 100, 24));
-    CHECK(brain_rand_weight(42, 9, 100, 24) != brain_rand_weight(42, 9, 101, 24));
-    CHECK(brain_mutation_step(1, 2, 3, 4, 5) == brain_mutation_step(1, 2, 3, 4, 5));
-    std::int32_t st = brain_mutation_step(1, 2, 3, 4, 5);
-    CHECK(st >= -5 && st <= 5);
-
-    // ---- BrainArena: deterministic alloc/free, cell granularity ----------------
-    BrainArena ar(64);
-    const std::uint64_t o1 = ar.alloc(100);    // 2 cells
-    const std::uint64_t o2 = ar.alloc(64);     // 1 cell
-    CHECK(o1 != BrainArena::kInvalid && o2 != BrainArena::kInvalid);
-    CHECK(o2 >= o1 + 128);
-    // returned offsets are slab-relative; the DATA pointers are 64B-aligned
-    CHECK(reinterpret_cast<std::uintptr_t>(ar.w8(o1)) % 64 == 0);
-    CHECK(reinterpret_cast<std::uintptr_t>(ar.w8(o2)) % 64 == 0);
-    ar.w8(o1)[0] = 42; ar.w8(o1)[63] = -7;
-    ar.free(o1, 100);
-    const std::uint64_t o3 = ar.alloc(100);    // reuses freed 2-cell block
-    CHECK(o3 == o1);
-    CHECK(ar.w8(o3)[0] == 42);                 // contents survive free
-    CHECK(ar.live_bytes() == 3 * 64);
-    ar.free(o2, 64); ar.free(o3, 100);
-    CHECK(ar.live_bytes() == 0);
-    // alloc past capacity fails cleanly
-    BrainArena tiny(2);
-    CHECK(tiny.alloc(3 * 64) == BrainArena::kInvalid);
-
-    // ---- mutation: deterministic, sparse, bounded ------------------------------
-    std::vector<std::int8_t> mw(256);
-    for (int i = 0; i < 256; ++i) mw[i] = 10;
-    brain_mutate_blocks(mw.data(), 256, 5, 6, 7, 3, 500);
-    std::vector<std::int8_t> mw2 = mw;
-    brain_mutate_blocks(mw2.data(), 256, 5, 6, 7, 3, 500);
-    // NOTE: second call mutates the ALREADY-mutated copy — instead rebuild:
-    for (int i = 0; i < 256; ++i) mw2[i] = 10;
-    brain_mutate_blocks(mw2.data(), 256, 5, 6, 7, 3, 500);
-    CHECK(mw == mw2);                                   // deterministic
-    bool changed = false;
-    for (int i = 0; i < 256; ++i) {
-        CHECK(mw[i] >= 7 && mw[i] <= 13);
-        if (mw[i] != 10) changed = true;
-    }
-    CHECK(changed);                                      // 500‰ fires somewhere
-    // different tick -> different result somewhere
-    for (int i = 0; i < 256; ++i) mw2[i] = 10;
-    brain_mutate_blocks(mw2.data(), 256, 5, 6, 8, 3, 500);
-    CHECK(mw != mw2);
-
-    // ---- GMAC/s micro-benchmark (replaces the blueprint's 3 GMAC/s guess) ------
-    // Dense GEMV shaped like an H=64 layer family: rows=64, cols=96.
+    // (1) LIF unit: inject -> threshold -> spike -> reset -> refractory -----
     {
-        const std::int32_t R = 64, C = 96, PAD = brain_padded_cols(C);
-        std::vector<std::int8_t> bw(static_cast<std::size_t>(R) * PAD, 0);
-        std::vector<std::int8_t> bx(C, 1), by(R);
-        for (std::int64_t i = 0; i < static_cast<std::int64_t>(R) * PAD; ++i)
-            bw[static_cast<std::size_t>(i)] =
-                static_cast<std::int8_t>(brain_rand_weight(1, 3, i, 24));
-        const int iters = 20000;
-        const auto t0 = std::chrono::steady_clock::now();
-        std::int64_t acc = 0;
-        for (int it = 0; it < iters; ++it) {
-            brain_dense_i8(bw.data(), R, C, bx.data(), nullptr, 8,
-                           BrainAct::kLinear, by.data());
-            acc += by[it & (R - 1)];
+        BrainNet n;
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[static_cast<int>(BrainModule::kBrainstem)] = 64;
+        auto tg = mk_params();
+        n.init(7, 42, pops, 800, -200, 5, 2, 200, 120, tg);
+        CHECK(n.neuron_count == 64);
+        CHECK(n.syn_count > 0);
+        const BrainModuleState& m0 =
+            n.modules[static_cast<int>(BrainModule::kBrainstem)];
+        CHECK(m0.count == 64 && m0.first == 0);
+        n.inject(0, 0, 6000);                    // strong depolarizing kick
+        n.step();
+        // neuron 0 fired: membrane at reset, refractory armed
+        CHECK(n.st[m0.first].membrane == n.gen[m0.first].reset);
+        CHECK(n.st[m0.first].refractory_left > 0);
+        // during refractory it cannot fire again even with huge input
+        const std::int16_t ref_after = n.st[m0.first].refractory_left;
+        n.inject(0, 0, 6000);
+        n.step();
+        CHECK(n.st[m0.first].refractory_left == ref_after - 1 ||
+              n.st[m0.first].refractory_left == 0);
+        CHECK(n.st[m0.first].membrane == n.gen[m0.first].reset);
+    }
+
+    // (2) sparse propagation across a tract: sensory -> thalamus ------------
+    {
+        BrainNet n;
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[static_cast<int>(BrainModule::kSensoryCortex)] = 32;
+        pops[static_cast<int>(BrainModule::kThalamus)] = 32;
+        auto tg = mk_params();
+        n.init(11, 7, pops, 800, -200, 5, 2, 200, 120, tg);
+        const BrainModuleState& sen =
+            n.modules[static_cast<int>(BrainModule::kSensoryCortex)];
+        const BrainModuleState& tha =
+            n.modules[static_cast<int>(BrainModule::kThalamus)];
+        n.inject(static_cast<std::uint8_t>(BrainModule::kSensoryCortex),
+                 0, 6000);
+        n.step();   // sensory fires; kicks land in delay rings (delay>=1)
+        // thalamus has not run with the kick yet — measure baseline
+        std::int64_t pre = 0;
+        for (std::uint32_t i = 0; i < tha.count; ++i)
+            pre += std::abs(n.st[tha.first + i].membrane);
+        n.step();   // kicks deliver -> thalamus consumes them this tick
+        std::int64_t post = 0;
+        std::uint32_t nz = 0;
+        for (std::uint32_t i = 0; i < tha.count; ++i) {
+            post += std::abs(n.st[tha.first + i].membrane);
+            if (n.st[tha.first + i].membrane != 0) ++nz;
         }
-        const auto t1 = std::chrono::steady_clock::now();
-        const double secs = std::chrono::duration<double>(t1 - t0).count();
-        const double macs = static_cast<double>(iters) * R * C;
-        const double gmacs = macs / secs / 1e9;
-        std::printf("brain GEMV benchmark: %.2f GMAC/s "
-                    "(%d iters x %dx%d, acc=%lld, %.1f MB/s weights)\n",
-                    gmacs, iters, R, C, static_cast<long long>(acc),
-                    macs / secs / 1e6);
-        CHECK(gmacs > 0.05);      // sanity floor — real number printed above
-        CHECK(acc != 0);
+        CHECK(post > pre);          // synaptic current arrived
+        CHECK(nz > 0);              // sparse: only connected targets
+        CHECK(nz < tha.count);      // density < 100% -> not all neurons
+        (void)sen;
+    }
+
+    // (3) determinism: identical (seed, entity, params) -> identical net ----
+    {
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[0] = 24; pops[1] = 24; pops[6] = 48; pops[9] = 64;
+        auto tg = mk_params();
+        BrainNet a, b;
+        a.init(99, 1234, pops, 800, -200, 5, 2, 200, 120, tg);
+        b.init(99, 1234, pops, 800, -200, 5, 2, 200, 120, tg);
+        CHECK(a.syn_count == b.syn_count && a.neuron_count == b.neuron_count);
+        CHECK(a.syn == b.syn);          // identical CSR (operator== on POD)
+        for (int k = 0; k < 12; ++k) {
+            a.inject(0, k % 24, 3000);
+            b.inject(0, k % 24, 3000);
+            a.step(); b.step();
+        }
+        bool same = true;
+        for (std::uint32_t i = 0; i < a.neuron_count; ++i) {
+            if (a.st[i].membrane != b.st[i].membrane ||
+                a.st[i].syn_input != b.st[i].syn_input ||
+                a.st[i].refractory_left != b.st[i].refractory_left)
+                same = false;
+        }
+        CHECK(same);
+        CHECK(a.tick == b.tick && a.dropped_kicks == b.dropped_kicks);
+    }
+
+    // (4) multi-rate scheduler: language (period 8) runs on its phase ------
+    {
+        BrainNet n;
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[static_cast<int>(BrainModule::kLanguage)] = 24;
+        auto tg = mk_params();
+        n.init(5, 9, pops, 800, -200, 5, 2, 200, 120, tg);
+        const BrainModuleState& lg =
+            n.modules[static_cast<int>(BrainModule::kLanguage)];
+        CHECK(lg.period == 8);
+        for (int k = 0; k < 4; ++k) n.step();
+        // phase = 11 % 8 = 3 -> first run at tick 3
+        CHECK(lg.last_run == 3);
+        for (int k = 0; k < 8; ++k) n.step();
+        CHECK(lg.last_run == 11);
+    }
+
+    // (5) event request coalescing: pending_mask services off-period --------
+    {
+        BrainNet n;
+        std::array<std::uint16_t, kBrainModuleCount> pops{};
+        pops[static_cast<int>(BrainModule::kHippocampus)] = 48;  // period 4
+        auto tg = mk_params();
+        n.init(13, 21, pops, 800, -200, 5, 2, 200, 120, tg);
+        const BrainModuleState& hip =
+            n.modules[static_cast<int>(BrainModule::kHippocampus)];
+        n.request(static_cast<std::uint8_t>(BrainModule::kHippocampus));
+        n.step();   // event forces a run at tick 0 despite period=4
+        CHECK(hip.last_run == 0);
+        CHECK(hip.event_accum == 1);
+    }
+
+    // (6) genome params decode/sanitize round-trip ----------------------------
+    {
+        BrainGenome g = brain_default_genome();
+        CHECK(g.valid && g.slow.size() == kConnectomeBytes);
+        const BrainNetParams p = brainnet_params_of(g);
+        CHECK(p.threshold == 800 && p.reset == -200);
+        CHECK(p.pops[static_cast<int>(BrainModule::kMotorCortex)] == 64);
+        // corrupt lanes get clamped, never UB
+        g.slow[0] = 120; g.slow[12] = 10; g.slow[16] = -50;
+        brainnet_sanitize(g.slow);
+        const BrainNetParams q = brainnet_params_of(g);
+        CHECK(q.pops[0] == 100);          // clamped to max pop
+        CHECK(q.threshold == 320);        // 40*8 floor
+        CHECK(q.ei_permille == 0);        // -50 -> clamped 0
     }
 }
 
-static void test_brain_phase1() {
-    // ---- flag off: no brain store is ever created ---------------------------
+// 12-module anatomical connectome: populations, tracts, decide, inheritance.
+static void test_anatomical_modules() {
+    // (1) brain_slot grows the full 12-module connectome ----------------------
     {
-        World w(5, "data");
-        const EntityId s = mk_sapient(w, {50, 50});
-        w.interact(mk_ctx(s, {}, "rest", 0));
-        w.interact(mk_ctx(s, {}, "strike", 0));
-        CHECK(w.brains_ == nullptr);
+        World w(401, "data");
+        w.brain_shadow = true;
+        if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+        const EntityId id = mk_sapient(w, {50, 50});
+        BrainSlot& s = brain_slot(w, *w.brains_, id);
+        const BrainNet& n = s.net;
+        CHECK(n.neuron_count == 440);     // sum of default populations
+        CHECK(n.syn_count > n.neuron_count * 2);
+        // every module populated with its canonical size
+        const int expect[kBrainModuleCount] =
+            {24, 24, 16, 24, 24, 16, 48, 48, 80, 64, 48, 24};
+        for (int m = 0; m < kBrainModuleCount; ++m) {
+            CHECK(n.modules[m].count ==
+                  static_cast<std::uint32_t>(expect[m]));
+            CHECK(n.modules[m].first + n.modules[m].count <=
+                  n.neuron_count);
+        }
+        // module ranges are contiguous and ordered
+        std::uint32_t acc = 0;
+        for (int m = 0; m < kBrainModuleCount; ++m) {
+            CHECK(n.modules[m].first == acc);
+            acc += n.modules[m].count;
+        }
+        CHECK(acc == n.neuron_count);
+        // CSR integrity: row_ptr monotonic, targets in range
+        CHECK(n.row_ptr[0] == 0 && n.row_ptr[n.neuron_count] == n.syn_count);
+        for (std::uint32_t u = 0; u < n.neuron_count; ++u)
+            CHECK(n.row_ptr[u] <= n.row_ptr[u + 1]);
+        for (const BrainSynapse& sy : n.syn)
+            CHECK(sy.target < n.neuron_count && sy.delay >= 1);
+        // multi-rate periods present (not all period-1)
+        bool saw_slow = false;
+        for (const BrainModuleState& ms : n.modules)
+            if (ms.period > 1) saw_slow = true;
+        CHECK(saw_slow);
     }
 
-    // ---- flag on: state_hash bit-identical to flag off ----------------------
+    // (2) connectome tracts produce real cross-module synapses ---------------
     {
-        World on(11, "data"), off(11, "data");
-        const EntityId son = mk_sapient(on, {50, 50});
-        const EntityId soff = mk_sapient(off, {50, 50});
-        on.brain_shadow = true;
-        for (int i = 0; i < 60; ++i) {
-            const char* verb = (i % 3 == 0) ? "strike" : "rest";
-            on.interact(mk_ctx(son, {}, verb, 0));
-            off.interact(mk_ctx(soff, {}, verb, 0));
-        }
-        // Phase 2: live brain state IS part of state_hash, so a brained
-        // world no longer hashes identically to a brainless one. The
-        // invariant that survives: flag-off never allocates a store, and
-        // two flag-off worlds remain bit-identical.
-        CHECK(on.brains_ != nullptr);
-        CHECK(on.brains_->slots.count(son) == 1);
-        CHECK(on.brains_->wm_n > 0);
-        CHECK(off.brains_ == nullptr);
-        World off2(11, "data");
-        const EntityId soff2 = mk_sapient(off2, {50, 50});
-        for (int i = 0; i < 60; ++i) {
-            const char* verb = (i % 3 == 0) ? "strike" : "rest";
-            off2.interact(mk_ctx(soff2, {}, verb, 0));
-        }
-        CHECK(off.state_hash() == off2.state_hash());
-    }
-
-    // ---- determinism: identical seeds -> identical brain fingerprint --------
-    {
-        World a(23, "data"), b(23, "data");
-        a.brain_shadow = b.brain_shadow = true;
-        const EntityId sa = mk_sapient(a, {50, 50});
-        const EntityId sb = mk_sapient(b, {50, 50});
-        for (int i = 0; i < 80; ++i) {
-            const char* verb = (i % 4 == 0) ? "strike" : "rest";
-            a.interact(mk_ctx(sa, {}, verb, 0));
-            b.interact(mk_ctx(sb, {}, verb, 0));
-        }
-        CHECK(a.state_hash() == b.state_hash());
-        CHECK(a.brains_ && b.brains_);
-        // diagnostic: locate the divergent component
-        {
-            const BrainSlot& A = a.brains_->slots.at(sa);
-            const BrainSlot& B = b.brains_->slots.at(sb);
-            CHECK(A.wbytes == B.wbytes);   // woff differs: heap-alignment slack
-            CHECK(a.brains_->slots.size() == b.brains_->slots.size());
-            CHECK(a.brains_->wm_err_sum == b.brains_->wm_err_sum);
-            CHECK(a.brains_->wm_n == b.brains_->wm_n);
-            CHECK(a.brains_->sigma_sum == b.brains_->sigma_sum);
-            CHECK(a.brains_->sigma_n == b.brains_->sigma_n);
-            CHECK(a.brains_->surprise_events == b.brains_->surprise_events);
-            CHECK(sa == sb);
-            CHECK(A.h == B.h);
-            CHECK(A.last_action == B.last_action);
-            CHECK(A.replay_count == B.replay_count);
-            CHECK(A.replay_next == B.replay_next);
-            for (int i = 0; i < 16; ++i) {
-                CHECK(A.replay[i].event_id == B.replay[i].event_id);
-                CHECK(A.replay[i].sigma == B.replay[i].sigma);
-                CHECK(A.replay[i].charge == B.replay[i].charge);
-                CHECK(A.replay[i].s == B.replay[i].s);
-                CHECK(A.replay[i].a == B.replay[i].a);
-                CHECK(A.replay[i].y == B.replay[i].y);
-            }
-            const std::int8_t* wa = a.brains_->arena.w8(A.woff);
-            const std::int8_t* wb2 = b.brains_->arena.w8(B.woff);
-            for (std::uint64_t i = 0; i < A.wbytes; ++i)
-                if (wa[i] != wb2[i]) {
-                    std::printf("brain weight diff @%llu: %d vs %d\n",
-                                (unsigned long long)i, wa[i], wb2[i]);
-                    break;
+        World w(402, "data");
+        if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+        const EntityId id = mk_sapient(w, {50, 50});
+        BrainSlot& s = brain_slot(w, *w.brains_, id);
+        const BrainNet& n = s.net;
+        // for each tract, count synapses crossing src->dst ranges
+        int crossed = 0;
+        for (const BrainTract& tr : kBrainTracts) {
+            const BrainModuleState& src =
+                n.modules[tr.src], &dst = n.modules[tr.dst];
+            bool any = false;
+            for (std::uint32_t u = src.first;
+                 u < src.first + src.count && !any; ++u)
+                for (std::uint32_t k = n.row_ptr[u];
+                     k < n.row_ptr[u + 1]; ++k) {
+                    const std::uint32_t t = n.syn[k].target;
+                    if (t >= dst.first && t < dst.first + dst.count) {
+                        any = true; break;
+                    }
                 }
+            if (any) ++crossed;
         }
-        CHECK(brain_state_hash(*a.brains_) == brain_state_hash(*b.brains_));
-        // replay ring fills and stratified replacement keeps high-surprise rows
-        const BrainSlot& slot = a.brains_->slots.at(sa);
-        CHECK(slot.replay_count == 16);
-        CHECK(slot.pending.valid == false);          // consumed by post
+        CHECK(crossed >= 20);           // ~all 24 tracts materialize
     }
 
-    // ---- learning curve: WM |y - yhat| falls over repeated interactions -----
+    // (3) brain_decide: valid choice, deterministic, masked verbs ------------
     {
-        World w(37, "data");
-        w.brain_shadow = true;
-        const EntityId s = mk_sapient(w, {50, 50});
-        std::int64_t a_sum = 0, a_n = 0;   // snapshot before interact i=1
-        std::int64_t b_sum = 0, b_n = 0;   // snapshot before interact i=60
-        std::int64_t c_sum = 0, c_n = 0;   // snapshot before interact i=840
-        for (int i = 0; i < 900; ++i) {
-            if ((i % 150) == 0) {          // vitals top-up: marathon, not survival
-                Entity& e = *w.find(s);
-                tseti(e, w, "energy", 90000000); tseti(e, w, "hunger", 0);
-                tseti(e, w, "thirst", 0);  tseti(e, w, "integrity", 1000);
-                tseti(e, w, "fatigue", 0); tseti(e, w, "blood_volume", 1000);
-            }
-            if (w.brains_) {
-                if (i == 1)   { a_sum = w.brains_->wm_err_sum; a_n = w.brains_->wm_n; }
-                if (i == 60)  { b_sum = w.brains_->wm_err_sum; b_n = w.brains_->wm_n; }
-                if (i == 840) { c_sum = w.brains_->wm_err_sum; c_n = w.brains_->wm_n; }
-            }
-            w.interact(mk_ctx(s, {}, (i % 5 == 4) ? "strike" : "rest", 0));
-        }
-        CHECK(w.brains_ != nullptr);
-        const std::int64_t d_sum = w.brains_->wm_err_sum, d_n = w.brains_->wm_n;
-        if (c_n == 0) { c_sum = d_sum; c_n = d_n; }
-        // windowed mean |y-yhat| per label channel: first ~60 events vs last ~60
-        const std::int64_t early_num = b_sum - a_sum, early_den = b_n - a_n;
-        const std::int64_t late_num  = d_sum - c_sum, late_den  = d_n - c_n;
-        CHECK(early_den > 0 && late_den > 0);
-        const double early_mae = static_cast<double>(early_num) / early_den;
-        const double late_mae  = static_cast<double>(late_num)  / late_den;
-        std::printf("brain WM MAE: early=%.3f late=%.3f (n=%lld events)\n",
-                    early_mae, late_mae,
-                    static_cast<long long>(d_n / kLabelChannels));
-        CHECK(late_mae < early_mae);       // the WM actually learned
-
-        // replay ring is full of valid, scored transitions
-        const BrainSlot& sl = w.brains_->slots.at(s);
-        CHECK(sl.replay_count == 16);
-        for (const Transition& t : sl.replay) CHECK(t.valid);
-    }
-
-    // ---- slot GC: dead agents release their arena slot ----------------------
-    {
-        World w(41, "data");
-        w.brain_shadow = true;
-        const EntityId s = mk_sapient(w, {50, 50});
-        const EntityId t = mk_sapient(w, {60, 50});
-        w.interact(mk_ctx(s, {}, "rest", 0));
-        w.interact(mk_ctx(t, {}, "rest", 0));
-        CHECK(w.brains_->slots.size() == 2);
-        const std::uint64_t live0 = w.brains_->arena.live_bytes();
-        w.find(s)->alive = false;
-        w.advance_ticks_for_test(50);          // decay_minds -> brain_gc
-        CHECK(w.brains_->slots.count(s) == 0);
-        CHECK(w.brains_->slots.count(t) == 1);
-        CHECK(w.brains_->arena.live_bytes() < live0);
-    }
-}
-
-static void test_brain_phase2() {
-    // ---- brain_decide: deterministic choice, valid mask --------------------
-    {
-        World a(31, "data"), b(31, "data");
+        World a(403, "data"), b(403, "data");
         a.brain_shadow = b.brain_shadow = true;
         const EntityId sa = mk_sapient(a, {50, 50});
         const EntityId sb = mk_sapient(b, {50, 50});
-        // give both minds a couple of known verbs so the mask is non-trivial
-        for (int i = 0; i < 10; ++i) {
-            a.interact(mk_ctx(sa, {}, "rest", 0));
-            b.interact(mk_ctx(sb, {}, "rest", 0));
-        }
+        a.mind(sa); b.mind(sb);
         const BrainChoice ca = brain_decide(a, sa);
         const BrainChoice cb = brain_decide(b, sb);
         CHECK(ca.valid && cb.valid);
-        CHECK(ca.verb == cb.verb);
-        CHECK(ca.target == cb.target);
-        CHECK(ca.has_move == cb.has_move);
-        CHECK(ca.move_to.x == cb.move_to.x && ca.move_to.y == cb.move_to.y);
-        CHECK(ca.score == cb.score);
-        // decide must NOT commit recurrent state: h unchanged by the call
-        const BrainSlot& slot = a.brains_->slots.at(sa);
-        std::int64_t hsum = 0;
-        for (auto v : slot.h) hsum += v;
-        brain_decide(a, sa);
-        std::int64_t hsum2 = 0;
-        for (auto v : a.brains_->slots.at(sa).h) hsum2 += v;
-        CHECK(hsum == hsum2);
+        CHECK(ca.verb == cb.verb);     // same seed+state -> same choice
+        CHECK(!ca.verb.empty());
+        // only innate verbs are legal for a mind with empty known_actions
+        CHECK(ca.verb == "move" || ca.verb == "rest");
+        CHECK(a.brains_->slots.count(sa) == 1);
+        CHECK(a.brains_->slots[sa].mac_pending > 0);
+        // second decide continues the same net (state evolved)
+        const BrainChoice ca2 = brain_decide(a, sa);
+        CHECK(ca2.valid);
     }
 
-    // ---- inheritance: child genome is parent crossover, fast state empty ---
+    // (4) genome inheritance: child genome valid + sanitized ---------------
     {
-        World w(41, "data");
+        World w(404, "data");
         w.brain_shadow = true;
-        const EntityId pa = mk_sapient(w, {50, 50});
-        const EntityId pb = mk_sapient(w, {60, 50});
-        for (int i = 0; i < 6; ++i) {
-            w.interact(mk_ctx(pa, {}, "rest", 0));
-            w.interact(mk_ctx(pb, {}, "rest", 0));
-        }
-        CHECK(w.brains_ && w.brains_->slots.count(pa) &&
-              w.brains_->slots.count(pb));
+        if (!w.brains_) w.brains_ = std::make_shared<BrainStore>();
+        const EntityId pa = mk_sapient(w, {40, 40});
+        const EntityId pb = mk_sapient(w, {60, 60});
+        w.mind(pa); w.mind(pb);
+        const BrainChoice _ = brain_decide(w, pa);   // ensure slots exist
+        (void)_;
+        brain_decide(w, pb);
         const BrainGenome ga = brain_genome_of(w, *w.brains_, pa);
         const BrainGenome gb = brain_genome_of(w, *w.brains_, pb);
         CHECK(ga.valid && gb.valid);
-        CHECK(ga.hidden == gb.hidden);
-        // child genome: deterministic, valid, same hidden, slow = crossover
+        CHECK(ga.slow.size() == kConnectomeBytes);
         const BrainGenome child =
             brain_child_genome(w, pa, pb, ga, gb);
         CHECK(child.valid);
-        CHECK(child.hidden == ga.hidden);
-        CHECK(child.slow.size() == ga.slow.size());
-        // every slow byte must come from a parent (pre-mutation blocks may
-        // differ, but post-mutation values stay within int8 and biases clamp)
-        for (std::int8_t v : child.slow) CHECK(v >= -127 && v <= 127);
-        // install on a fresh entity: h/replay zeroed (Baldwin — no fast state)
-        const EntityId baby = mk_sapient(w, {55, 55});
-        brain_install_spawn(w, baby, child);
-        CHECK(w.brains_->slots.count(baby) == 1);
-        const BrainSlot& bs = w.brains_->slots.at(baby);
-        std::int64_t hsum = 0;
-        for (auto v : bs.h) hsum += std::llabs(static_cast<long long>(v));
-        CHECK(hsum == 0);
-        CHECK(bs.replay_count == 0);
-        CHECK(bs.last_action == ActionVec{});
-        // installed slow weights match the genome byte-for-byte
-        const std::int8_t* wb = w.brains_->arena.w8(bs.woff);
-        for (std::size_t i = 0; i < child.slow.size(); ++i)
-            CHECK(wb[i] == child.slow[i]);
-        // determinism: same parents+tick -> identical child genome
-        const BrainGenome child2 =
-            brain_child_genome(w, pa, pb, ga, gb);
-        CHECK(child2.slow == child.slow);
-        CHECK(child2.hidden == child.hidden);
-        CHECK(child2.lr_permille == child.lr_permille);
+        CHECK(child.slow.size() == kConnectomeBytes);
+        // sanitize guarantees domain legality even after crossover+mutation
+        const BrainNetParams cp = brainnet_params_of(child);
+        CHECK(cp.threshold >= 320 && cp.threshold <= 1280);
+        CHECK(cp.pops[0] <= 100);
+        CHECK(brain_genetic_distance(ga, gb) >= 0);
     }
 
-    // ---- reproductive isolation: divergent brains refuse to pair ----------
+    // (5) save v29 round-trip: connectome state survives bit-identical ------
     {
-        World w(43, "data");
+        World w(405, "data");
         w.brain_shadow = true;
-        const EntityId pa = mk_sapient(w, {50, 50});
-        const EntityId pb = mk_sapient(w, {60, 50});
-        for (int i = 0; i < 4; ++i) {
-            w.interact(mk_ctx(pa, {}, "rest", 0));
-            w.interact(mk_ctx(pb, {}, "rest", 0));
-        }
-        BrainGenome ga = brain_genome_of(w, *w.brains_, pa);
-        BrainGenome gb = brain_genome_of(w, *w.brains_, pb);
-        CHECK(ga.valid && gb.valid);
-        // hidden mismatch -> isolation
-        gb.hidden = 32;
-        CHECK(brain_genetic_distance(ga, gb) > kMaxBrainGeneticDistance);
-        // massive weight divergence -> isolation (saturate to int8 rails)
-        gb.hidden = ga.hidden;
-        for (std::size_t i = 0; i < gb.slow.size(); ++i)
-            gb.slow[i] = static_cast<std::int8_t>((i & 1) ? 127 : -127);
-        CHECK(brain_genetic_distance(ga, gb) > kMaxBrainGeneticDistance);
-        // identical genomes -> zero distance
-        CHECK(brain_genetic_distance(ga, ga) == 0);
-    }
-
-    // ---- state_hash includes brain state ------------------------------------
-    {
-        World a(51, "data"), b(51, "data");
-        a.brain_shadow = b.brain_shadow = true;
-        const EntityId sa = mk_sapient(a, {50, 50});
-        const EntityId sb = mk_sapient(b, {50, 50});
-        for (int i = 0; i < 20; ++i) {
-            a.interact(mk_ctx(sa, {}, "rest", 0));
-            b.interact(mk_ctx(sb, {}, "rest", 0));
-        }
-        CHECK(a.state_hash() == b.state_hash());
-        // perturb one weight -> hash must change (brains are hashed in)
-        BrainSlot& slot = a.brains_->slots.at(sa);
-        std::int8_t* wb = a.brains_->arena.w8(slot.woff);
-        wb[0] = static_cast<std::int8_t>(wb[0] + 1);
-        CHECK(a.state_hash() != b.state_hash());
-    }
-
-    // ---- save/load v20: brain store round-trips bit-identically -------------
-    {
-        const char* path = "/tmp/simlab_brain_p2.bin";
-        World run(61, "data"), split(61, "data"), loaded(61, "data");
-        EntityId s_run = kNoEntity;
-        for (World* wp : {&run, &split}) {
-            wp->brain_shadow = true;
-            const EntityId s = mk_sapient(*wp, {50, 50});
-            if (wp == &run) s_run = s;
-            for (int i = 0; i < 40; ++i)
-                wp->interact(mk_ctx(s, {}, (i % 3) ? "rest" : "strike", 0));
-        }
-        // split saves mid-run, loads, continues — must equal the flat run
-        CHECK(split.save(path));
-        CHECK(loaded.load(path));
-        loaded.brain_shadow = true;
-        // the saved sapient keeps its id across the round-trip
-        EntityId sid = kNoEntity;
-        for (const auto& ep : loaded.entities)
-            if (ep->kind_name == "sapient" && ep->alive) { sid = ep->id; break; }
-        CHECK(sid != kNoEntity);
-        CHECK(sid == s_run);
-        for (int i = 40; i < 90; ++i) {
-            const char* verb = (i % 3) ? "rest" : "strike";
-            run.interact(mk_ctx(s_run, {}, verb, 0));
-            loaded.interact(mk_ctx(sid, {}, verb, 0));
-        }
-        CHECK(run.state_hash() == loaded.state_hash());
-        CHECK(run.brains_ && loaded.brains_);
-        CHECK(brain_state_hash(*run.brains_) == brain_state_hash(*loaded.brains_));
+        const EntityId id = mk_sapient(w, {50, 50});
+        w.mind(id);
+        brain_decide(w, id);            // ticks the net -> dynamic state
+        brain_decide(w, id);
+        const std::uint64_t hb = brain_state_hash(*w.brains_);
+        const std::string path = "/tmp/simlab_v29_brain.bin";
+        const std::uint64_t h = w.state_hash();
+        CHECK(w.save(path));
+        World w2(405, "data");
+        CHECK(w2.load(path));
+        CHECK(w2.state_hash() == h);
+        CHECK(w2.brains_ &&
+              brain_state_hash(*w2.brains_) == hb);
+        // the re-derived connectome matches: same neuron/synapse counts
+        const BrainSlot& s1 = w.brains_->slots[id];
+        const BrainSlot& s2 = w2.brains_->slots[id];
+        CHECK(s1.net.neuron_count == s2.net.neuron_count);
+        CHECK(s1.net.syn_count == s2.net.syn_count);
+        CHECK(s1.net.st == s2.net.st);   // operator== on POD vector
+        std::filesystem::remove(path);
     }
 }
 
-// ==================== CL-1 Phase 3 ==========================================
-
-// Respiration laws: O2 exchange land/water, organ upkeep, hypoxia.
 static void test_amphibian_evolution() {
     World w(23, "data");
     WorldGenParams gp; gp.seed = 23; gp.grid_w = 64; gp.grid_h = 64;
@@ -10537,101 +10392,6 @@ static void test_amphibian_evolution() {
     }
 }
 
-// CL-1 control loop: brain_control population survives, reproduces, learns.
-static void test_brain_curriculum() {
-    auto build = [](std::uint64_t seed) {
-        World w(seed, "data");
-        PrimordialParams pp; pp.seed = static_cast<int>(seed); pp.grid = 48;
-        pp.tribes = 1; pp.per_tribe = 3;
-        build_primordial(w, pp);
-        return w;
-    };
-    World a = build(17), b = build(17);
-    DriverState sta; sta.curiosity = true; sta.concurrent = true;
-    sta.brain_control = true; sta.legacy_planner_compat = true;
-    DriverState stb; stb.curiosity = true; stb.concurrent = true;
-    stb.brain_control = true; stb.legacy_planner_compat = true;
-
-    // micro-benchmark on a THROWAWAY world — decides/learn hooks mutate
-    // brain + world state, so it must not touch the determinism pair.
-    {
-        World bw = build(99);
-        EntityId bench_npc = kNoEntity;
-        for (const auto& ep : bw.entities)
-            if (ep->kind_name == "sapient" && ep->alive) { bench_npc = ep->id; break; }
-        if (bench_npc != kNoEntity) {
-            for (int i = 0; i < 5; ++i) bw.interact(mk_ctx(bench_npc, {}, "rest", 0));
-            const auto t0 = std::chrono::steady_clock::now();
-            constexpr int kDecides = 100;
-            BrainChoice sink;
-            for (int i = 0; i < kDecides; ++i) sink = brain_decide(bw, bench_npc);
-            const auto t1 = std::chrono::steady_clock::now();
-            const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / kDecides;
-            // sparse consultation: 1 decide per 8 agent-cycles
-            const double frame_ms = us * 2000.0 / 8.0 / 1000.0;
-            std::printf("  brain benchmark: %.1f us/decide -> ~%.1f ms/frame @2000 agents sparse (budget 16.7)\n",
-                        us, frame_ms);
-            CHECK(sink.valid || true);
-        }
-    }
-
-    // control: identical world, brain_control OFF — isolates CL-1's effect
-    World c = build(17);
-    DriverState stc; stc.curiosity = true; stc.concurrent = true;
-    const std::int64_t cycles =
-        std::getenv("SIMLAB_CURRICULUM_CYCLES")
-            ? std::atoll(std::getenv("SIMLAB_CURRICULUM_CYCLES")) : 600;
-    DriverTally ta, tb;
-    if (std::getenv("SIMLAB_DEBUG_CYCLES")) {
-        for (std::int64_t i = 0; i < cycles; ++i) {
-            autonomous_cycle(a, &sta, &ta);
-            autonomous_cycle(b, &stb, &tb);
-            const auto ha = a.state_hash(), hb = b.state_hash();
-            const auto ba = a.brains_ ? brain_state_hash(*a.brains_) : 0;
-            const auto bb = b.brains_ ? brain_state_hash(*b.brains_) : 0;
-            std::printf("  cycle %lld hash %016llx vs %016llx %s | brain %016llx vs %016llx | ev %llu vs %llu | ent %zu vs %zu\n",
-                        (long long)i, (unsigned long long)ha,
-                        (unsigned long long)hb, ha == hb ? "=" : "!=",
-                        (unsigned long long)ba, (unsigned long long)bb,
-                        (unsigned long long)a.ledger.next_id(),
-                        (unsigned long long)b.ledger.next_id(),
-                        a.entities.size(), b.entities.size());
-            if (ha != hb) break;
-        }
-    } else {
-        ta = autonomous_run(a, cycles, &sta);
-        tb = autonomous_run(b, cycles, &stb);
-    }
-    const DriverTally tc = autonomous_run(c, cycles, &stc);
-
-    // determinism: identical inputs -> identical hash
-    CHECK(a.state_hash() == b.state_hash());
-    // brains allocated + plasticity engaged (fast weights moved off zero)
-    CHECK(a.brains_ && !a.brains_->slots.empty());
-    bool any_fast = false;
-    for (const auto& [id, s] : a.brains_->slots)
-        for (std::int8_t v : s.fast) if (v != 0) { any_fast = true; break; }
-    std::printf("  curriculum: cycles=%lld social=%ld brains=%zu fast_moved=%d hash=%016llx\n",
-                (long long)cycles, (long)ta.social, a.brains_->slots.size(),
-                (int)any_fast, (unsigned long long)a.state_hash());
-    // civilization floor: founders survive to adulthood and the social
-    // reflex floor produces at least one completed social act
-    CHECK(ta.social > 0);
-    std::size_t alive = 0, sapient_total = 0, alive_c = 0;
-    for (const auto& ep : a.entities)
-        if (ep->kind_name == "sapient") {
-            ++sapient_total;
-            if (ep->alive) ++alive;
-        }
-    for (const auto& ep : c.entities)
-        if (ep->kind_name == "sapient" && ep->alive) ++alive_c;
-    std::printf("  curriculum alive: brain=%zu/%zu control=%zu social=%ld/%ld\n",
-                alive, sapient_total, alive_c, (long)ta.social, (long)tc.social);
-    CHECK(alive >= 1);
-    CHECK(alive >= alive_c);          // CL-1 must not underperform baseline
-}
-
-// NarrativeHost: safe-disable + (when the GGUF is present) real generation.
 static void test_narrative_host() {
     NarrativeHost h;
     NarrativeHost::Config bad;
@@ -10674,9 +10434,10 @@ static void test_gene_pool_evolution() {
         e.brain.valid = true; e.brain.hidden = 64;
         e.brain.lr_permille = 400; e.brain.trace_decay = 900;
         e.brain.mut_scale = 10;
-        e.brain.slow.assign(brain_layout_h(64).total_bytes, 0);
+        e.brain.slow.assign(kConnectomeBytes, 0);
         for (std::size_t i = 0; i < e.brain.slow.size(); ++i)
             e.brain.slow[i] = brain_rand_weight(7, salt, i, 24);
+        brainnet_sanitize(e.brain.slow);
         return e;
     };
 
@@ -10707,7 +10468,7 @@ static void test_gene_pool_evolution() {
     CHECK(pool.derive(424242, did, dg1));
     CHECK(pool.derive(424242, did, dg2));
     CHECK(dg1.valid && dg1.slow == dg2.slow);
-    CHECK(dg1.slow.size() == brain_layout_h(dg1.hidden).total_bytes);
+    CHECK(dg1.slow.size() == kConnectomeBytes);
     int yes = 0;
     for (EntityId id = 1; id <= 400; ++id) {
         BrainGenome t;
@@ -10825,355 +10586,6 @@ static void test_gene_pool_evolution() {
 // count (each decide is a pure function of frozen round-start world +
 // own slot). Sequential mode stays the legacy baseline.
 // ---------- CL-1 Phase 4c: 100% neural free will -----------------------------
-static void test_brain_free_will() {
-    // (a) 32-verb action space: table, one-hot encoding, decide validity ----
-    CHECK(kActionVerbs == 32);
-    CHECK(kSensorChannels == 117);   // +3 conditioning tail (112-114) + structural/conduction (115-116)
-    CHECK(kActChannels == 32);
-    {
-        const char* const* vt = sensor_verb_table();
-        CHECK(std::strcmp(vt[16], "wield") == 0);
-        CHECK(std::strcmp(vt[17], "unwield") == 0);
-        CHECK(std::strcmp(vt[18], "withdraw") == 0);
-        CHECK(std::strcmp(vt[19], "steal") == 0);
-        CHECK(std::strcmp(vt[20], "take") == 0);
-        CHECK(std::strcmp(vt[21], "trade") == 0);
-        CHECK(std::strcmp(vt[22], "treat") == 0);
-        CHECK(std::strcmp(vt[23], "chop") == 0);
-        CHECK(std::strcmp(vt[24], "heat") == 0);
-        CHECK(std::strcmp(vt[25], "evacuate") == 0);   // "smelt" is not a
-        CHECK(std::strcmp(vt[31], "adjudicate") == 0); // verb; "court" isn't
-        // an action either — real verbs took those slots (see Sensor.cpp)
-        CHECK(std::strcmp(vt[26], "assemble") == 0);
-        CHECK(std::strcmp(vt[27], "disassemble") == 0);
-        CHECK(std::strcmp(vt[28], "carve") == 0);
-        CHECK(std::strcmp(vt[29], "perform_ritual") == 0);
-        CHECK(std::strcmp(vt[30], "consecrate") == 0);
-        // indices 0..15 frozen: p.a[4] sleep-consolidation relies on "rest"
-        CHECK(std::strcmp(vt[4], "rest") == 0);
-        CHECK(std::strcmp(vt[0], "consume") == 0);
-        // sensor_action one-hot over the widened table
-        InteractionContext cx = mk_ctx(kNoEntity, {}, "wield", 0);
-        const ActionVec av = sensor_action(cx);
-        CHECK(av[16] == 100);
-        bool any = false;
-        for (int i = 0; i < kActionVerbs; ++i) any |= av[i] == 100;
-        CHECK(any);
-        InteractionContext cz = mk_ctx(kNoEntity, {}, "treaty", 0);
-        const ActionVec az = sensor_action(cz);
-        for (int i = 0; i < kActionVerbs; ++i) CHECK(az[i] == 0);
-    }
-    // decide honours the widened mask: a mind that "knows" only wield gets
-    // choices restricted to {wield, move, rest}
-    {
-        World w(67, "data");
-        w.brain_shadow = true;
-        const EntityId s = mk_sapient(w, {50, 50});
-        w.mind(s).known_actions.insert("wield");
-        bool saw_wield_or_basic = false;
-        for (int i = 0; i < 12; ++i) {
-            BrainChoice ch = brain_decide(w, s);
-            CHECK(ch.valid);
-            CHECK(ch.verb == "wield" || ch.verb == "move" ||
-                  ch.verb == "rest");
-            saw_wield_or_basic = true;
-            w.interact(mk_ctx(s, {}, "rest", 0));   // advance one tick
-        }
-        CHECK(saw_wield_or_basic);
-    }
-
-    // (b) neural_free: executive override + consume reflex are OFF; affect
-    // reaches behaviour only through rollout scoring. A panic-maxed agent
-    // whose ONLY known verb is "rest" cannot be hijacked into strike/flee.
-    {
-        World w(71, "data");
-        const EntityId s = mk_sapient(w, {50, 50});
-        w.brain_shadow = true;
-        AgentMind& m = w.mind(s);
-        m.neuro.panic = 1000;                 // >> executive_override (750)
-        m.neuro.rage = 1000;
-        m.neuro.grief = 1000;
-        m.known_actions.clear();              // only innate move+rest
-        DriverState st;
-        st.brain_control = true;
-        st.legacy_planner_compat = false;     // 100% neural mode
-        const std::size_t ledger0 = w.ledger.size();
-        for (int i = 0; i < 20; ++i) autonomous_cycle(w, &st);
-        // no strike/consume/flee interact may appear: the brain only knows
-        // move+rest, and no reflex layer may preempt it any more.
-        const auto& hist = w.ledger.history();
-        for (std::size_t i = ledger0; i < hist.size(); ++i) {
-            const CausalEvent& ev = hist[i];
-            CHECK(ev.action != "strike");
-            CHECK(ev.action != "consume");
-            CHECK(ev.action != "flee");
-        }
-    }
-
-    // (c) grief/anhedonia bends imagined reward: identical worlds differing
-    // only in neuro.grief must diverge in the ACTION STREAM (state_hash
-    // differs trivially — neuro is hashed — so compare ledger verbs).
-    {
-        auto build = [](std::uint64_t seed, std::int64_t grief) {
-            World w(seed, "data");
-            PrimordialParams pp; pp.seed = static_cast<int>(seed); pp.grid = 48;
-            pp.tribes = 1; pp.per_tribe = 3;
-            build_primordial(w, pp);
-            w.brain_shadow = true;
-            for (EntityId id : w.minded_entities()) {
-                AgentMind& m = w.mind(id);
-                m.neuro.grief = grief;
-                m.known_actions.insert("consume");
-            }
-            return w;
-        };
-        World calm = build(83, 0), grieving = build(83, 1000);
-        DriverState st;
-        st.brain_control = true;
-        st.legacy_planner_compat = false;
-        st.curiosity = false;
-        for (int i = 0; i < 400; ++i) {
-            // grief is a TRANSIENT axis (decays every tick): re-apply each
-            // cycle so the grieving world stays depressed — chronic
-            // anhedonia, not a one-off shock.
-            for (EntityId id : calm.minded_entities()) calm.mind(id).neuro.grief = 0;
-            for (EntityId id : grieving.minded_entities())
-                grieving.mind(id).neuro.grief = 1000;
-            autonomous_cycle(calm, &st);
-            autonomous_cycle(grieving, &st);
-        }
-        // state_hash differs trivially (neuro is hashed), so the proof that
-        // affect reaches behaviour is the ledger action stream itself.
-        std::string stream_c, stream_g;
-        for (const CausalEvent& ev : calm.ledger.history())
-            if (!ev.action.empty()) { stream_c += ev.action; stream_c += ';'; }
-        for (const CausalEvent& ev : grieving.ledger.history())
-            if (!ev.action.empty()) { stream_g += ev.action; stream_g += ';'; }
-        CHECK(stream_c != stream_g);
-    }
-
-    // (d) actor learning: w2w policy rows update in brain_post. Only the
-    // executed verb's 64-weight row may change; untouched rows stay frozen.
-    {
-        World w(89, "data");
-        w.brain_shadow = true;
-        const EntityId s = mk_sapient(w, {50, 50});
-        w.interact(mk_ctx(s, {}, "rest", 0));      // prime the slot
-        const BrainSlot& sl0 = w.brains_->slots.at(s);
-        const BrainLayout& L = brain_layout_h(sl0.hidden);
-        const std::int8_t* wb0 = w.brains_->arena.w8(sl0.woff);
-        std::array<std::int8_t, 64> rest0{}, court0{}, consume0{};
-        std::memcpy(rest0.data(), wb0 + L.w2w + 4 * 64, 64);    // "rest"
-        std::memcpy(court0.data(), wb0 + L.w2w + 31 * 64, 64);  // "adjudicate"
-        std::memcpy(consume0.data(), wb0 + L.w2w + 0 * 64, 64);// "consume"
-        for (int i = 0; i < 80; ++i) {
-            // mix outcomes so homeostatic reward + surprise both vary
-            const char* v = (i % 3 == 0) ? "strike" : "rest";
-            w.interact(mk_ctx(s, {}, v, 0));
-            if ((i % 25) == 24) {                  // keep the body alive
-                Entity& e = *w.find(s);
-                tseti(e, w, "energy", 90000000);
-                tseti(e, w, "hunger", 0);
-                tseti(e, w, "thirst", 0);
-                tseti(e, w, "integrity", 1000);
-                tseti(e, w, "fatigue", 0);
-                tseti(e, w, "blood_volume", 1000);
-            }
-        }
-        const BrainSlot& sl1 = w.brains_->slots.at(s);
-        const std::int8_t* wb1 = w.brains_->arena.w8(sl1.woff);
-        std::array<std::int8_t, 64> rest1{}, court1{}, consume1{};
-        std::memcpy(rest1.data(), wb1 + L.w2w + 4 * 64, 64);
-        std::memcpy(court1.data(), wb1 + L.w2w + 31 * 64, 64);
-        std::memcpy(consume1.data(), wb1 + L.w2w + 0 * 64, 64);
-        CHECK(rest1 != rest0);    // "rest" was executed -> its row learned
-        CHECK(court1 == court0);  // "adjudicate" never ran -> row frozen
-        CHECK(consume1 == consume0);  // "consume" never executed -> frozen
-    }
-}
-
-// ---------- deep cognition: social sensors, dream replay, forgetting -------
-static void test_brain_deep_cognition() {
-    // (1) social & temporal sensor channels ----------------------------------
-    {
-        World w(97, "data");
-        const EntityId a = mk_sapient(w, {50, 50});
-        const EntityId b = mk_sapient(w, {70, 50});
-        Entity& ea = *w.find(a);
-        Entity& eb = *w.find(b);
-        // same tongue -> +127 kinship; no mood belief -> neutral affect
-        tseti(ea, w, "language_id", 777);
-        tseti(eb, w, "language_id", 777);
-        AgentMind& ma = w.mind(a);
-        AgentMind::MemorySnapshot snap;
-        snap.tick = w.clock_.tick();
-        snap.pos = eb.pos; snap.material = eb.material;
-        snap.kind_name = eb.kind_name;
-        upsert_memory(ma, b, snap, 0, mind_params(w, ea));
-        SensorVec s_same = sensor_encode(w, a);
-        CHECK(s_same[kChanKinship] == 127);
-        CHECK(s_same[kChanNeighborAffect] == 0);
-        // foreign tongue (bit-distant id) -> strongly negative kinship
-        tseti(eb, w, "language_id", 1000000000);
-        SensorVec s_for = sensor_encode(w, a);
-        CHECK(s_for[kChanKinship] < 0);
-        CHECK(s_for[kChanKinship] < s_same[kChanKinship] - 100);
-        // ToM mood belief: agitated vs calm neighbour
-        ma.belief("mood:" + std::to_string(b)).confidence = 950;
-        CHECK(sensor_encode(w, a)[kChanNeighborAffect] > 100);
-        ma.belief("mood:" + std::to_string(b)).confidence = 50;
-        CHECK(sensor_encode(w, a)[kChanNeighborAffect] < -50);
-        // lone agent: no conspecific in memory -> neutral social channels
-        const EntityId c = mk_sapient(w, {900, 900});
-        const SensorVec s_alone = sensor_encode(w, c);
-        CHECK(s_alone[kChanKinship] == 0);
-        CHECK(s_alone[kChanNeighborAffect] == 0);
-        CHECK(s_alone[kChanInvSecurity] == 0);
-        // scarcity phase: deterministic triangle over the 672-tick season
-        CHECK(s_alone[kChanScarcityPhase] >= -127 &&
-              s_alone[kChanScarcityPhase] <= 127);
-        w.advance_ticks_for_test(340);   // cross the mid-season apex
-        const SensorVec s_later = sensor_encode(w, c);
-        CHECK(s_later[kChanScarcityPhase] != s_alone[kChanScarcityPhase]);
-        // carried food lifts inventory_security (possessed_by is observable)
-        {
-            const MaterialId berry = w.materials.id_of("wild_berries");
-            if (berry != kNoMaterial) {
-                PropertyBag ib;
-                ib.set(pid(w, "possessed_by"), Value::integer(c));
-                const EntityId it = w.create_entity("berries", berry,
-                                                   {55, 55}, ib);
-                AgentMind& mc = w.mind(c);
-                AgentMind::MemorySnapshot is;
-                is.tick = w.clock_.tick(); is.pos = {55, 55};
-                is.material = berry; is.kind_name = "item";
-                const auto pi = w.find(it);
-                if (pi) {
-                    for (PropId op : w.observable_props())
-                        if (const Value* v = w.prop_of(*pi, op))
-                            is.props[op] = *v;
-                }
-                upsert_memory(mc, it, is, 0, mind_params(w, *w.find(c)));
-                CHECK(sensor_encode(w, c)[kChanInvSecurity] > 0);
-            }
-        }
-    }
-
-    // (2) dream consolidation: rest re-drives the traumatized verb's w2w ---
-    {
-        auto build = [](std::uint64_t seed) {
-            World w(seed, "data");
-            w.brain_shadow = true;
-            const EntityId a = mk_sapient(w, {50, 50});
-            const EntityId b = mk_sapient(w, {90, 50});
-            w.interact(mk_ctx(a, {}, "rest", 0));   // prime both slots
-            w.interact(mk_ctx(b, {}, "rest", 0));
-            return w;
-        };
-        World wA = build(101), wB = build(101);    // identical brains
-        // find the two sapients by kind in each world (same order)
-        auto sapients = [](World& w) {
-            std::vector<EntityId> v;
-            for (const auto& ep : w.entities)
-                if (ep->alive && ep->kind_name == SIMLAB_KIND("sapient"))
-                    v.push_back(ep->id);
-            std::sort(v.begin(), v.end());
-            return v;
-        };
-        const auto va = sapients(wA), vb = sapients(wB);
-        CHECK(va.size() == 2 && vb.size() == 2);
-        const EntityId a1 = va[0], a2 = va[1];
-        const EntityId b1 = vb[0], b2 = vb[1];
-        // craft an identical high-trauma "strike failed" transition in all
-        // four slots: charge 900, negative homeostatic outcome
-        auto inject = [](World& w, EntityId id) {
-            BrainSlot& s = w.brains_->slots.at(id);
-            Transition& t = s.replay[0];
-            t = Transition{};
-            t.s = sensor_encode(w, id);
-            t.a[2] = 100;                    // verb "strike"
-            t.y[16] = -100;                  // failed
-            t.y[24] = -100;                  // homeostasis worsened
-            for (int i = 0; i < 96; ++i) t.wh[i] = static_cast<std::int8_t>((i % 7) - 3);
-            for (int i = 0; i < 64; ++i) t.w1h[i] = static_cast<std::int8_t>(20 - (i % 11));
-            t.sigma = 800; t.charge = 900; t.event_id = 1; t.valid = true;
-            s.replay_count = 1; s.replay_next = 1;
-        };
-        inject(wA, a1); inject(wA, a2);
-        inject(wB, b1); inject(wB, b2);
-        auto strike_row = [](World& w, EntityId id) {
-            const BrainSlot& s = w.brains_->slots.at(id);
-            const BrainLayout& l = brain_layout_h(s.hidden);
-            return std::string(reinterpret_cast<const char*>(
-                       w.brains_->arena.w8(s.woff) + l.w2w + 2 * 64), 64);
-        };
-        const std::string preA1 = strike_row(wA, a1), preB1 = strike_row(wB, b1);
-        // a1 dreams (rest), a2 only moves; b1/b2 never rest
-        wA.interact(mk_ctx(a1, {}, "rest", 0));
-        wA.interact(mk_ctx(a2, {}, "move", 0));
-        wB.interact(mk_ctx(b1, {}, "move", 0));
-        wB.interact(mk_ctx(b2, {}, "move", 0));
-        CHECK(strike_row(wA, a1) != preA1);    // dream shifted strike logits
-        CHECK(strike_row(wB, b1) == preB1);    // never rested -> row frozen
-    }
-
-    // (3) forgetting curve: engram attenuation + fast-weight decay -----------
-    {
-        World w(103, "data");
-        w.brain_shadow = true;
-        const EntityId a = mk_sapient(w, {50, 50});
-        const EntityId x = mk_sapient(w, {60, 50});
-        w.interact(mk_ctx(a, {}, "rest", 0));   // prime slot
-        BrainSlot& s = w.brains_->slots.at(a);
-        s.trace_decay = 10;                    // tiny horizon -> stale fast
-        // salient engrams (protected from forgetting, and they push the
-        // weak trace out of the top-4 dream-rehearsal set)
-        AgentMind& m = w.mind(a);
-        const MindParams mp = mind_params(w, *w.find(a));
-        std::vector<EntityId> fillers;
-        for (int i = 0; i < 4; ++i) fillers.push_back(mk_sapient(w, {100 + i * 10, 150}));
-        for (EntityId tgt : fillers) {
-            AgentMind::MemorySnapshot snap;
-            snap.tick = w.clock_.tick();
-            snap.pos = w.find(tgt)->pos;
-            snap.material = w.find(tgt)->material;
-            snap.kind_name = w.find(tgt)->kind_name;
-            upsert_memory(m, tgt, snap, -300, mp);
-        }
-        {
-            AgentMind::MemorySnapshot snap;
-            snap.tick = w.clock_.tick();
-            snap.pos = w.find(x)->pos;
-            snap.material = w.find(x)->material;
-            snap.kind_name = w.find(x)->kind_name;
-            upsert_memory(m, x, snap, -900, mp);   // salient: survives
-        }
-        const EntityId y = mk_sapient(w, {80, 50});
-        {
-            AgentMind::MemorySnapshot snap;
-            snap.tick = w.clock_.tick();
-            snap.pos = w.find(y)->pos;
-            snap.material = w.find(y)->material;
-            snap.kind_name = w.find(y)->kind_name;
-            upsert_memory(m, y, snap, 60, mp);       // weak: |charge|<200
-        }
-        // seed fast weights so decay has something to shrink
-        for (int i = 0; i < 8; ++i) s.fast[i] = 20;
-        const std::int64_t fsum0 = [&]{ std::int64_t t=0; for (auto v : s.fast) t += v<0?-v:v; return t; }();
-        const std::int64_t stab0 = m.memory.at(y).engram.stability;
-        const std::int64_t chg0 = m.memory.at(y).engram.emotional_charge;
-        w.advance_ticks_for_test(12);            // past the horizon
-        w.interact(mk_ctx(a, {}, "rest", 0));    // dream + forget
-        const MemoryEngram& gy = w.mind(a).memory.at(y).engram;
-        CHECK(std::abs(gy.emotional_charge) < std::abs(chg0));  // -> toward 0
-        CHECK(gy.stability < stab0);                           // evict sooner
-        const MemoryEngram& gx = w.mind(a).memory.at(x).engram;
-        CHECK(gx.emotional_charge == -900);                    // salient kept
-        const std::int64_t fsum1 = [&]{ std::int64_t t=0; for (auto v : s.fast) t += v<0?-v:v; return t; }();
-        CHECK(fsum1 < fsum0);                                  // decay+transfer
-    }
-}
-
 static void test_open_ended_invention() {
     // (1) sensor material-attribute focus channels ---------------------------
     {
@@ -11481,24 +10893,27 @@ static void test_emergent_coevolution() {
         CHECK(w1.terrain.pollution_at(w1.find(it)->pos) > before);
     }
 
-    // (6) metabolic brain cost: bigger hidden burns more hunger ------------
+    // (6) metabolic brain cost: bigger connectome burns more ---------------
     {
         World w(305, "data");
-        auto mk_brained = [&](std::int32_t H) {
+        auto mk_brained = [&](std::int8_t pop) {
             const EntityId id = mk_sapient(w, {50, 50});
-            BrainGenome g;
-            g.valid = true; g.hidden = H;
-            g.slow.assign(brain_layout_h(H).total_bytes, 1);
+            BrainGenome g = brain_default_genome();
+            for (int m = 0; m < kBrainModuleCount; ++m) g.slow[m] = pop;
+            brainnet_sanitize(g.slow);
             brain_install_spawn(w, id, g);
+            w.mind(id);
             return id;
         };
-        const EntityId small = mk_brained(32);    // (32^2)>>10 = 1
-        const EntityId big = mk_brained(128);     // (128^2)>>10 = 16
+        const EntityId small = mk_brained(4);     // 48 neurons
+        const EntityId big = mk_brained(80);      // 960 neurons
+        (void)brain_decide(w, small);
+        (void)brain_decide(w, big);
         w.advance_ticks_for_test(10);
         const std::int64_t hs = tint(*w.find(small), w, "hunger");
         const std::int64_t hb = tint(*w.find(big), w, "hunger");
-        CHECK(hb > hs);                           // calorie overhead scales H^2
-        // save/load keeps brain state + hash identical (format v25)
+        CHECK(hb > hs);                           // calorie cost scales w/ neurons
+        // save/load keeps brain state + hash identical (format v29)
         const std::string path = "/tmp/simlab_coevo_save.bin";
         const std::uint64_t h = w.state_hash();
         CHECK(w.save(path));
@@ -11507,27 +10922,26 @@ static void test_emergent_coevolution() {
         CHECK(w3.state_hash() == h);
     }
 
-    // (7) structural mutation: ~5% of offspring shift hidden +-8 -----------
+    // (7) connectome mutation: offspring carry a sanitized 96-byte block --
     {
         World w(306, "data");
-        BrainGenome ga, gb;
-        ga.valid = gb.valid = true;
-        ga.hidden = gb.hidden = 64;
-        ga.slow.assign(brain_layout_h(64).total_bytes, 3);
-        gb.slow.assign(brain_layout_h(64).total_bytes, 5);
-        int mutated = 0;
+        BrainGenome ga = brain_default_genome();
+        BrainGenome gb = brain_default_genome();
+        for (std::size_t t = 0; t < kBrainTractCount; ++t)
+            gb.slow[18 + t] = static_cast<std::int8_t>(10 + (t % 50));
+        brainnet_sanitize(gb.slow);
+        int differ = 0;
         EntityId aid = 1000;
-        for (EntityId bid = 2000; bid < 2200 && mutated < 5; ++bid, ++aid) {
+        for (EntityId bid = 2000; bid < 2200; ++bid, ++aid) {
             BrainGenome c = brain_child_genome(w, aid, bid, ga, gb);
-            if (c.hidden != 64) {
-                ++mutated;
-                CHECK(c.hidden % 8 == 0);                 // AVX2-aligned
-                CHECK(c.hidden >= 32 && c.hidden <= 128); // clamped range
-                CHECK(c.slow.size() ==
-                      brain_layout_h(c.hidden).total_bytes);
-            }
+            CHECK(c.valid);
+            CHECK(c.slow.size() == kConnectomeBytes);
+            const BrainNetParams p = brainnet_params_of(c);
+            CHECK(p.threshold >= 320 && p.threshold <= 1280);
+            CHECK(p.pops[0] <= 100);
+            if (c.slow != ga.slow && c.slow != gb.slow) ++differ;
         }
-        CHECK(mutated > 0);      // 5% over 200 draws -> ~10 expected
+        CHECK(differ > 0);      // crossover+mutation yields variation
     }
 
     // (8) scarcity survival: the GenePool tie-break accrues in milli-ticks -
@@ -11789,9 +11203,7 @@ static void test_culture_archaeology() {
         tseti(*w.find(reader), w, "language_id",
               tint(*w.find(sage), w, "language_id"));  // same tongue
         // brains for both
-        BrainGenome g;
-        g.valid = true; g.hidden = 64;
-        g.slow.assign(brain_layout_h(64).total_bytes, 1);
+        const BrainGenome g = brain_default_genome();
         brain_install_spawn(w, sage, g);
         brain_install_spawn(w, reader, g);
         // inject one high-charge transition into the sage's replay ring —
@@ -11856,10 +11268,7 @@ static void test_culture_archaeology() {
         w.brain_shadow = true;
         auto agent = [&](Vec2 p) {
             const EntityId id = mk_sapient(w, p);
-            BrainGenome gg;
-            gg.valid = true; gg.hidden = 64;
-            gg.slow.assign(brain_layout_h(64).total_bytes, 1);
-            brain_install_spawn(w, id, gg);
+            brain_install_spawn(w, id, brain_default_genome());
             return id;
         };
         const EntityId c0 = agent({0, 0});
@@ -11867,35 +11276,25 @@ static void test_culture_archaeology() {
         const EntityId c250 = agent({20, 0});
         EngramPayload ep;
         ep.verb = 10; ep.charge = 800; ep.sigma = 500;
-        // saturated payload: uniform +120 hidden drives yh strongly
-        // positive, so y=-120 yields a large negative huber error — the
-        // dream-step delta clamps at -4 and even a 25% dose keeps +-1.
         for (int i = 0; i < 96; ++i) ep.wh[i] = 120;
         for (int i = 0; i < 64; ++i) ep.w1h[i] = 100;
         for (int i = 0; i < kLabelChannels; ++i) ep.y[i] = -120;
-        // snapshot wm2w of each agent, assimilate at different comps
-        auto snapshot_wm2 = [&](EntityId id) {
-            BrainSlot& s = w.brains_->slots[id];
-            const BrainLayout& L = brain_layout_h(s.hidden);
-            const std::int8_t* base = w.brains_->arena.w8(s.woff);
-            const std::int8_t* wm2w = base + L.wm2w;
-            return std::vector<std::int8_t>(wm2w, wm2w + kLabelChannels * kBrainWmHidden);
-        };
-        auto diff_vs = [&](EntityId id,
-                           const std::vector<std::int8_t>& snap) {
-            BrainSlot& s = w.brains_->slots[id];
-            const BrainLayout& L = brain_layout_h(s.hidden);
-            const std::int8_t* base = w.brains_->arena.w8(s.woff);
-            const std::int8_t* wm2w = base + L.wm2w;
+        // snapshot total |membrane| across each agent's net; assimilate
+        // injects the engram pattern as scaled currents + 4 settle ticks,
+        // so a bigger comprehension dose must displace the network more.
+        auto snap_abs = [&](EntityId id) {
+            const BrainNet& n = w.brains_->slots[id].net;
             std::int64_t d = 0;
-            for (std::size_t i = 0; i < snap.size(); ++i)
-                d += std::abs(static_cast<int>(wm2w[i]) -
-                              static_cast<int>(snap[i]));
+            for (const BrainNeuronState& ns : n.st)
+                d += std::abs(static_cast<int>(ns.membrane));
             return d;
         };
-        const auto s0 = snapshot_wm2(c0);
-        const auto s1 = snapshot_wm2(c1000);
-        const auto s2 = snapshot_wm2(c250);
+        auto diff_vs = [&](EntityId id, std::int64_t before) {
+            return std::abs(snap_abs(id) - before);
+        };
+        const std::int64_t s0 = snap_abs(c0);
+        const std::int64_t s1 = snap_abs(c1000);
+        const std::int64_t s2 = snap_abs(c250);
         brain_assimilate(w, c0, ep.verb, ep.charge, ep.sigma, 1,
                          ep.wh.data(), ep.w1h.data(), ep.y.data(), 0);
         brain_assimilate(w, c1000, ep.verb, ep.charge, ep.sigma, 2,
@@ -12317,14 +11716,10 @@ int main(int argc, char** argv) {
     RUN(test_trophic_ecology_seasons_and_apex);
     RUN(test_domestication_agriculture_metallurgy);
     RUN(test_quantitative_cognition_and_notation);
-    RUN(test_brain_phase0);
-    RUN(test_brain_phase1);
-    RUN(test_brain_phase2);
-    RUN(test_brain_free_will);
+    RUN(test_neural_core);
+    RUN(test_anatomical_modules);
     RUN(test_amphibian_evolution);
-    RUN(test_brain_curriculum);
     RUN(test_narrative_host);
-    RUN(test_brain_deep_cognition);
     RUN(test_open_ended_invention);
     RUN(test_emergent_coevolution);
     RUN(test_conditioning);

@@ -1268,3 +1268,63 @@ onto `TerrainGrid` per-cell derived fields + enclosure footprints:
   collapse + rubble re-support, pillar grid stability, siege pillar kill
   -> secondary collapse, 6-cell heat chain vs stone control, 8-cell surge
   shock, save v28 round-trip + post-load advance hash equality.
+
+## Phase 20 — CL-1 connectome brain (save v29, in progress)
+
+The monolithic MLP/minGRU brain is REPLACED (Option B, no shadow mode) by a
+12-module spiking network per brain.txt. Legacy weight blob, hidden-state
+array, fast/anchor plasticity and WM1/WM2 are gone.
+
+- `BrainNet` (include/simlab/BrainNet.hpp, src/BrainNet.cpp): integer-only
+  LIF (membrane i16, syn_input i32 saturating, refractory, per-neuron
+  threshold/reset/leak jitter via hash), CSR synapses, delay rings
+  (kRingLen=16, synapse-index FIFO, overflow counted in dropped_kicks),
+  uint64 spike masks + ctzll sparse iteration, multi-rate module
+  scheduler (periods 1/2/4/8, event coalescing via pending_mask).
+- Connectome is DATA-DRIVEN: `kBrainTracts[24]` table (src,dst,gain,
+  density,delay,inh_permille) expanded at init from
+  (world_seed, entity, genome). Synapses/weights are NEVER serialized —
+  re-derived deterministically; only dynamic state (membranes,
+  syn_input, refractory, module clocks, ring contents, tick, spikes,
+  pending_mask, dropped_kicks) goes into save v29.
+- `BrainGenome::slow` is now a 96-byte connectome PARAM block
+  (kConnectomeBytes): lanes 0..11 = module populations (0..100),
+  12=threshold code, 13=reset, 14=leak_shift, 15=refractory,
+  16=ei_permille/8, 17=density_permille/8, 18..41=per-tract gain*2,
+  42..95 reserved. `brainnet_params_of`/`brainnet_sanitize` decode/clamp.
+  `hidden`/`lr_permille`/`trace_decay`/`mut_scale` remain as legacy
+  hyper-gene fields (mut_scale still scales birth mutation + decide jitter).
+- `BrainSlot` = {genome, net, last_action, pending, replay[16], tried[64],
+  mac_*}. Memory buffers kept per spec: replay ring + tried ring are the
+  procedural/episodic substrate; AgentMind stays the independent memory
+  system. `Transition.wh[96]`/`w1h[64]` now carry engram patterns
+  (hippocampus+PFC / sensory membrane readouts via engram_snapshot) so
+  the archaeology/engraving pipeline (EngramPayload, SocialLaws) is
+  unchanged.
+- `brain_decide` = think-burst: sensor_encode -> inject Sensory Cortex
+  (+Hypothalamus intero, +Cerebellum efference copy) -> 8 net.step() ->
+  Motor Cortex first-32 membranes = verb logits, last-4 Association
+  neurons = entity saliency -> known_actions mask + doctrine bias +
+  invent bonus + hash jitter -> BrainChoice{verb,target,move_to,score}.
+  Pure per-agent mutation; parallel_think safe (slots pre-created,
+  disjoint nets — do NOT add shared-store counters inside decide;
+  per-net `spikes` is the hashed diagnostic instead).
+- `brain_pre`/`brain_post` hooks unchanged (World.cpp interact); post
+  pushes replay + engram snapshot + tried-mark + surprise stats.
+  Plasticity (STDP/reward) is Phase 6 — not yet implemented.
+- GenePool: `entry_sane` requires slow.size()==kConnectomeBytes;
+  gene_pool.bin kVersion=2 (v1 weight blobs rejected -> pool resets).
+- Save v29: per-slot genome fields + slow blob + nn/nsyn + net clocks +
+  neuron/module/ring state + replay/pending/tried. Load re-derives the
+  connectome via net.init(world_seed,nid,params) and REJECTS on
+  neuron/syn count mismatch. fmt 20..28 brain sections parse-and-discard
+  (legacy MLP cannot map; brains regenerate lazily).
+- Tests: test_neural_core (LIF/refractory/sparse propagation/determinism/
+  scheduler/event coalescing/genome decode) + test_anatomical_modules
+  (440-neuron Standard connectome, 24-tract coverage, decide contract,
+  inheritance, v29 round-trip). The 7 legacy monolithic suites were
+  removed; dependent suites (gene_pool/coevolution/culture/conditioning/
+  parallel_think/invention/narrative) adapted to connectome APIs.
+- Capstone hash is UNCHANGED (846c6d3eb0152463): autonomous_run does not
+  enable brain_control, so world dynamics are untouched. Re-baseline only
+  if a brain_control civilization baseline is added later.

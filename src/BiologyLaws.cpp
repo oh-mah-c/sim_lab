@@ -515,7 +515,7 @@ PredictionResult BiologyModel::predict(const World& w,
         const BrainGenome ga = brain_genome_of(w, *w.brains_, actor->id);
         const BrainGenome gb = brain_genome_of(w, *w.brains_, partner->id);
         if (ga.valid || gb.valid) {
-            if (!ga.valid || !gb.valid || ga.hidden != gb.hidden ||
+            if (!ga.valid || !gb.valid ||
                 brain_genetic_distance(ga, gb) > kMaxBrainGeneticDistance) {
                 r.failure =
                     "brain genomes incompatible (reproductive isolation)";

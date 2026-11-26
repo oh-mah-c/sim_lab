@@ -750,8 +750,9 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     if (brains_ && has_h) {
         const auto bit = brains_->slots.find(e.id);
         if (bit != brains_->slots.end()) {
-            const std::int64_t H = bit->second.hidden;
-            const std::int64_t overhead = (H * H) >> 10;
+            const std::int64_t nn =
+                static_cast<std::int64_t>(bit->second.net.neuron_count);
+            const std::int64_t overhead = nn >> 6;
             if (overhead > 0) {
                 static thread_local SeqPidCache bh_c_;
                 SeqPid bhp(bh_c_, props);
@@ -6383,7 +6384,7 @@ std::uint64_t World::state_hash() const {
 namespace {
 
 constexpr std::uint32_t kSaveMagic = 0x444C5753u;   // 'SWLD'
-constexpr std::uint32_t kSaveFormat = 28;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail); v27: mind doctrines + doctrine_accum (oral tradition); v28: terrain support_strength/overburden_load/conductivity + sensor 117ch / label 28ch
+constexpr std::uint32_t kSaveFormat = 29;            // v3: event.spawned, belief.self_evidence; v4: rng stream counters; v5: event failed/failure/conditions; v6: mind discovery records; v7: record failed_conditions + sample_entities; v8: entity genome; v9: social tie weights; v10: entity last_metabolized; v11: gen_cells_ + mind memory/visited_cells; v12: ledger archive state; v13: memory/discovery engrams (Ebbinghaus); v14: neuro state, panic_relief, born_memories; v15: recent_witnessed, sublimation_relief, ostracism_accum; v16: political_accum; v17: terrain.traffic_wear; v18: myth_accum; v19: ruleset; v20: CL-1 BrainStore; v21: Transition.w1h (dream replay); v22: synthesized materials; v23: brain tried-combo set; v24: terrain.pollution; v25: brain h widened to 128 (hidden up to 128); v26: sensor 115ch / label 26ch (conditioning tail); v27: mind doctrines + doctrine_accum (oral tradition); v28: terrain support_strength/overburden_load/conductivity + sensor 117ch / label 28ch; v29: connectome brain (genome params + LIF state + delay rings; synapses re-derived)
 
 struct Writer {
     std::ofstream f;
@@ -6744,21 +6745,46 @@ bool World::save(const std::string& path, std::string* err) const {
         w.put(static_cast<std::uint64_t>(bs.slots.size()));
         for (const auto& [nid, s] : bs.slots) {
             w.put(nid);
-            w.put(s.hidden); w.put(s.lr_permille);
-            w.put(s.trace_decay); w.put(s.mut_scale);
-            w.put(s.woff); w.put(s.wbytes);
-            w.str(std::string(reinterpret_cast<const char*>(bs.arena.w8(s.woff)),
-                              static_cast<std::size_t>(s.wbytes)));
-            w.str(std::string(reinterpret_cast<const char*>(s.h.data()),
-                              s.h.size() * sizeof(std::int16_t)));
+            // v29: connectome genome params (synapses are re-derived)
+            w.boolean(s.genome.valid);
+            w.put(s.genome.hidden); w.put(s.genome.lr_permille);
+            w.put(s.genome.trace_decay); w.put(s.genome.mut_scale);
+            w.str(std::string(
+                reinterpret_cast<const char*>(s.genome.slow.data()),
+                s.genome.slow.size()));
+            // v29: neural dynamic state — membranes, pending kicks, module
+            // clocks, delay rings. CSR synapses/weights are NOT stored:
+            // they regenerate deterministically from (world_seed, entity,
+            // genome) at load.
+            const BrainNet& n = s.net;
+            w.put(static_cast<std::uint32_t>(n.neuron_count));
+            w.put(static_cast<std::uint32_t>(n.syn_count));
+            w.put(n.tick); w.put(n.pending_mask); w.put(n.dropped_kicks);
+            w.put(n.spikes);                                   // v29
+            for (const BrainNeuronState& ns : n.st) {
+                w.put(ns.membrane); w.put(ns.syn_input);
+                w.put(static_cast<std::uint8_t>(ns.refractory_left));
+                w.put(static_cast<std::uint8_t>(ns.flags));
+            }
+            for (const BrainModuleState& ms : n.modules) {
+                w.put(ms.last_run); w.put(ms.event_accum);
+                w.put(ms.scalar);
+            }
+            for (const auto& ring : n.ring) {
+                w.put(static_cast<std::uint32_t>(ring.size()));
+                for (std::uint32_t idx : ring) w.put(idx);
+            }
             w.str(std::string(reinterpret_cast<const char*>(s.last_action.data()),
                               s.last_action.size()));
+            w.boolean(s.pending.valid);
+            w.str(std::string(reinterpret_cast<const char*>(s.pending.s.data()),
+                              s.pending.s.size()));
+            w.str(std::string(reinterpret_cast<const char*>(s.pending.a.data()),
+                              s.pending.a.size()));
+            w.put(s.pending.tick);
+            w.put(s.pending.pm_a); w.put(s.pending.pm_b);
             w.put(s.replay_next); w.put(s.replay_count);
             w.put(s.mac_pending); w.put(s.mac_frac);
-            w.str(std::string(reinterpret_cast<const char*>(s.fast.data()),
-                              s.fast.size()));
-            w.str(std::string(reinterpret_cast<const char*>(s.anchor.data()),
-                              s.anchor.size()));
             for (const Transition& t : s.replay) {
                 w.boolean(t.valid); w.put(t.event_id);
                 w.put(t.sigma); w.put(t.charge);
@@ -7383,61 +7409,145 @@ bool World::load(const std::string& path, std::string* err) {
             if (!r.get(nslots) || nslots > (1u << 22)) return fail("bad brain slot count");
             for (std::uint64_t i = 0; i < nslots; ++i) {
                 EntityId nid = 0;
-                BrainSlot s;
-                if (!r.get(nid) || !r.get(s.hidden) || !r.get(s.lr_permille) ||
-                    !r.get(s.trace_decay) || !r.get(s.mut_scale) ||
-                    !r.get(s.woff) || !r.get(s.wbytes))
-                    return fail("truncated brain slot");
-                std::string wblob, hblob, ablob;
-                if (!r.str(wblob) || wblob.size() != s.wbytes)
-                    return fail("truncated brain weights");
-                if (!r.str(hblob) || hblob.size() != s.h.size() * sizeof(std::int16_t))
-                    return fail("truncated brain hidden");
-                if (!r.str(ablob) || ablob.size() != s.last_action.size())
-                    return fail("truncated brain action");
-                std::memcpy(bs->arena.w8(s.woff), wblob.data(), s.wbytes);
-                std::memcpy(s.h.data(), hblob.data(), hblob.size());
-                std::memcpy(s.last_action.data(), ablob.data(), ablob.size());
-                if (!r.get(s.replay_next) || !r.get(s.replay_count) ||
-                    !r.get(s.mac_pending) || !r.get(s.mac_frac))
-                    return fail("truncated brain replay head");
-                s.fast.assign(kBrainFastLen, 0);
-                s.anchor.assign(kBrainFastLen, 0);
-                std::string fblob, anblob;
-                if (!r.str(fblob) || fblob.size() != s.fast.size() ||
-                    !r.str(anblob) || anblob.size() != s.anchor.size())
-                    return fail("truncated brain plasticity");
-                std::memcpy(s.fast.data(), fblob.data(), fblob.size());
-                std::memcpy(s.anchor.data(), anblob.data(), anblob.size());
-                for (Transition& t : s.replay) {
-                    std::uint8_t tv = 0;
-                    if (!r.get(tv) || !r.get(t.event_id) || !r.get(t.sigma) ||
-                        !r.get(t.charge)) return fail("truncated brain transition");
-                    t.valid = tv != 0;
-                    std::string sb, ab, yb, wb;
-                    if (!r.str(sb) || sb.size() != t.s.size() ||
-                        !r.str(ab) || ab.size() != t.a.size() ||
-                        !r.str(yb) || yb.size() != t.y.size() ||
-                        !r.str(wb) || wb.size() != t.wh.size())
-                        return fail("truncated brain transition vecs");
-                    std::memcpy(t.s.data(), sb.data(), sb.size());
-                    std::memcpy(t.a.data(), ab.data(), ab.size());
-                    std::memcpy(t.y.data(), yb.data(), yb.size());
-                    std::memcpy(t.wh.data(), wb.data(), wb.size());
-                    if (fmt >= 21) {           // v21: dream-replay worker hidden
-                        std::string h1b;
-                        if (!r.str(h1b) || h1b.size() != t.w1h.size())
-                            return fail("truncated brain transition w1h");
+                if (!r.get(nid)) return fail("truncated brain slot");
+                if (fmt >= 29) {
+                    // ---- v29 connectome brain ----------------------------------
+                    BrainSlot s;
+                    std::uint8_t gv = 0;
+                    if (!r.get(gv) || !r.get(s.genome.hidden) ||
+                        !r.get(s.genome.lr_permille) ||
+                        !r.get(s.genome.trace_decay) ||
+                        !r.get(s.genome.mut_scale))
+                        return fail("truncated brain genome");
+                    s.genome.valid = gv != 0;
+                    std::string gblob;
+                    if (!r.str(gblob)) return fail("truncated brain genome slow");
+                    s.genome.slow.assign(gblob.begin(), gblob.end());
+                    brainnet_sanitize(s.genome.slow);
+                    std::uint32_t nn = 0, nsyn = 0;
+                    if (!r.get(nn) || !r.get(nsyn))
+                        return fail("truncated brain net header");
+                    const BrainNetParams bp = brainnet_params_of(s.genome);
+                    s.net.init(world_seed, nid, bp.pops, bp.threshold,
+                               bp.reset, bp.leak_shift, bp.refractory,
+                               bp.ei_permille, bp.density_permille,
+                               bp.tract_gain);
+                    if (s.net.neuron_count != nn || s.net.syn_count != nsyn)
+                        return fail("brain connectome mismatch");
+                    if (!r.get(s.net.tick) || !r.get(s.net.pending_mask) ||
+                        !r.get(s.net.dropped_kicks) || !r.get(s.net.spikes))
+                        return fail("truncated brain net clocks");
+                    for (BrainNeuronState& ns : s.net.st) {
+                        std::uint8_t rf = 0, fl = 0;
+                        if (!r.get(ns.membrane) || !r.get(ns.syn_input) ||
+                            !r.get(rf) || !r.get(fl))
+                            return fail("truncated brain neuron");
+                        ns.refractory_left = rf; ns.flags = fl;
+                    }
+                    for (BrainModuleState& ms : s.net.modules) {
+                        if (!r.get(ms.last_run) || !r.get(ms.event_accum) ||
+                            !r.get(ms.scalar))
+                            return fail("truncated brain module");
+                    }
+                    for (auto& ring : s.net.ring) {
+                        std::uint32_t cnt = 0;
+                        if (!r.get(cnt) || cnt > (1u << 20))
+                            return fail("bad brain ring");
+                        ring.resize(cnt);
+                        for (std::uint32_t& idx : ring)
+                            if (!r.get(idx)) return fail("truncated brain ring");
+                    }
+                    std::string ablob, ps, pa;
+                    std::uint8_t pv = 0;
+                    if (!r.str(ablob) || ablob.size() != s.last_action.size() ||
+                        !r.get(pv) || !r.str(ps) || ps.size() != s.pending.s.size() ||
+                        !r.str(pa) || pa.size() != s.pending.a.size() ||
+                        !r.get(s.pending.tick) ||
+                        !r.get(s.pending.pm_a) || !r.get(s.pending.pm_b))
+                        return fail("truncated brain pending");
+                    s.pending.valid = pv != 0;
+                    std::memcpy(s.last_action.data(), ablob.data(), ablob.size());
+                    std::memcpy(s.pending.s.data(), ps.data(), ps.size());
+                    std::memcpy(s.pending.a.data(), pa.data(), pa.size());
+                    if (!r.get(s.replay_next) || !r.get(s.replay_count) ||
+                        !r.get(s.mac_pending) || !r.get(s.mac_frac))
+                        return fail("truncated brain replay head");
+                    for (Transition& t : s.replay) {
+                        std::uint8_t tv = 0;
+                        if (!r.get(tv) || !r.get(t.event_id) || !r.get(t.sigma) ||
+                            !r.get(t.charge)) return fail("truncated brain transition");
+                        t.valid = tv != 0;
+                        std::string sb, ab, yb, wb, h1b;
+                        if (!r.str(sb) || sb.size() != t.s.size() ||
+                            !r.str(ab) || ab.size() != t.a.size() ||
+                            !r.str(yb) || yb.size() != t.y.size() ||
+                            !r.str(wb) || wb.size() != t.wh.size() ||
+                            !r.str(h1b) || h1b.size() != t.w1h.size())
+                            return fail("truncated brain transition vecs");
+                        std::memcpy(t.s.data(), sb.data(), sb.size());
+                        std::memcpy(t.a.data(), ab.data(), ab.size());
+                        std::memcpy(t.y.data(), yb.data(), yb.size());
+                        std::memcpy(t.wh.data(), wb.data(), wb.size());
                         std::memcpy(t.w1h.data(), h1b.data(), h1b.size());
                     }
-                }
-                if (fmt >= 23) {               // v23: invention tried-set
                     if (!r.get(s.tried_next))
                         return fail("truncated brain tried");
                     for (std::uint64_t& k : s.tried)
                         if (!r.get(k)) return fail("truncated brain tried");
+                    bs->slots.emplace(nid, std::move(s));
+                } else {
+                    // ---- v20..v28 legacy monolithic brain: parse-and-discard --
+                    // The old MLP/minGRU slot cannot map onto the connectome;
+                    // brains regenerate lazily via brain_slot() on the next
+                    // decide. We still consume the bytes to keep the stream
+                    // aligned.
+                    std::int32_t l_hidden = 0, l_lr = 0, l_td = 0, l_ms = 0;
+                    std::uint64_t l_woff = 0, l_wbytes = 0;
+                    if (!r.get(l_hidden) || !r.get(l_lr) || !r.get(l_td) ||
+                        !r.get(l_ms) || !r.get(l_woff) || !r.get(l_wbytes))
+                        return fail("truncated brain slot");
+                    std::string wblob, hblob, ablob;
+                    if (!r.str(wblob) || wblob.size() != l_wbytes)
+                        return fail("truncated brain weights");
+                    if (!r.str(hblob) || hblob.size() != 128 * sizeof(std::int16_t))
+                        return fail("truncated brain hidden");
+                    if (!r.str(ablob) || ablob.size() != kActionVerbs)
+                        return fail("truncated brain action");
+                    std::int32_t l_rn = 0, l_rc = 0;
+                    std::int64_t l_mp = 0, l_mf = 0;
+                    if (!r.get(l_rn) || !r.get(l_rc) ||
+                        !r.get(l_mp) || !r.get(l_mf))
+                        return fail("truncated brain replay head");
+                    constexpr std::size_t kLegacyFastLen =
+                        static_cast<std::size_t>(kLabelChannels) * 96;
+                    std::string fblob, anblob;
+                    if (!r.str(fblob) || fblob.size() != kLegacyFastLen ||
+                        !r.str(anblob) || anblob.size() != kLegacyFastLen)
+                        return fail("truncated brain plasticity");
+                    for (int ti = 0; ti < 16; ++ti) {
+                        std::uint8_t tv = 0;
+                        std::uint64_t teid = 0;
+                        std::uint16_t tsig = 0, tch = 0;
+                        if (!r.get(tv) || !r.get(teid) || !r.get(tsig) ||
+                            !r.get(tch)) return fail("truncated brain transition");
+                        std::string sb, ab, yb, wb;
+                        if (!r.str(sb) || !r.str(ab) || !r.str(yb) || !r.str(wb))
+                            return fail("truncated brain transition vecs");
+                        if (fmt >= 21) {
+                            std::string h1b;
+                            if (!r.str(h1b))
+                                return fail("truncated brain transition w1h");
+                        }
+                    }
+                    if (fmt >= 23) {
+                        std::int32_t l_tn = 0;
+                        if (!r.get(l_tn)) return fail("truncated brain tried");
+                        for (int ti = 0; ti < 64; ++ti) {
+                            std::uint64_t k = 0;
+                            if (!r.get(k)) return fail("truncated brain tried");
+                        }
+                    }
                 }
-                bs->slots.emplace(nid, std::move(s));
             }
             if (!r.get(bs->wm_err_sum) || !r.get(bs->wm_n) ||
                 !r.get(bs->sigma_sum) || !r.get(bs->sigma_n) ||

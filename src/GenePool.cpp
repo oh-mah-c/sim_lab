@@ -16,7 +16,7 @@ namespace simlab {
 namespace {
 
 constexpr std::uint32_t kMagic = 0x31475053;   // "SPG1"
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;   // v29: connectome param block, not weights
 
 std::uint64_t mix(std::uint64_t h, std::uint64_t v) {
     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
@@ -75,8 +75,10 @@ struct Reader {
 // ---- hall-of-fame bookkeeping -------------------------------------------------
 
 static bool entry_sane(const GenePoolEntry& e) {
-    return e.brain.valid && !e.brain.slow.empty() &&
-           e.brain.slow.size() == brain_layout_h(e.brain.hidden).total_bytes;
+    // v29: pool entries carry the kConnectomeBytes connectome parameter
+    // block (module pops, LIF baselines, E/I, tract gains) — not weights.
+    return e.brain.valid &&
+           e.brain.slow.size() == kConnectomeBytes;
 }
 
 void GenePool::consider(GenePoolEntry e) {
@@ -120,27 +122,15 @@ bool GenePool::derive(std::uint64_t world_seed, EntityId npc,
 
     const std::size_t i1 = static_cast<std::size_t>((h >> 8) % n);
     const std::size_t i2 = static_cast<std::size_t>((h >> 24) % n);
-    // donors must share a hidden size for the block crossover to be legal
-    const std::int32_t H = entries_[i1].brain.hidden;
-    const GenePoolEntry* e1 = nullptr;
-    const GenePoolEntry* e2 = nullptr;
-    for (std::size_t k = 0; k < n && (!e1 || !e2); ++k) {
-        const GenePoolEntry& c = entries_[(i1 + k) % n];
-        if (!e1 && c.brain.hidden == H && !c.brain.slow.empty()) e1 = &c;
-    }
-    for (std::size_t k = 0; k < n && !e2; ++k) {
-        const GenePoolEntry& c = entries_[(i2 + k) % n];
-        if (c.brain.hidden == H && !c.brain.slow.empty() &&
-            (!e1 || &c != e1 || n == 1)) { e2 = &c; break; }
-    }
-    if (!e1) return false;
-    if (!e2) e2 = e1;
+    const GenePoolEntry* e1 = &entries_[i1];
+    const GenePoolEntry* e2 = &entries_[i2];
+    if (e2 == e1 && n > 1) e2 = &entries_[(i2 + 1) % n];
 
     const BrainGenome& ga = e1->brain;
     const BrainGenome& gb = e2->brain;
     BrainGenome g;
     g.valid = true;
-    g.hidden = H;
+    g.hidden = ga.hidden;
     auto pick = [&](std::int32_t x, std::int32_t y, std::uint64_t f) {
         return (mix(world_seed ^ (static_cast<std::uint64_t>(npc) << 1), f) & 1)
                    ? y : x;
@@ -149,34 +139,23 @@ bool GenePool::derive(std::uint64_t world_seed, EntityId npc,
     g.trace_decay = pick(ga.trace_decay, gb.trace_decay, 2);
     g.mut_scale = pick(ga.mut_scale, gb.mut_scale, 3);
 
-    const BrainLayout& L = brain_layout_h(H);
-    const std::size_t nb = L.total_bytes;
-    g.slow.assign(nb, 0);
-    // block crossover: 64-byte blocks from either donor, hash-picked
-    for (std::size_t blk = 0; blk * 64 < nb; ++blk) {
-        const GenePoolEntry& src =
+    // block crossover on the connectome parameter block (64-byte blocks)
+    g.slow.assign(kConnectomeBytes, 0);
+    for (std::size_t blk = 0; blk * 64 < kConnectomeBytes; ++blk) {
+        const BrainGenome& src =
             (mix(world_seed ^ (static_cast<std::uint64_t>(npc) << 1),
-                 blk + 100) & 1) ? *e2 : *e1;
-        const std::size_t cnt = std::min<std::size_t>(64, nb - blk * 64);
+                 blk + 100) & 1) ? gb : ga;
+        const std::size_t cnt =
+            std::min<std::size_t>(64, kConnectomeBytes - blk * 64);
         const std::size_t soff = blk * 64;
-        if (soff + cnt <= src.brain.slow.size())
-            std::memcpy(g.slow.data() + soff, src.brain.slow.data() + soff, cnt);
+        if (soff + cnt <= src.slow.size())
+            std::memcpy(g.slow.data() + soff, src.slow.data() + soff, cnt);
     }
-    // light mutation at the child's own mut_scale
-    brain_mutate_blocks(g.slow.data(), static_cast<std::int64_t>(nb),
+    // light mutation at the child's own mut_scale, then domain sanitize
+    brain_mutate_blocks(g.slow.data(),
+                        static_cast<std::int64_t>(g.slow.size()),
                         world_seed, npc, 0, 3, g.mut_scale);
-    // clamp int16 bias regions (byte crossover can produce bad halves)
-    auto clamp_bias = [&](std::uint32_t boff, std::uint32_t rows) {
-        std::int16_t* bp = reinterpret_cast<std::int16_t*>(g.slow.data() + boff);
-        for (std::uint32_t i = 0; i < rows; ++i)
-            bp[i] = static_cast<std::int16_t>(
-                std::max<std::int64_t>(-4096, std::min<std::int64_t>(4095, bp[i])));
-    };
-    const std::int32_t Hh = g.hidden;
-    clamp_bias(L.embed_b, Hh); clamp_bias(L.zb, Hh); clamp_bias(L.hb, Hh);
-    clamp_bias(L.m1b, 32);    clamp_bias(L.m2b, 8);
-    clamp_bias(L.w1b, 64);    clamp_bias(L.w2b, 16); clamp_bias(L.aqb, 16);
-    clamp_bias(L.wm1b, 96);   clamp_bias(L.wm2b, 25); clamp_bias(L.valb, 1);
+    brainnet_sanitize(g.slow);
     out = std::move(g);
     return true;
 }
