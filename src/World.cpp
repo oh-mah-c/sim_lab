@@ -700,10 +700,10 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     }
     constexpr std::int64_t kDefaultMetabolism = 2000;
     bool touched = false;
-    auto bump = [&](PropId p, std::int64_t rate) {
-        if (p == kNoProp || !prop_of(e, p)) return;
+    auto bumpd = [&](PropId p, std::int64_t delta) {
+        if (p == kNoProp || !prop_of(e, p) || delta <= 0) return;
         const std::int64_t cur = prop_int(e, p, 0);
-        const std::int64_t nxt = std::min<std::int64_t>(1000, cur + rate * dt);
+        const std::int64_t nxt = std::min<std::int64_t>(1000, cur + delta);
         if (nxt == cur) return;
         StateChange ch;
         ch.entity = e.id; ch.prop = p; ch.had_before = true;
@@ -711,6 +711,9 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
         e.props.set(p, Value::integer(nxt));
         ev.changes.push_back(ch);
         touched = true;
+    };
+    auto bump = [&](PropId p, std::int64_t rate) {
+        bumpd(p, rate * dt);
     };
     if (np.age != kNoProp && !e.genome.loci.empty()) {
         const std::int64_t cur = prop_int(e, np.age, 0);
@@ -782,14 +785,73 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
     }
     if (has_need && met > 0) {
         const std::int64_t h_rate = met / 1000;
+        const std::int64_t t_rate = met / 500;
+        // ALife juvenile runway: growing animals (age < adult_age) accrue
+        // hunger/thirst at `juvenile_need_scale` permille — a biological
+        // growth-metabolism discount, not a behavioral crutch. Fractional
+        // credit persists in need_accum_* props so per-tick and batched
+        // (dormant LOD) drift stay bit-identical.
+        bool juvenile = false;
+        std::int64_t jscale = 1000, jh_acc0 = 0, jt_acc0 = 0;
+        {
+            const PropId p_ad = SIMLAB_PID(props, "adult_age");
+            if (np.age != kNoProp && p_ad != kNoProp &&
+                prop_of(e, np.age) && prop_of(e, p_ad)) {
+                const std::int64_t a = prop_int(e, np.age, 0);
+                const std::int64_t ad = prop_int(e, p_ad, 200);
+                if (ad > 0 && a >= 0 && a < ad) juvenile = true;
+            }
+            if (juvenile) {
+                // species-scoped metabolic discount: only organisms whose
+                // species declares `juvenile_need_scale` get the runway —
+                // absent prop means full adult metabolism from birth.
+                const PropId p_js = SIMLAB_PID(props, "juvenile_need_scale");
+                jscale = (p_js != kNoProp && prop_of(e, p_js))
+                    ? prop_int(e, p_js, 1000) : 1000;
+                if (jscale >= 1000) juvenile = false;
+            }
+            if (juvenile) {
+                const PropId p_ha = SIMLAB_PID(props, "need_accum_hunger");
+                const PropId p_ta = SIMLAB_PID(props, "need_accum_thirst");
+                jh_acc0 = p_ha != kNoProp ? prop_int(e, p_ha, 0) : 0;
+                jt_acc0 = p_ta != kNoProp ? prop_int(e, p_ta, 0) : 0;
+            }
+        }
+        // permille applied this window; sub-permille remainder persists
+        auto need_delta = [&](PropId accp, std::int64_t rate,
+                              std::int64_t acc0) -> std::int64_t {
+            if (!juvenile || jscale >= 1000 || accp == kNoProp)
+                return rate * dt;
+            const bool had = prop_of(e, accp) != nullptr;
+            const std::int64_t a1 = acc0 + rate * dt * jscale;
+            const std::int64_t applied = a1 / 1000;
+            const std::int64_t rem = a1 % 1000;
+            if (rem != acc0 || !had) {
+                StateChange ch;
+                ch.entity = e.id; ch.prop = accp; ch.had_before = had;
+                ch.before = had ? Value::integer(acc0)
+                                : Value::integer(0);
+                ch.after = Value::integer(rem);
+                e.props.set(accp, ch.after);
+                ev.changes.push_back(ch);
+                touched = true;
+            }
+            return applied;
+        };
+        const PropId p_ha = SIMLAB_PID(props, "need_accum_hunger");
+        const PropId p_ta = SIMLAB_PID(props, "need_accum_thirst");
+        const std::int64_t h_win = has_h
+            ? need_delta(p_ha, h_rate, jh_acc0) : 0;
+        const std::int64_t t_win = has_t
+            ? need_delta(p_ta, t_rate, jt_acc0) : 0;
         if (brain_drop == 0) {
-            bump(np.hunger, h_rate);
+            bumpd(np.hunger, h_win);
         } else if (has_h) {
             // metabolic brain tax lands as a flat window total on top of
-            // the metabolic rate (same clamp as bump()).
+            // the metabolic rate (same clamp as bumpd()).
             const std::int64_t cur = prop_int(e, np.hunger, 0);
             const std::int64_t nxt = std::min<std::int64_t>(
-                1000, cur + h_rate * dt + brain_drop);
+                1000, cur + h_win + brain_drop);
             if (nxt != cur) {
                 StateChange ch;
                 ch.entity = e.id; ch.prop = np.hunger; ch.had_before = true;
@@ -800,7 +862,7 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                 touched = true;
             }
         }
-        bump(np.thirst, met / 500);
+        bumpd(np.thirst, t_win);
         // conditioning: a trained body accrues baseline fatigue slower
         // (same effort factor as charge_effort / swim strokes).
         std::int64_t fat_rate = met / 2000;
@@ -918,7 +980,11 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
             }
         }
         if (np.integrity != kNoProp) {
-            const std::int64_t rh = h_rate, rt = met / 500;
+            // starvation onset: per-tick need rate -> ticks until 950.
+            // Juveniles accrue at jscale permille through the Euclid
+            // accumulator, so the crossing uses the exact fractional
+            // trajectory need(t) = cur + floor((acc0 + rate*jscale*t)/1000).
+            const std::int64_t rh = h_rate, rt = t_rate;
             auto first_starving = [&](bool has, std::int64_t cur,
                                       std::int64_t rate) {
                 if (!has) return std::numeric_limits<std::int64_t>::max();
@@ -926,9 +992,22 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                 if (rate <= 0) return std::numeric_limits<std::int64_t>::max();
                 return (950 - cur + rate - 1) / rate;    // ceil, 1-indexed
             };
-            const std::int64_t s = std::min(
-                first_starving(has_h, h_start, rh),
-                first_starving(has_t, t_start, rt));
+            auto first_starving_juv = [&](bool has, std::int64_t cur,
+                                          std::int64_t rate,
+                                          std::int64_t acc0) {
+                if (!has) return std::numeric_limits<std::int64_t>::max();
+                if (cur >= 950) return std::int64_t{1};
+                const std::int64_t r = rate * jscale;
+                if (r <= 0) return std::numeric_limits<std::int64_t>::max();
+                const std::int64_t need_pm = (950 - cur) * 1000 - acc0;
+                if (need_pm <= 0) return std::int64_t{1};
+                return (need_pm + r - 1) / r;            // ceil, 1-indexed
+            };
+            const std::int64_t s = juvenile
+                ? std::min(first_starving_juv(has_h, h_start, rh, jh_acc0),
+                           first_starving_juv(has_t, t_start, rt, jt_acc0))
+                : std::min(first_starving(has_h, h_start, rh),
+                           first_starving(has_t, t_start, rt));
             const std::int64_t starving = s <= dt ? dt - s + 1 : 0;
             if (starving > 0) {
                 // spec 2.3: scarcity survival is lineage fitness evidence —

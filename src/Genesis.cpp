@@ -227,8 +227,12 @@ PrimordialWorld build_primordial(World& w, const PrimordialParams& pp) {
                 if (const Value* mv = sp->props.get(pm)) pb.set(pe, Value::integer(mv->i));
             if (const PropId lr = pid("last_reproduce"); lr != kNoProp) pb.set(lr, Value::integer(0));
             if (p_age != kNoProp)
-                pb.set(p_age, Value::integer(adult + static_cast<std::int64_t>(
-                                                 ghash(pp.seed, t * 64 + i, 0xA6Eu) % 200)));
+                // founding bands arrive YOUNG: ages spread 0..adult+199 so
+                // most members get the juvenile developmental runway
+                // (cheap metabolism while they learn) before maturity.
+                pb.set(p_age, Value::integer(static_cast<std::int64_t>(
+                    ghash(pp.seed, t * 64 + i, 0xA6E) %
+                    static_cast<std::uint64_t>(adult + 200))));
             const Vec2 pos{home.x + (i % 4) * 24 - 36, home.y + (i / 4) * 24 - 24};
             const EntityId id = w.create_entity(sp->name, sp->material, pos, pb);
             if (id == kNoEntity) continue;

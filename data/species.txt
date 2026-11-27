@@ -426,7 +426,7 @@ species sapient
   condition vegetation 200 1000
   sight_range 600
   speed 5500
-  metabolism 1600
+  metabolism 1100
   hunger 200
   thirst 200
   fatigue 100
@@ -437,6 +437,7 @@ species sapient
   gene plasticity
   fertility 400
   adult_age 250
+  juvenile_need_scale 400
   mutation_rate 40
   energy 80000
   max_energy 120000

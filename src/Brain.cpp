@@ -167,6 +167,19 @@ BrainGenome brain_founder_genome(std::uint64_t world_seed, EntityId npc) {
         const std::int64_t c = kBrainTracts[t].gain / 2;
         set8(18 + t, c + draw(0x300 + t, c / 4), 1, 127);
     }
+    // ALife bootstrap priors: the interoceptive->action and
+    // sensory->executive routes get WIDER heritable variance than the
+    // generic tracts, so founder populations naturally contain
+    // "wired-for-survival" phenotypes (strong Hypothalamus->BG and
+    // Sensory->Thalamus->PFC->Motor coupling). Symmetric spread —
+    // selection, not the prior, decides which direction wins.
+    //   0 Sens->Thal, 2 Thal->PFC, 5 Amyg->Hypo, 8 Hypo->BG,
+    //   10 BG->Motor, 11 PFC->BG, 12 PFC->Motor
+    static const std::size_t kPriorTracts[] = {0, 2, 5, 8, 10, 11, 12};
+    for (std::size_t t : kPriorTracts) {
+        const std::int64_t c = kBrainTracts[t].gain / 2;
+        set8(18 + t, c + draw(0x700 + t, c * 3 / 8), 1, 127);
+    }
     set8(42, 6 + draw(0x42, 3), 0, 16);         // stdp_window
     set8(43, 100 + draw(0x43, 40), 0, 255);     // plastic_rate
     set8(44, 100 + draw(0x44, 40), 0, 255);     // reward_rate
@@ -1283,22 +1296,39 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     if (nallowed == 0) return out;
 
     // ---- nearest remembered entities (same bounded insertion as before) -------
-    struct NearEnt { std::int64_t d2; EntityId id; Vec2 pos; };
-    NearEnt near[kEntitySlots];
+    // Memory recall bandwidth: the live sensor has 4 entity channels, but
+    // action candidacy may recall deeper — a brain can only act on what it
+    // remembers, and 4 slots loses most of the engram store. kMemNear is a
+    // recall-depth parameter, not a world-truth peek: every entry is the
+    // agent's own MemorySnapshot.
+    constexpr int kMemNear = 12;
+    struct NearEnt { std::int64_t d2; EntityId id; Vec2 pos;
+                     std::int64_t memsal; std::int64_t key; };
+    NearEnt near[kMemNear];
     int nnear = 0;
     for (const auto& [kid, snap] : mind->memory) {
         if (kid == npc) continue;
         const std::int64_t dx = snap.pos.x - me->pos.x;
         const std::int64_t dy = snap.pos.y - me->pos.y;
         const std::int64_t d2 = dx * dx + dy * dy;
-        if (nnear == kEntitySlots && d2 >= near[kEntitySlots - 1].d2) continue;
-        int p = nnear < kEntitySlots ? nnear++ : kEntitySlots - 1;
-        while (p > 0 && near[p - 1].d2 > d2) { near[p] = near[p - 1]; --p; }
-        near[p] = {d2, kid, snap.pos};
+        // Affective recall: rank by engram emotional charge (encoded at
+        // perception time from the observer's own needs — a drink seen
+        // while desperate IS a flashbulb memory) blended with proximity.
+        // Neutral memories fall back to nearest-first; trauma-signed
+        // engrams sink. This is the memory system's own retrieval order,
+        // not a world-truth lookup.
+        const std::int64_t chg =
+            std::clamp<std::int64_t>(snap.engram.emotional_charge,
+                                     -4000, 4000);
+        const std::int64_t key = chg * 32 - d2 / 64;
+        if (nnear == kMemNear && key <= near[kMemNear - 1].key) continue;
+        int p = nnear < kMemNear ? nnear++ : kMemNear - 1;
+        while (p > 0 && near[p - 1].key < key) { near[p] = near[p - 1]; --p; }
+        near[p] = {d2, kid, snap.pos, chg, key};
     }
 
     // ---- candidate generation ---------------------------------------------------
-    constexpr int kC = 7;
+    constexpr int kC = 14;
     struct Cand { std::int32_t score; int verb; int tgt; };
     std::array<Cand, kC> cands{};
     int ncand = 0;
@@ -1323,8 +1353,17 @@ BrainChoice brain_decide(World& w, EntityId npc) {
         // consume with no target is a guaranteed no-op (the law iterates
         // ctx.targets) — never worth a candidacy slot
         if (v != 0) consider(vlogit[v] / 16, v, -1);
-        for (int t = 0; t < nnear; ++t)
-            consider(vlogit[v] / 16 + entsal[t] / 16, v, t);
+        for (int t = 0; t < nnear; ++t) {
+            // live-percept channels (4) carry cortical saliency; deeper
+            // recall ranks by the engram's own emotional charge — the
+            // amygdala-modulated memory trace, not a world-truth read.
+            const std::int32_t msal = t < kEntitySlots
+                ? entsal[t] / 16
+                : static_cast<std::int32_t>(
+                      std::clamp<std::int64_t>(near[t].memsal, -4000, 4000)
+                      / 64);
+            consider(vlogit[v] / 16 + msal, v, t);
+        }
     }
 
     // Pure ALife: candidate generation ends here. Every candidate is a

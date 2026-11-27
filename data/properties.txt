@@ -571,3 +571,6 @@ oxygen                integer  permille range 0 1000   domain=biological # blood
 organ_lung_gain       integer  permille range 0 1000   domain=biological # lung expression locus
 organ_gill_gain       integer  permille range 0 1000   domain=biological # gill expression locus
 resp_accum             integer  milli-units range 0 1000000000 domain=biological # respiration Euclid remainder (organ upkeep + O2 exchange)
+need_accum_hunger    integer permille^2 range 0 100000000 domain=need # juvenile need-drift remainder (Euclid LOD, internal)
+need_accum_thirst    integer permille^2 range 0 100000000 domain=need # juvenile need-drift remainder (Euclid LOD, internal)
+juvenile_need_scale  integer permille range 0 1000 domain=biological # juvenile metabolic need discount (default 500)

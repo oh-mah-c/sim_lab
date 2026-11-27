@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <climits>
 #include <sstream>
+#include <unordered_set>
 
 namespace simlab {
 
@@ -992,6 +993,18 @@ std::size_t perceive(World& w, EntityId npc) {
     const MindParams mparams = mind_params(w, *me);
     neuro_touch(w, npc);
 
+    // Self-inventory boundary: entities the observer CARRIES (symbiont
+    // and pathogen "infection"/"pathogen_strain" motes seeded at the body)
+    // or that are its own anatomy PARTS live inside the body wall — they
+    // are interoceptive state (infection_level, anatomy_function), never
+    // external objects. Without this filter a founder's engram store
+    // saturates with dozens of d≈0 self-motes that crowd every real
+    // percept out of memory-recall candidacy.
+    std::unordered_set<EntityId> self_internal;
+    for (const char* rt : {"carries", "part_of"})
+        for (const Relation& r : w.relations_of(npc, rt))
+            self_internal.insert(r.a == npc ? r.b : r.a);
+
     std::size_t added = 0;
     // Phase 12.2: perceived supply per material — what the agent actually
     // SEES nearby becomes its pa:<mat> abundance belief (private economics).
@@ -1033,7 +1046,7 @@ std::size_t perceive(World& w, EntityId npc) {
         else if (!elig && present) fb_cands.erase(pos);
     };
     for (const EntityId eid : w.entities_near(me->pos, range)) {
-        if (eid == npc) continue;
+        if (eid == npc || self_internal.count(eid)) continue;
         const Entity* e = w.find(eid);
         if (!e) continue;
         // Phase 11: the dead are visible only as unburied, uncremated
