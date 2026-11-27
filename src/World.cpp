@@ -5808,6 +5808,16 @@ InteractionResult World::interact(const InteractionContext& ctx) {
         // CL-1 Phase 2: inherited brain installs with slow weights +
         // hyper-genes; h/replay/fast state starts empty (Baldwin).
         if (s.brain.valid) brain_install_spawn(*this, nid, s.brain);
+        // Developmental biology: a sapient newborn expresses its species'
+        // innate reflexes — founders and influx migrants get this at
+        // genesis/wake; births need the same step or they are born
+        // mindless (metabolize only, never act, never reproduce).
+        if (const SpeciesDef* sp = species.find_name(s.kind))
+            if (!sp->innate.empty()) {
+                AgentMind& nm = mind(nid);
+                for (const std::string& v : sp->innate)
+                    nm.learn_action(v);
+            }
         // Epigenetic marks (Nhịp 3): the newborn's AgentMind is born with
         // vague trauma engrams keyed by material/kind — born_memories,
         // never entity memory. Only created when marks actually transmit.

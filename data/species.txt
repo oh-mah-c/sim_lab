@@ -488,6 +488,9 @@ species sapient
   gene immune_power_base
   gene dna_repair_gain
   gene juvenile_need_scale
+  gene adult_age
+  gene reach
+  gene repro_cooldown
 
 # ---- Phase 17: trophic web, seasonal migration & apex predators -------------
 # All behaviour below is emergent from the integer props — the engine holds
