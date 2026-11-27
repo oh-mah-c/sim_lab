@@ -50,9 +50,11 @@ public:
     void submit(std::uint64_t key, const std::string& summary);
 
     // Enqueue a full system+user prompt (chronicle chapters, batched
-    // narration). Same queue/poll contract as submit().
+    // narration). Same queue/poll contract as submit(). `max_new` > 0
+    // overrides Config::max_new_tokens for this job only (long-form
+    // chapters need more room than one-line callouts).
     void submit_prompt(std::uint64_t key, const std::string& sys,
-                       const std::string& user);
+                       const std::string& user, int max_new = 0);
 
     // Fetch a completed narration for `key` (non-blocking). Returns false
     // until the worker finishes it; each key is delivered once.

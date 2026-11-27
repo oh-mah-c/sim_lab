@@ -35,6 +35,8 @@
 #include "simlab/render/Narrative.hpp"
 #include "simlab/render/Globe.hpp"
 #include "simlab/NarrativeHost.hpp"
+#include "simlab/Chronicle.hpp"
+#include "simlab/SunnyChronicle.hpp"
 #include "simlab/GenePool.hpp"
 #include "simlab/Brain.hpp"
 #include <algorithm>
@@ -260,6 +262,10 @@ struct Viewer {
     std::deque<std::uint64_t> llm_ch_outstanding;
     std::string chron_tail;                     // last ~3 sentences of prev chapter
     std::string chron_path;                     // saves/chronicle_<seed>.md
+    // ---- Sunnyworld Chronicle: era-boundary literary novelist -------------
+    // Read-only collector -> NarrativeHost worker -> saves/sunnyworld_
+    // chronicle.md. Lives outside World; cannot affect state_hash().
+    SunnyChronicle sunny_chron;
     int chron_open = -1;                        // expanded chapter row (-1 none)
     static constexpr std::size_t kChronFactCap = 1024;  // facts per chapter window
     std::uint64_t chron_overflow = 0;           // facts dropped past the cap (this window)
@@ -4409,7 +4415,7 @@ struct Viewer {
                 }
                 // LLM chronicler: same incremental ledger scan, salient events
                 // only; results re-enter cfeed tagged llm=true.
-                if (frames % 4 == 2) { llm_scan(w); llm_drain(); mat_scan(w); llm_mat_drain(); myth_scan(w); llm_myth_drain(); chron_tick(w); llm_ch_drain(); }
+                if (frames % 4 == 2) { llm_scan(w); llm_drain(); mat_scan(w); llm_mat_drain(); myth_scan(w); llm_myth_drain(); chron_tick(w); llm_ch_drain(); sunny_chron.tick(w, llm_host.active() ? &llm_host : nullptr); }
                 if (frames % 15 == 2) build_patron_caches();
                 if (avatar != kNoEntity) {
                     c_av_verbs.clear(); c_av_line.clear();

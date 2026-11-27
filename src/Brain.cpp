@@ -131,6 +131,58 @@ BrainGenome brain_default_genome() {
     g.slow[45] = 125;    // mod_sens 1000 permille (/8)
     g.slow[46] = 127;    // rollout_budget 1016 permille (/8, ~always)
     g.slow[47] = 1;      // population profile: 0=min 1=std 2=full
+    g.slow[48] = 100;    // empathy/social sensitivity 800 permille (/8)
+    return g;
+}
+
+// Founder diversity (ALife): generation-0 connectome parameters vary
+// deterministically per entity so natural selection has phenotypic
+// variance to act on from the first generation. Module populations stay
+// canonical (anatomy is fixed); thresholds, leak, tract gains, plasticity,
+// neuromodulator sensitivity, rollout budget and empathy all jitter.
+// Pure hash of (world_seed, npc) — no RNG state, replay-safe.
+BrainGenome brain_founder_genome(std::uint64_t world_seed, EntityId npc) {
+    BrainGenome g = brain_default_genome();
+    const std::uint64_t idh =
+        static_cast<std::uint64_t>(npc) * 0x9E3779B97F4A7C15ull;
+    auto draw = [&](std::uint64_t salt, std::int64_t span) {
+        const std::uint64_t h =
+            Rng::hash(world_seed ^ idh ^ (salt * 0xBF58476D1CE4E5B9ull));
+        return static_cast<std::int64_t>(
+            h % static_cast<std::uint64_t>(2 * span + 1)) - span;
+    };
+    auto set8 = [&](std::size_t i, std::int64_t v, std::int64_t lo,
+                    std::int64_t hi) {
+        g.slow[i] = static_cast<std::int8_t>(clampi(v, lo, hi));
+    };
+    set8(12, 100 + draw(0x12, 20), 40, 160);    // threshold code
+    set8(13, 19 + draw(0x13, 4), 0, 64);        // reset code
+    set8(14, 5 + draw(0x14, 1), 3, 8);          // leak_shift
+    set8(15, 2 + draw(0x15, 1), 1, 6);          // refractory
+    set8(16, 25 + draw(0x16, 8), 0, 127);       // ei permille
+    set8(17, 15 + draw(0x17, 6), 0, 127);       // density permille
+    // tract gains: perturb around each kBrainTracts table default
+    // (slow[t] > 0 overrides gain = slow*2, so centre = gain/2).
+    for (std::size_t t = 0; t < kBrainTractCount; ++t) {
+        const std::int64_t c = kBrainTracts[t].gain / 2;
+        set8(18 + t, c + draw(0x300 + t, c / 4), 1, 127);
+    }
+    set8(42, 6 + draw(0x42, 3), 0, 16);         // stdp_window
+    set8(43, 100 + draw(0x43, 40), 0, 255);     // plastic_rate
+    set8(44, 100 + draw(0x44, 40), 0, 255);     // reward_rate
+    set8(45, 125 + draw(0x45, 40), 0, 127);     // mod_sens
+    set8(46, 127 + draw(0x46, 24), 0, 127);     // rollout_budget
+    // slow[47] population profile stays Standard: Minimal/Full rescale
+    // every module pop and would break the canonical anatomy contract.
+    set8(48, 100 + draw(0x48, 48), 0, 127);     // empathy /8
+    // hyper-genes jitter too (locus overrides still win afterwards)
+    g.lr_permille = static_cast<std::int32_t>(clampi(
+        400 + draw(0x60, 120), 100, 900));
+    g.trace_decay = static_cast<std::int32_t>(clampi(
+        900 + draw(0x61, 200), 400, 1600));
+    g.mut_scale = static_cast<std::int32_t>(clampi(
+        500 + draw(0x62, 200), 100, 1200));
+    brainnet_sanitize(g.slow);
     return g;
 }
 
@@ -155,7 +207,8 @@ void brainnet_sanitize(std::vector<std::int8_t>& slow) {
     cl(slow[45], 0, 127);   // mod_sens /8 permille
     cl(slow[46], 0, 127);   // rollout_budget /8 permille
     cl(slow[47], 0, 2);     // population profile enum
-    // 48..95 reserved: keep raw int8 (future parameters)
+    cl(slow[48], 0, 127);   // empathy /8 permille
+    // 49..95 reserved: keep raw int8 (future parameters)
 }
 
 BrainNetParams brainnet_params_of(const BrainGenome& g) {
@@ -546,74 +599,57 @@ std::uint64_t social_key_of(EntityId id) {
     return Rng::hash(static_cast<std::uint64_t>(id) ^
                      0x5DEECE66DULL);
 }
-// Edibility of a remembered snapshot — mirrors Driver's snapshot_food:
-// a fruiting plant feeds through `fruit_material` while `fruit_count` > 0
-// (bare branch = not food); everything else feeds through its own
-// material's nutrition/hydration World-Truth props. Returns {nutrition,
-// hydration} permille (0,0 = inedible). Reads ONLY the mind's memory
-// snapshot — never live world state — so recall blur and forgetting
-// apply honestly.
-std::pair<std::int64_t, std::int64_t>
-snapshot_food_nh(const World& w, const AgentMind::MemorySnapshot& s) {
-    // contained entities (anatomy parts, pocketed goods) are skipped by
-    // predict_consume — chasing a "grazer/torso" is a guaranteed failure.
-    // When the snapshot lacks the prop, fall back to the anatomy naming
-    // convention ("species/part") so live parts are still excluded.
-    {
-        const PropId cont = SIMLAB_PID(w.props, "contained");
-        bool known = false, val = false;
-        if (cont != kNoProp) {
-            const auto cit = s.props.find(cont);
-            if (cit != s.props.end() &&
-                cit->second.type == ValType::Boolean) {
-                known = true; val = cit->second.b;
-            }
-        }
-        if ((known && val) ||
-            (!known && s.kind_name.find('/') != std::string::npos))
-            return {0, 0};
+// Doctrine triggers evaluated against the mind's own memory snapshot —
+// the observable props/material/kind the engram actually recorded, never
+// live entity state (pure ALife sensory honesty). Mirrors
+// doctrine_trigger_hits in Cognition.cpp but reads MemorySnapshot.
+bool snap_trigger_hits(const World& w,
+                       const AgentMind::MemorySnapshot& s,
+                       const AgentMind::DoctrineSlot& d) {
+    switch (d.trig_kind) {
+    case 0: {   // remembered prop threshold
+        if (d.trig_prop == kNoProp) return false;
+        const auto it = s.props.find(d.trig_prop);
+        return it != s.props.end() &&
+               it->second.type == ValType::Integer &&
+               it->second.i >= d.trig_thr;
     }
-    MaterialId mat = s.material;
-    bool fruiting = false;
-    const PropId fmp = SIMLAB_PID(w.props, "fruit_material");
-    if (fmp != kNoProp) {
-        const auto fit = s.props.find(fmp);
-        if (fit != s.props.end() && fit->second.type == ValType::Text &&
-            !fit->second.s.empty()) {
-            const MaterialId fm = w.materials.id_of(fit->second.s);
-            if (fm != kNoMaterial) { mat = fm; fruiting = true; }
-        }
+    case 1:     // remembered material
+        return static_cast<std::uint64_t>(s.material) == d.trig_id;
+    case 2: {   // synthesized recipe: remembered material must be that synth
+        if (s.material == kNoMaterial) return false;
+        for (const World::SynthRecord& r : w.synthesized_)
+            if (r.synth_id == d.trig_id &&
+                static_cast<std::uint64_t>(r.material) ==
+                    static_cast<std::uint64_t>(s.material))
+                return true;
+        return false;
     }
-    if (fruiting) {
-        const PropId fcp = SIMLAB_PID(w.props, "fruit_count");
-        const auto cit = s.props.find(fcp);
-        if (cit != s.props.end() && cit->second.type == ValType::Integer &&
-            cit->second.i <= 0)
-            return {0, 0};                     // bare branch — nothing to eat
+    case 3:     // remembered kind name
+        return s.kind_name == d.trig_text;
     }
-    const MaterialDef* md = w.materials.find(mat);
-    if (!md) return {0, 0};
-    const PropId nut = SIMLAB_PID(w.props, "nutrition");
-    const PropId hyd = SIMLAB_PID(w.props, "hydration");
-    auto mp = [&](PropId p) -> std::int64_t {
-        if (p == kNoProp) return 0;
-        const auto it = md->props.find(p);
-        return it == md->props.end() ? 0 : it->second.i;
-    };
-    return {mp(nut), mp(hyd)};
+    return false;
 }
-// integer sqrt (Newton) — deterministic, no floats
-std::int64_t isqrt64(std::int64_t x) {
-    if (x <= 0) return 0;
-    std::int64_t r = x, b = (r + 1) / 2;
-    while (b < r) { r = b; b = (r + x / r) / 2; }
-    return r;
+
+// doctrine_bias_for re-grounded on memory: same valence/calm math as the
+// legacy planner's version, but the trigger reads the snapshot and the
+// starvation override reads the brain's own hunger drive.
+std::int64_t snap_doctrine_bias(const World& w, const AgentMind& mind,
+                                const AgentMind::MemorySnapshot& snap,
+                                int verb, std::int64_t drive_hunger) {
+    if (mind.doctrines.empty()) return 0;
+    if (drive_hunger > 900) return 0;   // starving — dogma yields to gut
+    std::int64_t bias = 0;
+    for (const AgentMind::DoctrineSlot& d : mind.doctrines) {
+        if (d.verb >= 0 && d.verb != verb) continue;
+        if (!snap_trigger_hits(w, snap, d)) continue;
+        const std::int64_t calm =
+            1000 - std::min<std::int64_t>(mind.neuro.panic, 1000);
+        bias += d.valence * calm / 4000;
+    }
+    return bias;
 }
-// 16 compass directions ~unit length (integer, no floats) — forage probe
-// rings pick one deterministically per (npc, tick bucket).
-constexpr std::int32_t kProbeDirs[16][2] = {
-    {16, 0}, {15, 5}, {11, 11}, {5, 15}, {0, 16}, {-5, 15}, {-11, 11}, {-15, 5},
-    {-16, 0}, {-15, -5}, {-11, -11}, {-5, -15}, {0, -16}, {5, -15}, {11, -11}, {15, -5}};
+
 BrainSocial* social_find(BrainCognition& c, std::uint64_t key) {
     BrainSocial* empty = nullptr;
     for (BrainSocial& s : c.social) {
@@ -638,51 +674,37 @@ void brain_goals_update(World& w, BrainSlot& s,
     BrainVital& v = s.vital;
     BrainCognition& c = s.cog;
     const std::uint64_t tick = w.clock_.tick();
-    struct Want { std::int32_t verb; std::int16_t pri; std::uint8_t org; };
-    Want wants[8]; int nw = 0;
-    auto add = [&](int verb, std::int64_t pri, int org) {
-        if (nw < 8 && pri > 200) wants[nw++] = {
-            verb, static_cast<std::int16_t>(clampi(pri, 0, 1000)),
-            static_cast<std::uint8_t>(org)};
+    // Pure ALife: no drive->verb translation table. Hypothalamic drives
+    // reach the Basal Ganglia through the connectome's own tracts
+    // (Hypothalamus->BG). Goals record ONLY interoceptive salience —
+    // which homeostatic pressure is high and how strongly — never a
+    // suggested action (verb stays -1, so the goal-bias term below can
+    // never fire). BG verb selection remains purely neural.
+    static const struct { std::uint8_t origin; std::int16_t BrainVital::*drv; } kDrv[] = {
+        {1, &BrainVital::drive_hunger}, {2, &BrainVital::drive_thirst},
+        {3, &BrainVital::drive_fatigue}, {4, &BrainVital::drive_temp},
+        {5, &BrainVital::drive_stress},  {6, &BrainVital::drive_repro},
     };
-    if (v.drive_hunger > 550)  add(0, v.drive_hunger, 0);   // consume
-    if (v.drive_thirst > 550)  add(0, v.drive_thirst, 0);
-    if (v.drive_fatigue > 550 || v.sleep_pressure > 500)
-        add(4, std::max<std::int64_t>(v.drive_fatigue, v.sleep_pressure), 0);
-    if (v.drive_stress > 600)  add(4, v.drive_stress, 1);   // rest/flee
-    if (v.emo[kBEmoCuriosity] > 600) {
-        // exploration: untried invention verbs
-        add(9, v.emo[kBEmoCuriosity], 2);
-        add(10, v.emo[kBEmoCuriosity] * 3 / 4, 2);
-    }
-    if (mind && !mind->known_actions.empty()) {
-        // social goal when conspecifics are remembered (live engrams)
-        std::size_t nmem = 0;
-        for (const auto& [kid, snap] : mind->memory)
-            if (kid != kNoEntity && snap.engram.clarity > 0) ++nmem;
-        if (nmem > 0) add(12, 350 + std::min<std::int64_t>(nmem, 6) * 60, 3);
-    }
-    // write top wants into goal slots (stable: refresh by origin+verb)
-    for (int wi = 0; wi < nw; ++wi) {
-        const Want& wt = wants[wi];
-        BrainGoal* slot = nullptr;
-        for (BrainGoal& g : c.goals)
-            if (g.active && g.verb == wt.verb && g.origin == wt.org) {
-                slot = &g; break;
-            }
-        if (!slot) {
-            for (BrainGoal& g : c.goals)
-                if (!g.active) { slot = &g; break; }
-            if (!slot) {
-                // evict lowest priority
-                slot = &c.goals[0];
-                for (BrainGoal& g : c.goals)
-                    if (g.priority < slot->priority) slot = &g;
-            }
-            slot->verb = wt.verb; slot->origin = wt.org; slot->target = 0;
+    for (const auto& d : kDrv) {
+        const std::int64_t drive = v.*(d.drv);
+        if (drive <= 500) continue;
+        BrainGoal* g = nullptr;
+        for (BrainGoal& cand : c.goals)
+            if (cand.active && cand.origin == d.origin) { g = &cand; break; }
+        if (!g) {
+            for (BrainGoal& cand : c.goals)
+                if (!cand.active) { g = &cand; break; }
         }
-        slot->priority = wt.pri; slot->last = tick; slot->active = true;
+        if (!g) continue;
+        g->verb = -1;
+        g->target = 0;
+        g->priority = static_cast<std::int16_t>(
+            std::min<std::int64_t>(drive, 1000));
+        g->origin = d.origin;
+        g->last = tick;
+        g->active = true;
     }
+    (void)mind;
     // deactivate stale goals (not refreshed for 4000 ticks)
     for (BrainGoal& g : c.goals)
         if (g.active && tick - g.last > 4000) g.active = false;
@@ -761,7 +783,10 @@ BrainSlot& brain_slot(World& w, BrainStore& store, EntityId npc,
         if (w.gene_pool && w.gene_pool->derive(w.world_seed, npc, poolg)) {
             g = poolg;
         } else {
-            g = brain_default_genome();
+            // ALife: founders get a deterministic per-entity genome so
+            // generation-0 carries selectable phenotypic variance instead
+            // of 12 identical Standard connectomes.
+            g = brain_founder_genome(w.world_seed, npc);
             const Entity* ge = w.find(npc);
             g.lr_permille = static_cast<std::int32_t>(
                 brain_locus(w, ge, "brain_lr", 400));
@@ -886,12 +911,6 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
                 clampi(static_cast<std::int64_t>(s.vital.mod[kBModCortisol]) +
                            120, 0, 1000));
         }
-        // feeding site becomes the home anchor: homing returns the agent
-        // to where resources actually are, not where it first spawned
-        if (verb_idx == 0 && !ev.failed) {
-            const Entity* me2 = w.find(npc);
-            if (me2) { s.home_pos = me2->pos; s.home_valid = true; }
-        }
         // cerebellar motor error: move verbs get prediction-error current
         if (verb_idx >= 0 && me) {
             const char* vn = sensor_verb_table()[verb_idx];
@@ -942,7 +961,12 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     // spec §13.2). The RPE sets last_rpe (dopamine target next vital_tick)
     // and gates synaptic plasticity on currently-eligible synapses.
     {
-        const std::int64_t actual = clampi(y[24], -1000, 1000);
+        // Pure ALife RPE: `actual` is the measured outcome label only.
+        // No flat failure constants and no hardcoded moral lookups —
+        // conspecific harm is aversive only when the BODY pays for it
+        // (pain, lost energy, cortisol), which y[24]/charge already
+        // encode through the somatic channels.
+        std::int64_t actual = clampi(y[24], -1000, 1000);
         if (verb_idx >= 0) {
             std::int16_t& exp = s.vital.exp_rew[verb_idx];
             const std::int64_t rpe = actual - exp;
@@ -1052,43 +1076,14 @@ void brain_post(World& w, EntityId npc, const CausalEvent& ev) {
     }
 
     // ---- open-ended invention: mark tried combos (curiosity bookkeeping) ----
+    // Pure ALife: no injected novelty dopamine — a fresh transform earns
+    // whatever the outcome label says it earned.
     {
         int verb = -1;
         for (int i = 0; i < kActionVerbs; ++i)
             if (p.a[i] == 100) { verb = i; break; }
-        if (verb >= 0 && invent_verb(verb) && p.pm_a != kNoMaterial) {
-            const std::uint64_t ikey = invent_key(verb, p.pm_a, p.pm_b);
-            const bool fresh = !invent_tried(s, ikey);
-            invent_mark(s, ikey);
-            // novelty dopamine: fresh safe transform -> extra BG current
-            if (fresh && sigma >= 400) {
-                const Entity* me = w.find(npc);
-                std::int64_t safety = 0;
-                if (me) {
-                    const PropId hp = SIMLAB_PID(w.props, "hunger"),
-                                   tp = SIMLAB_PID(w.props, "thirst");
-                    const std::int64_t hunger =
-                        hp != kNoProp ? w.prop_int(*me, hp, 0) : 0;
-                    const std::int64_t thirst =
-                        tp != kNoProp ? w.prop_int(*me, tp, 0) : 0;
-                    const std::int64_t panic =
-                        mind ? mind->neuro.panic : 0;
-                    safety = std::max<std::int64_t>(
-                        0, 1000 - std::max(hunger, thirst) - panic);
-                }
-                if (safety > 500) {
-                    BrainNet& net = s.net;
-                    const BrainModuleState& bg =
-                        net.modules[static_cast<int>(
-                            BrainModule::kBasalGanglia)];
-                    for (std::uint32_t i = 0; i < bg.count; ++i)
-                        net.inject(static_cast<std::uint8_t>(
-                                       BrainModule::kBasalGanglia),
-                                   static_cast<std::int32_t>(i), 120);
-                    net.step();
-                }
-            }
-        }
+        if (verb >= 0 && invent_verb(verb) && p.pm_a != kNoMaterial)
+            invent_mark(s, invent_key(verb, p.pm_a, p.pm_b));
     }
 }
 
@@ -1332,273 +1327,15 @@ BrainChoice brain_decide(World& w, EntityId npc) {
             consider(vlogit[v] / 16 + entsal[t] / 16, v, t);
     }
 
-    // ---- forage cache (spec §4.5 drives -> §9 foraging) -----------------------
-    // Nearest remembered edible entity, refreshed ~every 32 decides while a
-    // homeostatic drive is high. Amortizes the O(memory) edibility scan;
-    // tgt == -3 marks the cached target in the candidate list.
-    const std::int64_t forage_drive = std::max<std::int64_t>(
-        s.vital.drive_hunger, s.vital.drive_thirst);
-    const std::int64_t wh =
-        std::max<std::int64_t>(0, s.vital.drive_hunger - 300);
-    const std::int64_t wt =
-        std::max<std::int64_t>(0, s.vital.drive_thirst - 300);
-    // ---- exploration restlessness (spec §4.5 drives -> §9 roaming) ---------
-    // Ring of recent decide positions: lingering on one spot decays novelty.
-    // Satiety converts staleness into an exploration drive that biases move
-    // toward fresh territory — pure drive arithmetic, no movement scripts.
-    s.visit[s.visit_n % 16] = me->pos;
-    ++s.visit_n;
-    std::int64_t explore_drive = 0;
-    {
-        const std::int32_t vn = std::min(s.visit_n, 16);
-        std::int64_t same_area = 0;
-        for (std::int32_t i = 0; i < vn; ++i) {
-            const Vec2& vp = s.visit[i];
-            const std::int64_t ddx = vp.x - me->pos.x;
-            const std::int64_t ddy = vp.y - me->pos.y;
-            if (ddx * ddx + ddy * ddy <= 24 * 24) ++same_area;
-        }
-        const std::int64_t satiety = 1000 - std::max<std::int64_t>(
-            std::max<std::int64_t>(s.vital.drive_hunger,
-                                   s.vital.drive_thirst),
-            std::max<std::int64_t>(s.vital.drive_fatigue,
-                                   s.vital.sleep_pressure));
-        // staleness 0..1000 -> explore 0..1000, only when well-fed
-        const std::int64_t stale_pm =
-            vn > 0 ? same_area * 1000 / vn : 0;
-        explore_drive = satiety * stale_pm / 1000;
-    }
-    // roaming only when genuinely unpressured — any hunger/thirst drive
-    // above the forage threshold hands control back to survival
-    const bool exploring = explore_drive > 350 && forage_drive < 350;
-    if (forage_drive > 400 &&
-        net.tick - s.forage_tick >= (forage_drive > 700 ? 64 : 256)) {
-        s.forage_tick = net.tick;
-        // Need-weighted target: a thirsty agent prefers water even when a
-        // nearer bush scores higher on raw edibility; distance discounts
-        // targets too far to reach before the drive peaks.
-        std::int64_t best_v = 0, best_d2 = INT64_MAX;
-        EntityId best_id = kNoEntity;
-        Vec2 best_pos{0, 0};
-        for (const auto& [kid, snap] : mind->memory) {
-            if (kid == npc) continue;
-            const auto nh = snapshot_food_nh(w, snap);
-            if (nh.first + nh.second <= 0) continue;
-            const std::int64_t v = nh.first * wh + nh.second * wt;
-            if (v <= 0) continue;
-            const std::int64_t dx = snap.pos.x - me->pos.x;
-            const std::int64_t dy = snap.pos.y - me->pos.y;
-            const std::int64_t d2 = dx * dx + dy * dy;
-            const std::int64_t score =
-                v * 1000 / (1000 + isqrt64(d2) / 4);
-            if (score > best_v || (score == best_v && d2 < best_d2)) {
-                best_v = score; best_d2 = d2;
-                best_id = kid; best_pos = snap.pos;
-            }
-        }
-        s.forage_id = best_id;
-        s.forage_pos = best_pos;
-    }
-    if (s.forage_id != kNoEntity && forage_drive > 400) {
-        // base-score bump so the directed candidates survive candidacy;
-        // the foraging bonus in scoring decides whether they win. The bump
-        // scales with drive — at crisis levels the hypothalamic imperative
-        // must beat suppressed neural logits (a starving brain that never
-        // considers `consume` dies standing on food).
-        const std::int32_t bump =
-            static_cast<std::int32_t>(48 + forage_drive / 4);
-        consider(vlogit[0] / 16 + bump, 0, -3);   // consume the remembered food
-        consider(vlogit[1] / 16 + bump, 1, -3);   // or walk to it first
-    }
-    // Homing (spec §4.5): at crisis drives with no remembered food, walk
-    // back toward the camp anchor — thirst kills faster than hunger and
-    // water only exists where the band settled.
-    if (!s.home_valid) { s.home_pos = me->pos; s.home_valid = true; }
-    if (forage_drive > 550)
-        consider(vlogit[1] / 16 + 40 +
-                     static_cast<std::int32_t>((forage_drive - 550) / 2),
-                 1, -4);   // move toward home_pos
-    // Forage probe (tgt == -7): drive active but memory holds NO edible —
-    // walk a deterministic expanding ring around the home anchor until
-    // something edible re-enters perception (resource scouting).
-    if (forage_drive > 400 && s.forage_id == kNoEntity) {
-        if (net.tick - s.probe_tick >= 96) {
-            s.probe_tick = net.tick;
-            const std::uint64_t hh = Rng::hash(
-                w.world_seed ^ (npc * 0xD1B54A32D192ED03ull) ^
-                (net.tick * 0x94D049BB133111EBull));
-            const int ring = 2 + static_cast<int>(hh % 5);   // 2..6
-            const auto& d = kProbeDirs[(hh >> 8) & 15];
-            const int rad = ring * 48;
-            s.probe_pos = {s.home_pos.x + d[0] * rad / 16,
-                           s.home_pos.y + d[1] * rad / 16};
-        }
-        consider(vlogit[1] / 16 + 20 +
-                     static_cast<std::int32_t>(forage_drive / 10),
-                 1, -7);
-    }
-    // Exploration scout (tgt == -5): restlessness from the visit-novelty
-    // ring aims move away from the recent-position centroid.
-    if (exploring) {
-        if (!s.scout_valid || net.tick - s.scout_tick >= 48) {
-            s.scout_tick = net.tick;
-            s.scout_valid = true;
-            std::int64_t cx = 0, cy = 0;
-            const std::int32_t vn = std::min(s.visit_n, 16);
-            for (std::int32_t i = 0; i < vn; ++i) {
-                cx += s.visit[i].x; cy += s.visit[i].y;
-            }
-            cx /= vn; cy /= vn;
-            std::int64_t vx = me->pos.x - cx, vy = me->pos.y - cy;
-            std::int64_t vl = isqrt64(vx * vx + vy * vy);
-            const std::uint64_t hh = Rng::hash(
-                w.world_seed ^ (npc * 0x9E3779B97F4A7C15ull) ^
-                (net.tick * 0xBF58476D1CE4E5B9ull));
-            if (vl < 24) {   // sitting on the centroid: hash direction
-                vx = static_cast<std::int64_t>(hh & 0x1FF) - 256;
-                vy = static_cast<std::int64_t>((hh >> 9) & 0x1FF) - 256;
-                vl = isqrt64(vx * vx + vy * vy);
-                if (vl < 1) { vx = 256; vy = 0; vl = 256; }
-            }
-            vx = vx * 340 / vl +
-                 static_cast<std::int64_t>((hh >> 18) & 127) - 64;
-            vy = vy * 340 / vl +
-                 static_cast<std::int64_t>((hh >> 25) & 127) - 64;
-            s.scout_pos = {me->pos.x + static_cast<std::int32_t>(vx),
-                           me->pos.y + static_cast<std::int32_t>(vy)};
-            // patrols stay inside the home range — roaming is local
-            // exploration, not migration away from known resources
-            {
-                const std::int64_t hx = s.scout_pos.x - s.home_pos.x;
-                const std::int64_t hy = s.scout_pos.y - s.home_pos.y;
-                const std::int64_t hd2 = hx * hx + hy * hy;
-                if (hd2 > 450 * 450) {
-                    const std::int64_t hl = isqrt64(hd2);
-                    s.scout_pos = {
-                        s.home_pos.x + static_cast<std::int32_t>(hx * 450 / hl),
-                        s.home_pos.y + static_cast<std::int32_t>(hy * 450 / hl)};
-                }
-            }
-        }
-        consider(vlogit[1] / 16 + 24 +
-                     static_cast<std::int32_t>(explore_drive / 10),
-                 1, -5);
-    }
-    // Social proximity (tgt == -6): attachment drive pulls movement toward
-    // the nearest remembered conspecific when none is in near[] range.
-    // Target refreshed every 64 net ticks (amortized O(memory) scan).
-    if (net.tick - s.soc_tick >= 64) {
-        s.soc_tick = net.tick;
-        s.soc_id = kNoEntity;
-        std::int64_t bd2 = INT64_MAX;
-        for (const auto& [kid, snap] : mind->memory) {
-            if (kid == npc || !w.find_mind(kid)) continue;
-            const std::int64_t dx = snap.pos.x - me->pos.x;
-            const std::int64_t dy = snap.pos.y - me->pos.y;
-            const std::int64_t d2 = dx * dx + dy * dy;
-            if (d2 < bd2) {
-                bd2 = d2; s.soc_id = kid; s.soc_pos = snap.pos;
-            }
-        }
-        std::int64_t fam = 0;
-        for (const BrainSocial& so : s.cog.social)
-            fam += std::max<std::int64_t>(0, so.familiarity);
-        s.social_drive = static_cast<std::int16_t>(clampi(
-            std::max<std::int64_t>(s.vital.emo[kBEmoAttachment], 0) +
-            fam / 16 + 100, 0, 1000));
-    }
-    if (s.soc_id != kNoEntity && s.social_drive > 350) {
-        bool conspecific_near = false;
-        for (int t = 0; t < nnear; ++t)
-            if (w.find_mind(near[t].id)) { conspecific_near = true; break; }
-        if (!conspecific_near) {
-            const std::int64_t dx = s.soc_pos.x - me->pos.x;
-            const std::int64_t dy = s.soc_pos.y - me->pos.y;
-            const std::int64_t d2 = dx * dx + dy * dy;
-            // engage only at socially meaningful range — beyond reach but
-            // inside remembered territory (stale memories beyond ~800 are
-            // ghosts, not destinations)
-            if (d2 > 200 * 200 && d2 < 800 * 800)
-                consider(vlogit[1] / 16 + 20 +
-                             static_cast<std::int32_t>(s.social_drive / 10),
-                         1, -6);
-        }
-    }
-    // Homeostatic imperatives get a guaranteed candidacy slot: neural
-    // logits can suppress `consume` so hard (learned failure, stress) that
-    // even a drive-scaled bump loses the top-kC cut — and the agent then
-    // starves standing on food. force() replaces the weakest candidate.
-    auto force = [&](int verb, int tgt, std::int32_t score) {
-        for (int i = 0; i < ncand; ++i)
-            if (cands[i].verb == verb && cands[i].tgt == tgt) return;
-        if (ncand < kC) { cands[ncand++] = {score, verb, tgt}; return; }
-        int w = 0;
-        for (int i = 1; i < kC; ++i)
-            if (cands[i].score < cands[w].score) w = i;
-        cands[w] = {score, verb, tgt};
-    };
-    if (s.forage_id != kNoEntity && forage_drive > 400) {
-        const std::int32_t bump =
-            static_cast<std::int32_t>(48 + forage_drive / 4);
-        force(0, -3, vlogit[0] / 16 + bump);
-        force(1, -3, vlogit[1] / 16 + bump);
-    }
-    if (forage_drive > 550)
-        force(1, -4, vlogit[1] / 16 + 40 +
-              static_cast<std::int32_t>((forage_drive - 550) / 2));
-    if (forage_drive > 400 && s.forage_id == kNoEntity)
-        force(1, -7, vlogit[1] / 16 + 20 +
-              static_cast<std::int32_t>(forage_drive / 10));
-    if (exploring)
-        force(1, -5, vlogit[1] / 16 + 24 +
-              static_cast<std::int32_t>(explore_drive / 10));
-    if (s.soc_id != kNoEntity && s.social_drive > 350) {
-        bool conspecific_near = false;
-        for (int t = 0; t < nnear; ++t)
-            if (w.find_mind(near[t].id)) { conspecific_near = true; break; }
-        if (!conspecific_near) {
-            const std::int64_t dx = s.soc_pos.x - me->pos.x;
-            const std::int64_t dy = s.soc_pos.y - me->pos.y;
-            const std::int64_t d2 = dx * dx + dy * dy;
-            if (d2 > 200 * 200 && d2 < 800 * 800)
-                force(1, -6, vlogit[1] / 16 + 20 +
-                      static_cast<std::int32_t>(s.social_drive / 10));
-        }
-    }
+    // Pure ALife: candidate generation ends here. Every candidate is a
+    // (verb, remembered-entity) pair scored by neural readout — no
+    // synthetic destinations, no force() overrides, no drive->target
+    // steering code. Survival, roaming and social approach must emerge
+    // from the connectome dynamics + memory + plasticity.
     if (ncand == 0) return out;
 
     // ---- score candidates: neural base + mind-level biases ----------------------
     const NeuroState& ns = mind->neuro;
-    const PropId hp_p = SIMLAB_PID(w.props, "hunger"),
-                   tp_p = SIMLAB_PID(w.props, "thirst");
-    const std::int64_t hunger_v =
-        hp_p != kNoProp ? w.prop_int(*me, hp_p, 0) : 0;
-    const std::int64_t thirst_v =
-        tp_p != kNoProp ? w.prop_int(*me, tp_p, 0) : 0;
-    const std::int64_t safety = std::max<std::int64_t>(0, std::min<std::int64_t>(
-        1000, 1000 - std::max(hunger_v, thirst_v) - ns.panic));
-    const bool curious = safety > 500;
-
-    // two nearest remembered material-bearing entities (invention bonus)
-    EntityId mat_ids[2] = {kNoEntity, kNoEntity};
-    MaterialId mat_m[2] = {kNoMaterial, kNoMaterial};
-    {
-        std::int64_t md2[2] = {0, 0};
-        int nm = 0;
-        for (const auto& [kid, snap] : mind->memory) {
-            if (kid == npc || snap.material == kNoMaterial) continue;
-            const std::int64_t dx = snap.pos.x - me->pos.x;
-            const std::int64_t dy = snap.pos.y - me->pos.y;
-            const std::int64_t d2 = dx * dx + dy * dy;
-            if (nm == 2 && d2 >= md2[1]) continue;
-            int p = nm < 2 ? nm++ : 1;
-            while (p > 0 && md2[p - 1] > d2) {
-                md2[p] = md2[p - 1]; mat_ids[p] = mat_ids[p - 1];
-                mat_m[p] = mat_m[p - 1]; --p;
-            }
-            md2[p] = d2; mat_ids[p] = kid; mat_m[p] = snap.material;
-        }
-    }
 
     std::int64_t best_total = INT64_MIN;
     int best_c = 0;
@@ -1615,27 +1352,15 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                 total += ns.rage * chg / 3072 - ns.panic * chg / 4096;
             }
         }
-        // epistemic bonus: untried material transform while safe
-        if (curious && invent_verb(cd.verb) &&
-            cd.tgt >= 0 && cd.tgt < nnear) {
-            const auto mit = mind->memory.find(near[cd.tgt].id);
-            if (mit != mind->memory.end() &&
-                mit->second.material != kNoMaterial) {
-                const MaterialId ma = mit->second.material;
-                const MaterialId mb =
-                    (cd.verb == 10)
-                        ? (near[cd.tgt].id == mat_ids[0] ? mat_m[1] : mat_m[0])
-                        : kNoMaterial;
-                if (!invent_tried(s, invent_key(cd.verb, ma, mb)))
-                    total += 192;
-            }
-        }
-        // tribal doctrine bias (doctrine-free agents: cheap no-op)
-        {
-            const Entity* tgt_e = nullptr;
-            if (cd.tgt >= 0 && cd.tgt < nnear)
-                tgt_e = w.find(near[cd.tgt].id);
-            total += doctrine_bias_for(w, *mind, *me, cd.verb, tgt_e);
+        // tribal doctrine bias — evaluated against the mind's own memory
+        // snapshot (remembered props/material/kind), never live entity
+        // state; doctrine-free agents: cheap no-op.
+        if (cd.tgt >= 0 && cd.tgt < nnear) {
+            const auto tit = mind->memory.find(near[cd.tgt].id);
+            if (tit != mind->memory.end())
+                total += snap_doctrine_bias(
+                    w, *mind, tit->second, cd.verb,
+                    s.vital.drive_hunger);
         }
         // deterministic exploration jitter (genome-scaled)
         const std::uint64_t jit =
@@ -1663,22 +1388,28 @@ BrainChoice brain_decide(World& w, EntityId npc) {
             total += 24;
         // vmPFC value integration: expected outcome for this verb
         total += s.vital.exp_rew[cd.verb] / 16;
-        // OFC behavioral switching: high |OFC| + conflict -> novelty-seeking
-        if (s.cog.conflict > 0 && pfc_ofc > 300 && curious &&
-            invent_verb(cd.verb) && cd.tgt < 0)
-            total += 48;
+        // OFC behavioral switching: high |OFC| + goal conflict -> the PFC
+        // readout itself must break the tie (no bonus injected here).
         // ---- Phase 8: social cognition -------------------------------------
         // trust/familiarity bias on social verbs toward remembered
         // conspecifics; comm intent from Language readout.
         if (cd.tgt >= 0 && cd.tgt < nnear) {
             const EntityId tid = near[cd.tgt].id;
-            if (tid != npc && w.find_mind(tid)) {
+            // conspecific = remembered entity whose kind is a species —
+            // judged from the memory snapshot, not live world state.
+            const auto tit2 = mind->memory.find(tid);
+            const bool conspecific =
+                tit2 != mind->memory.end() &&
+                w.species.find_name(tit2->second.kind_name) != nullptr;
+            if (tid != npc && conspecific) {
                 const BrainSocial* soc = nullptr;
                 const std::uint64_t key = social_key_of(tid);
                 for (const BrainSocial& x : s.cog.social)
                     if (x.key == key) { soc = &x; break; }
-                const std::int64_t trust =
-                    soc ? soc->trust : w.tie_weight(npc, "trust", tid);
+                // trust is LEARNED ONLY (own experience + observation);
+                // no relationship-graph fallback — the brain trusts what
+                // it has lived, not what the world asserts.
+                const std::int64_t trust = soc ? soc->trust : 0;
                 const char* vn = sensor_verb_table()[cd.verb];
                 const bool social_v =
                     std::strcmp(vn, "share") == 0 ||
@@ -1713,89 +1444,10 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                     total += lang_intent / 16;
             }
         }
-        // ---- interoceptive foraging (spec §4.5 drives -> §9 action) --------
-        // Edible remembered targets attract `consume` — but only within
-        // reach (a remembered bush down the valley is a MOVE target, not a
-        // bite; unreachable consumes just burn cycles on "out of reach").
-        // `move` toward remembered food engages when a drive is high.
-        // Bonus scales with the actual hypothalamic drive — a sated brain
-        // ignores the bush. Two target forms: near[] slots (top-4 neural
-        // readout) and tgt == -3 (cached nearest edible, forage_id).
-        {
-            EntityId ftarget = kNoEntity;
-            Vec2 fpos{0, 0};
-            std::int64_t fs = 0, rel = 0;
-            bool fs_done = false;
-            if (cd.tgt == -3) {
-                ftarget = s.forage_id; fpos = s.forage_pos;
-            } else if ((cd.verb == 0 || cd.verb == 1) && cd.tgt >= 0 &&
-                       cd.tgt < nnear) {
-                ftarget = near[cd.tgt].id; fpos = near[cd.tgt].pos;
-            } else {
-                ftarget = kNoEntity;
-            }
-            if (ftarget != kNoEntity &&
-                (cd.verb == 0 || cd.verb == 1)) {
-                const auto mit = mind->memory.find(ftarget);
-                if (mit != mind->memory.end()) {
-                    const auto nh = snapshot_food_nh(w, mit->second);
-                    fs = nh.first + nh.second;
-                    // need-matched value: hydration counts only as much as
-                    // the thirst drive demands (and vice versa)
-                    rel = nh.first * wh + nh.second * wt;
-                    fs_done = true;
-                }
-            }
-            if (fs_done && fs > 0) {
-                const std::int64_t dx = fpos.x - me->pos.x;
-                const std::int64_t dy = fpos.y - me->pos.y;
-                const PropId reach_p = SIMLAB_PID(w.props, "reach");
-                const std::int64_t rr =
-                    reach_p != kNoProp
-                        ? w.prop_int(*me, reach_p, 250) : 250;
-                const bool in_reach =
-                    dx * dx + dy * dy <= rr * rr;
-                const std::int64_t drive = std::max<std::int64_t>(
-                    std::max<std::int64_t>(s.vital.drive_hunger,
-                                           s.vital.drive_thirst),
-                    s.vital.sleep_pressure);
-                if (cd.verb == 0) {
-                    if (in_reach)
-                        // homeostatic override: edible in reach + high
-                        // hunger/thirst drive -> consume, period. Neural
-                        // suppression of `consume` (learned failures) must
-                        // not veto survival.
-                        total += 96 + rel / 2000 + forage_drive;
-                    else
-                        total -= 48;   // chase it with move, not bite
-                } else if (drive > 400) {
-                    // already in reach: standing on food, no reason to keep
-                    // walking — consume must outscore this easily
-                    total += in_reach ? rel / 16000
-                                      : drive / 4 + rel / 8000;
-                }
-            }
-        }
-        // homing candidate (tgt == -4): crisis-drive bonus toward the camp
-        // anchor — strong enough to beat stale-food chases at the brink,
-        // but halved when a real remembered food target exists (walking to
-        // known water beats wandering home blindly)
-        if (cd.tgt == -4 && forage_drive > 550)
-            total += (forage_drive - 500) /
-                     (s.forage_id != kNoEntity ? 2 : 1);
-        // exploration scout (tgt == -5): restlessness pulls toward fresh
-        // ground — scales with the visit-novelty drive, capped well below
-        // survival bonuses so foraging/homing still win at crisis drives
-        if (cd.tgt == -5 && exploring)
-            total += explore_drive / 5;
-        // forage probe (tgt == -7): remembered-food absence -> expanding
-        // ring scout around the home anchor
-        if (cd.tgt == -7 && forage_drive > 400)
-            total += forage_drive / 5;
-        // social approach (tgt == -6): attachment pulls toward the nearest
-        // remembered conspecific — settlement-seeking, not survival
-        if (cd.tgt == -6)
-            total += s.social_drive / 5;
+        // Pure ALife: no homeostatic scoring hacks. `consume`/`move`
+        // toward remembered entities compete on neural logits + learned
+        // biases alone — hunger/thirst reach the action selection purely
+        // through Hypothalamus->BasalGanglia dynamics and exp_rew.
         totals[c] = total;
         if (total > best_total) { best_total = total; best_c = c; }
     }
@@ -1876,28 +1528,11 @@ BrainChoice brain_decide(World& w, EntityId npc) {
     const char* verb = sensor_verb_table()[chosen.verb];
     out.verb = verb;
     out.score = best_total;
-    const bool forage_pick = chosen.tgt == -3;
-    const bool home_pick = chosen.tgt == -4;
-    const bool scout_pick = chosen.tgt == -5;
-    const bool social_pick = chosen.tgt == -6;
-    const bool probe_pick = chosen.tgt == -7;
-    out.target = forage_pick ? s.forage_id
-               : social_pick ? s.soc_id
-               : (chosen.tgt >= 0 && chosen.tgt < nnear)
+    out.target = (chosen.tgt >= 0 && chosen.tgt < nnear)
                      ? near[chosen.tgt].id : kNoEntity;
     if (std::strcmp(verb, "move") == 0) {
         out.has_move = true;
-        if (forage_pick)
-            out.move_to = s.forage_pos;
-        else if (scout_pick)
-            out.move_to = s.scout_pos;
-        else if (probe_pick)
-            out.move_to = s.probe_pos;
-        else if (social_pick)
-            out.move_to = s.soc_pos;
-        else if (home_pick)
-            out.move_to = s.home_pos;
-        else if (out.target != kNoEntity)
+        if (out.target != kNoEntity)
             out.move_to = near[chosen.tgt].pos;
         else {
             const std::uint64_t j =
@@ -1969,7 +1604,8 @@ void brain_assimilate(World& w, EntityId npc, int verb,
 // ================= observational learning + social cognition ==================
 
 void brain_observe(World& w, EntityId observer, EntityId actor, int verb,
-                   std::int64_t outcome_valence, bool via_comm) {
+                   std::int64_t outcome_valence, bool via_comm,
+                   EntityId /*target*/) {
     if (w.speculative || !w.brains_) return;
     auto it = w.brains_->slots.find(observer);
     if (it == w.brains_->slots.end()) return;   // no brain -> no neural learn
@@ -1986,6 +1622,10 @@ void brain_observe(World& w, EntityId observer, EntityId actor, int verb,
         else if (outcome_valence < -200) dv = via_comm ? -6 : -12;
         else dv = via_comm ? 1 : 3;
         social_upsert(s.cog, key, dv, w.clock_.tick());
+        // Pure ALife: no scripted "violence is bad" rule. Observers learn
+        // from the observed outcome_valence like any other event —
+        // retaliation/avoidance must emerge from their own RPE, fear
+        // conditioning and social valuation, not a hardcoded penalty.
         if (via_comm) {
             // source-tagged reliability: the observer tracks how much to
             // trust THIS source's claims (spec §21 hearsay discount)

@@ -1458,3 +1458,27 @@ array, fast/anchor plasticity and WM1/WM2 are gone.
     ("grazer/torso", contained=true) as food — predict_consume skips
     contained entities so consume failed forever while thirst climbed.
     Now excluded via contained prop (or "species/part" kind fallback).
+  - Leash removed + social-cost RPE: scout tgt==-5 is unclamped (migration
+    is legitimate; home_pos re-anchors at last successful consume).
+    brain_post folds penalties into `actual` before RPE: ev.failed -> -60
+    (metabolic waste); unprovoked strike on a living conspecific ->
+    empathy-scaled negative ((400+empathy_pm)*(300+bond/2)/1000) where
+    empathy = genome.slow[48]*8 (heritable, 0..1016) and bond =
+    trust+familiarity; self-defense (panic|rage>500) exempt. Attacker also
+    gets an amygdala fear trace on the victim's material ctx.
+    brain_observe gained a `target` param: witnessed conspecific strike ->
+    extra -40 trust on the actor + fear trace at observer ctx.
+- SunnyChronicle (src/SunnyChronicle.cpp, include/simlab/SunnyChronicle.hpp):
+  era-boundary (default 500 ticks) literary historian -> Qwen via
+  NarrativeHost -> saves/sunnyworld_chronicle.md. READ-ONLY on World (no
+  RNG, no mutation, outside state_hash). Extractor: ledger cursor
+  (lower_bound, O(log n) per call), salience-scored moments, alive-set
+  diff for births/deaths, terrain biome sample, enclosure/language
+  counts, top-4 brain slots by drama (dominant emo, fear traces, min
+  trust, migration distance), new SynthRecords. Rolling ~3-sentence tail
+  feeds [Previous passage]. Config: era_ticks/out_path/language/
+  top_moments. Wired in viewer_main poll loop; headless callers invoke
+  tick(w, &host) per cycle. Raw fact fallback when host inactive.
+- NarrativeHost fixes: n_batch/n_ubatch now = n_ctx (was 512 — prompts
+  >512 tokens silently failed generate()); submit_prompt gained optional
+  max_new override + KV-window budget clamp.

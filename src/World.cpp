@@ -5836,7 +5836,9 @@ InteractionResult World::interact(const InteractionContext& ctx) {
                         }
                     brain_observe(*this, wid, ctx.actor, verb,
                                   pev->failed ? -300 : 150,
-                                  pev->action == "communicate");
+                                  pev->action == "communicate",
+                                  ctx.targets.empty()
+                                      ? kNoEntity : ctx.targets.front());
                 }
             }
         }

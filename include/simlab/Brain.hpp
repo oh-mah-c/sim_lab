@@ -52,7 +52,9 @@ struct BrainGenome;
 //   [45]      neuromodulator sensitivity /8 permille (0..127 -> 0..1016)
 //   [46]      rollout budget /8 permille (0..127 -> planning frequency)
 //   [47]      population profile (0=min 0.5x, 1=std 1x, 2=full 1.5x)
-//   [48..95]  reserved
+//   [48]      empathy/social sensitivity /8 permille (0..127 -> 0..1016);
+//             scales the negative RPE of unprovoked conspecific harm
+//   [49..95]  reserved
 constexpr std::size_t kConnectomeBytes = 96;
 
 // Decoded + sanitized connectome parameters (what BrainNet::init consumes).
@@ -278,32 +280,9 @@ struct BrainSlot {
     // Lifetime-only (Baldwin), never inherited.
     std::array<std::uint64_t, 64> tried{};
     std::int32_t tried_next = 0;
-    // Forage cache (transient — re-derived from memory, never serialized):
-    // nearest remembered edible entity while a homeostatic drive is high.
-    // The 4-slot neural entity readout can't see past a crowd, so hungry
-    // agents get one explicit food-directed candidate per decide.
-    EntityId forage_id = kNoEntity;
-    Vec2 forage_pos{0, 0};
-    std::uint64_t forage_tick = 0;
-    // Home anchor (transient): first-seen position — the camp a founder
-    // woke up in. Desperate agents with nothing edible remembered walk
-    // back toward it (place-cell homing, spec §4.5 survival behavior).
-    Vec2 home_pos{0, 0};
-    bool home_valid = false;
-    // Exploration/social scouting (transient): recent-position ring feeds
-    // a novelty signal — lingering in one spot inflates the exploration
-    // drive so satiated agents keep patrolling instead of idling.
-    std::array<Vec2, 16> visit{};
-    std::int32_t visit_n = 0;          // entries filled (<=16, then wraps)
-    Vec2 scout_pos{0, 0};
-    std::uint64_t scout_tick = 0;
-    bool scout_valid = false;
-    Vec2 probe_pos{0, 0};        // forage-probe ring target around home_pos
-    std::uint64_t probe_tick = 0;
-    EntityId soc_id = kNoEntity;       // nearest remembered conspecific
-    Vec2 soc_pos{0, 0};
-    std::uint64_t soc_tick = 0;
-    std::int16_t social_drive = 0;     // attachment+familiarity, 0..1000
+    // Pure ALife: no synthetic-target caches live here. Movement,
+    // foraging and social approach must emerge from the connectome +
+    // memory readout — the engine keeps no hand-computed destinations.
 };
 
 // Canonical default connectome genome (Standard profile).
@@ -391,7 +370,8 @@ BrainChoice brain_decide(World& w, EntityId npc);
 // claim): trust moves at half rate and low comm_rel breeds suspicion.
 // No-op when the observer has no brain slot yet.
 void brain_observe(World& w, EntityId observer, EntityId actor, int verb,
-                   std::int64_t outcome_valence, bool via_comm);
+                   std::int64_t outcome_valence, bool via_comm,
+                   EntityId target = kNoEntity);
 
 void brain_install_spawn(World& w, EntityId nid, const BrainGenome& g);
 

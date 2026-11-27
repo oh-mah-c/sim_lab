@@ -5,6 +5,7 @@
 // This file NEVER reads or writes World state — state_hash() cannot see it.
 #include "simlab/NarrativeHost.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -122,7 +123,8 @@ struct LlamaApi {
     ~LlamaApi() { if (h) dlclose(h); }
 };
 
-struct Job { std::uint64_t key; std::string sys; std::string user; };
+struct Job { std::uint64_t key; std::string sys; std::string user;
+             int max_new = 0; };
 
 } // namespace
 
@@ -153,8 +155,11 @@ struct NarrativeHost::Impl {
         llama_context_params cp = api.ctx_params();
         cp.n_ctx = cfg.n_ctx;
         cp.n_seq_max = 1;
-        cp.n_batch = 512;
-        cp.n_ubatch = 512;
+        // Prompt + generation must fit one batch: chapter prompts run
+        // well past 512 tokens — size the batch to the context window or
+        // bext_add() overflows and generate() silently drops the job.
+        cp.n_batch = cfg.n_ctx;
+        cp.n_ubatch = cfg.n_ctx;
         ctx = api.ctx_init(model, cp);
         if (!ctx) { api.model_free(model); model = nullptr;
                     if (backend_up) { api.backend_free(); backend_up = false; }
@@ -202,7 +207,7 @@ struct NarrativeHost::Impl {
 
     // Generate one narration; returns false on any llama error.
     bool generate(const std::string& sys, const std::string& user,
-                  std::string& out) {
+                  int max_new, std::string& out) {
         const std::string prompt = prompt_for(sys, user);
         std::vector<llama_token> toks(static_cast<std::size_t>(prompt.size()) + 64);
         const int nt = api.tokenize(vocab, prompt.data(),
@@ -234,9 +239,13 @@ struct NarrativeHost::Impl {
         api.chain_add(smpl, api.samp_dist(cfg.seed));
 
         std::vector<llama_token> gen;
-        gen.reserve(static_cast<std::size_t>(cfg.max_new_tokens));
+        int budget = max_new > 0 ? max_new : cfg.max_new_tokens;
+        // never overflow the KV window: shrink the budget to what fits
+        budget = std::min<int>(budget,
+            std::max<int>(8, cfg.n_ctx - nt - 8));
+        gen.reserve(static_cast<std::size_t>(budget));
         llama_token tok = LLAMA_TOKEN_NULL;
-        for (int i = 0; i < cfg.max_new_tokens; ++i) {
+        for (int i = 0; i < budget; ++i) {
             tok = api.samp_sample(smpl, ctx, -1);
             if (tok == LLAMA_TOKEN_NULL) break;
             if (vocab && api.vocab_is_eog(vocab, tok)) break;
@@ -280,7 +289,7 @@ struct NarrativeHost::Impl {
             if (!ready.load()) continue;
             std::string text;
             const std::string sys = job.sys.empty() ? kOnelinerSys() : job.sys;
-            if (generate(sys, job.user, text)) {
+            if (generate(sys, job.user, job.max_new, text)) {
                 std::lock_guard<std::mutex> lk(mu);
                 if (done.size() < cfg.max_results) done[job.key] = std::move(text);
             }
@@ -312,11 +321,11 @@ void NarrativeHost::submit(std::uint64_t key, const std::string& summary) {
 }
 
 void NarrativeHost::submit_prompt(std::uint64_t key, const std::string& sys,
-                                  const std::string& user) {
+                                  const std::string& user, int max_new) {
     if (!active()) return;
     std::lock_guard<std::mutex> lk(impl_->mu);
     if (impl_->queue.size() >= impl_->cfg.max_queue) impl_->queue.pop_front();
-    impl_->queue.push_back({key, sys, user});
+    impl_->queue.push_back({key, sys, user, max_new});
     impl_->cv.notify_one();
 }
 
