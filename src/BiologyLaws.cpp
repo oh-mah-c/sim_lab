@@ -40,16 +40,16 @@ constexpr std::int64_t kDefaultAdultAge = 100;    // ticks
 constexpr std::int64_t kDefaultMutationRate = 25; // permille per locus
 constexpr std::int64_t kDefaultReproCooldown = 200; // ticks between offspring
 constexpr std::int64_t kFertilityMin = 1;         // permille — must be > 0
-// Parental budget (mass/energy conservation): each parent pays half the
-// offspring's initial energy reserve; the other half-equivalent is the
-// biological overhead of gestation. The child is spawned WITH
-// kChildInitEnergy milliJ — energy moves parent -> offspring, it is
-// neither created nor destroyed. A parent that cannot pay, or is too
-// hungry to gestate, fails physically — scarcity stops births through
-// the same laws as everything else, never through a population cap.
+// Parental budget (mass/energy conservation): the litter's energy is
+// split EXACTLY across the parents — each pays half of the offspring's
+// `birth_energy` reserve (species prop, default kChildInitEnergy milliJ),
+// the child is spawned WITH that reserve. No energy is created or
+// destroyed. A parent that cannot pay, or is too hungry to gestate,
+// fails physically — scarcity stops births through the same laws as
+// everything else, never through a population cap.
 constexpr std::int64_t kChildInitEnergy = 40000;  // milliJ in the newborn
-constexpr std::int64_t kParentEnergyShare = 40000;// milliJ per parent
 constexpr std::int64_t kParentHungerCost = 300;   // permille hunger per birth
+constexpr std::int64_t kParentThirstCost = 150;   // permille thirst per birth
 constexpr std::int64_t kParentHungerMax = 500;    // permille — above = too hungry
 
 PropId prop_id(const World& w, const char* name) {
@@ -362,14 +362,25 @@ PredictionResult BiologyModel::predict(const World& w,
     }
 
     // ---- parental budget: BOTH parents pay for the offspring ------------------
-    // Each contributes kParentEnergyShare milliJ of `energy` (half the
-    // child's initial reserve; the rest is gestation overhead) plus
-    // kParentHungerCost hunger. A parent with no energy reserve, too little
-    // energy, or hunger above kParentHungerMax cannot reproduce — the
-    // offspring's kChildInitEnergy is carved out of what the parents paid,
-    // so no energy is created from nothing.
+    // Maternal investment is a species trait: `birth_energy` (milliJ,
+    // default kChildInitEnergy) is the newborn's reserve. Conservation is
+    // EXACT — the litter's energy is split across the parents: each pays
+    // neonatal/2 and the child receives the whole amount (2*share). A
+    // parent with too little energy, or hunger above kParentHungerMax,
+    // cannot reproduce — scarcity stops births through the same laws as
+    // everything else, never through a population cap.
+    const PropId be_p = prop_id(w, "birth_energy");
+    // floor keeps a degenerate low allele from making births free — the
+    // cheapest possible litter still costs each parent real reserves.
+    const std::int64_t neonatal =
+        be_p != kNoProp ? std::clamp<std::int64_t>(
+            w.prop_int(*actor, be_p, kChildInitEnergy), 20000, 400000)
+                        : kChildInitEnergy;
+    const std::int64_t share = neonatal / 2;   // milliJ per parent
+    const std::int64_t litter = share * 2;     // exact conserved total
     const PropId energy_p = prop_id(w, "energy");
     const PropId hunger_p = prop_id(w, "hunger");
+    const PropId thirst_p = prop_id(w, "thirst");
     std::int64_t parent_energy[2] = {0, 0};
     {
         int pi = 0;
@@ -378,7 +389,7 @@ PredictionResult BiologyModel::predict(const World& w,
                 ? w.prop_of(*p, energy_p) : nullptr;
             const std::int64_t have = ev ? ev->i : 0;
             parent_energy[pi++] = have;
-            add_cond(r, "parent_energy", have, kParentEnergyShare);
+            add_cond(r, "parent_energy", have, share);
             if (hunger_p != kNoProp) {
                 const std::int64_t h = w.prop_int(*p, hunger_p, 0);
                 Condition hc;
@@ -392,7 +403,7 @@ PredictionResult BiologyModel::predict(const World& w,
                     return r;
                 }
             }
-            if (energy_p == kNoProp || !ev || ev->i < kParentEnergyShare) {
+            if (energy_p == kNoProp || !ev || ev->i < share) {
                 r.failure = "parent lacks energy reserve for offspring";
                 return r;
             }
@@ -411,16 +422,17 @@ PredictionResult BiologyModel::predict(const World& w,
         ch.after = Value::integer(static_cast<std::int64_t>(tick));
         r.changes.push_back(ch);
     }
-    // Parental payments — symmetric: BOTH parents lose kParentEnergyShare
-    // energy and gain kParentHungerCost hunger (gestation). Recorded as
-    // causal StateChanges so the ledger shows exactly where the child's
-    // initial energy came from.
+    // Parental payments — symmetric: BOTH parents lose `share` energy
+    // (together exactly the litter's `litter` milliJ) and gain gestation
+    // need-costs (hunger + thirst — carrying young dehydrates the
+    // mother). Recorded as causal StateChanges so the ledger shows
+    // exactly where the child's reserve came from.
     {
         int pi = 0;
         for (const Entity* p : {actor, partner}) {
             if (energy_p != kNoProp)
                 set_change(r, p->id, energy_p, parent_energy[pi],
-                           parent_energy[pi] - kParentEnergyShare);
+                           parent_energy[pi] - share);
             if (hunger_p != kNoProp) {
                 const Value* hv = w.prop_of(*p, hunger_p);
                 if (hv && hv->type == ValType::Integer) {
@@ -428,6 +440,15 @@ PredictionResult BiologyModel::predict(const World& w,
                         std::min<std::int64_t>(1000, hv->i + kParentHungerCost);
                     if (nh != hv->i)
                         set_change(r, p->id, hunger_p, hv->i, nh);
+                }
+            }
+            if (thirst_p != kNoProp) {
+                const Value* tv = w.prop_of(*p, thirst_p);
+                if (tv && tv->type == ValType::Integer) {
+                    const std::int64_t nt =
+                        std::min<std::int64_t>(1000, tv->i + kParentThirstCost);
+                    if (nt != tv->i)
+                        set_change(r, p->id, thirst_p, tv->i, nt);
                 }
             }
             ++pi;
@@ -505,6 +526,16 @@ PredictionResult BiologyModel::predict(const World& w,
     s.pos = {(actor->pos.x + partner->pos.x) / 2,
              (actor->pos.y + partner->pos.y) / 2};
     s.genome = child;
+    // Developmental baseline: the newborn expresses its species template —
+    // every NON-gene prop (circulation, thermoregulation, vocal tract,
+    // tradecraft, max_energy...) exactly like a genesis founder does.
+    // Gene loci then overwrite with inherited alleles below. Without this
+    // merge, births were phenotypically incomplete: missing blood_volume,
+    // consciousness, communicate_range, vocal_capability, hardness and
+    // every other non-heritable species trait.
+    if (const SpeciesDef* sp = w.species.find_name(actor->kind_name))
+        for (const auto& [spid, sval] : sp->props.entries)
+            s.props.set(spid, sval);
     // ---- CL-1 brain inheritance (Baldwin, Phase 2) ---------------------------
     // Only SLOW weights + hyper-genes cross the generational boundary; the
     // newborn's h/replay/fast state starts empty (installed at spawn-commit).
@@ -564,11 +595,13 @@ PredictionResult BiologyModel::predict(const World& w,
     if (fatigue2 != kNoProp) s.props.set(fatigue2, Value::integer(0));
     // conditioning: the newborn starts at its own genetic `endurance_base`
     // allele — trained `endurance` is NOT copied (Baldwin runs through
-    // selection on the loci, not through prop inheritance).
+    // selection on the loci, not through prop inheritance). The species
+    // template merge above may have supplied a flat `endurance`, so the
+    // allele always wins here — same as before the baseline merge.
     {
         const PropId p_en = prop_id(w, "endurance"),
                    p_eb = prop_id(w, "endurance_base");
-        if (p_en != kNoProp && p_eb != kNoProp && !s.props.get(p_en)) {
+        if (p_en != kNoProp && p_eb != kNoProp) {
             const Value* bv = s.props.get(p_eb);
             const std::int64_t base = bv ? bv->i : 0;
             s.props.set(p_en, Value::integer(
@@ -579,7 +612,7 @@ PredictionResult BiologyModel::predict(const World& w,
     // paid — without this prop the child was unbounded (missing energy
     // used to mean "free actions forever").
     if (energy_p != kNoProp)
-        s.props.set(energy_p, Value::integer(kChildInitEnergy));
+        s.props.set(energy_p, Value::integer(litter));
     // Phase 10.4 passive immunity: the mother passes up to 2 of her
     // strongest cleared-antigen signatures to the newborn as temporary
     // immune memory — not heritable alleles, a borrowed shield that fades

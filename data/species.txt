@@ -93,10 +93,34 @@ species tropical_tree
   condition moisture 550 1000
   condition vegetation 500 1000
 
+# Water gourd — a shoreline succulent. Its fruit is literal water
+# (hydration 1000 per fruit, zero nutrition): the only flora that fully
+# quenches thirst in a single bite. Roots only beside open water, so it
+# marks the riparian band — a living waterskin for drought-struck
+# juveniles and travellers. Added LAST among flora so it fills cells no
+# earlier species claimed (pure gain, no displacement of berry/grain).
+species water_gourd
+  kind flora
+  material living_wood
+  fruit_material water
+  fruit_count 10
+  max_fruit 10
+  fruit_regrow_rate 80
+  fruit_spoil_rate 6
+  death_drops dormant_seed=2,wood_debris=1
+  density 130
+  condition temperature -50 400
+  condition moisture 300 1000
+  condition near_water 1 1
+  condition vegetation 250 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 300
+
 species grazer
   kind fauna
   material flesh
-  density 15
+  density 25
   condition temperature 0 330
   condition moisture 300 1000
   condition slope 0 25
@@ -244,7 +268,7 @@ species grazer
 species reservoir_beast
   kind fauna
   material flesh
-  density 8
+  density 12
   condition temperature -100 400
   condition moisture 300 1000
   condition slope 0 25
@@ -442,6 +466,7 @@ species sapient
   mutation_rate 40
   energy 80000
   max_energy 120000
+  birth_energy 80000
   blood_volume 1000
   blood_accum 0
   pain_level 0
@@ -469,7 +494,7 @@ species sapient
   immune_cost_permille 6
   immune_cost_accum 0
   communicate_range 500
-  reach 250
+  reach 400
   architectural_style_bias 500
   agency_attribution_bias 500
   rhythmic_meter_bias 500
@@ -491,6 +516,7 @@ species sapient
   gene adult_age
   gene reach
   gene repro_cooldown
+  gene birth_energy
 
 # ---- Phase 17: trophic web, seasonal migration & apex predators -------------
 # All behaviour below is emergent from the integer props — the engine holds
@@ -503,7 +529,7 @@ species sapient
 species migrant_herd
   kind fauna
   material flesh
-  density 18
+  density 28
   condition temperature 40 360
   condition moisture 450 1000
   condition slope 0 15
@@ -792,7 +818,7 @@ species shore_reaver
 species commensal_rat
   kind fauna
   material flesh
-  density 60
+  density 80
   condition temperature -50 400
   condition moisture 300 1000
   condition slope 0 35

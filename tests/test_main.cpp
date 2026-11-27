@@ -2410,11 +2410,11 @@ static void test_phase7_biology() {
             CHECK(pv && pv->type == ValType::Integer && pv->i == v);
         }
         // BOTH parents paid their half of the offspring's energy reserve
-        // (conservation: child_init 40000 + gestation overhead, split evenly)
+        // (exact conservation: litter 40000 split evenly, no overhead burn)
         const Entity* pa = w.find(a);
         const Entity* pb = w.find(b);
-        CHECK(w.prop_int(*pa, energy_p, 0) == 100000 - 40000);
-        CHECK(w.prop_int(*pb, energy_p, 0) == 100000 - 40000);
+        CHECK(w.prop_int(*pa, energy_p, 0) == 100000 - 20000);
+        CHECK(w.prop_int(*pb, energy_p, 0) == 100000 - 20000);
         // the newborn carries the initial energy carved out of the parents
         CHECK(w.prop_int(*child, energy_p, 0) == 40000);
         // relations: both parents recorded as parent_of the child
