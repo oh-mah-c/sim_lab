@@ -39,7 +39,7 @@ species berry_bush
   blight_susceptibility 700
   sterilization_temp 700
   death_drops dormant_seed=4,wood_debris=1
-  density 120
+  density 160
   condition temperature -100 400
   condition moisture 300 1000
   condition vegetation 400 1000
@@ -61,7 +61,7 @@ species wild_grain
   blight_susceptibility 600
   sterilization_temp 700
   death_drops dormant_seed=3,wood_debris=1
-  density 90
+  density 120
   condition temperature -50 350
   condition moisture 350 1000
   condition vegetation 400 1000
@@ -436,7 +436,8 @@ species sapient
   gene endurance_base
   gene plasticity
   fertility 400
-  adult_age 250
+  adult_age 150
+  repro_cooldown 100
   juvenile_need_scale 400
   mutation_rate 40
   energy 80000
@@ -486,6 +487,7 @@ species sapient
   gene mutation_rate
   gene immune_power_base
   gene dna_repair_gain
+  gene juvenile_need_scale
 
 # ---- Phase 17: trophic web, seasonal migration & apex predators -------------
 # All behaviour below is emergent from the integer props — the engine holds

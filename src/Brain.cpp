@@ -1348,12 +1348,28 @@ BrainChoice brain_decide(World& w, EntityId npc) {
                           return a.score > b.score; });
         }
     };
+    // reproduce (verb 11) is a guaranteed no-op without a partner target —
+    // same class of prune as untargeted consume above.
+    constexpr int kReproVerb = 11;  // "reproduce" in sensor_verb_table
+    const std::string& own_kind = me->kind_name;
     for (int v = 0; v < kActionVerbs; ++v) {
         if (!allowed[v]) continue;
         // consume with no target is a guaranteed no-op (the law iterates
         // ctx.targets) — never worth a candidacy slot
-        if (v != 0) consider(vlogit[v] / 16, v, -1);
+        if (v != 0 && v != kReproVerb) consider(vlogit[v] / 16, v, -1);
         for (int t = 0; t < nnear; ++t) {
+            // Mating proposal sanity: the reproduce law requires a living
+            // partner of the SAME kind (its own compatibility gate). The
+            // memory snapshot already records the perceived kind_name —
+            // proposing reproduce on a remembered berry bush is a
+            // physically impossible action, exactly like untargeted
+            // consume. Filter on the agent's own belief, never world truth.
+            if (v == kReproVerb) {
+                const auto kit = mind->memory.find(near[t].id);
+                if (kit == mind->memory.end() ||
+                    kit->second.kind_name != own_kind)
+                    continue;
+            }
             // live-percept channels (4) carry cortical saliency; deeper
             // recall ranks by the engram's own emotional charge — the
             // amygdala-modulated memory trace, not a world-truth read.

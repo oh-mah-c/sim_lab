@@ -217,6 +217,24 @@ std::int64_t perceive_charge(const World& w, const Entity& npc,
             charge -= std::min<std::int64_t>(500,
                 w.prop_int(target, bm, 0) / 2);
     }
+    // Conspecific salience: a mature, fertile observer finds same-kind
+    // entities inherently attention-grabbing (mate/competitor/kin
+    // detection). Encoded through the same affective channel as food and
+    // water — sub-urgent magnitude so it never outranks survival needs,
+    // but enough to keep conspecifics inside the recall window. Uses only
+    // the observer's own interoceptive state (age/fertility props).
+    if (target.kind_name == npc.kind_name) {
+        const PropId age_p = SIMLAB_PID(w.props, "age");
+        const PropId adult_p = SIMLAB_PID(w.props, "adult_age");
+        const PropId fert_p = SIMLAB_PID(w.props, "fertility");
+        const std::int64_t adult_age = adult_p != kNoProp
+            ? w.prop_int(npc, adult_p, 100) : 100;
+        const std::int64_t age = age_p != kNoProp
+            ? w.prop_int(npc, age_p, 0) : 0;
+        const std::int64_t fert = fert_p != kNoProp
+            ? w.prop_int(npc, fert_p, 0) : 0;
+        if (age >= adult_age && fert > 0) charge += 200;
+    }
     return mem_clamp(charge, -1000, 1000);
 }
 
