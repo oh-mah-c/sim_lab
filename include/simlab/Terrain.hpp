@@ -87,6 +87,15 @@ struct TerrainGrid {
             std::min<std::int64_t>(1000, std::max<std::int64_t>(0,
                 static_cast<std::int64_t>(w) + delta)));
     }
+    // Local moisture pulse (rain/succulence): same direct-field convention
+    // as add_wear — deterministic, already covered by state_hash/save.
+    void add_moisture(Vec2 p, std::int32_t delta) {
+        if (moisture.empty() || !contains(p)) return;
+        std::int32_t& m = moisture[index(p)];
+        m = static_cast<std::int32_t>(
+            std::min<std::int64_t>(1000, std::max<std::int64_t>(0,
+                static_cast<std::int64_t>(m) + delta)));
+    }
     bool near_water(Vec2 p, int radius_cells = 1) const;
 };
 

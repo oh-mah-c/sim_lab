@@ -187,8 +187,11 @@ struct Viewer {
     std::string pref_dir;              // SDL_GetPrefPath("Sunnyworld","SimLab")
     std::string status_msg;
     PatronJournal journal;             // player knowledge + Resonance (saved as .journal)
-    enum Tool { kToolNone = 0, kToolBeacon, kToolBlueprint, kToolFear };
+    enum Tool { kToolNone = 0, kToolBeacon, kToolBlueprint, kToolFear,
+                kToolCupid, kToolPanic, kToolRain, kToolFeast, kToolPredator };
     int tool = kToolNone;
+    EntityId cupid_a = kNoEntity;      // first pick of a Cupid's-arrow pair
+    bool god_open = true;              // God-Hand toolbar row expanded
     bool dragging = false;
     Vec2 drag_a{}, drag_b{};
     bool show_journal = false;
@@ -423,6 +426,12 @@ struct Viewer {
     // floating "z" glyphs for sleepers — world_rt px anchor + age
     struct Zed { float x, y, t; };
     std::vector<Zed> zeds;
+    // mind-reader: one outstanding Qwen interrogation per selected NPC
+    std::uint64_t mind_ask_key = 0, mind_ask_seq = 0;
+    EntityId mind_ask_id = kNoEntity;
+    std::string mind_reply;
+    bool mind_ask_busy = false;
+    int mind_ask_wait = 0;
     bool show_badges = true, show_ticker = true;
     bool show_atlas = false, show_codex = false, show_inspector = true;
     std::map<std::string, std::string> rosetta;     // player guesses: glyph token -> meaning
@@ -495,6 +504,7 @@ struct Viewer {
         std::vector<std::pair<std::string, int>> brain_act;   // 12 modules, 0..100
         std::vector<std::pair<std::string, int>> neuros;      // neuromodulators 0..1000
         std::vector<std::pair<std::string, std::string>> traits;  // inherited genome props
+        std::string mind_digest;        // text fed to Qwen for Ask/Read Mind
     } insp;
     struct Stone { EntityId id; std::int64_t lang; std::string text, treaty; };
     std::vector<Stone> c_stones;
@@ -555,6 +565,9 @@ struct Viewer {
         act_last = 0;
         c_badge.clear(); c_intent.clear(); hover_id = kNoEntity;
         c_anim.clear(); rings.clear(); hearts.clear(); zeds.clear();
+        cupid_a = kNoEntity; god_open = true;
+        mind_ask_key = 0; mind_ask_id = kNoEntity; mind_reply.clear();
+        mind_ask_busy = false; mind_ask_wait = 0;
         ground_key = ~0ull;
         if (ground) { SDL_DestroyTexture(ground); ground = nullptr; }
         if (fog_tex) { SDL_DestroyTexture(fog_tex); fog_tex = nullptr; }
@@ -1599,6 +1612,7 @@ struct Viewer {
         const std::string& v = an.verb;
         const bool eating = fresh && (v == "consume" || v == "eat" || v == "forage");
         const bool attacking = fresh && (v == "strike" || v == "launch" || v == "attack");
+        const bool lovin = fresh && (v == "reproduce" || v == "mate");
         const float hr = std::max(1.4f, sw * 0.055f);          // hand half-size
         const float breathe = std::sin(float(time_s) * 2.2f + float(e.id % 7)) * 0.7f;
         const float swing = std::sin(an.phase);                 // gait -1..1
@@ -1610,6 +1624,10 @@ struct Viewer {
             if (gliding) {                                     // alternating arm swing
                 hx += side * swing * sw * 0.05f;
                 hy += swing * (i ? -1.f : 1.f) * sh * 0.06f;
+            }
+            if (lovin) {                                     // happy wiggle
+                hx += std::sin(float(time_s) * 7.f + float(i) * 3.14159f) * sw * 0.05f;
+                hy += std::sin(float(time_s) * 9.f + float(i)) * sh * 0.04f;
             }
             if (eating) {                                      // raise to mouth, chew
                 hx = fx + side * sw * 0.10f;
@@ -1804,6 +1822,10 @@ struct Viewer {
             double tilt = !e.alive ? 90.0 : e.routed ? -12.0 : 0.0;
             if (an && e.alive && !e.routed)
                 tilt = lying ? (flip ? -90.0 : 90.0) : lean;      // rest pose / motion lean
+            // post-coital wiggle: reproduce/mate verb fresh -> gentle sway
+            if (an && e.alive && an->until > c_tick &&
+                (an->verb == "reproduce" || an->verb == "mate") && !lying)
+                tilt += std::sin(float(time_s) * 6.f + float(e.id % 11)) * 5.0;
             auto blit = [&](SDL_Texture* tx, const SDL_FRect& d, double ang) {
                 if (ang == 0.0) SDL_RenderTexture(ren, tx, nullptr, &d);      // fast path
                 else SDL_RenderTextureRotated(ren, tx, nullptr, &d, ang, nullptr, SDL_FLIP_NONE);
@@ -2551,6 +2573,158 @@ struct Viewer {
                      std::to_string(marked) + " memories turned aversive";
     }
     void punish(EntityId id) { post([=, this] { do_punish(id); }); }
+    // ---- God-Hand sandbox tools ---------------------------------------------
+    // Every command is a deterministic world mutation issued under the lock
+    // via post(): same inputs -> same state_hash, headless runs never see
+    // them (the toolbar only exists in the GUI).
+    static AgentMind::MemorySnapshot god_snap(const World& w, const Entity& e) {
+        AgentMind::MemorySnapshot s;
+        s.tick = w.clock_.tick(); s.pos = e.pos;
+        s.material = e.material; s.kind_name = e.kind_name;
+        for (PropId op : w.observable_props())
+            if (const Value* v = w.prop_of(e, op)) s.props[op] = *v;
+        return s;
+    }
+    // Forge/raise a brain slot and surge neuromodulators (god tools may
+    // allocate a slot — the command itself is the deterministic input).
+    void god_mod_surge(EntityId id, int dopa, int sero, int cortisol,
+                       int norepi, int joy) {
+        if (!w.brains_) return;
+        BrainSlot& bs = brain_slot(w, *w.brains_, id);
+        auto bump = [](std::int16_t& v, int d, int lo, int hi) {
+            v = static_cast<std::int16_t>(std::clamp<int>(int(v) + d, lo, hi)); };
+        bump(bs.vital.mod[kBModDopa], dopa, 0, 1000);
+        bump(bs.vital.mod[kBModSero], sero, 0, 1000);
+        bump(bs.vital.mod[kBModCortisol], cortisol, 0, 1000);
+        bump(bs.vital.mod[kBModNorepi], norepi, 0, 1000);
+        bump(bs.vital.emo[kBEmoJoy], joy, -1000, 1000);
+    }
+    void do_cupid(EntityId a, EntityId b) {
+        const Entity* ea = w.find(a); const Entity* eb = w.find(b);
+        if (!ea || !eb || !ea->alive || !eb->alive || a == b) {
+            status_msg = "Cupid: pick two different living beings"; return; }
+        if (!w.find_mind(a) || !w.find_mind(b)) {
+            status_msg = "Cupid: only sapient minds can be kindled"; return; }
+        if (!journal.spend(15)) { status_msg = "Not enough Resonance (15)"; return; }
+        AgentMind& ma = w.mind(a); AgentMind& mb = w.mind(b);
+        const MindParams mpa = mind_params(w, *ea), mpb = mind_params(w, *eb);
+        // mutual deep-positive engrams (~bonded threshold is 650) — the
+        // same channel natural courtship writes through, just kindled.
+        upsert_memory(ma, b, god_snap(w, *eb), 800, mpa);
+        upsert_memory(mb, a, god_snap(w, *ea), 800, mpb);
+        god_mod_surge(a, 220, 200, 0, 0, 220);
+        god_mod_surge(b, 220, 200, 0, 0, 220);
+        status_msg = "Cupid's arrow: " + sid(a) + " <3 " + sid(b) +
+                     " — watch whether they close the distance";
+    }
+    void cupid(EntityId a, EntityId b) { post([=, this] { do_cupid(a, b); }); }
+    void do_instill_panic(EntityId id) {
+        const Entity* e = w.find(id);
+        if (!e || !e->alive) { status_msg = "Panic: no living entity"; return; }
+        if (!journal.spend(10)) { status_msg = "Not enough Resonance (10)"; return; }
+        AgentMind& m = w.mind(id);   // get-or-create (god-tool, same as punish)
+        m.neuro.panic = std::min<std::int64_t>(1000, m.neuro.panic + 700);
+        m.neuro.rage = std::min<std::int64_t>(1000, m.neuro.rage + 400);
+        god_mod_surge(id, 0, 0, 400, 300, 0);   // cortisol + norepinephrine
+        status_msg = "Panic instilled in " + sid(id) +
+                     " — expect paranoia, flight or factional gossip";
+    }
+    void instill_panic(EntityId id) { post([=, this] { do_instill_panic(id); }); }
+    // deterministic pseudo-random ring offset for scatter spawns
+    static Vec2 god_ring(Vec2 p, int k, int cell, int rad) {
+        const int dx = int((k * 37) % (2 * rad + 1)) - rad;
+        const int dy = int((k * 53) % (2 * rad + 1)) - rad;
+        return Vec2{p.x + dx * cell, p.y + dy * cell};
+    }
+    void do_summon_rain(Vec2 p) {
+        if (!journal.spend(20)) { status_msg = "Not enough Resonance (20)"; return; }
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        int wetted = 0;
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                const Vec2 q{p.x + dx * cell, p.y + dy * cell};
+                if (t.contains(q) && !t.is_water(q)) {
+                    w.terrain.add_moisture(q, 140); ++wetted;
+                }
+            }
+        // drinkable pools left behind (kind "water", stock quantity)
+        const MaterialId wm = w.materials.id_of("water");
+        const PropId qd = w.props.find_name("quantity")
+            ? w.props.find_name("quantity")->id : kNoProp;
+        PropertyBag pb;
+        if (qd != kNoProp) pb.set(qd, Value::integer(3000));
+        int pools = 0;
+        for (int k = 0; k < 6; ++k) {
+            const Vec2 q = god_ring(p, k + 11, cell, 2);
+            if (!t.contains(q) || t.is_water(q)) continue;
+            if (w.create_entity("water", wm, q, pb) != kNoEntity) ++pools;
+        }
+        status_msg = "Rain over the hollow: " + std::to_string(wetted) +
+                     " cells moistened, " + std::to_string(pools) + " pools";
+    }
+    void summon_rain(Vec2 p) { post([=, this] { do_summon_rain(p); }); }
+    void do_summon_feast(Vec2 p) {
+        if (!journal.spend(30)) { status_msg = "Not enough Resonance (30)"; return; }
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        const MaterialId bm = w.materials.id_of("wild_berries");
+        const PropId qd = w.props.find_name("quantity")
+            ? w.props.find_name("quantity")->id : kNoProp;
+        PropertyBag pb;
+        if (qd != kNoProp) pb.set(qd, Value::integer(12));
+        int made = 0;
+        for (int k = 0; k < 8; ++k) {
+            const Vec2 q = god_ring(p, k + 31, cell, 3);
+            if (!t.contains(q) || t.is_water(q)) continue;
+            if (w.create_entity("goods", bm, q, pb) != kNoEntity) ++made;
+        }
+        // a waterskin alongside the berries
+        const MaterialId wm = w.materials.id_of("water");
+        PropertyBag wpb;
+        if (qd != kNoProp) wpb.set(qd, Value::integer(2000));
+        for (int k = 0; k < 2; ++k) {
+            const Vec2 q = god_ring(p, k + 47, cell, 2);
+            if (t.contains(q) && !t.is_water(q) &&
+                w.create_entity("water", wm, q, wpb) != kNoEntity) ++made;
+        }
+        status_msg = "Feast spread: " + std::to_string(made) +
+                     " caches — sharing vs hoarding is now observable";
+    }
+    void summon_feast(Vec2 p) { post([=, this] { do_summon_feast(p); }); }
+    void do_summon_predator(Vec2 p) {
+        if (!journal.spend(40)) { status_msg = "Not enough Resonance (40)"; return; }
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        const SpeciesDef* sp = w.species.find_name("pack_stalker");
+        if (!sp) sp = w.species.find_name("trail_hound");
+        if (!sp) { status_msg = "Predator: no predator species in data"; return; }
+        // nearest dry land to the click
+        Vec2 q = p; bool found = false;
+        for (int r = 0; r <= 6 && !found; ++r)
+            for (int k = 0; k < 8 * (r + 1) && !found; ++k) {
+                const Vec2 c = god_ring(p, k, cell, r);
+                if (t.contains(c) && !t.is_water(c)) { q = c; found = true; }
+            }
+        if (!found) { status_msg = "Predator: no dry land in reach"; return; }
+        PropertyBag pb = sp->props;
+        const EntityId id = w.create_entity(sp->name, sp->material, q, pb);
+        if (id == kNoEntity) { status_msg = "Predator: spawn rejected"; return; }
+        Entity* e = w.find(id);
+        // species gene loci at baseline (same as a worldgen individual,
+        // minus the per-capita hash deviation)
+        for (PropId g : sp->genes) {
+            const PropertyDef* pd = w.props.find(g);
+            if (!pd) continue;
+            const Value* cur = e->prop(w, g);
+            std::int64_t v = cur ? cur->i : 0;
+            if (pd->has_range) v = std::clamp(v, pd->lo, pd->hi);
+            e->genome.set(g, v); e->props.set(g, Value::integer(v));
+        }
+        w.build_anatomy(id);
+        status_msg = "A " + sp->name + " stalks the land — tribal defense, or dinner, will decide";
+    }
+    void summon_predator(Vec2 p) { post([=, this] { do_summon_predator(p); }); }
     void do_place_beacon(Vec2 p) {
         if (!journal.spend(10)) { status_msg = "Not enough Resonance (10)"; return; }
         const auto scouts = nearest_tribe(p, 2);
@@ -2667,9 +2841,29 @@ struct Viewer {
         power("Blueprint", kToolBlueprint, 25, "Drag a circle: builders dream of a shelter there");
         ImGui::SameLine(0, 4);
         power("Dread", kToolFear, 15, "Click a thing: your people who remember it come to fear it");
-        if (tool != kToolNone)
-            ImGui::TextColored(ImVec4(0.6f, 0.82f, 1, 1), tool == kToolBlueprint ? "Drag on the map - right click cancels"
-                                                                                 : "Click the map - right click cancels");
+        ImGui::SameLine(0, 4);
+        if (ImGui::SmallButton(god_open ? "God-Hand v" : "God-Hand >")) god_open = !god_open;
+        if (god_open) {
+            // second row: sandbox powers (deterministic world commands)
+            power("Cupid", kToolCupid, 15, "Click two sapients: kindle a mutual bond");
+            ImGui::SameLine(0, 4);
+            power("Panic", kToolPanic, 10, "Click an agent: cortisol/norepinephrine spike");
+            ImGui::SameLine(0, 4);
+            power("Rain", kToolRain, 20, "Click terrain: moisture pulse + drinkable pools");
+            ImGui::SameLine(0, 4);
+            power("Feast", kToolFeast, 30, "Click terrain: berry caches + water — sharing vs hoarding");
+            ImGui::SameLine(0, 4);
+            power("Predator", kToolPredator, 40, "Click terrain: a wild pack_stalker arrives");
+        }
+        if (tool != kToolNone) {
+            const std::string hint =
+                tool == kToolBlueprint ? "Drag on the map - right click cancels"
+                : tool == kToolCupid ? "Cupid: click two sapients" +
+                    std::string(cupid_a != kNoEntity ? " (second pick)" : " (first pick)") +
+                    " - right click cancels"
+                : "Click the map - right click cancels";
+            ImGui::TextColored(ImVec4(0.6f, 0.82f, 1, 1), "%s", hint.c_str());
+        }
         if (insp.found && insp.has_mind) {
             ImGui::Separator();
             ImGui::AlignTextToFramePadding();
@@ -3407,6 +3601,57 @@ struct Viewer {
                     if (tv) insp.traits.emplace_back(tn, value_str(*tv));
                 }
             }
+            // ---- mind-reader digest: everything Qwen needs to voice the
+            // NPC in first person (built under lock, consumed by the
+            // inspector's Ask button — display-only, never serialized)
+            {
+                std::string d;
+                d += "You are " + sid(e->id) + ", a " + e->kind_name.str() +
+                     " in Sunnyworld.\n";
+                d += "Current state: " + insp.intent + ".\n";
+                d += "Neuro: panic " + std::to_string(m->neuro.panic) +
+                     ", rage " + std::to_string(m->neuro.rage) +
+                     ", grief " + std::to_string(m->neuro.grief) + ".\n";
+                const BrainSlot* bs = nullptr;
+                if (w.brains_) {
+                    auto sit = w.brains_->slots.find(e->id);
+                    if (sit != w.brains_->slots.end()) bs = &sit->second;
+                }
+                if (bs) {
+                    d += "Neuromods: dopa " + std::to_string(bs->vital.mod[kBModDopa]) +
+                         ", sero " + std::to_string(bs->vital.mod[kBModSero]) +
+                         ", norepi " + std::to_string(bs->vital.mod[kBModNorepi]) +
+                         ", cortisol " + std::to_string(bs->vital.mod[kBModCortisol]) + ".\n";
+                    d += "Drives: hunger " + std::to_string(bs->vital.drive_hunger) +
+                         ", thirst " + std::to_string(bs->vital.drive_thirst) +
+                         ", fatigue " + std::to_string(bs->vital.drive_fatigue) + ".\n";
+                }
+                if (!insp.memories.empty()) {
+                    d += "Memories: ";
+                    for (std::size_t i = 0; i < insp.memories.size() && i < 6; ++i) {
+                        if (i) d += "; ";
+                        d += insp.memories[i];
+                    }
+                    d += ".\n";
+                }
+                if (!insp.ties.empty()) {
+                    d += "Relationships: ";
+                    for (std::size_t i = 0; i < insp.ties.size() && i < 4; ++i) {
+                        if (i) d += "; ";
+                        d += insp.ties[i];
+                    }
+                    d += ".\n";
+                }
+                if (!insp.life.empty()) {
+                    d += "Life: ";
+                    for (std::size_t i = 0; i < insp.life.size() && i < 4; ++i) {
+                        if (i) d += "; ";
+                        d += insp.life[i];
+                    }
+                    d += ".\n";
+                }
+                insp.mind_digest = std::move(d);
+            }
         }
         const PropId poss = P("possessed_by");
         for (const auto& ep : w.entities)
@@ -3617,6 +3862,36 @@ struct Viewer {
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
+        }
+        // ---- Ask / Read Mind: async Qwen monologue (never blocks render) --
+        if (insp.has_mind) {
+            ImGui::Separator();
+            if (mind_ask_busy) {
+                ImGui::TextDisabled("Qwen is reading its mind...");
+            } else if (ImGui::Button("Ask / Read Mind", ImVec2(-1, 0))) {
+                if (llm_host.active() && !insp.mind_digest.empty()) {
+                    static const char* kMindSys =
+                        "You are reading the mind of a creature in a "
+                        "deterministic ecosystem simulation. Using ONLY the "
+                        "facts given, write a short first-person monologue "
+                        "(2-4 sentences) in Vietnamese as the creature "
+                        "itself — what it fears, desires, remembers, or "
+                        "resent. No narration, no quotes.";
+                    mind_ask_key = ++llm_key_seq;
+                    mind_ask_id = selected;
+                    mind_reply.clear();
+                    mind_ask_wait = 0;
+                    llm_host.submit_prompt(mind_ask_key, kMindSys, insp.mind_digest);
+                    mind_ask_busy = true;
+                } else {
+                    status_msg = "Mind-reader needs the Qwen model "
+                                 "(SIMLAB_LLM_MODEL) and a sapient target";
+                }
+            }
+            if (!mind_reply.empty()) {
+                ImGui::Separator();
+                ImGui::TextWrapped("%s", mind_reply.c_str());
+            }
         }
         ImGui::End();
     }
@@ -3906,6 +4181,15 @@ struct Viewer {
             if (tool == kToolBlueprint) { dragging = true; drag_a = drag_b = wp; return; }
             pick(e.button.x / kPix, e.button.y / kPix);
             if (tool == kToolFear && selected != kNoEntity) { instill_fear(selected); tool = kToolNone; }
+            if (tool == kToolCupid && selected != kNoEntity) {
+                if (cupid_a == kNoEntity || cupid_a == selected) cupid_a = selected;
+                else { const EntityId b = selected; const EntityId a2 = cupid_a;
+                       cupid_a = kNoEntity; cupid(a2, b); }
+            }
+            if (tool == kToolPanic && selected != kNoEntity) { instill_panic(selected); tool = kToolNone; }
+            if (tool == kToolRain) { summon_rain(wp); tool = kToolNone; }
+            if (tool == kToolFeast) { summon_feast(wp); tool = kToolNone; }
+            if (tool == kToolPredator) { summon_predator(wp); tool = kToolNone; }
         }
         if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) drag_b = screen_to_world(e.motion.x / kPix, e.motion.y / kPix);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && dragging && e.button.button == SDL_BUTTON_LEFT) {
@@ -3928,6 +4212,12 @@ struct Viewer {
             if (k == SDLK_F5) { save_slot(1); return; }
             if (k == SDLK_J) { show_journal = !show_journal; return; }
             if (k == SDLK_B) { show_badges = !show_badges; return; }
+            if (k == SDLK_P) {                 // possess selected / release
+                if (avatar != kNoEntity) set_possess(kNoEntity);
+                else if (selected != kNoEntity) set_possess(selected);
+                return;
+            }
+            if (k == SDLK_E && avatar != kNoEntity) { avatar_act("consume"); return; }
             if (k == SDLK_M && is_planet()) { if (globe) enter_surface(gview.lon, gview.lat); else enter_globe(); return; }
             if (avatar != kNoEntity && k >= SDLK_1 && k <= SDLK_9) {   // avatar verbs
                 int n = 0;
@@ -4898,7 +5188,7 @@ struct Viewer {
                         else if (a == "communicate" || a == "speak" || a == "chant") { label = "Talk";   col = IM_COL32(110, 220, 120, 255); }
                         else if (a == "perform_ritual" || a == "consecrate")         { label = "Rite";   col = IM_COL32(235, 200, 110, 255); }
                         else if (a == "rest" || a == "sleep")                        { label = "zZ";     col = IM_COL32(185, 190, 215, 255); }
-                        else if (a == "reproduce" || a == "mate")                    { label = "Mate";   col = IM_COL32(235, 135, 200, 255); }
+                        else if (a == "reproduce" || a == "mate")                    { label = "Lovin'"; col = IM_COL32(255, 140, 210, 255); }
                         else if (a == "trade" || a == "gift" || a == "share")        { label = "Share";  col = IM_COL32(225, 200, 100, 255); }
                         else if (a == "steal")                                       { label = "Steal!"; col = IM_COL32(200, 90, 160, 255); }
                         else if (a == "treaty" || a == "parley" || a == "diplomatic_parley") { label = "Talk"; col = IM_COL32(130, 225, 225, 255); }
@@ -4907,7 +5197,16 @@ struct Viewer {
                         if (ev.failed) { label += "!"; col = IM_COL32(150, 155, 165, 255); }
                         {
                             ThoughtBadge& b = c_badge[actor];
-                            if (b.rank < 3) { b.label = label; b.col = col; b.until = c_tick + 30; b.rank = 2; }
+                            if (b.rank < 3) { b.label = label; b.col = col;
+                                b.until = c_tick + ((a == "reproduce" || a == "mate") ? 50 : 30);
+                                b.rank = 2; }
+                        }
+                        // post-coital glow: the partner wears Lovin' too
+                        if ((a == "reproduce" || a == "mate") && target != kNoEntity) {
+                            ThoughtBadge& tb = c_badge[target];
+                            if (tb.rank < 3) { tb.label = "Lovin'";
+                                tb.col = IM_COL32(255, 140, 210, 255);
+                                tb.until = c_tick + 50; tb.rank = 2; }
                         }
                         // intent link: actor -> last interacted target
                         if (target != kNoEntity) {
@@ -5024,6 +5323,65 @@ struct Viewer {
                                         b.label = "..."; b.col = IM_COL32(140, 145, 160, 255);
                                         b.until = c_tick + 30; b.rank = 0;
                                     }
+                                }
+                            }
+                        }
+                        // ---- drama badges: jealousy signature, fresh grudges,
+                        // betrayal wounds, secretive hunger+stress. Reads
+                        // engram charge/freshness only — never mutates.
+                        {
+                            int fresh_neg = 0, stale_grudge = 0;
+                            std::int64_t worst_neg = 0;
+                            for (const auto& [kid, s] : m->memory) {
+                                if (kid == e.id) continue;
+                                if (s.kind_name != e.kind &&
+                                    s.kind_name != e.species) continue;
+                                const std::int64_t ch = s.engram.emotional_charge;
+                                if (ch > -450) continue;
+                                const std::uint64_t age =
+                                    c_tick > s.engram.last_rehearsal
+                                        ? c_tick - s.engram.last_rehearsal : 0;
+                                if (age < 120) { ++fresh_neg;
+                                    if (ch < worst_neg) worst_neg = ch; }
+                                else if (ch <= -600 && age < 3000) ++stale_grudge;
+                            }
+                            // crowd check for the secretive read
+                            bool crowded = false;
+                            if (bs && bs->vital.drive_hunger > 600 &&
+                                (bs->vital.mod[kBModCortisol] > 350 ||
+                                 m->neuro.panic > 250)) {
+                                int cn = 0;
+                                for (const EntityView& o : snap.entities) {
+                                    if (cn >= 2) break;
+                                    if (o.id == e.id || !o.alive ||
+                                        o.fog != Fog::Visible) continue;
+                                    if (o.kind != e.kind &&
+                                        o.species != e.species) continue;
+                                    const std::int64_t dx =
+                                        std::int64_t(o.pos.x) - e.pos.x;
+                                    const std::int64_t dy =
+                                        std::int64_t(o.pos.y) - e.pos.y;
+                                    if (dx * dx + dy * dy < 128 * 128) ++cn;
+                                }
+                                crowded = cn >= 2;
+                            }
+                            const char* dl = nullptr; ImU32 dc = 0; int dr = 0;
+                            if (fresh_neg >= 2) {
+                                dl = "Jealous!"; dc = IM_COL32(255, 120, 60, 255); dr = 2;
+                            } else if (fresh_neg == 1 && worst_neg <= -680) {
+                                dl = "Grudge"; dc = IM_COL32(200, 60, 60, 255); dr = 2;
+                            } else if (fresh_neg == 1) {
+                                dl = "Betrayed!"; dc = IM_COL32(255, 110, 170, 255); dr = 2;
+                            } else if (stale_grudge > 0) {
+                                dl = "Grudge"; dc = IM_COL32(160, 70, 70, 255); dr = 1;
+                            } else if (crowded) {
+                                dl = "Secretive"; dc = IM_COL32(150, 170, 200, 255); dr = 1;
+                            }
+                            if (dl) {
+                                ThoughtBadge& b = c_badge[e.id];
+                                if (b.rank <= dr || b.until <= c_tick) {
+                                    b.label = dl; b.col = dc;
+                                    b.until = c_tick + 40; b.rank = dr;
                                 }
                             }
                         }
@@ -5194,6 +5552,17 @@ struct Viewer {
             if (globe) draw_globe_icons(); else draw_overlays();
             ui_topbar();
             if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
+            // mind-reader reply: poll the worker every frame (mutexed,
+            // non-blocking) so it completes even with the inspector shut
+            if (mind_ask_busy && mind_ask_key) {
+                std::string out;
+                if (llm_host.poll(mind_ask_key, out)) {
+                    mind_reply = out; mind_ask_busy = false;
+                } else if (++mind_ask_wait > 3600) {   // ~60 s: give up
+                    mind_ask_busy = false;
+                    status_msg = "Mind-reader timed out";
+                }
+            }
             ui_inspector(); ui_player(); ui_journal(); ui_successor(); ui_toast(); ui_ticker();
             if (!show_journal) ui_word_editor();
         }

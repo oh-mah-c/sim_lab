@@ -15,6 +15,7 @@
 
 #include "simlab/Cognition.hpp"
 #include "simlab/World.hpp"
+#include "simlab/Brain.hpp"
 #include "simlab/Laws.hpp"
 #include "simlab/Causal.hpp"
 #include "simlab/Discovery.hpp"
@@ -1900,10 +1901,31 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
                     neuro_touch(w, npc);
                     mind.neuro.rage = std::min<std::int64_t>(1000,
                         mind.neuro.rage + bq * mp.jealousy_gain / 1000);
+                    // betrayal mark: the unfaithful partner's engram flips
+                    // negative (upsert keeps the STRONGER charge, so this
+                    // must be a direct write) and panic spikes — the acute
+                    // stress axis, not just slow-burn rage.
+                    bit->second.engram.emotional_charge =
+                        std::min<std::int64_t>(bit->second.engram.emotional_charge,
+                                               -(300 + bq / 3));
+                    mind.neuro.panic = std::min<std::int64_t>(1000,
+                        mind.neuro.panic + 200 + bq * mp.jealousy_gain / 2000);
                     AgentMind::MemorySnapshot rs =
                         snapshot_now(w, rival, ev.tick);
                     upsert_memory(mind, rival, rs, -700, mp);
-                    bit->second.engram.emotional_charge = bq * 3 / 4;
+                    // neuromod surge on the existing brain slot (find-only —
+                    // witness hooks must never allocate a connectome):
+                    // cortisol + norepinephrine are the engine's stress axes.
+                    if (w.brains_) {
+                        auto sit = w.brains_->slots.find(npc);
+                        if (sit != w.brains_->slots.end()) {
+                            BrainVital& bv = sit->second.vital;
+                            bv.mod[kBModCortisol] = static_cast<std::int16_t>(
+                                std::clamp<int>(int(bv.mod[kBModCortisol]) + 260, 0, 1000));
+                            bv.mod[kBModNorepi] = static_cast<std::int16_t>(
+                                std::clamp<int>(int(bv.mod[kBModNorepi]) + 200, 0, 1000));
+                        }
+                    }
                 }
             }
         }
@@ -3329,6 +3351,26 @@ void social_from_event(World& w, EntityId actor,
                 const std::int64_t bc = bond_charge(mp);
                 bond_engram(w, actor, partner, ev.tick, bc, mp);
                 bond_engram(w, partner, actor, ev.tick, bc, mp);
+                // post-coital surge ("lovin'"): dopamine + serotonin — the
+                // engine's affiliation axes; there is no oxytocin/endorphin
+                // channel — plus a joy emotion kick and a fatigue deposit so
+                // the pair drifts into shared rest through the EXISTING
+                // drives. Find-only slot lookup: never allocate here.
+                if (w.brains_) {
+                    for (EntityId p : {actor, partner}) {
+                        auto sit = w.brains_->slots.find(p);
+                        if (sit == w.brains_->slots.end()) continue;
+                        BrainVital& bv = sit->second.vital;
+                        bv.mod[kBModDopa] = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.mod[kBModDopa]) + 240, 0, 1000));
+                        bv.mod[kBModSero] = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.mod[kBModSero]) + 200, 0, 1000));
+                        bv.emo[kBEmoJoy] = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.emo[kBEmoJoy]) + 250, -1000, 1000));
+                        bv.drive_fatigue = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.drive_fatigue) + 220, 0, 1000));
+                    }
+                }
                 // parental imprint: deep mark each way parent<->child;
                 // drive ~0 writes nothing -> the lineage abandons its young
                 const std::int64_t pc = mem_clamp(

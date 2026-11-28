@@ -1161,6 +1161,45 @@ void cycle_one_agent(World& w, DriverState* st, DriverTally* tally,
                 dint(w, *me, hunger, 0) > 500 || dint(w, *me, thirst, 0) > 500;
             const bool desperate =
                 dint(w, *me, hunger, 0) > 900 || dint(w, *me, thirst, 0) > 900;
+            // Secretive hoarding: a stressed, hungry mind does not dine in
+            // front of a crowd — it first puts distance between itself and
+            // nearby conspecifics, then eats in peace. Deterministic:
+            // sorted ids, fixed-axis away vector, consume cooldown shared
+            // with a meal so it cannot jitter every cycle.
+            if (mm && urgent && !desperate &&
+                dint(w, *me, hunger, 0) > 500 && mm->neuro.panic >= 300) {
+                std::vector<EntityId> near = w.entities_near(me->pos, 96);
+                std::sort(near.begin(), near.end());
+                std::int64_t cx = 0, cy = 0;
+                int cn = 0;
+                for (EntityId cid : near) {
+                    if (cid == npc) continue;
+                    const Entity* ce = w.find(cid);
+                    if (!ce || !ce->alive || ce->kind_name != me->kind_name)
+                        continue;
+                    cx += ce->pos.x; cy += ce->pos.y; ++cn;
+                }
+                if (cn >= 2) {
+                    cool(st, npc, kConsume, now, kCooldown[kConsume]);
+                    const std::int64_t ax = me->pos.x * cn - cx;
+                    const std::int64_t ay = me->pos.y * cn - cy;
+                    const bool xdom = std::llabs(ax) >= std::llabs(ay);
+                    InteractionContext rc;
+                    rc.actor = npc; rc.parameters.ticks = 1;
+                    rc.parameters.action = "move";
+                    rc.parameters.destination = xdom
+                        ? Vec2{me->pos.x +
+                              static_cast<std::int32_t>(ax > 0 ? 96 : -96),
+                              me->pos.y}
+                        : Vec2{me->pos.x, me->pos.y +
+                              static_cast<std::int32_t>(ay > 0 ? 96 : -96)};
+                    rc.parameters.has_destination = true;
+                    if (drive_move(w, st, npc, rc)) {
+                        if (tally) ++tally->maintenance;
+                        continue;
+                    }
+                }
+            }
             if (mm && urgent && mm->known_actions.count("consume")) {
                 const std::int64_t rr = dint(w, *me_c, reach, 64);
                 const std::int64_t r2 = rr * rr;
