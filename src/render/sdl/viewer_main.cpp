@@ -381,11 +381,18 @@ struct Viewer {
     std::unordered_map<EntityId, ImVec2> vis_pos, vis_prev;
     std::unordered_map<EntityId, float> dust_at;        // last dust puff (time_s)
     // Action telegraph: last causal verb per actor, scanned incrementally
-    // from the ledger — display-only, expires after ~2 s of render time.
-    std::unordered_map<EntityId, std::string> c_act;
-    std::unordered_map<EntityId, ImU32> c_act_col;
-    std::unordered_map<EntityId, std::uint64_t> c_act_until;
+    // from the ledger — display-only.
     std::uint64_t act_last = 0;                          // last scanned EventId
+    // ---- DF-style HUD (viewer-only, never serialized) ------------------------
+    // Thought/action badges above NPCs: label + color + world-tick expiry.
+    // rank resolves collisions: fear(3) > action(2) > rest(1) > idle(0).
+    struct ThoughtBadge { std::string label; ImU32 col = 0; std::uint64_t until = 0; int rank = 0; };
+    std::unordered_map<EntityId, ThoughtBadge> c_badge;
+    // remembered-target links for selected/hovered NPCs (dashed intent line)
+    struct IntentLink { EntityId target = kNoEntity; Vec2 pos{}; std::string label; std::uint64_t until = 0; };
+    std::unordered_map<EntityId, IntentLink> c_intent;
+    EntityId hover_id = kNoEntity;                       // nearest entity to cursor
+    bool show_badges = true, show_ticker = true;
     bool show_atlas = false, show_codex = false, show_inspector = true;
     std::map<std::string, std::string> rosetta;     // player guesses: glyph token -> meaning
     SDL_Texture* glow = nullptr;
@@ -448,6 +455,15 @@ struct Viewer {
         std::vector<std::pair<std::string, long long>> beliefs;
         std::string intent;                  // Phase 15: what it's doing now
         std::vector<std::string> life;       // Phase 15: scars/fears/loves/proofs
+        // ---- DF HUD fields (viewer-only) ------------------------------------
+        std::string gen;                     // "F0 Founder" / "F1" / "F2+"
+        long long age = 0, adult_age = 0, n_parents = 0, n_children = 0;
+        std::vector<std::pair<std::string, std::pair<long long, long long>>> needs;  // label,(cur,max)
+        std::vector<std::string> memories;   // charge-tagged engrams
+        std::vector<std::string> ties;       // social bonds/trust
+        std::vector<std::pair<std::string, int>> brain_act;   // 12 modules, 0..100
+        std::vector<std::pair<std::string, int>> neuros;      // neuromodulators 0..1000
+        std::vector<std::pair<std::string, std::string>> traits;  // inherited genome props
     } insp;
     struct Stone { EntityId id; std::int64_t lang; std::string text, treaty; };
     std::vector<Stone> c_stones;
@@ -505,7 +521,8 @@ struct Viewer {
         selected = kNoEntity; avatar = kNoEntity; av_targets.clear();
         parts.clear(); last_pos.clear(); facing.clear(); bob_until.clear(); last_integ.clear(); last_pain.clear();
         vis_pos.clear(); vis_prev.clear(); dust_at.clear();
-        c_act.clear(); c_act_col.clear(); c_act_until.clear(); act_last = 0;
+        act_last = 0;
+        c_badge.clear(); c_intent.clear(); hover_id = kNoEntity;
         ground_key = ~0ull;
         if (ground) { SDL_DestroyTexture(ground); ground = nullptr; }
         if (fog_tex) { SDL_DestroyTexture(fog_tex); fog_tex = nullptr; }
@@ -1531,6 +1548,21 @@ struct Viewer {
     }
 
     void draw_entities(double dt) {
+        // hover pick: nearest living entity to the cursor (world_rt px)
+        hover_id = kNoEntity;
+        {
+            const ImVec2 mp = ImGui::GetIO().MousePos;
+            if (mp.x >= 0 && show_badges) {
+                const float mxx = mp.x / kPix, myy = mp.y / kPix;
+                float best = 28.f * 28.f;
+                for (const EntityView& e : snap.entities) {
+                    if (!e.alive || e.fog != Fog::Visible) continue;
+                    const float fx = cam.sx(float(e.pos.x)), fy = cam.sy(float(e.pos.y), elev_at(e.pos));
+                    const float d = (fx - mxx) * (fx - mxx) + (fy - myy) * (fy - myy);
+                    if (d < best) { best = d; hover_id = e.id; }
+                }
+            }
+        }
         for (const EntityView& e : snap.entities) {
             if (e.kind == "enclosure") { draw_enclosure(e); continue; }
             // ---- smooth visual position: exponential chase of sim pos ----
@@ -1652,18 +1684,26 @@ struct Viewer {
             }
             if (e.epic && lens == kSacred) draw_glow(vpos, 0xFFE090, 0.8f);
             draw_entity_lens(e, fx, fy, sw, sh);
-            // action telegraph: last causal verb floating over the head
-            if (creature && e.alive && e.fog == Fog::Visible) {
-                auto ait = c_act.find(e.id);
-                auto uit = c_act_until.find(e.id);
-                if (ait != c_act.end() && uit != c_act_until.end() && uit->second > frames) {
+            // thought/action badge: DF-style pill floating over the head,
+            // fades out over its last ~8 world ticks (viewer-only state)
+            if (creature && e.alive && e.fog == Fog::Visible && show_badges) {
+                auto bit = c_badge.find(e.id);
+                if (bit != c_badge.end() && bit->second.until > c_tick) {
+                    const ThoughtBadge& b = bit->second;
+                    const float rem = float(bit->second.until - c_tick);
+                    const int alpha = int(235.f * std::min(1.f, rem / 8.f));
                     ImDrawList* dl = ImGui::GetForegroundDrawList();
-                    const ImVec2 tp(ux(fx), ux(fy - sh) - 9.f);
-                    const ImVec2 ts = ImGui::CalcTextSize(ait->second.c_str());
-                    dl->AddRectFilled(ImVec2(tp.x - ts.x * 0.5f - 2.f, tp.y - 1.f),
-                                      ImVec2(tp.x + ts.x * 0.5f + 2.f, tp.y + ts.y + 1.f),
-                                      IM_COL32(10, 10, 14, 175), 2.f);
-                    dl->AddText(ImVec2(tp.x - ts.x * 0.5f, tp.y), c_act_col[e.id], ait->second.c_str());
+                    const ImVec2 tp(ux(fx), ux(fy - sh) - 10.f);
+                    const ImVec2 ts = ImGui::CalcTextSize(b.label.c_str());
+                    const ImU32 bg = IM_COL32(10, 10, 14, alpha * 3 / 4);
+                    const ImU32 fg = (b.col & 0x00FFFFFFu) | (ImU32(alpha) << 24);
+                    dl->AddRectFilled(ImVec2(tp.x - ts.x * 0.5f - 4.f, tp.y - 2.f),
+                                      ImVec2(tp.x + ts.x * 0.5f + 4.f, tp.y + ts.y + 2.f),
+                                      bg, 3.f);
+                    dl->AddRect(ImVec2(tp.x - ts.x * 0.5f - 4.f, tp.y - 2.f),
+                                ImVec2(tp.x + ts.x * 0.5f + 4.f, tp.y + ts.y + 2.f),
+                                (b.col & 0x00FFFFFFu) | (ImU32(alpha * 2 / 3) << 24), 3.f);
+                    dl->AddText(ImVec2(tp.x - ts.x * 0.5f, tp.y), fg, b.label.c_str());
                 }
             }
             if (e.id == selected) {
@@ -1692,7 +1732,7 @@ struct Viewer {
             };
             prune(last_pos); prune(facing); prune(bob_until); prune(last_integ); prune(last_pain);
             prune(vis_pos); prune(vis_prev); prune(dust_at);
-            prune(c_act); prune(c_act_col); prune(c_act_until);
+            prune(c_badge); prune(c_intent);
         }
     }
 
@@ -1741,6 +1781,65 @@ struct Viewer {
             dl->AddLine(ImVec2(ux(cam.sx(float(l.a.x))), ux(cam.sy(float(l.a.y), elev_at(l.a)) - 12 * cam.zoom)),
                         ImVec2(ux(cam.sx(float(l.b.x))), ux(cam.sy(float(l.b.y), elev_at(l.b)) - 20 * cam.zoom)),
                         IM_COL32(230, 190, 60, 150), 1.5f);
+    }
+
+    // DF-style intent lines: a dashed line from the selected (or hovered)
+    // NPC to the entity its mind/brain is currently reaching for.
+    static void dashed_seg(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col,
+                           float dash = 7.f, float gap = 5.f, float thick = 1.5f) {
+        const float dx = b.x - a.x, dy = b.y - a.y;
+        const float len = std::hypot(dx, dy);
+        if (len < 1.f) return;
+        const float ux_ = dx / len, uy_ = dy / len;
+        for (float t = 0.f; t < len; t += dash + gap) {
+            const float e = std::min(t + dash, len);
+            dl->AddLine(ImVec2(a.x + ux_ * t, a.y + uy_ * t),
+                        ImVec2(a.x + ux_ * e, a.y + uy_ * e), col, thick);
+        }
+    }
+    void draw_intents() {
+        if (!show_badges || globe) return;
+        // chosen actor: explicit selection wins, else hovered entity
+        auto fresh = [&](EntityId id) {
+            auto it = c_intent.find(id);
+            return it != c_intent.end() && it->second.until > c_tick;
+        };
+        EntityId who = kNoEntity;
+        if (selected != kNoEntity && fresh(selected)) who = selected;
+        else if (hover_id != kNoEntity && fresh(hover_id)) who = hover_id;
+        if (who == kNoEntity) return;
+        auto iit = c_intent.find(who);
+        if (iit == c_intent.end() || iit->second.until <= c_tick) return;
+        const EntityView* src = nullptr;
+        const EntityView* dst = nullptr;
+        for (const EntityView& e : snap.entities) {
+            if (e.id == who) src = &e;
+            if (e.id == iit->second.target) dst = &e;
+            if (src && dst) break;
+        }
+        if (!src || !src->alive || src->fog != Fog::Visible) return;
+        const float ax = ux(cam.sx(float(src->pos.x)));
+        const float ay = ux(cam.sy(float(src->pos.y), elev_at(src->pos)));
+        float bx, by;
+        if (dst && dst->fog == Fog::Visible) {
+            bx = ux(cam.sx(float(dst->pos.x)));
+            by = ux(cam.sy(float(dst->pos.y), elev_at(dst->pos)));
+        } else {
+            bx = ux(cam.sx(float(iit->second.pos.x)));
+            by = ux(cam.sy(float(iit->second.pos.y)));
+        }
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const ImU32 col = who == selected ? IM_COL32(255, 225, 120, 200) : IM_COL32(150, 210, 255, 170);
+        dashed_seg(dl, ImVec2(ax, ay - 14.f), ImVec2(bx, by - 10.f), col);
+        if (!iit->second.label.empty()) {
+            const ImVec2 tp((ax + bx) * 0.5f, (ay + by) * 0.5f - 8.f);
+            const ImVec2 ts = ImGui::CalcTextSize(iit->second.label.c_str());
+            dl->AddRectFilled(ImVec2(tp.x - ts.x * 0.5f - 3.f, tp.y - 1.f),
+                              ImVec2(tp.x + ts.x * 0.5f + 3.f, tp.y + ts.y + 1.f),
+                              IM_COL32(10, 10, 14, 170), 2.f);
+            dl->AddText(ImVec2(tp.x - ts.x * 0.5f, tp.y), IM_COL32(235, 225, 180, 230),
+                        iit->second.label.c_str());
+        }
     }
 
     // Phase 15: narrative callouts — short story lines floating over the spot
@@ -1864,6 +1963,8 @@ struct Viewer {
             ImGui::Separator();
             ImGui::TextDisabled("Panels");
             ImGui::Checkbox("Inspector on selection", &show_inspector);
+            ImGui::Checkbox("Thought badges (B)", &show_badges);
+            ImGui::Checkbox("Event ticker", &show_ticker);
             ImGui::Checkbox("Field journal (chronicle)", &show_journal);
             ImGui::Checkbox("Chronicle & Rosetta codex", &show_codex);
             ImGui::Checkbox("Sprite atlas", &show_atlas);
@@ -1899,6 +2000,45 @@ struct Viewer {
         ImGui::TextColored(ImVec4(1, 0.88f, 0.6f, 1), "%s", toast_msg.c_str());
         ImGui::End();
         ImGui::PopStyleVar(2);
+    }
+
+    // ---- live event ticker ("jump-to-drama"): last notable chronicle lines -
+    // click flies the camera to the spot and selects the actor. Pure viewer
+    // state read from cfeed; nothing here touches World.
+    void ui_ticker() {
+        if (!show_ticker || !has_game || globe || in_menu) return;
+        // pinned bottom-left; ~10 wrapped lines max so 240px clears the HUD
+        ImGui::SetNextWindowPos(ImVec2(10, float(win_h) - 240), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.72f);
+        ImGui::Begin("##ticker", nullptr, ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        ImGui::TextDisabled("chronicle");
+        int shown = 0;
+        for (auto it = cfeed.lines.rbegin(); it != cfeed.lines.rend() && shown < 10; ++it) {
+            const NarrativeLine& l = *it;
+            if (!(l.cat & (kCatCombat | kCatSurvival | kCatDiscovery | kCatSociety | kCatPinned))) continue;
+            ++shown;
+            ImGui::PushID(static_cast<int>(l.seq % 100000));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                l.llm ? ImVec4(1.f, 0.9f, 0.55f, 1)
+                : (l.cat & kCatCombat) ? ImVec4(1.f, 0.55f, 0.45f, 1)
+                : (l.cat & kCatDiscovery) ? ImVec4(1.f, 0.82f, 0.5f, 1)
+                : (l.cat & kCatSociety) ? ImVec4(0.6f, 0.9f, 0.95f, 1)
+                : (l.cat & kCatSurvival) ? ImVec4(0.65f, 0.95f, 0.6f, 1)
+                : ImVec4(0.85f, 0.85f, 0.88f, 1));
+            if (ImGui::Selectable(l.text.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick,
+                                  ImVec2(520, 0))) {
+                cam_gx = float(l.pos.x); cam_gy = float(l.pos.y); cam_gz = cam.zoom;
+                cam_goal = true;
+                if (l.who != kNoEntity) selected = l.who;
+                else if (l.about != kNoEntity) selected = l.about;
+                if (globe) { globe = false; globe_dive = false; }
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::End();
     }
 
     // ---- menus: Title -> New Game / Continue / Load ; in game Esc -> Pause --------
@@ -2850,6 +2990,35 @@ struct Viewer {
             insp.props.emplace_back(d ? d->name : "?", value_str(v));
         }
         auto P = [&](const char* n) { const PropertyDef* d = w.props.find_name(n); return d ? d->id : kNoProp; };
+        // ---- DF HUD: lineage generation (parent_of walk, dead ancestors ----
+        // still count — lineage is a record, not a survival claim)
+        {
+            int depth = 0;
+            std::vector<EntityId> frontier{e->id};
+            std::set<EntityId> seen{e->id};
+            for (int d = 0; d < 8 && !frontier.empty(); ++d) {
+                std::vector<EntityId> next;
+                bool any = false;
+                for (EntityId cur : frontier)
+                    for (const Relation& r : w.relations_of(cur, "parent_of"))
+                        if (r.b == cur && seen.insert(r.a).second) { next.push_back(r.a); any = true; }
+                if (!any) break;
+                ++depth; frontier.swap(next);
+            }
+            for (const Relation& r : w.relations_of(e->id, "parent_of")) {
+                if (r.b == e->id) ++insp.n_parents;
+                else if (r.a == e->id) ++insp.n_children;
+            }
+            insp.gen = depth == 0 ? "F0 Founder" : depth == 1 ? "F1" : "F2+";
+            insp.age = w.prop_int(*e, P("age"), 0);
+            insp.adult_age = w.prop_int(*e, P("adult_age"), 0);
+            auto need = [&](const char* n, long long mx) {
+                insp.needs.emplace_back(n, std::pair<long long,long long>{
+                    w.prop_int(*e, P(n), 0), mx});
+            };
+            need("energy", 120000); need("hunger", 1000);
+            need("thirst", 1000); need("integrity", 1000);
+        }
         const PropertyDef* rd = w.props.find_name("part_role");
         for (const Relation& r : w.relations_of(e->id, "part_of")) {     // anatomy (Phase 10)
             if (r.b != e->id) continue;
@@ -2946,6 +3115,92 @@ struct Viewer {
                         mems.push_back({-5000, "proved: " + d.claim});
                 std::sort(mems.begin(), mems.end(), [](const EM& a, const EM& b) { return a.score < b.score; });
                 for (std::size_t i = 0; i < mems.size() && i < 10; ++i) insp.life.push_back(mems[i].s);
+            }
+            // ---- DF HUD: memories with affective charge ----------------------
+            {
+                struct ME { std::int64_t score; std::string s; };
+                std::vector<ME> top;
+                for (const auto& [eid, ms] : m->memory) {
+                    const MemoryEngram& g = ms.engram;
+                    if (g.clarity < 150 || g.emotional_charge == 0) continue;
+                    std::string what = ms.kind_name;
+                    if (ms.material != kNoMaterial)
+                        if (const MaterialDef* md = w.materials.find(ms.material)) what += " (" + md->name + ")";
+                    char tag[48];
+                    std::snprintf(tag, sizeof tag, "%s%lld",
+                                  g.emotional_charge >= 0 ? "+" : "", (long long)g.emotional_charge);
+                    top.push_back({-std::llabs(g.emotional_charge) * std::min<std::int64_t>(g.clarity, 400) / 400,
+                                   "#" + std::to_string(eid % 100000) + " " + what + "  [" + tag + "]"});
+                }
+                std::sort(top.begin(), top.end(), [](const ME& a, const ME& b) { return a.score < b.score; });
+                for (std::size_t i = 0; i < top.size() && i < 8; ++i) insp.memories.push_back(top[i].s);
+            }
+            // ---- DF HUD: live brain — module activity, neuromodulators, -----
+            // social ties, inherited traits (all read-only)
+            {
+                const BrainSlot* bs = nullptr;
+                if (w.brains_) {
+                    auto sit = w.brains_->slots.find(e->id);
+                    if (sit != w.brains_->slots.end()) bs = &sit->second;
+                }
+                if (bs) {
+                    static const char* kModNames[kBModCount] = {
+                        "Dopamine", "Serotonin", "Norepinephrine", "Acetylcholine",
+                        "GABA", "Glutamate", "Cortisol"};
+                    for (int i = 0; i < kBModCount; ++i)
+                        insp.neuros.emplace_back(kModNames[i], int(bs->vital.mod[i]));
+                    static const char* kModShort[kBrainModuleCount] = {
+                        "Brainstem", "Thalamus", "Hypothal.", "Cerebellum",
+                        "BasalGang.", "Amygdala", "Hippocampus", "Prefrontal",
+                        "Sens.Cortex", "MotorCort.", "Association", "Language"};
+                    for (int i = 0; i < kBrainModuleCount; ++i) {
+                        const BrainModuleState& ms = bs->net.modules[i];
+                        int act = 0;
+                        for (std::uint32_t j = 0; j < ms.count; ++j) {
+                            const std::uint32_t n = ms.first + j;
+                            if (n >= bs->net.st.size()) break;
+                            if (bs->net.st[n].membrane * 2 > bs->net.gen[n].threshold ||
+                                bs->net.st[n].refractory_left > 0) ++act;
+                        }
+                        insp.brain_act.emplace_back(kModShort[i],
+                            ms.count ? int(act * 100 / ms.count) : 0);
+                    }
+                    // social ties: BrainSocial keys are hash(entity id) —
+                    // resolve by hashing every living mind's id once
+                    {
+                        std::unordered_map<std::uint64_t, EntityId> key2id;
+                        for (const auto& [mid, mm] : w.minds_) {
+                            const Entity* other = w.find(mid);
+                            if (!other || !other->alive) continue;
+                            key2id[Rng::hash(static_cast<std::uint64_t>(mid) ^ 0x5DEECE66DULL)] = mid;
+                        }
+                        for (const BrainSocial& s : bs->cog.social) {
+                            if (s.key == 0) continue;
+                            auto kit = key2id.find(s.key);
+                            if (kit == key2id.end()) continue;
+                            const Entity* other = w.find(kit->second);
+                            char buf[160];
+                            std::snprintf(buf, sizeof buf, "%s %s  trust %+d  fam %d",
+                                sid(kit->second).c_str(),
+                                other ? other->kind_name.str().c_str() : "?",
+                                int(s.trust), int(s.familiarity));
+                            insp.ties.push_back(buf);
+                        }
+                    }
+                    const BrainNetParams np = brainnet_params_of(bs->genome);
+                    insp.traits.emplace_back("plasticity", std::to_string(np.plastic_rate));
+                    insp.traits.emplace_back("mod sensitivity", std::to_string(np.mod_sens_pm));
+                    insp.traits.emplace_back("rollout budget", std::to_string(np.rollout_budget_pm));
+                    insp.traits.emplace_back("connectome profile", std::to_string(np.profile));
+                }
+                // inherited life-history traits live as expressed gene props
+                for (const char* tn : {"thirst_scale", "juvenile_need_scale",
+                                       "birth_energy", "metabolism", "fertility"}) {
+                    const PropertyDef* td = w.props.find_name(tn);
+                    if (!td) continue;
+                    const Value* tv = w.prop_of(*e, td->id);
+                    if (tv) insp.traits.emplace_back(tn, value_str(*tv));
+                }
             }
         }
         const PropId poss = P("possessed_by");
@@ -3051,8 +3306,34 @@ struct Viewer {
         if (!open) { selected = kNoEntity; ImGui::End(); return; }
         ImGui::TextUnformatted(insp.head.c_str());
         if (!insp.mat.empty()) ImGui::TextUnformatted(insp.mat.c_str());
+        if (!insp.gen.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(insp.gen == "F0 Founder" ? ImVec4(0.55f,0.75f,1.f,1)
+                                 : insp.gen == "F1" ? ImVec4(0.75f,0.6f,1.f,1)
+                                 : ImVec4(1.f,0.8f,0.4f,1), "  %s", insp.gen.c_str());
+        }
         if (ImGui::BeginTabBar("insp")) {
-            if (ImGui::BeginTabItem("Body")) {
+            if (ImGui::BeginTabItem("Status")) {
+                // biography header: age/maturity + lineage counts
+                if (insp.adult_age > 0) {
+                    const float mat = std::clamp(float(insp.age) / float(insp.adult_age), 0.f, 1.f);
+                    ImGui::Text("age %lld  (adult at %lld)", insp.age, insp.adult_age);
+                    ImGui::ProgressBar(mat, ImVec2(-1, 0), mat >= 1.f ? "adult" : "juvenile");
+                } else if (insp.age > 0) {
+                    ImGui::Text("age %lld", insp.age);
+                }
+                if (insp.n_parents || insp.n_children)
+                    ImGui::TextDisabled("parents %lld   offspring %lld", insp.n_parents, insp.n_children);
+                // needs bars
+                for (const auto& [label, nv] : insp.needs) {
+                    const float frac = nv.second > 0 ? std::clamp(float(nv.first) / float(nv.second), 0.f, 1.f) : 0.f;
+                    ImGui::TextUnformatted(label.c_str()); ImGui::SameLine(90);
+                    ImGui::ProgressBar(frac, ImVec2(-1, 0),
+                        (std::to_string(nv.first) + "/" + std::to_string(nv.second)).c_str());
+                }
+                if (!insp.intent.empty())
+                    ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.45f, 1), "now: %s", insp.intent.c_str());
+                ImGui::Separator();
                 if (ImGui::BeginTable("props", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 160))) {
                     ImGuiListClipper clip;
                     clip.Begin(static_cast<int>(insp.props.size()));
@@ -3067,11 +3348,19 @@ struct Viewer {
                 for (const std::string& l : insp.body) ImGui::BulletText("%s", l.c_str());
                 ImGui::EndTabItem();
             }
-            if (insp.has_mind && ImGui::BeginTabItem("Mind")) {
+            if (insp.has_mind && ImGui::BeginTabItem("Memories & Ties")) {
                 ImGui::TextUnformatted(insp.mind_head.c_str());
-                if (!insp.intent.empty())
-                    ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.45f, 1), "now: %s", insp.intent.c_str());
-                if (ImGui::BeginTable("bel", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 200))) {
+                if (!insp.memories.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("engrams:");
+                    for (const std::string& mm : insp.memories) ImGui::BulletText("%s", mm.c_str());
+                }
+                if (!insp.ties.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("social ties:");
+                    for (const std::string& t : insp.ties) ImGui::BulletText("%s", t.c_str());
+                }
+                if (ImGui::BeginTable("bel", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 140))) {
                     ImGuiListClipper clip;
                     clip.Begin(static_cast<int>(insp.beliefs.size()));
                     while (clip.Step())
@@ -3088,6 +3377,34 @@ struct Viewer {
                     for (const std::string& l : insp.life) ImGui::BulletText("%s", l.c_str());
                 }
                 for (const std::string& d : insp.discoveries) ImGui::BulletText("%s", d.c_str());
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Brain")) {
+                if (!insp.brain_act.empty()) {
+                    ImGui::TextDisabled("module activity (live):");
+                    for (const auto& [name, act] : insp.brain_act) {
+                        ImGui::TextUnformatted(name.c_str()); ImGui::SameLine(110);
+                        ImGui::ProgressBar(act / 100.f, ImVec2(-1, 0),
+                            (std::to_string(act) + "%").c_str());
+                    }
+                }
+                if (!insp.neuros.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("neuromodulators:");
+                    for (const auto& [name, v] : insp.neuros) {
+                        ImGui::TextUnformatted(name.c_str()); ImGui::SameLine(110);
+                        ImGui::ProgressBar(v / 1000.f, ImVec2(-1, 0),
+                            std::to_string(v).c_str());
+                    }
+                }
+                if (!insp.traits.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("inherited traits:");
+                    for (const auto& [k, v] : insp.traits)
+                        ImGui::BulletText("%s = %s", k.c_str(), v.c_str());
+                }
+                if (insp.brain_act.empty() && insp.neuros.empty() && insp.traits.empty())
+                    ImGui::TextDisabled("no connectome allocated for this entity");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Property & Law")) {
@@ -3405,6 +3722,7 @@ struct Viewer {
             }
             if (k == SDLK_F5) { save_slot(1); return; }
             if (k == SDLK_J) { show_journal = !show_journal; return; }
+            if (k == SDLK_B) { show_badges = !show_badges; return; }
             if (k == SDLK_M && is_planet()) { if (globe) enter_surface(gview.lon, gview.lat); else enter_globe(); return; }
             if (avatar != kNoEntity && k >= SDLK_1 && k <= SDLK_9) {   // avatar verbs
                 int n = 0;
@@ -4352,28 +4670,128 @@ struct Viewer {
                             a == "political_drift" || a == "myth_drift" || a == "language" ||
                             a == "anatomy_drift" || a == "decay_minds" || a == "move" ||
                             a == "perceive" || a == "witness" || a == "advance_ticks") continue;
+                        // DF-style badge: friendly label + theme color,
+                        // lives ~30 world ticks (viewer-only state).
                         std::string label; ImU32 col = IM_COL32(205, 210, 220, 255);
-                        if (a == "consume" || a == "eat" || a == "forage")            { label = "eat";    col = IM_COL32(110, 210, 95, 255); }
+                        EntityId actor = ev.participants[0];
+                        EntityId target = ev.participants.size() > 1 ? ev.participants[1] : kNoEntity;
+                        if (a == "consume" || a == "eat" || a == "forage") {
+                            // drink vs eat: the target's material decides
+                            const Entity* te = target != kNoEntity ? w.find(target) : nullptr;
+                            const MaterialDef* tm = te ? w.materials.find(te->material) : nullptr;
+                            const bool watery = tm && tm->name.find("water") != std::string::npos;
+                            label = watery ? "Drink" : "Eat";
+                            col = watery ? IM_COL32(90, 205, 240, 255) : IM_COL32(235, 175, 80, 255);
+                        }
                         else if (a == "assemble" || a == "disassemble" || a == "craft" ||
-                                 a == "compose_clause" || a == "inscribe")          { label = "craft";  col = IM_COL32(230, 170, 70, 255); }
-                        else if (a == "dig" || a == "extract" || a == "quarry")      { label = "dig";    col = IM_COL32(190, 150, 100, 255); }
-                        else if (a == "plant" || a == "sow")                          { label = "plant";  col = IM_COL32(120, 200, 110, 255); }
-                        else if (a == "harvest" || a == "gather")                     { label = "harvest";col = IM_COL32(220, 190, 80, 255); }
-                        else if (a == "strike" || a == "launch" || a == "attack")    { label = "fight!"; col = IM_COL32(235, 70, 60, 255); }
-                        else if (a == "treat" || a == "heal")                         { label = "heal";   col = IM_COL32(120, 220, 220, 255); }
-                        else if (a == "communicate" || a == "speak" || a == "chant") { label = "talk";   col = IM_COL32(100, 170, 235, 255); }
-                        else if (a == "perform_ritual" || a == "consecrate")         { label = "rite";   col = IM_COL32(235, 200, 110, 255); }
-                        else if (a == "rest" || a == "sleep")                        { label = "zZz";    col = IM_COL32(185, 190, 215, 255); }
-                        else if (a == "reproduce" || a == "mate")                    { label = "family"; col = IM_COL32(235, 135, 200, 255); }
-                        else if (a == "trade" || a == "gift" || a == "share")        { label = "share";  col = IM_COL32(225, 200, 100, 255); }
-                        else if (a == "steal")                                       { label = "steal!"; col = IM_COL32(200, 90, 160, 255); }
-                        else if (a == "treaty" || a == "parley" || a == "diplomatic_parley") { label = "treaty"; col = IM_COL32(130, 225, 225, 255); }
-                        else if (a == "wield" || a == "don" || a == "doff" || a == "coat")  { label = "gear";   col = IM_COL32(170, 160, 190, 255); }
+                                 a == "compose_clause" || a == "inscribe")          { label = "Craft";  col = IM_COL32(230, 170, 70, 255); }
+                        else if (a == "dig" || a == "extract" || a == "quarry")      { label = "Dig";    col = IM_COL32(190, 150, 100, 255); }
+                        else if (a == "plant" || a == "sow")                          { label = "Plant";  col = IM_COL32(120, 200, 110, 255); }
+                        else if (a == "harvest" || a == "gather")                     { label = "Gather"; col = IM_COL32(220, 190, 80, 255); }
+                        else if (a == "strike" || a == "launch" || a == "attack")    { label = "Fight!"; col = IM_COL32(235, 70, 60, 255); }
+                        else if (a == "treat" || a == "heal")                         { label = "Heal";   col = IM_COL32(120, 220, 220, 255); }
+                        else if (a == "communicate" || a == "speak" || a == "chant") { label = "Talk";   col = IM_COL32(110, 220, 120, 255); }
+                        else if (a == "perform_ritual" || a == "consecrate")         { label = "Rite";   col = IM_COL32(235, 200, 110, 255); }
+                        else if (a == "rest" || a == "sleep")                        { label = "zZ";     col = IM_COL32(185, 190, 215, 255); }
+                        else if (a == "reproduce" || a == "mate")                    { label = "Mate";   col = IM_COL32(235, 135, 200, 255); }
+                        else if (a == "trade" || a == "gift" || a == "share")        { label = "Share";  col = IM_COL32(225, 200, 100, 255); }
+                        else if (a == "steal")                                       { label = "Steal!"; col = IM_COL32(200, 90, 160, 255); }
+                        else if (a == "treaty" || a == "parley" || a == "diplomatic_parley") { label = "Talk"; col = IM_COL32(130, 225, 225, 255); }
+                        else if (a == "wield" || a == "don" || a == "doff" || a == "coat")  { label = "Gear";   col = IM_COL32(170, 160, 190, 255); }
                         else { label = a.substr(0, 10); }
                         if (ev.failed) { label += "!"; col = IM_COL32(150, 155, 165, 255); }
-                        c_act[ev.participants[0]] = label;
-                        c_act_col[ev.participants[0]] = col;
-                        c_act_until[ev.participants[0]] = frames + 110;    // ~2 s telegraph
+                        {
+                            ThoughtBadge& b = c_badge[actor];
+                            if (b.rank < 3) { b.label = label; b.col = col; b.until = c_tick + 30; b.rank = 2; }
+                        }
+                        // intent link: actor -> last interacted target
+                        if (target != kNoEntity) {
+                            IntentLink& il = c_intent[actor];
+                            il.target = target;
+                            if (const Entity* te = w.find(target)) il.pos = te->pos;
+                            il.label = label;
+                            il.until = c_tick + 60;
+                        }
+                        // newborns flash a "Born" badge (generation counted
+                        // lazily by the inspector; the badge is generic)
+                        for (EntityId nid : ev.spawned)
+                            if (nid != actor) {
+                                ThoughtBadge& nb = c_badge[nid];
+                                if (nb.rank < 3) {
+                                    nb.label = "Born"; nb.col = IM_COL32(255, 215, 90, 255);
+                                    nb.until = c_tick + 60; nb.rank = 2;
+                                }
+                            }
+                    }
+                }
+                // ---- thought-state scan: fear / rest / idle badges + ------
+                // intent links from journeys & fresh brain commits. Reads
+                // minds + brain slots READ-ONLY (never creates a slot).
+                if (frames % 10 == 4) {
+                    for (const EntityView& e : snap.entities) {
+                        if (!e.minded || !e.alive || e.fog != Fog::Visible) continue;
+                        const AgentMind* m = w.find_mind(e.id);
+                        if (!m) continue;
+                        const BrainSlot* bs = nullptr;
+                        if (w.brains_) {
+                            auto sit = w.brains_->slots.find(e.id);
+                            if (sit != w.brains_->slots.end()) bs = &sit->second;
+                        }
+                        const bool fear = m->neuro.panic > 550 ||
+                                          (bs && bs->vital.emo[kBEmoFear] > 600);
+                        if (fear) {
+                            ThoughtBadge& b = c_badge[e.id];
+                            b.label = "!! Fear"; b.col = IM_COL32(255, 70, 60, 255);
+                            b.until = c_tick + 30; b.rank = 3;
+                        } else {
+                            auto bit = c_badge.find(e.id);
+                            const bool fresh_action = bit != c_badge.end() &&
+                                bit->second.rank >= 2 && bit->second.until > c_tick + 12;
+                            if (!fresh_action) {
+                                bool resting = bs && bs->vital.drive_fatigue > 650;
+                                if (!resting && bs) {
+                                    int bi = -1, bv = 0;
+                                    for (int i = 0; i < kActionVerbs; ++i) {
+                                        const int v = std::abs(int(bs->last_action[i]));
+                                        if (v > bv) { bv = v; bi = i; }
+                                    }
+                                    if (bi >= 0) {
+                                        const char* vn = sensor_verb_table()[bi];
+                                        resting = vn && std::string(vn) == "rest";
+                                    }
+                                }
+                                ThoughtBadge& b = c_badge[e.id];
+                                if (resting) {
+                                    if (b.rank < 2) {
+                                        b.label = "zZ"; b.col = IM_COL32(170, 180, 215, 255);
+                                        b.until = c_tick + 30; b.rank = 1;
+                                    }
+                                } else {
+                                    auto iit = c_badge.find(e.id);
+                                    const bool any_fresh = iit != c_badge.end() && iit->second.until > c_tick;
+                                    if (!any_fresh && e.moved_tick + 30 < c_tick &&
+                                        dstate.pending.find(e.id) == dstate.pending.end()) {
+                                        b.label = "..."; b.col = IM_COL32(140, 145, 160, 255);
+                                        b.until = c_tick + 30; b.rank = 0;
+                                    }
+                                }
+                            }
+                        }
+                        // intent link: active journey beats a fresh brain
+                        // commit target; the ledger-derived link is the fallback
+                        auto pit = dstate.pending.find(e.id);
+                        if (pit != dstate.pending.end() && pit->second.until > c_tick) {
+                            IntentLink& l = c_intent[e.id];
+                            l.target = pit->second.subject;
+                            l.pos = pit->second.target;
+                            l.label = "journey"; l.until = c_tick + 60;
+                        } else if (bs && bs->pending.valid && bs->pending.pm_target != kNoEntity &&
+                                   c_tick - bs->pending.tick < 80) {
+                            IntentLink& l = c_intent[e.id];
+                            l.target = bs->pending.pm_target;
+                            if (const Entity* te = w.find(l.target)) l.pos = te->pos;
+                            l.label = "reach"; l.until = c_tick + 60;
+                        }
                     }
                 }
                 wrap_camera();
@@ -4479,6 +4897,7 @@ struct Viewer {
             t_ter = ms(t); t = clk::now();
             if (!(skip & 2)) draw_entities(dt);
             draw_links();
+            draw_intents();
             draw_callouts();
             if (!(skip & 4)) draw_night();
         }
@@ -4497,7 +4916,7 @@ struct Viewer {
             if (globe) draw_globe_icons(); else draw_overlays();
             ui_topbar();
             if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
-            ui_inspector(); ui_player(); ui_journal(); ui_successor(); ui_toast();
+            ui_inspector(); ui_player(); ui_journal(); ui_successor(); ui_toast(); ui_ticker();
             if (!show_journal) ui_word_editor();
         }
         if (!in_menu) {
