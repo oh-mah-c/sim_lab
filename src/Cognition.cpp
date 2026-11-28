@@ -1844,6 +1844,10 @@ void learn_from_event(World& w, EntityId npc, std::uint64_t event_id) {
     }
 }
 
+// defined below with social_from_event (emergent social buffering)
+void focal_buffer(World& w, EntityId npc, EntityId focal);
+bool is_social_calming_verb(const std::string& a);
+
 void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
     AgentMind& mind = w.mind(npc);
     mind.learn_action(ev.action);                      // saw the verb used
@@ -1947,6 +1951,13 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
         }
         treat_gratitude(w, npc, ev, mp);
         apply_event_shock(w, mind, npc, ev);
+    }
+    // bystander co-regulation: watching others commune at a shared focal
+    // point is itself calming — same physiological substrate as the actor
+    if (is_social_calming_verb(ev.action) && !ev.participants.empty()) {
+        const EntityId actor = ev.participants.front();
+        for (EntityId p : ev.participants)
+            if (p != npc && p != actor) { focal_buffer(w, npc, p); break; }
     }
 }
 
@@ -2811,10 +2822,62 @@ EntityId lex_neighbor_entry(const World& w, EntityId entry) {
     return best;
 }
 
+// ---- emergent social buffering at shared focal points ----------------------
+// No totem flag, no ritual schedule: any entity that MULTIPLE minds hold
+// deep affective engrams (|charge| >= 600) on is de-facto sacred ground.
+// When a mind socially engages such a focal entity (communicate/share/
+// gift/drop) — or merely witnesses others doing so nearby — the gathering
+// itself is anxiolytic: cortisol damps, the affiliation axes (serotonin
+// analogue + dopamine) rise, and acute panic eases. Whether agents learn
+// to SEEK these gatherings is left entirely to RPE/STDP — this is only
+// the physiological substrate, never a scripted behaviour.
+void focal_buffer(World& w, EntityId npc, EntityId focal) {
+    if (focal == kNoEntity || focal == npc || !w.brains_) return;
+    const AgentMind* m = w.find_mind(npc);
+    if (!m) return;
+    const auto fit = m->memory.find(focal);
+    if (fit == m->memory.end() ||
+        std::llabs(fit->second.engram.emotional_charge) < 600) return;
+    // communal check: at least one OTHER living mind shares the fixation
+    int others = 0;
+    for (const auto& [mid, mm] : w.minds_) {
+        if (mid == npc) continue;
+        const auto oit = mm.memory.find(focal);
+        if (oit != mm.memory.end() &&
+            std::llabs(oit->second.engram.emotional_charge) >= 600) {
+            if (++others >= 1) break;
+        }
+    }
+    if (others < 1) return;
+    auto sit = w.brains_->slots.find(npc);
+    if (sit == w.brains_->slots.end()) return;   // find-only: no alloc
+    BrainVital& bv = sit->second.vital;
+    bv.mod[kBModCortisol] = static_cast<std::int16_t>(
+        std::clamp<int>(int(bv.mod[kBModCortisol]) - 90, 0, 1000));
+    bv.mod[kBModSero] = static_cast<std::int16_t>(
+        std::clamp<int>(int(bv.mod[kBModSero]) + 140, 0, 1000));
+    bv.mod[kBModDopa] = static_cast<std::int16_t>(
+        std::clamp<int>(int(bv.mod[kBModDopa]) + 80, 0, 1000));
+    // acute panic eases too — the felt relief is what STDP can learn from
+    neuro_touch(w, npc);
+    AgentMind& nm = w.mind(npc);
+    nm.neuro.panic = std::max<std::int64_t>(0, nm.neuro.panic - 50);
+}
+
+// verbs that count as social/calming contact for buffering purposes
+bool is_social_calming_verb(const std::string& a) {
+    return a == "communicate" || a == "share" || a == "gift" ||
+           a == "trade" || a == "drop" || a == "rest";
+}
+
 void social_from_event(World& w, EntityId actor,
                        const std::vector<EntityId>& targets,
                        const CausalEvent& ev) {
     if (actor == kNoEntity) return;
+    // social buffering at shared focal points (see focal_buffer above):
+    // communing with an entity others also hold deep engrams on is calming
+    if (is_social_calming_verb(ev.action))
+        for (EntityId t : targets) focal_buffer(w, actor, t);
     const PropId integrity = s_pid(w, "integrity");
     const PropId collective = s_pid(w, "collective");
     const PropId taboo = s_pid(w, "taboo_harm");

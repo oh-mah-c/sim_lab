@@ -188,7 +188,8 @@ struct Viewer {
     std::string status_msg;
     PatronJournal journal;             // player knowledge + Resonance (saved as .journal)
     enum Tool { kToolNone = 0, kToolBeacon, kToolBlueprint, kToolFear,
-                kToolCupid, kToolPanic, kToolRain, kToolFeast, kToolPredator };
+                kToolCupid, kToolPanic, kToolRain, kToolFeast, kToolPredator,
+                kToolMiracle, kToolBounty };
     int tool = kToolNone;
     EntityId cupid_a = kNoEntity;      // first pick of a Cupid's-arrow pair
     bool god_open = true;              // God-Hand toolbar row expanded
@@ -414,6 +415,9 @@ struct Viewer {
         std::uint64_t expr_until = 0;        // expression-state freshness (mind scan)
         float flash = -1.f;                  // hit-flash deadline (time_s)
         float tantrum_until = -1.f;          // stomp-bounce deadline (time_s)
+        bool mourning = false;               // grief>300: droop, slow gait, tears
+        float argue = 0.f;                   // hot temper + fresh grudge: lean-in
+        float proud = 0.f;                   // high dopa + satiated: chest-puff
         std::uint64_t last_puff = 0;         // ripple throttle (frames)
         float z_at = -10.f;                  // last "z" particle (time_s)
     };
@@ -427,6 +431,17 @@ struct Viewer {
     // floating "z" glyphs for sleepers — world_rt px anchor + age
     struct Zed { float x, y, t; };
     std::vector<Zed> zeds;
+    // comic glyph pops (! ? ~) for arguments — world_rt px anchor + age
+    struct Sym { float x, y, t; char c; };
+    std::vector<Sym> syms;
+    // Miracle tool: golden beam columns — world pos + spawn time (time_s)
+    struct Beam { float x, y, t0; };
+    std::vector<Beam> beams;
+    // emergent gatherings: minds intent-fixed on one focal entity
+    struct Gather { EntityId focal = kNoEntity; Vec2 pos{};
+                    std::vector<EntityId> members; };
+    std::vector<Gather> c_gather;
+    std::unordered_map<EntityId, EntityId> gather_of;   // member -> focal
     // mind-reader: one outstanding Qwen interrogation per selected NPC
     std::uint64_t mind_ask_key = 0, mind_ask_seq = 0;
     EntityId mind_ask_id = kNoEntity;
@@ -566,6 +581,7 @@ struct Viewer {
         act_last = 0;
         c_badge.clear(); c_intent.clear(); hover_id = kNoEntity;
         c_anim.clear(); rings.clear(); hearts.clear(); zeds.clear();
+        syms.clear(); beams.clear(); c_gather.clear(); gather_of.clear();
         cupid_a = kNoEntity; god_open = true;
         mind_ask_key = 0; mind_ask_id = kNoEntity; mind_reply.clear();
         mind_ask_busy = false; mind_ask_wait = 0;
@@ -1615,7 +1631,9 @@ struct Viewer {
         const bool attacking = fresh && (v == "strike" || v == "launch" || v == "attack");
         const bool lovin = fresh && (v == "reproduce" || v == "mate");
         const float hr = std::max(1.4f, sw * 0.055f);          // hand half-size
-        const float breathe = std::sin(float(time_s) * 2.2f + float(e.id % 7)) * 0.7f;
+        const bool gathered = gather_of.count(e.id) != 0;
+        const float breathe = std::sin(float(time_s) * 2.2f +
+            (gathered ? 0.f : float(e.id % 7))) * 0.7f;   // ritual circle breathes as one
         const float swing = std::sin(an.phase);                 // gait -1..1
         // ---- hands -------------------------------------------------------
         for (int i = 0; i < 2; ++i) {
@@ -1647,10 +1665,12 @@ struct Viewer {
         // ---- face ---------------------------------------------------------
         const float gaze_x = std::cos(an.ang) * hr * 0.9f;
         const float gaze_y = std::sin(an.ang) * hr * 0.4f;
-        const float ex = sw * 0.16f;                            // half eye spacing
+        float ex = sw * 0.16f;                             // half eye spacing
+        if (an.argue > 0.5f) ex *= 0.55f;                   // argument: lean-in
         float er = std::max(1.3f, sw * 0.085f);                  // eye radius
         er *= 1.f + an.fear * 0.55f;                            // fear -> wide eyes
-        const float jit = an.fear * std::sin(float(time_s) * 43.f + float(e.id)) * 0.8f;
+        const float jit = an.fear * std::sin(float(time_s) * 43.f + float(e.id)) * 0.8f +
+            (an.argue > 0.5f ? std::sin(float(time_s) * 31.f + float(e.id)) * 1.1f : 0.f);
         const float hx = fx + gaze_x * 0.4f, hy = fy - sh * 0.80f;
         const float lid_k = an.tired > 0.55f ? 1.f - 0.45f * an.tired : 1.f;
         for (int i = 0; i < 2; ++i) {
@@ -1746,7 +1766,11 @@ struct Viewer {
                 if (ait != c_anim.end()) an = &ait->second;
             }
             if (an) {
-                an->phase += float(dt) * (gliding ? 9.f : 2.f);   // gait cycle
+                const bool mourn_gait = an->mourning && an->expr_until > c_tick;
+                an->phase += float(dt) * (gliding ? (mourn_gait ? 5.f : 9.f)
+                                                   : (mourn_gait ? 0.9f : 2.f));
+                if (!gliding && gather_of.count(e.id))      // shared ritual sway
+                    an->phase = std::fmod(float(time_s) * 2.f, 6.2831853f);
                 // facing: remembered/intent target beats raw velocity; the
                 // angle is smoothed so characters visibly turn toward mates,
                 // water and predators instead of snapping left/right.
@@ -1784,6 +1808,8 @@ struct Viewer {
                 (an->verb == "consume" || an->verb == "eat" || an->verb == "forage");
             const bool tantrum_now = an && float(time_s) < an->tantrum_until;
             const bool starving = an && an->tired > 0.85f;   // hunger/thirst critical
+            const bool mourn_now = an && an->mourning && an->expr_until > c_tick;
+            const bool proud_now = an && an->proud > 0.5f && an->expr_until > c_tick;
             const float bounce = tantrum_now
                 ? std::fabs(std::sin(float(time_s) * 18.f + float(e.id % 5))) * 3.f * cam.zoom
                 : 0.f;                                       // stomp hop
@@ -1817,6 +1843,11 @@ struct Viewer {
             float squash = 1.f, ox = 0, sox = 0;
             const bool moving = gliding || (bob_until.count(e.id) && bob_until[e.id] > time_s);
             if (just_ate) { sw *= 1.13f; sh *= 1.05f; }        // food baby belly
+            if (proud_now) {                                   // dopamine chest-puff
+                const float pp = 1.f + 0.035f * std::sin(float(time_s) * 5.f);
+                sw *= pp; sh *= pp;
+            }
+            if (mourn_now) { sw *= 0.97f; sh *= 0.98f; }        // grief slouch
             if (creature && e.alive && moving) {               // squash & stretch hop
                 const float ph = std::sin(float(time_s) * 12.f + float(e.id % 17));
                 squash = 1.f + 0.08f * ph; sh *= squash; sw /= squash;
@@ -1843,6 +1874,8 @@ struct Viewer {
             double tilt = !e.alive ? 90.0 : e.routed ? -12.0 : 0.0;
             if (an && e.alive && !e.routed)
                 tilt = lying ? (flip ? -90.0 : 90.0) : lean;      // rest pose / motion lean
+            if (mourn_now && !lying) tilt += 14.0;                 // grief hunch
+            if (proud_now && !lying) tilt -= 3.0;                  // proud upright
             // post-coital wiggle: reproduce/mate verb fresh -> gentle sway
             if (an && e.alive && an->until > c_tick &&
                 (an->verb == "reproduce" || an->verb == "mate") && !lying)
@@ -1967,6 +2000,49 @@ struct Viewer {
                             IM_COL32(170, 200, 235, int(220 * a)), "z");
             }
             zeds.erase(std::remove_if(zeds.begin(), zeds.end(), [](const Zed& z) { return z.t > 1.7f; }), zeds.end());
+            // ---- emergent gathering auras: soft pulsing gold ellipse under
+            // clustered attendees of the same focal entity
+            for (const Gather& g : c_gather) {
+                const float gx = ux(cam.sx(float(g.pos.x)));
+                const float gy = ux(cam.sy(float(g.pos.y), elev_at(g.pos)));
+                const float pulse = 0.7f + 0.3f * std::sin(float(time_s) * 2.2f);
+                const float rx = 46.f * cam.zoom * pulse, ry = 18.f * cam.zoom * pulse;
+                dl->AddEllipseFilled(ImVec2(gx, gy), ImVec2(rx, ry),
+                                     IM_COL32(255, 220, 130, 26), 0.f, 24);
+                dl->AddEllipse(ImVec2(gx, gy), ImVec2(rx, ry),
+                               IM_COL32(255, 225, 150, 70), 0.f, 1.2f, 24);
+            }
+            // ---- miracle beams: golden column fading over ~1.4 s
+            for (Beam& b : beams) {
+                const float age = float(time_s) - b.t0;
+                if (age > 1.4f) continue;
+                const float a = 1.f - age / 1.4f;
+                const float bx = ux(b.x), by = ux(b.y);
+                const float bh = 90.f * cam.zoom;
+                dl->AddRectFilledMultiColor(ImVec2(bx - 7.f * cam.zoom, by - bh),
+                                            ImVec2(bx + 7.f * cam.zoom, by),
+                                            IM_COL32(255, 230, 140, int(90 * a)),
+                                            IM_COL32(255, 230, 140, int(90 * a)),
+                                            IM_COL32(255, 200, 80, int(10 * a)),
+                                            IM_COL32(255, 200, 80, int(10 * a)));
+                dl->AddCircleFilled(ImVec2(bx, by - 4.f * cam.zoom),
+                                    10.f * cam.zoom * (0.6f + 0.4f * a),
+                                    IM_COL32(255, 235, 160, int(200 * a)), 16);
+            }
+            beams.erase(std::remove_if(beams.begin(), beams.end(),
+                [&](const Beam& b) { return float(time_s) - b.t0 > 1.4f; }), beams.end());
+            // ---- comic glyph pops (! ? ~ #) for arguments
+            for (Sym& s : syms) {
+                s.t += float(dt);
+                if (s.t > 0.9f) continue;
+                const float a = 1.f - s.t / 0.9f;
+                const float wob = std::sin(s.t * 11.f) * 2.f;
+                dl->AddText(ImVec2(ux(s.x + wob), ux(s.y - s.t * 16.f)),
+                            IM_COL32(255, 90, 70, int(240 * a)),
+                            std::string(1, s.c).c_str());
+            }
+            syms.erase(std::remove_if(syms.begin(), syms.end(),
+                [](const Sym& s) { return s.t > 0.9f; }), syms.end());
         }
         // prune aux animation maps: entries for entities that died or left
         // the snapshot would otherwise grow forever.
@@ -2657,8 +2733,8 @@ struct Viewer {
         const int dy = int((k * 53) % (2 * rad + 1)) - rad;
         return Vec2{p.x + dx * cell, p.y + dy * cell};
     }
-    void do_summon_rain(Vec2 p) {
-        if (!journal.spend(20)) { status_msg = "Not enough Resonance (20)"; return; }
+    // fx bodies (payment already taken by the do_* wrapper / bounty combo)
+    void rain_fx(Vec2 p) {
         const TerrainGrid& t = w.terrain;
         const int cell = t.cell > 0 ? t.cell : 16;
         int wetted = 0;
@@ -2684,9 +2760,7 @@ struct Viewer {
         status_msg = "Rain over the hollow: " + std::to_string(wetted) +
                      " cells moistened, " + std::to_string(pools) + " pools";
     }
-    void summon_rain(Vec2 p) { post([=, this] { do_summon_rain(p); }); }
-    void do_summon_feast(Vec2 p) {
-        if (!journal.spend(30)) { status_msg = "Not enough Resonance (30)"; return; }
+    void feast_fx(Vec2 p) {
         const TerrainGrid& t = w.terrain;
         const int cell = t.cell > 0 ? t.cell : 16;
         const MaterialId bm = w.materials.id_of("wild_berries");
@@ -2712,7 +2786,78 @@ struct Viewer {
         status_msg = "Feast spread: " + std::to_string(made) +
                      " caches — sharing vs hoarding is now observable";
     }
+    void do_summon_rain(Vec2 p) {
+        if (!journal.spend(20)) { status_msg = "Not enough Resonance (20)"; return; }
+        rain_fx(p);
+    }
+    void summon_rain(Vec2 p) { post([=, this] { do_summon_rain(p); }); }
+    void do_summon_feast(Vec2 p) {
+        if (!journal.spend(30)) { status_msg = "Not enough Resonance (30)"; return; }
+        feast_fx(p);
+    }
     void summon_feast(Vec2 p) { post([=, this] { do_summon_feast(p); }); }
+    // Bounty: rain + feast in one divine gesture (single payment)
+    void do_bounty(Vec2 p) {
+        if (!journal.spend(35)) { status_msg = "Not enough Resonance (35)"; return; }
+        rain_fx(p); feast_fx(p);
+        status_msg = "Bounty falls: rain and a feast — watch who shares, who hoards";
+    }
+    void bounty(Vec2 p) { post([=, this] { do_bounty(p); }); }
+    // Miracle: localized awe impulse. Pure physiology — sero/dopa/joy surge
+    // plus cortisol relief for every sapient mind within 220 units, and a
+    // strong positive engram toward the focal entity (picked target, else
+    // nearest living thing to the tile). Whether they revere, fight over,
+    // or ignore the spot is left entirely to the SNN/ STDP.
+    void do_miracle(Vec2 p, EntityId picked) {
+        if (!journal.spend(25)) { status_msg = "Not enough Resonance (25)"; return; }
+        // resolve focal: the picked entity if it is near the click,
+        // else the nearest living entity to the tile (min id = deterministic)
+        EntityId focal = kNoEntity;
+        if (picked != kNoEntity) {
+            const Entity* pe = w.find(picked);
+            if (pe && pe->alive && dist2(pe->pos, p) < 96LL * 96) focal = picked;
+        }
+        if (focal == kNoEntity) {
+            std::vector<EntityId> near = w.entities_near(p, 128);
+            std::sort(near.begin(), near.end());
+            for (EntityId nid : near) {
+                const Entity* ne = w.find(nid);
+                if (ne && ne->alive) { focal = nid; break; }
+            }
+        }
+        int touched = 0;
+        for (auto& [mid, mm] : w.minds_) {
+            const Entity* me = w.find(mid);
+            if (!me || !me->alive) continue;
+            if (dist2(me->pos, p) > 220LL * 220) continue;
+            auto sit = w.brains_ ? w.brains_->slots.find(mid)
+                                 : w.brains_->slots.end();
+            if (w.brains_ && sit != w.brains_->slots.end()) {
+                BrainVital& bv = sit->second.vital;
+                bv.mod[kBModSero] = static_cast<std::int16_t>(
+                    std::clamp<int>(int(bv.mod[kBModSero]) + 160, 0, 1000));
+                bv.mod[kBModDopa] = static_cast<std::int16_t>(
+                    std::clamp<int>(int(bv.mod[kBModDopa]) + 120, 0, 1000));
+                bv.emo[kBEmoJoy] = static_cast<std::int16_t>(
+                    std::clamp<int>(int(bv.emo[kBEmoJoy]) + 150, -1000, 1000));
+                bv.mod[kBModCortisol] = static_cast<std::int16_t>(
+                    std::clamp<int>(int(bv.mod[kBModCortisol]) - 60, 0, 1000));
+            }
+            mm.neuro.panic = std::max<std::int64_t>(0, mm.neuro.panic - 60);
+            if (focal != kNoEntity) {
+                const Entity* fe = w.find(focal);
+                if (fe) {
+                    const MindParams mp = mind_params(w, *me);
+                    upsert_memory(mm, focal, god_snap(w, *fe), 450, mp);
+                }
+            }
+            ++touched;
+        }
+        status_msg = "Miracle at the hollow: " + std::to_string(touched) +
+                     " minds felt the awe" +
+                     (focal != kNoEntity ? " — a focal point is born" : "");
+    }
+    void miracle(Vec2 p, EntityId picked) { post([=, this] { do_miracle(p, picked); }); }
     void do_summon_predator(Vec2 p) {
         if (!journal.spend(40)) { status_msg = "Not enough Resonance (40)"; return; }
         const TerrainGrid& t = w.terrain;
@@ -2875,6 +3020,10 @@ struct Viewer {
             power("Feast", kToolFeast, 30, "Click terrain: berry caches + water — sharing vs hoarding");
             ImGui::SameLine(0, 4);
             power("Predator", kToolPredator, 40, "Click terrain: a wild pack_stalker arrives");
+            ImGui::SameLine(0, 4);
+            power("Miracle", kToolMiracle, 25, "Click tile/entity: awe impulse — gold beam, nearby minds feel it");
+            ImGui::SameLine(0, 4);
+            power("Bounty", kToolBounty, 35, "Click terrain: rain + feast caches — sharing vs hoarding");
         }
         if (tool != kToolNone) {
             const std::string hint =
@@ -4211,6 +4360,13 @@ struct Viewer {
             if (tool == kToolRain) { summon_rain(wp); tool = kToolNone; }
             if (tool == kToolFeast) { summon_feast(wp); tool = kToolNone; }
             if (tool == kToolPredator) { summon_predator(wp); tool = kToolNone; }
+            if (tool == kToolMiracle) {
+                miracle(wp, selected);   // focal resolved under the lock
+                beams.push_back({cam.sx(float(wp.x)),
+                                 cam.sy(float(wp.y), elev_at(wp)), float(time_s)});
+                tool = kToolNone;
+            }
+            if (tool == kToolBounty) { bounty(wp); tool = kToolNone; }
         }
         if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) drag_b = screen_to_world(e.motion.x / kPix, e.motion.y / kPix);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && dragging && e.button.button == SDL_BUTTON_LEFT) {
@@ -5412,35 +5568,57 @@ struct Viewer {
                                     const bool any_fresh = iit != c_badge.end() && iit->second.until > c_tick;
                                     if (!any_fresh && e.moved_tick + 30 < c_tick &&
                                         dstate.pending.find(e.id) == dstate.pending.end()) {
-                                        // witty thought bubble: synthesized from
-                                        // live drives + engram state (display only)
+                                        // dynamic status tag: peak neuromod
+                                        // deviation + live focus (top engram,
+                                        // bonded mate, grudge, dominant need).
+                                        // No canned lines — pure telemetry.
                                         const std::int64_t hunger = bs ? bs->vital.drive_hunger : 0;
                                         const std::int64_t thirst = bs ? bs->vital.drive_thirst : 0;
                                         const std::int64_t fatigue = bs ? bs->vital.drive_fatigue : 0;
-                                        std::string bub;
-                                        if (thirst > 850) bub = "Water... need water...";
-                                        else if (hunger > 850) bub = "So hungry...";
-                                        else if (fresh_neg >= 2 && grudge_id != kNoEntity)
-                                            bub = "Who is #" +
-                                                std::to_string(grudge_id % 100000) + "?!";
-                                        else if (mate_id != kNoEntity &&
-                                                 m->neuro.panic < 300 && m->neuro.rage < 400)
-                                            bub = "Thinking of #" +
+                                        std::string bub, focus;
+                                        if (mate_id != kNoEntity &&
+                                            m->neuro.panic < 300 && m->neuro.rage < 400)
+                                            focus = "#" +
                                                 std::to_string(mate_id % 100000) + " <3";
-                                        else if (fresh_neg == 1 && grudge_id != kNoEntity)
-                                            bub = "#" + std::to_string(grudge_id % 100000) +
-                                                  "... interesting.";
-                                        else if (crowded) bub = "Hiding this berry...";
-                                        else if (m->neuro.panic > 500) bub = "RUN!";
-                                        else if (m->neuro.rage > 500) bub = "Curse you all!";
-                                        else if (fatigue > 800) bub = "So tired...";
+                                        else if (fresh_neg >= 1 && grudge_id != kNoEntity)
+                                            focus = "#" +
+                                                std::to_string(grudge_id % 100000) + "!";
                                         else {
-                                            static const char* kIdle[] = {
-                                                "...", "hm.", "What now?", "*blinks*",
-                                                "(awkward)", "...again."};
-                                            bub = kIdle[(size_t(e.id) +
-                                                         size_t(c_tick / 900)) % 6];
+                                            // strongest |charge| engram wins
+                                            std::int64_t best = 0;
+                                            std::string bk;
+                                            for (const auto& [kid, s] : m->memory) {
+                                                const std::int64_t ch =
+                                                    s.engram.emotional_charge;
+                                                if (std::llabs(ch) > std::llabs(best) &&
+                                                    s.engram.clarity > 150) {
+                                                    best = ch; bk = s.kind_name;
+                                                }
+                                            }
+                                            if (!bk.empty())
+                                                focus = bk.size() > 14 ? bk.substr(0, 14) : bk;
+                                            else if (thirst > 500) focus = "H2O";
+                                            else if (hunger > 500) focus = "FOOD";
+                                            else if (fatigue > 700) focus = "REST";
+                                            else focus = "...";
                                         }
+                                        if (bs) {
+                                            static const char* kModN[kBModCount] = {
+                                                "DOPA", "SERO", "NEPI", "ACHI",
+                                                "GABA", "GLUT", "CORT"};
+                                            int bi = 0, bd = 0;
+                                            for (int i = 0; i < kBModCount; ++i) {
+                                                const int d = std::abs(
+                                                    int(bs->vital.mod[i]) - 500);
+                                                if (d > bd) { bd = d; bi = i; }
+                                            }
+                                            bub = "[" + std::string(kModN[bi]) +
+                                                  (int(bs->vital.mod[bi]) >= 500 ? "↑" : "↓") +
+                                                  "] " + focus;
+                                        } else if (m->neuro.panic > 500) bub = "[PANIC] " + focus;
+                                        else if (m->neuro.rage > 500) bub = "[RAGE] " + focus;
+                                        else if (m->neuro.grief > 400) bub = "[GRIEF] " + focus;
+                                        else bub = "[--] " + focus;
                                         b.label = bub; b.col = IM_COL32(150, 156, 172, 255);
                                         b.until = c_tick + 30; b.rank = 0;
                                     }
@@ -5487,6 +5665,12 @@ struct Viewer {
                                             float(k - 1) * 22.f, -30.f - float(k) * 8.f,
                                             0.55f,
                                             k == 1 ? 0xFFFF5030 : 0xFFFFC040});
+                                    // comic glyph pop (! ? ~) — deterministic pick
+                                    static const char kGly[] = {'!', '?', '~', '#'};
+                                    if (syms.size() < 48)
+                                        syms.push_back({fx + float((c_tick / 9) % 5 - 2) * 8.f,
+                                            fy - 26.f * cam.zoom, float(time_s),
+                                            kGly[(size_t(e.id) + size_t(c_tick)) % 4]});
                                 }
                                 IntentLink& il = c_intent[e.id];
                                 il.target = grudge_id; il.pos = grudge_pos;
@@ -5527,6 +5711,22 @@ struct Viewer {
                             an.lying = resting;
                             an.in_water = w.terrain.is_water(e.pos);
                             an.expr_until = c_tick + 30;
+                            // grief -> mourning posture (droop + tears); hot
+                            // temper near a grudge -> argument lean-in; high
+                            // dopamine + satiation -> proud chest-puff.
+                            an.mourning = m->neuro.grief > 300;
+                            an.argue = (fresh_neg >= 1 &&
+                                        (m->neuro.rage > 400 || m->neuro.panic > 400))
+                                       ? 1.f : 0.f;
+                            an.proud = bs && bs->vital.mod[kBModDopa] > 650 &&
+                                       bs->vital.drive_hunger < 400 ? 1.f : 0.f;
+                            if (an.mourning && frames % 22 == e.id % 22 &&
+                                parts.size() < 600) {
+                                const float mx = cam.sx(float(e.pos.x));
+                                const float my = cam.sy(float(e.pos.y), elev_at(e.pos));
+                                parts.push_back({mx + 4.f, my - 13.f * cam.zoom,
+                                    0.f, 12.f, 0.7f, 0xFF9FC8F0});
+                            }
                             // gaze prefers the freshest intent target (journey
                             // or brain commit), else the last ledger target
                             auto iit = c_intent.find(e.id);
@@ -5534,6 +5734,61 @@ struct Viewer {
                                 iit->second.target != kNoEntity) {
                                 an.target = iit->second.target;
                                 an.tpos = iit->second.pos; an.tpos_ok = true;
+                            }
+                        }
+                    }
+                    // ---- emergent gatherings --------------------------------
+                    // >=3 living minds intent-fixed on the SAME focal entity
+                    // while clustered within ~280 units: shared ground aura,
+                    // synced idle rhythm, drifting incense sparkles. Purely a
+                    // read of c_intent + world positions — nothing is written
+                    // to the simulation.
+                    c_gather.clear(); gather_of.clear();
+                    {
+                        std::map<EntityId, std::vector<EntityId>> by_focal;
+                        for (const auto& [mid, il] : c_intent)
+                            if (il.until > c_tick && il.target != kNoEntity)
+                                by_focal[il.target].push_back(mid);
+                        for (auto& [focal, mem] : by_focal) {
+                            if (mem.size() < 3) continue;
+                            std::int64_t cx = 0, cy = 0; int n = 0;
+                            for (EntityId mid : mem) {
+                                const Entity* me = w.find(mid);
+                                if (!me || !me->alive) continue;
+                                cx += me->pos.x; cy += me->pos.y; ++n;
+                            }
+                            if (n < 3) continue;
+                            cx /= n; cy /= n;
+                            bool tight = true;
+                            for (EntityId mid : mem) {
+                                const Entity* me = w.find(mid);
+                                if (!me || !me->alive) continue;
+                                const std::int64_t dx = me->pos.x - cx;
+                                const std::int64_t dy = me->pos.y - cy;
+                                if (dx * dx + dy * dy > 280LL * 280) {
+                                    tight = false; break;
+                                }
+                            }
+                            if (!tight) continue;
+                            Gather g; g.focal = focal;
+                            g.pos = Vec2{std::int32_t(cx), std::int32_t(cy)};
+                            for (EntityId mid : mem) {
+                                const Entity* me = w.find(mid);
+                                if (me && me->alive) {
+                                    g.members.push_back(mid);
+                                    gather_of[mid] = focal;
+                                }
+                            }
+                            if (g.members.size() < 3) continue;
+                            c_gather.push_back(std::move(g));
+                            if (parts.size() < 550) {
+                                const Vec2 gp{std::int32_t(cx), std::int32_t(cy)};
+                                const float gx = cam.sx(float(gp.x));
+                                const float gy = cam.sy(float(gp.y), elev_at(gp));
+                                parts.push_back({gx + float((c_tick / 4) % 9 - 4) * 9.f,
+                                    gy - 4.f * cam.zoom,
+                                    0.f, -11.f - float(c_tick % 5) * 3.f, 1.1f,
+                                    0xFFFFE9A0});
                             }
                         }
                     }
