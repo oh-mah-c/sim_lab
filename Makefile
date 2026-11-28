@@ -83,12 +83,18 @@ $(BUILDDIR)/imgui/%.o: third_party/imgui/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) -std=c++20 -O2 $(VIEW_FLAGS) -c $< -o $@
 
-$(BUILDDIR)/viewer_main.o: src/render/sdl/viewer_main.cpp $(HDR) $(SDL_LIB)
-	@mkdir -p $(BUILDDIR)
+VIEWER_SRC := src/render/sdl/viewer_main.cpp src/render/sdl/viewer_core.cpp \
+              src/render/sdl/viewer_planet.cpp src/render/sdl/viewer_entities.cpp \
+              src/render/sdl/viewer_hud.cpp src/render/sdl/viewer_tools.cpp \
+              src/render/sdl/viewer_mind.cpp
+VIEWER_OBJ := $(VIEWER_SRC:src/render/sdl/%.cpp=$(BUILDDIR)/viewer/%.o)
+
+$(BUILDDIR)/viewer/%.o: src/render/sdl/%.cpp src/render/sdl/viewer.hpp $(HDR) $(SDL_LIB)
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(VIEW_FLAGS) -c $< -o $@
 
-$(BUILDDIR)/sunnyworld_viewer: $(OBJ) $(IMGUI_OBJ) $(BUILDDIR)/viewer_main.o $(SDL_LIB)
-	$(CXX) $(LDFLAGS) $(OBJ) $(IMGUI_OBJ) $(BUILDDIR)/viewer_main.o $(SDL_LIB) -ldl -lpthread -lm -o $@
+$(BUILDDIR)/sunnyworld_viewer: $(OBJ) $(IMGUI_OBJ) $(VIEWER_OBJ) $(SDL_LIB)
+	$(CXX) $(LDFLAGS) $(OBJ) $(IMGUI_OBJ) $(VIEWER_OBJ) $(SDL_LIB) -ldl -lpthread -lm -o $@
 
 viewer sunnyworld_viewer: $(BUILDDIR)/sunnyworld_viewer
 
