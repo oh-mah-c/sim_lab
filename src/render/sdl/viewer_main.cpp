@@ -392,6 +392,37 @@ struct Viewer {
     struct IntentLink { EntityId target = kNoEntity; Vec2 pos{}; std::string label; std::uint64_t until = 0; };
     std::unordered_map<EntityId, IntentLink> c_intent;
     EntityId hover_id = kNoEntity;                       // nearest entity to cursor
+    // ---- Procedural animation & juice (viewer-only, never serialized) ------
+    // Per-mind animation state: facing angle (screen-space rad, 0 = +x),
+    // gait phase, expression drivers read from live neuromodulators, and the
+    // freshest action verb/target for pose selection. Everything here is
+    // derived each poll from World reads — nothing feeds back.
+    struct AnimState {
+        std::string verb;                    // raw ledger verb, "" = none fresh
+        EntityId target = kNoEntity;         // remembered/gaze target
+        Vec2 tpos{};                         // last known target world pos
+        bool tpos_ok = false;                // tpos holds a real position
+        float ang = 0;                       // smoothed facing (screen rad)
+        float phase = 0;                     // gait cycle accumulator
+        float fear = 0, joy = 0, tired = 0;  // expression drivers 0..1
+        bool lying = false;                  // rest pose (side-lying + zZ)
+        bool in_water = false;               // standing in a water cell
+        std::uint64_t until = 0;             // verb freshness (world tick)
+        std::uint64_t expr_until = 0;        // expression-state freshness (mind scan)
+        float flash = -1.f;                  // hit-flash deadline (time_s)
+        std::uint64_t last_puff = 0;         // ripple throttle (frames)
+        float z_at = -10.f;                  // last "z" particle (time_s)
+    };
+    std::unordered_map<EntityId, AnimState> c_anim;
+    // expanding ring particles (footstep ripples, speech waves) — world_rt px
+    struct Ring { float x, y, r, vr, life, ttl; std::uint32_t c; };
+    std::vector<Ring> rings;
+    // rising heart motes on birth/reproduce events — world_rt px anchor
+    struct Heart { float x, y, t; };
+    std::vector<Heart> hearts;
+    // floating "z" glyphs for sleepers — world_rt px anchor + age
+    struct Zed { float x, y, t; };
+    std::vector<Zed> zeds;
     bool show_badges = true, show_ticker = true;
     bool show_atlas = false, show_codex = false, show_inspector = true;
     std::map<std::string, std::string> rosetta;     // player guesses: glyph token -> meaning
@@ -523,6 +554,7 @@ struct Viewer {
         vis_pos.clear(); vis_prev.clear(); dust_at.clear();
         act_last = 0;
         c_badge.clear(); c_intent.clear(); hover_id = kNoEntity;
+        c_anim.clear(); rings.clear(); hearts.clear(); zeds.clear();
         ground_key = ~0ull;
         if (ground) { SDL_DestroyTexture(ground); ground = nullptr; }
         if (fog_tex) { SDL_DestroyTexture(fog_tex); fog_tex = nullptr; }
@@ -1547,6 +1579,93 @@ struct Viewer {
         SDL_RenderTexture(ren, glow, nullptr, &d);
     }
 
+    // ---- procedural character animation (sapients only) -------------------
+    // RimWorld-style overlay pass in world_rt px on top of the creature
+    // sprite: expressive pixel eyes driven by live neuromodulators (fear ->
+    // wide jittering, dopamine/joy -> squint, exhaustion -> heavy lids), two
+    // articulated hands posed by the freshest action verb, and floating "z"
+    // motes for sleepers. Pure presentation — reads only c_anim viewer state.
+    void draw_actor_anim(const EntityView& e, AnimState& an, float fx, float fy,
+                         float sw, float sh, bool gliding, bool lying) {
+        if (lying) {
+            // sleeper: occasional rising "z" (glyphs drawn in the ImGui pass)
+            if (time_s - an.z_at > 0.8f && zeds.size() < 48) {
+                an.z_at = float(time_s);
+                zeds.push_back({fx + sw * 0.30f, fy - sh * 0.60f, 0.f});
+            }
+            return;
+        }
+        const bool fresh = an.until > c_tick;
+        const std::string& v = an.verb;
+        const bool eating = fresh && (v == "consume" || v == "eat" || v == "forage");
+        const bool attacking = fresh && (v == "strike" || v == "launch" || v == "attack");
+        const float hr = std::max(1.4f, sw * 0.055f);          // hand half-size
+        const float breathe = std::sin(float(time_s) * 2.2f + float(e.id % 7)) * 0.7f;
+        const float swing = std::sin(an.phase);                 // gait -1..1
+        // ---- hands -------------------------------------------------------
+        for (int i = 0; i < 2; ++i) {
+            const float side = i == 0 ? -1.f : 1.f;
+            float hx = fx + side * sw * 0.30f;
+            float hy = fy - sh * 0.42f + breathe;
+            if (gliding) {                                     // alternating arm swing
+                hx += side * swing * sw * 0.05f;
+                hy += swing * (i ? -1.f : 1.f) * sh * 0.06f;
+            }
+            if (eating) {                                      // raise to mouth, chew
+                hx = fx + side * sw * 0.10f;
+                hy = fy - sh * 0.70f +
+                     std::sin(float(time_s) * 11.f + float(i) * 3.14159f) * sh * 0.05f;
+            } else if (attacking) {                            // slashing lunge
+                const float dir = std::cos(an.ang) >= 0.f ? 1.f : -1.f;
+                const float jab = std::max(0.f, std::sin(float(time_s) * 13.f + float(i) * 3.14159f));
+                hx += dir * jab * sw * 0.14f * (i ? 0.6f : 1.f);
+                hy -= jab * sh * 0.10f;
+            }
+            SDL_FRect hd{hx - hr, hy - hr, hr * 2.f, hr * 2.f};
+            set_color(ren, 0xFFBE9678); SDL_RenderFillRect(ren, &hd);
+            set_color(ren, 0xFF8A6248); SDL_RenderRect(ren, &hd);
+        }
+        // ---- face ---------------------------------------------------------
+        const float gaze_x = std::cos(an.ang) * hr * 0.9f;
+        const float gaze_y = std::sin(an.ang) * hr * 0.4f;
+        const float ex = sw * 0.16f;                            // half eye spacing
+        float er = std::max(1.3f, sw * 0.085f);                  // eye radius
+        er *= 1.f + an.fear * 0.55f;                            // fear -> wide eyes
+        const float jit = an.fear * std::sin(float(time_s) * 43.f + float(e.id)) * 0.8f;
+        const float hx = fx + gaze_x * 0.4f, hy = fy - sh * 0.80f;
+        const float lid_k = an.tired > 0.55f ? 1.f - 0.45f * an.tired : 1.f;
+        for (int i = 0; i < 2; ++i) {
+            const float exx = hx + (i ? ex : -ex) + jit;
+            const float eyy = hy + gaze_y * 0.3f;
+            if (an.joy > 0.55f && an.fear < 0.4f) {              // happy squint
+                SDL_FRect lid{exx - er * 1.4f, eyy - er * 0.35f,
+                              er * 2.8f, std::max(1.f, er * 0.55f)};
+                set_color(ren, 0xFF2A1E18); SDL_RenderFillRect(ren, &lid);
+                continue;
+            }
+            SDL_FRect wht{exx - er, eyy - er * lid_k, er * 2.f, er * 2.f * lid_k};
+            set_color(ren, 0xFFF6EEDC); SDL_RenderFillRect(ren, &wht);
+            if (lid_k < 1.f) {                                  // heavy eyelid
+                SDL_FRect lid{wht.x, wht.y, wht.w, wht.h * (1.f - lid_k) * 1.6f};
+                set_color(ren, 0xFFBE9678); SDL_RenderFillRect(ren, &lid);
+            }
+            const float pr = er * 0.55f;                        // pupil w/ gaze
+            SDL_FRect pu{exx + gaze_x - pr, eyy + gaze_y - pr, pr * 2.f, pr * 2.f};
+            set_color(ren, 0xFF241A12); SDL_RenderFillRect(ren, &pu);
+        }
+        if (eating) {                                           // open mouth
+            SDL_FRect mo{hx - er, hy + er * 2.4f, er * 2.f, er * 1.2f};
+            set_color(ren, 0xFF5A1E1E); SDL_RenderFillRect(ren, &mo);
+        }
+        // hit-flash decal: brief white bloom over the sprite
+        if (time_s < an.flash) {
+            const float a = std::clamp((an.flash - float(time_s)) / 0.18f, 0.f, 1.f);
+            set_color(ren, 0xFFFFFFFF, int(140 * a));
+            SDL_FRect fl{fx - sw * 0.55f, fy - sh * 1.05f, sw * 1.1f, sh * 1.1f};
+            SDL_RenderFillRect(ren, &fl);
+        }
+    }
+
     void draw_entities(double dt) {
         // hover pick: nearest living entity to the cursor (world_rt px)
         hover_id = kNoEntity;
@@ -1589,6 +1708,48 @@ struct Viewer {
             const bool gliding = spd > 12.f;                     // world units / sec
             const float elev = elev_at(Vec2{std::int32_t(vit->second.x), std::int32_t(vit->second.y)});
             const float fx = cam.sx(vit->second.x), fy = cam.sy(vit->second.y, elev);
+            // ---- procedural animation state (sapients, viewer-only) -------
+            AnimState* an = nullptr;
+            bool lying = false;
+            double lean = 0.0;
+            if (e.minded && e.alive && e.fog == Fog::Visible) {
+                auto ait = c_anim.find(e.id);
+                if (ait != c_anim.end()) an = &ait->second;
+            }
+            if (an) {
+                an->phase += float(dt) * (gliding ? 9.f : 2.f);   // gait cycle
+                // facing: remembered/intent target beats raw velocity; the
+                // angle is smoothed so characters visibly turn toward mates,
+                // water and predators instead of snapping left/right.
+                float want = an->ang;
+                bool has_dir = false;
+                if ((an->until > c_tick || an->expr_until > c_tick) &&
+                    an->target != kNoEntity && an->tpos_ok) {
+                    const float sx2 = cam.sx(float(an->tpos.x));
+                    const float sy2 = cam.sy(float(an->tpos.y), elev_at(an->tpos));
+                    const float ddx = sx2 - fx, ddy = sy2 - fy;
+                    if (ddx * ddx + ddy * ddy > 9.f) { want = std::atan2(ddy, ddx); has_dir = true; }
+                }
+                if (!has_dir && (std::fabs(mvx) > 0.03f || std::fabs(mvy) > 0.03f)) {
+                    want = std::atan2(mvy, mvx); has_dir = true;
+                }
+                if (has_dir) {
+                    float d = want - an->ang;
+                    while (d > 3.14159265f) d -= 6.2831853f;
+                    while (d < -3.14159265f) d += 6.2831853f;
+                    an->ang += d * std::min(1.f, float(dt) * 9.f);
+                }
+                if (gliding) {                                     // body lean into motion
+                    const float mdir = spd > 1.f ? mvx / (spd * float(dt)) : 0.f;
+                    lean = std::clamp(mdir, -1.f, 1.f) * 6.0;
+                }
+                lying = an->lying && an->expr_until > c_tick;
+                // expanding ripple while wading (throttled per entity)
+                if (gliding && an->in_water && frames - an->last_puff > 18 && rings.size() < 48) {
+                    an->last_puff = frames;
+                    rings.push_back({fx, fy - cam.zoom, 2.f, 16.f, 0.8f, 0.8f, 0xFF7FC8E8});
+                }
+            }
             // motion memory -> bob / flip (viewer-side, never World state)
             auto lp = last_pos.find(e.id);
             if (lp != last_pos.end() && (lp->second.x != e.pos.x || lp->second.y != e.pos.y)) {
@@ -1628,18 +1789,21 @@ struct Viewer {
                 sox = std::sin(float(time_s) * 1.25f + float((e.id * 2654435761u >> 8) % 1024) / 163.f) * 1.4f * cam.zoom;
             if (creature && (e.infected || e.toxin > 300 || e.temperature > 385))   // fever tremor
                 ox = std::sin(float(time_s) * 40.f + float(e.id)) * 1.2f * cam.zoom;
-            SDL_FRect dst{fx - sw / 2 + ox + sox, fy - sh, sw, sh};
+            SDL_FRect dst{fx - sw / 2 + ox + sox, fy - sh + (lying ? sh * 0.22f : 0.f), sw, sh};
             // ground shadow, slanted by the sun
             const float sun = float((snap.day_phase - 12)) / 12.f;
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 70);
             SDL_FRect sh_r{fx - sw * 0.35f + sun * sw * 0.4f, fy - 2 * cam.zoom, sw * 0.7f, 3 * cam.zoom};
             SDL_RenderFillRect(ren, &sh_r);
-            const bool flip = facing.count(e.id) && facing[e.id] < 0;
+            bool flip = facing.count(e.id) && facing[e.id] < 0;
+            if (an && std::fabs(std::cos(an->ang)) > 0.25f) flip = std::cos(an->ang) < 0.f;
             SDL_Texture* t = tex.get(*sp, flip);                   // paper flip, pre-mirrored
             if (e.fog == Fog::Shrouded) SDL_SetTextureColorMod(t, 120, 120, 135);
             if (!e.alive) SDL_SetTextureColorMod(t, 150, 140, 130);
-            const double tilt = !e.alive ? 90.0 : e.routed ? -12.0 : 0.0;
+            double tilt = !e.alive ? 90.0 : e.routed ? -12.0 : 0.0;
+            if (an && e.alive && !e.routed)
+                tilt = lying ? (flip ? -90.0 : 90.0) : lean;      // rest pose / motion lean
             auto blit = [&](SDL_Texture* tx, const SDL_FRect& d, double ang) {
                 if (ang == 0.0) SDL_RenderTexture(ren, tx, nullptr, &d);      // fast path
                 else SDL_RenderTextureRotated(ren, tx, nullptr, &d, ang, nullptr, SDL_FLIP_NONE);
@@ -1653,6 +1817,8 @@ struct Viewer {
                 SDL_FRect wd{fx + (flip ? -sw * 0.6f : sw * 0.05f), fy - sh * 0.75f, sw * 0.6f, sh * 0.6f};
                 blit(wt, wd, 0.0);
             }
+            if (an && show_badges)
+                draw_actor_anim(e, *an, fx, fy, sw, sh, gliding, lying);
             if (e.leader) {                                    // crown of authority
                 SDL_SetRenderDrawColor(ren, 255, 210, 60, 255);
                 for (int k = 0; k < 3; ++k) {
@@ -1720,6 +1886,45 @@ struct Viewer {
             SDL_RenderFillRect(ren, &d);
         }
         parts.erase(std::remove_if(parts.begin(), parts.end(), [](const Particle& p) { return p.life <= 0; }), parts.end());
+        // ---- ambient particle layers (viewer-only juice) ------------------
+        // expanding rings: wading ripples + speech waves; rising hearts on
+        // births; floating "z" on sleepers. All fade with their own TTL.
+        {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            for (Ring& r : rings) {
+                r.life -= float(dt); r.r += r.vr * float(dt);
+                if (r.life <= 0.f) continue;
+                const int a = int(210.f * (r.life / r.ttl));
+                dl->AddCircle(ImVec2(ux(r.x), ux(r.y)), r.r * float(kPix),
+                              (r.c & 0x00FFFFFFu) | (ImU32(a) << 24), 1.5f, 24);
+            }
+            rings.erase(std::remove_if(rings.begin(), rings.end(), [](const Ring& r) { return r.life <= 0.f; }), rings.end());
+            auto heart = [&](ImVec2 c, float s, ImU32 col) {
+                dl->AddCircleFilled(ImVec2(c.x - s * 0.34f, c.y - s * 0.16f), s * 0.36f, col, 10);
+                dl->AddCircleFilled(ImVec2(c.x + s * 0.34f, c.y - s * 0.16f), s * 0.36f, col, 10);
+                dl->AddTriangleFilled(ImVec2(c.x - s * 0.66f, c.y - s * 0.04f),
+                                      ImVec2(c.x + s * 0.66f, c.y - s * 0.04f),
+                                      ImVec2(c.x, c.y + s * 0.60f), col);
+            };
+            for (Heart& h : hearts) {
+                h.t += float(dt);
+                if (h.t > 1.4f) continue;
+                const float a = 1.f - h.t / 1.4f;
+                const float wob = std::sin(h.t * 9.f) * 1.5f;
+                heart(ImVec2(ux(h.x + wob), ux(h.y - h.t * 10.f)), 4.2f,
+                      IM_COL32(255, 110, 150, int(235 * a)));
+            }
+            hearts.erase(std::remove_if(hearts.begin(), hearts.end(), [](const Heart& h) { return h.t > 1.4f; }), hearts.end());
+            for (Zed& z : zeds) {
+                z.t += float(dt);
+                if (z.t > 1.7f) continue;
+                const float a = z.t < 0.3f ? z.t / 0.3f : 1.f - (z.t - 0.3f) / 1.4f;
+                const float wob = std::sin(z.t * 3.f + z.x) * 1.2f;
+                dl->AddText(ImVec2(ux(z.x + wob), ux(z.y - z.t * 8.f)),
+                            IM_COL32(170, 200, 235, int(220 * a)), "z");
+            }
+            zeds.erase(std::remove_if(zeds.begin(), zeds.end(), [](const Zed& z) { return z.t > 1.7f; }), zeds.end());
+        }
         // prune aux animation maps: entries for entities that died or left
         // the snapshot would otherwise grow forever.
         if (frames % 120 == 0 && !snap.entities.empty()) {
@@ -1732,7 +1937,7 @@ struct Viewer {
             };
             prune(last_pos); prune(facing); prune(bob_until); prune(last_integ); prune(last_pain);
             prune(vis_pos); prune(vis_prev); prune(dust_at);
-            prune(c_badge); prune(c_intent);
+            prune(c_badge); prune(c_intent); prune(c_anim);
         }
     }
 
@@ -4712,6 +4917,43 @@ struct Viewer {
                             il.label = label;
                             il.until = c_tick + 60;
                         }
+                        // ---- procedural animation state + event juice ------
+                        // Pose/facing/gaze for the draw pass; particles are
+                        // screen-space bursts spawned once per causal event.
+                        {
+                            AnimState& an = c_anim[actor];
+                            an.verb = a; an.until = c_tick + 40;
+                            an.target = target;
+                            if (target != kNoEntity)
+                                if (const Entity* te = w.find(target)) {
+                                    an.tpos = te->pos; an.tpos_ok = true;
+                                }
+                            if (const Entity* ae = w.find(actor)) {
+                                const float ax = cam.sx(float(ae->pos.x));
+                                const float ay = cam.sy(float(ae->pos.y), elev_at(ae->pos));
+                                const bool watery = label.compare(0, 5, "Drink") == 0;
+                                if (a == "consume" || a == "eat" || a == "forage") {
+                                    // droplets for drinking, crumbs for eating
+                                    for (int k = 0; k < 5 && parts.size() < 600; ++k) {
+                                        const float j = float((frames * 13 + k * 29) % 23) / 23.f - 0.5f;
+                                        parts.push_back({ax + j * 8.f, ay - 8.f * cam.zoom,
+                                            j * 26.f, watery ? -34.f - float(k % 3) * 9.f : -16.f - float(k) * 6.f,
+                                            watery ? 0.55f : 0.8f,
+                                            watery ? 0xFF5FD8F0 : 0xFFE0A040});
+                                    }
+                                } else if (a == "communicate" || a == "speak" || a == "chant" ||
+                                           a == "treaty" || a == "parley" || a == "diplomatic_parley") {
+                                    if (rings.size() < 40)
+                                        rings.push_back({ax, ay - 10.f * cam.zoom, 3.f, 26.f, 0.7f, 0.7f, 0xFF80E0A0});
+                                } else if (a == "reproduce" || a == "mate") {
+                                    for (int k = 0; k < 3 && hearts.size() < 60; ++k)
+                                        hearts.push_back({ax + float(k - 1) * 5.f, ay - 10.f * cam.zoom, float(k) * 0.12f});
+                                } else if (a == "strike" || a == "launch" || a == "attack") {
+                                    // victim hit-flash (viewer-side decal)
+                                    if (target != kNoEntity) c_anim[target].flash = float(time_s) + 0.18f;
+                                }
+                            }
+                        }
                         // newborns flash a "Born" badge (generation counted
                         // lazily by the inspector; the badge is generic)
                         for (EntityId nid : ev.spawned)
@@ -4737,29 +4979,37 @@ struct Viewer {
                             auto sit = w.brains_->slots.find(e.id);
                             if (sit != w.brains_->slots.end()) bs = &sit->second;
                         }
+                        bool resting = bs && bs->vital.drive_fatigue > 650;
+                        if (!resting && bs) {
+                            int bi = -1, bv = 0;
+                            for (int i = 0; i < kActionVerbs; ++i) {
+                                const int v = std::abs(int(bs->last_action[i]));
+                                if (v > bv) { bv = v; bi = i; }
+                            }
+                            if (bi >= 0) {
+                                const char* vn = sensor_verb_table()[bi];
+                                resting = vn && std::string(vn) == "rest";
+                            }
+                        }
                         const bool fear = m->neuro.panic > 550 ||
                                           (bs && bs->vital.emo[kBEmoFear] > 600);
                         if (fear) {
                             ThoughtBadge& b = c_badge[e.id];
                             b.label = "!! Fear"; b.col = IM_COL32(255, 70, 60, 255);
                             b.until = c_tick + 30; b.rank = 3;
+                            // sudden fear -> sweat beads (viewer-side juice)
+                            if (parts.size() < 600) {
+                                const float fx = cam.sx(float(e.pos.x));
+                                const float fy = cam.sy(float(e.pos.y), elev_at(e.pos));
+                                for (int k = 0; k < 2; ++k)
+                                    parts.push_back({fx + float(k * 3 - 1) * cam.zoom, fy - 14.f * cam.zoom,
+                                        float(k - 1) * 8.f, -26.f, 0.5f, 0xFFAFD8FF});
+                            }
                         } else {
                             auto bit = c_badge.find(e.id);
                             const bool fresh_action = bit != c_badge.end() &&
                                 bit->second.rank >= 2 && bit->second.until > c_tick + 12;
                             if (!fresh_action) {
-                                bool resting = bs && bs->vital.drive_fatigue > 650;
-                                if (!resting && bs) {
-                                    int bi = -1, bv = 0;
-                                    for (int i = 0; i < kActionVerbs; ++i) {
-                                        const int v = std::abs(int(bs->last_action[i]));
-                                        if (v > bv) { bv = v; bi = i; }
-                                    }
-                                    if (bi >= 0) {
-                                        const char* vn = sensor_verb_table()[bi];
-                                        resting = vn && std::string(vn) == "rest";
-                                    }
-                                }
                                 ThoughtBadge& b = c_badge[e.id];
                                 if (resting) {
                                     if (b.rank < 2) {
@@ -4791,6 +5041,34 @@ struct Viewer {
                             l.target = bs->pending.pm_target;
                             if (const Entity* te = w.find(l.target)) l.pos = te->pos;
                             l.label = "reach"; l.until = c_tick + 60;
+                        }
+                        // ---- facial-expression + pose drivers ---------------
+                        // All read-only: panic/emo fear -> wide eyes, dopamine/
+                        // joy -> squint, fatigue/hunger/thirst -> heavy lids,
+                        // rest verb -> side-lying pose, water cell -> ripples.
+                        {
+                            AnimState& an = c_anim[e.id];
+                            an.fear = std::clamp(
+                                std::max(int(m->neuro.panic), bs ? int(bs->vital.emo[kBEmoFear]) : 0) / 1000.f,
+                                0.f, 1.f);
+                            const int joy_raw = bs ? std::max(int(bs->vital.mod[kBModDopa]),
+                                                               int(bs->vital.emo[kBEmoJoy])) : 0;
+                            an.joy = std::clamp(joy_raw / 1000.f, 0.f, 1.f);
+                            const int drain = bs ? std::max({int(bs->vital.drive_fatigue),
+                                                             int(bs->vital.drive_hunger),
+                                                             int(bs->vital.drive_thirst)}) : 0;
+                            an.tired = std::clamp(drain / 1000.f, 0.f, 1.f);
+                            an.lying = resting;
+                            an.in_water = w.terrain.is_water(e.pos);
+                            an.expr_until = c_tick + 30;
+                            // gaze prefers the freshest intent target (journey
+                            // or brain commit), else the last ledger target
+                            auto iit = c_intent.find(e.id);
+                            if (iit != c_intent.end() && iit->second.until > c_tick &&
+                                iit->second.target != kNoEntity) {
+                                an.target = iit->second.target;
+                                an.tpos = iit->second.pos; an.tpos_ok = true;
+                            }
                         }
                     }
                 }
