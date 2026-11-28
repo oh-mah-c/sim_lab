@@ -93,6 +93,12 @@ no engine code changes.
   Brain cost: drift_needs drains `energy` by
   mind_brain_metabolic_cost * ((horizon-2) + (abstraction-1000)/1000)
   permille-granular, remainder in `mind_brain_accum` (Euclid LOD-exact).
+  Need drift scales: `juvenile_need_scale` (permille, species prop + gene
+  locus) discounts hunger AND thirst while `age < adult_age`;
+  `thirst_scale` (permille, species prop + gene locus, default 1000)
+  discounts thirst at ALL ages and composes with the juvenile discount.
+  Both accumulate fractional credit in `need_accum_hunger`/
+  `need_accum_thirst` so per-tick and batched drift stay bit-identical.
   NOTE: state_hash covers the causal ledger, so batch-vs-stepped
   advance_ticks legitimately differ in metabolize EVENT COUNT — LOD
   invariance applies to prop math, not ledger granularity.

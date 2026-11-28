@@ -117,6 +117,30 @@ species water_gourd
   growing_mask 7
   dormant_growth_permille 300
 
+# Water fern — the inland counterpart of the water gourd. Same literal-
+# water fruit, but roots in ANY moist cell (moisture >= 550), not just
+# the 1-cell shoreline band: river terraces, seep zones, humid hollows.
+# This is what lets migrant bands crossing dry country between watersheds
+# find a drink without reaching the coast. Placed after water_gourd so
+# the gourd keeps first claim on riparian cells; the fern takes the
+# wider moist interior.
+species water_fern
+  kind flora
+  material living_wood
+  fruit_material water
+  fruit_count 8
+  max_fruit 8
+  fruit_regrow_rate 60
+  fruit_spoil_rate 6
+  death_drops dormant_seed=2,wood_debris=1
+  density 140
+  condition temperature -50 400
+  condition moisture 500 1000
+  condition vegetation 300 1000
+  trophic_tier 0
+  growing_mask 7
+  dormant_growth_permille 300
+
 species grazer
   kind fauna
   material flesh
@@ -463,6 +487,7 @@ species sapient
   adult_age 150
   repro_cooldown 100
   juvenile_need_scale 400
+  thirst_scale 600
   mutation_rate 40
   energy 80000
   max_energy 120000
@@ -513,6 +538,7 @@ species sapient
   gene immune_power_base
   gene dna_repair_gain
   gene juvenile_need_scale
+  gene thirst_scale
   gene adult_age
   gene reach
   gene repro_cooldown

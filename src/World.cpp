@@ -792,7 +792,13 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
         // credit persists in need_accum_* props so per-tick and batched
         // (dormant LOD) drift stay bit-identical.
         bool juvenile = false;
-        std::int64_t jscale = 1000, jh_acc0 = 0, jt_acc0 = 0;
+        std::int64_t jscale = 1000;
+        // species hydration economy: `thirst_scale` permille scales thirst
+        // drift at EVERY age (default 1000 = no discount). Sapients declare
+        // a lower value so inland migrants get a fair biological window
+        // to reach moisture between watersheds. Composes with the juvenile
+        // growth discount — both are biological traits, not behavior.
+        std::int64_t tscale = 1000;
         {
             const PropId p_ad = SIMLAB_PID(props, "adult_age");
             if (np.age != kNoProp && p_ad != kNoProp &&
@@ -810,20 +816,28 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
                     ? prop_int(e, p_js, 1000) : 1000;
                 if (jscale >= 1000) juvenile = false;
             }
-            if (juvenile) {
-                const PropId p_ha = SIMLAB_PID(props, "need_accum_hunger");
-                const PropId p_ta = SIMLAB_PID(props, "need_accum_thirst");
-                jh_acc0 = p_ha != kNoProp ? prop_int(e, p_ha, 0) : 0;
-                jt_acc0 = p_ta != kNoProp ? prop_int(e, p_ta, 0) : 0;
-            }
+            const PropId p_ts = SIMLAB_PID(props, "thirst_scale");
+            tscale = (p_ts != kNoProp && prop_of(e, p_ts))
+                ? prop_int(e, p_ts, 1000) : 1000;
+        }
+        const std::int64_t hscale = juvenile ? jscale : 1000;
+        const std::int64_t tscale_eff =
+            juvenile ? jscale * tscale / 1000 : tscale;
+        std::int64_t jh_acc0 = 0, jt_acc0 = 0;
+        if (hscale < 1000 || tscale_eff < 1000) {
+            const PropId p_ha = SIMLAB_PID(props, "need_accum_hunger");
+            const PropId p_ta = SIMLAB_PID(props, "need_accum_thirst");
+            jh_acc0 = p_ha != kNoProp ? prop_int(e, p_ha, 0) : 0;
+            jt_acc0 = p_ta != kNoProp ? prop_int(e, p_ta, 0) : 0;
         }
         // permille applied this window; sub-permille remainder persists
         auto need_delta = [&](PropId accp, std::int64_t rate,
-                              std::int64_t acc0) -> std::int64_t {
-            if (!juvenile || jscale >= 1000 || accp == kNoProp)
+                              std::int64_t acc0, std::int64_t scale)
+                -> std::int64_t {
+            if (scale >= 1000 || accp == kNoProp)
                 return rate * dt;
             const bool had = prop_of(e, accp) != nullptr;
-            const std::int64_t a1 = acc0 + rate * dt * jscale;
+            const std::int64_t a1 = acc0 + rate * dt * scale;
             const std::int64_t applied = a1 / 1000;
             const std::int64_t rem = a1 % 1000;
             if (rem != acc0 || !had) {
@@ -841,9 +855,9 @@ bool World::drift_needs(Entity& e, std::uint64_t dt_u, const NeedProps& np,
         const PropId p_ha = SIMLAB_PID(props, "need_accum_hunger");
         const PropId p_ta = SIMLAB_PID(props, "need_accum_thirst");
         const std::int64_t h_win = has_h
-            ? need_delta(p_ha, h_rate, jh_acc0) : 0;
+            ? need_delta(p_ha, h_rate, jh_acc0, hscale) : 0;
         const std::int64_t t_win = has_t
-            ? need_delta(p_ta, t_rate, jt_acc0) : 0;
+            ? need_delta(p_ta, t_rate, jt_acc0, tscale_eff) : 0;
         if (brain_drop == 0) {
             bumpd(np.hunger, h_win);
         } else if (has_h) {
