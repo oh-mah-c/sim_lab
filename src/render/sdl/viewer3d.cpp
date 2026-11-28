@@ -180,6 +180,7 @@ void Viewer::draw_3d(double dt) {
     const bool kb = ImGui::GetIO().WantCaptureKeyboard;
     if (!kb) {
         if (avatar == kNoEntity) {
+            v3_av = kNoEntity;
             const float boost = (ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]) ? 3.f : 1.f;
             const float sp = v3_speed * boost * float(dt);
             const float sy = std::sin(v3_yaw), cyw = std::cos(v3_yaw);
@@ -195,16 +196,20 @@ void Viewer::draw_3d(double dt) {
             if (ks[SDL_SCANCODE_Q]) v3_yaw += 1.8f * float(dt);
             if (ks[SDL_SCANCODE_E]) v3_yaw -= 1.8f * float(dt);
         } else {
-            // third-person possess: drift behind the avatar, WASD steered
-            // camera-relative in pan_keys; ease pitch toward a readable angle
+            // third-person possess: Minecraft-style follow cam. Pitch eases
+            // in only for the first ~1.2 s after possessing, then the player
+            // owns it (RMB drag / Q / E). WASD steers camera-relative.
+            if (avatar != v3_av) { v3_av = avatar; v3_blend = 0.f; }
+            v3_blend += float(dt);
             const float tx = float(c_av_pos.x), tz = float(c_av_pos.y);
             const float gy = v3_height(tx, tz);
             const float sy = std::sin(v3_yaw), cyw = std::cos(v3_yaw);
-            const float dx = tx - sy * 95.f, dz = tz - cyw * 95.f;
-            const float k = std::min(1.f, float(dt) * 5.f);
+            const float dx = tx - sy * 78.f, dz = tz - cyw * 78.f;
+            const float k = std::min(1.f, float(dt) * 6.f);
             v3_x += (dx - v3_x) * k; v3_z += (dz - v3_z) * k;
-            v3_y += ((gy + 62.f) - v3_y) * k;
-            v3_pitch += (-0.42f - v3_pitch) * k;
+            v3_y += ((gy + 46.f) - v3_y) * k;
+            if (v3_blend < 1.2f)
+                v3_pitch += (-0.38f - v3_pitch) * std::min(1.f, float(dt) * 3.f);
         }
         const float floor_y = v3_height(v3_x, v3_z) + 26.f;
         if (v3_y < floor_y) v3_y = floor_y;
@@ -264,17 +269,48 @@ void Viewer::draw_3d(double dt) {
 
     // ---- entity billboards (cylindrical, Y-locked) ----------------------
     struct BB {
-        float d, w, h, gy;
-        const EntityView* e;
-        const Sprite* sp;
-        bool flip;
+        float d = 0, w = 0, h = 0, gy = 0, ex = 0, ez = 0;
+        float yoff = 0, xoff = 0, sx = 1, sy = 1;
+        const EntityView* e = nullptr;
+        const Sprite* sp = nullptr;
+        bool flip = false;
     };
     std::vector<BB> bbs;
     bbs.reserve(snap.entities.size());
     const float syaw = std::sin(v3_yaw), cyaw = std::cos(v3_yaw);
     const F3 rh{-cyaw, 0.f, syaw};        // billboard right (faces camera horizontally)
+    // smooth visual positions + gait phase — mirrors draw_entities' update so
+    // NPCs keep walking/breathing/squash-stretching exactly like the 2D view
     for (const EntityView& e : snap.entities) {
-        const float ex = float(e.pos.x), ez = float(e.pos.y);
+        const float tx = float(e.pos.x), ty = float(e.pos.y);
+        auto vit = vis_pos.find(e.id);
+        if (vit == vis_pos.end()) vit = vis_pos.emplace(e.id, ImVec2(tx, ty)).first;
+        else {
+            const float ddx = tx - vit->second.x, ddy = ty - vit->second.y;
+            if (ddx * ddx + ddy * ddy > 400.f * 400.f) vit->second = ImVec2(tx, ty);
+            else {
+                const float k = 1.f - std::exp(-float(dt) * 12.f);
+                vit->second.x += ddx * k; vit->second.y += ddy * k;
+            }
+        }
+        const auto pit = vis_prev.find(e.id);
+        const ImVec2 pp = pit == vis_prev.end() ? vit->second : pit->second;
+        const float mvx = vit->second.x - pp.x, mvy = vit->second.y - pp.y;
+        vis_prev[e.id] = vit->second;
+        const float spd = std::sqrt(mvx * mvx + mvy * mvy) / std::max(1e-3f, float(dt));
+        const bool gliding = spd > 12.f;
+        AnimState* an = nullptr;
+        if (e.minded && e.alive) {
+            auto ait = c_anim.find(e.id);
+            if (ait != c_anim.end()) an = &ait->second;
+        }
+        const bool mourn_gait = an && an->mourning && an->expr_until > c_tick;
+        float phase = 0.f;
+        if (an) {
+            an->phase += float(dt) * (gliding ? (mourn_gait ? 5.f : 9.f) : (mourn_gait ? 0.9f : 2.f));
+            phase = an->phase;
+        }
+        const float ex = vit->second.x, ez = vit->second.y;
         const float dx = ex - v3_x, dz = ez - v3_z;
         if (dx * dx + dz * dz > kV3ViewRadius * kV3ViewRadius) continue;
         const Sprite* sp = nullptr;
@@ -291,8 +327,31 @@ void Viewer::draw_3d(double dt) {
         const F3 base{ex, gy + 0.4f, ez};
         const float d = dot3(base - cc.pos, cc.fwd);
         if (d < 4.f) continue;
-        bool flip = facing.count(e.id) && facing[e.id] < 0.f;
-        bbs.push_back({d, float(sp->w) * 0.85f, float(sp->h) * 0.85f, gy, &e, sp, flip});
+        // facing: flip when travelling screen-left (velocity . billboard right)
+        const float cvx = mvx * (-cyaw) + mvy * syaw;
+        bool flip = gliding && cvx < -0.4f;
+        BB b;
+        b.d = d; b.w = float(sp->w) * 0.85f; b.h = float(sp->h) * 0.85f; b.gy = gy;
+        b.ex = ex; b.ez = ez; b.e = &e; b.sp = sp; b.flip = flip;
+        // ---- procedural pose (same drivers as the 2D anim) --------------
+        const bool lying = an && an->lying && an->expr_until > c_tick;
+        const bool tantrum = an && float(time_s) < an->tantrum_until;
+        const bool proud = an && an->proud > 0.5f && an->expr_until > c_tick;
+        const bool mourn = an && an->mourning && an->expr_until > c_tick;
+        if (gliding && e.alive) {                     // gait squash & stretch + bob
+            const float sq = 1.f + 0.07f * std::sin(phase * 2.f);
+            b.sy *= sq; b.sx /= sq;
+            b.yoff += std::fabs(std::sin(phase)) * 1.7f;
+        } else if (e.alive && an) {                   // idle breathing
+            b.sy *= 1.f + 0.016f * std::sin(float(time_s) * 2.2f + float(e.id % 31));
+        }
+        if (lying) { b.sx *= 1.55f; b.sy *= 0.45f; b.yoff += b.h * 0.12f; }
+        if (mourn) { b.sy *= 0.96f; }
+        if (proud) { const float pp = 1.f + 0.035f * std::sin(float(time_s) * 5.f); b.sx *= pp; b.sy *= pp; }
+        if (tantrum) b.yoff += std::fabs(std::sin(float(time_s) * 18.f + float(e.id % 5))) * 2.2f;
+        if (an && an->tired > 0.85f)                  // critical hunger/thirst shiver
+            b.xoff = std::sin(float(time_s) * 40.f + float(e.id)) * 0.9f;
+        bbs.push_back(b);
     }
     std::sort(bbs.begin(), bbs.end(), [](const BB& a, const BB& b) { return a.d > b.d; });
 
@@ -301,9 +360,9 @@ void Viewer::draw_3d(double dt) {
 
     // contact shadows (flat dark quads on the block top)
     for (const BB& b : bbs) {
-        const float ex = float(b.e->pos.x), ez = float(b.e->pos.y);
+        const float ex = b.ex + b.xoff, ez = b.ez;
         const float gy = b.gy + 0.5f;
-        const float hw = b.w * 0.34f, hd = b.w * 0.16f;
+        const float hw = b.w * b.sx * 0.34f, hd = b.w * b.sx * 0.16f;
         const F3 pp[4] = {
             {ex - rh.x * hw - syaw * hd, gy, ez - rh.z * hw - cyaw * hd},
             {ex + rh.x * hw - syaw * hd, gy, ez + rh.z * hw - cyaw * hd},
@@ -323,13 +382,14 @@ void Viewer::draw_3d(double dt) {
 
     // billboards: one textured quad each, sorted back-to-front
     for (const BB& b : bbs) {
-        const float ex = float(b.e->pos.x), ez = float(b.e->pos.y);
-        const float hw = b.w * 0.5f;
+        const float ex = b.ex + b.xoff, ez = b.ez;
+        const float hw = b.w * b.sx * 0.5f;
+        const float bot = b.gy + 0.4f + b.yoff, top = bot + b.h * b.sy;
         const F3 p[4] = {
-            {ex - rh.x * hw, b.gy + 0.4f,       ez - rh.z * hw},
-            {ex + rh.x * hw, b.gy + 0.4f,       ez + rh.z * hw},
-            {ex + rh.x * hw, b.gy + 0.4f + b.h, ez + rh.z * hw},
-            {ex - rh.x * hw, b.gy + 0.4f + b.h, ez - rh.z * hw},
+            {ex - rh.x * hw, bot, ez - rh.z * hw},
+            {ex + rh.x * hw, bot, ez + rh.z * hw},
+            {ex + rh.x * hw, top, ez + rh.z * hw},
+            {ex - rh.x * hw, top, ez - rh.z * hw},
         };
         bool ok = true;
         for (int i = 0; i < 4; ++i) {

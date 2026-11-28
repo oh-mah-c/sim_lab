@@ -1761,6 +1761,8 @@ struct Viewer {
     float v3_speed = 460.f;
     bool v3_look = false;                      // right-mouse drag look active
     float v3_saved_zoom = 0.9f;
+    EntityId v3_av = kNoEntity;               // avatar the follow-cam is locked to
+    float v3_blend = 99.f;                    // seconds since possess (pitch ease-in)
     std::unordered_map<std::uint64_t, V3Chunk> v3_chunks;
     void toggle_view3d() ;
     void draw_3d(double dt) ;
