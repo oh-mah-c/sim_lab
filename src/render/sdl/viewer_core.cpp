@@ -376,7 +376,8 @@ namespace simlab_viewer {
         if (e.type == SDL_EVENT_QUIT) quit = true;
         if (e.type == SDL_EVENT_WINDOW_RESIZED) { win_w = e.window.data1; win_h = e.window.data2; resize_world_rt(); }
         if (e.type == SDL_EVENT_MOUSE_WHEEL && !ui && !in_menu) {
-            if (globe) globe_zoom(e.wheel.y > 0 ? 1.15 : 1 / 1.15, e.wheel.mouse_x / kPix, e.wheel.mouse_y / kPix);
+            if (view3d) v3_speed = std::clamp(v3_speed * (e.wheel.y > 0 ? 1.18f : 1 / 1.18f), 60.f, 4000.f);
+            else if (globe) globe_zoom(e.wheel.y > 0 ? 1.15 : 1 / 1.15, e.wheel.mouse_x / kPix, e.wheel.mouse_y / kPix);
             else if (is_planet() && e.wheel.y < 0 && cam.zoom <= 0.2501f) enter_globe();   // zoom out to orbit
             else cam.zoom = std::clamp(cam.zoom * (e.wheel.y > 0 ? 1.15f : 1 / 1.15f), 0.25f, 3.0f);
         }
@@ -427,10 +428,20 @@ namespace simlab_viewer {
                 if (e.button.x >= b.x0 && e.button.x <= b.x1 && e.button.y >= b.y0 && e.button.y <= b.y1) {
                     open_word(b.lang, b.word); return;
                 }
-            const Vec2 wp = screen_to_world(e.button.x / kPix, e.button.y / kPix);
+            EntityId v3hit = kNoEntity;
+            const Vec2 wp = view3d ? v3_pick(e.button.x / kPix, e.button.y / kPix, &v3hit)
+                                   : screen_to_world(e.button.x / kPix, e.button.y / kPix);
+            if (view3d) {           // 3D raycast pick: billboard first, then terrain
+                if (avatar != kNoEntity) {
+                    if (v3hit != kNoEntity && v3hit != avatar) {
+                        av_targets.insert(av_targets.begin(), v3hit);
+                        if (av_targets.size() > 2) av_targets.resize(2);
+                        selected = v3hit;
+                    } else if (v3hit == kNoEntity) avatar_move(wp);
+                } else selected = v3hit;
+            } else pick(e.button.x / kPix, e.button.y / kPix);
             if (tool == kToolBeacon) { place_beacon(wp); tool = kToolNone; return; }
             if (tool == kToolBlueprint) { dragging = true; drag_a = drag_b = wp; return; }
-            pick(e.button.x / kPix, e.button.y / kPix);
             if (tool == kToolFear && selected != kNoEntity) { instill_fear(selected); tool = kToolNone; }
             if (tool == kToolCupid && selected != kNoEntity) {
                 if (cupid_a == kNoEntity || cupid_a == selected) cupid_a = selected;
@@ -451,14 +462,21 @@ namespace simlab_viewer {
             if (tool == kToolRelic) { relic(wp); tool = kToolNone; }
             if (tool == kToolTempest) { tempest(wp); tool = kToolNone; }
         }
-        if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) drag_b = screen_to_world(e.motion.x / kPix, e.motion.y / kPix);
+        if (e.type == SDL_EVENT_MOUSE_MOTION && dragging)
+            drag_b = view3d ? v3_pick(e.motion.x / kPix, e.motion.y / kPix, nullptr)
+                            : screen_to_world(e.motion.x / kPix, e.motion.y / kPix);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && dragging && e.button.button == SDL_BUTTON_LEFT) {
             dragging = false;
             const std::int64_t r = std::int64_t(std::sqrt(double(dist2(drag_a, drag_b))));
             place_blueprint(drag_a, r); tool = kToolNone;
         }
         if (e.type == SDL_EVENT_MOUSE_MOTION && !ui && (e.motion.state & SDL_BUTTON_RMASK)) {
-            cam.cx -= e.motion.xrel / kPix / cam.zoom; cam.cy -= e.motion.yrel / kPix / cam.zoom / Camera::kY;
+            if (view3d) {                       // right-drag look (yaw/pitch)
+                v3_yaw += e.motion.xrel * 0.008f;
+                v3_pitch = std::clamp(v3_pitch - e.motion.yrel * 0.008f, -1.48f, 1.48f);
+            } else {
+                cam.cx -= e.motion.xrel / kPix / cam.zoom; cam.cy -= e.motion.yrel / kPix / cam.zoom / Camera::kY;
+            }
         }
         if (e.type == SDL_EVENT_KEY_DOWN && !kb) {
             const SDL_Keycode k = e.key.key;
@@ -472,6 +490,7 @@ namespace simlab_viewer {
             if (k == SDLK_F5) { save_slot(1); return; }
             if (k == SDLK_J) { show_journal = !show_journal; return; }
             if (k == SDLK_B) { show_badges = !show_badges; return; }
+            if (k == SDLK_V && has_game) { toggle_view3d(); return; }
             if (k == SDLK_P) {                 // possess selected / release
                 if (avatar != kNoEntity) set_possess(kNoEntity);
                 else if (selected != kNoEntity) set_possess(selected);
@@ -501,6 +520,25 @@ namespace simlab_viewer {
     void Viewer::pan_keys(double dt) {
         if (ImGui::GetIO().WantCaptureKeyboard) return;
         const bool* ks = SDL_GetKeyboardState(nullptr);
+        if (view3d) {
+            if (avatar == kNoEntity) return;      // free-fly handled in draw_3d
+            // possessed: WASD walks relative to the 3D camera yaw
+            move_cool -= dt;
+            int dx = 0, dy = 0;
+            if (ks[SDL_SCANCODE_W] || ks[SDL_SCANCODE_UP]) dy -= 1;
+            if (ks[SDL_SCANCODE_S] || ks[SDL_SCANCODE_DOWN]) dy += 1;
+            if (ks[SDL_SCANCODE_A] || ks[SDL_SCANCODE_LEFT]) dx -= 1;
+            if (ks[SDL_SCANCODE_D] || ks[SDL_SCANCODE_RIGHT]) dx += 1;
+            if ((dx || dy) && move_cool <= 0) {
+                const float sy = std::sin(v3_yaw), cy = std::cos(v3_yaw);
+                const float wx = float(dx) * -cy + float(-dy) * sy;
+                const float wy = float(dx) * sy + float(-dy) * cy;
+                avatar_move(Vec2{std::int32_t(c_av_pos.x + std::int64_t(wx * 56)),
+                                 std::int32_t(c_av_pos.y + std::int64_t(wy * 56))});
+                move_cool = 0.22;
+            }
+            return;
+        }
         if (globe) {                             // WASD spins the planet
             const double r = 1.4 * dt;
             if (ks[SDL_SCANCODE_A] || ks[SDL_SCANCODE_LEFT]) gview.lon -= r;
@@ -1202,6 +1240,9 @@ namespace simlab_viewer {
                 ui_wants = true;
             }
         };
+        if (view3d) { cam.cx = v3_x; cam.cy = v3_z; cam.zoom = cam.sw * 0.5f / 1300.f; }
+        static const bool v3d_force = std::getenv("SIMLAB_V3D") != nullptr;
+        if (v3d_force && has_game && !view3d && !globe) toggle_view3d();
         poll_world();
         t_cap = ms(t); t = clk::now();
         globe_step(dt);
@@ -1218,6 +1259,8 @@ namespace simlab_viewer {
             draw_title_globe(dt);
         } else if (globe) {
             draw_globe();
+        } else if (view3d) {
+            draw_3d(dt);
         } else {
             if (!(skip & 1)) {
                 if (is_planet()) { draw_ground_chunks(); draw_fog_chunks(); }
@@ -1242,7 +1285,7 @@ namespace simlab_viewer {
         }
         if (in_menu || !has_game) { if (!in_menu) open_menu(kTitle); ui_menu(); }
         else if (!(skip & 16)) {
-            if (globe) draw_globe_icons(); else draw_overlays();
+            if (globe) draw_globe_icons(); else if (!view3d) draw_overlays();
             ui_topbar();
             if (!globe) { if (is_planet()) ui_mini_globe(); else ui_minimap(); }
             // mind-reader reply: poll the worker every frame (mutexed,

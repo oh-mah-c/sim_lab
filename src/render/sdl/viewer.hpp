@@ -1752,6 +1752,22 @@ struct Viewer {
 
 
 
+    // ---- 3D voxel "HD-2D" view (client-only; never touches World) ---------
+    struct V3Vert { float x, y, z; std::uint8_t r, g, b, a; };
+    struct V3Chunk { std::vector<V3Vert> v; std::vector<int> i; double t = 0; };
+    bool view3d = false;
+    float v3_x = 0, v3_z = 0, v3_y = 220;       // camera position (world units; y = up)
+    float v3_yaw = 0.f, v3_pitch = -0.85f;     // radians; pitch < 0 looks down
+    float v3_speed = 460.f;
+    bool v3_look = false;                      // right-mouse drag look active
+    float v3_saved_zoom = 0.9f;
+    std::unordered_map<std::uint64_t, V3Chunk> v3_chunks;
+    void toggle_view3d() ;
+    void draw_3d(double dt) ;
+    Vec2 v3_pick(float mx, float my, EntityId* hit) ;
+    float v3_height(float x, float z) const ;
+    void v3_build_chunk(int ccx, int ccz) ;
+
 };
 
 }  // namespace simlab_viewer

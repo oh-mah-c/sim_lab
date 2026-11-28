@@ -92,6 +92,9 @@ namespace simlab_viewer {
             ImGui::Checkbox("Chronicle & Rosetta codex", &show_codex);
             ImGui::Checkbox("Sprite atlas", &show_atlas);
             ImGui::Checkbox("Performance stats", &show_perf);
+            ImGui::Separator();
+            if (ImGui::MenuItem(view3d ? "2D top-down view" : "3D voxel view", "V")) toggle_view3d();
+            if (view3d) ImGui::TextDisabled("WASD fly · RMB look · Space/C up/down · wheel speed");
             if (is_planet()) { ImGui::Separator(); if (ImGui::MenuItem("Planet view", "M")) enter_globe(); }
             ImGui::EndPopup();
         }

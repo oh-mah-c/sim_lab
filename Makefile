@@ -86,7 +86,7 @@ $(BUILDDIR)/imgui/%.o: third_party/imgui/%.cpp
 VIEWER_SRC := src/render/sdl/viewer_main.cpp src/render/sdl/viewer_core.cpp \
               src/render/sdl/viewer_planet.cpp src/render/sdl/viewer_entities.cpp \
               src/render/sdl/viewer_hud.cpp src/render/sdl/viewer_tools.cpp \
-              src/render/sdl/viewer_mind.cpp
+              src/render/sdl/viewer_mind.cpp src/render/sdl/viewer3d.cpp
 VIEWER_OBJ := $(VIEWER_SRC:src/render/sdl/%.cpp=$(BUILDDIR)/viewer/%.o)
 
 $(BUILDDIR)/viewer/%.o: src/render/sdl/%.cpp src/render/sdl/viewer.hpp $(HDR) $(SDL_LIB)
