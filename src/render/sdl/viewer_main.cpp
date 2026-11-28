@@ -413,6 +413,7 @@ struct Viewer {
         std::uint64_t until = 0;             // verb freshness (world tick)
         std::uint64_t expr_until = 0;        // expression-state freshness (mind scan)
         float flash = -1.f;                  // hit-flash deadline (time_s)
+        float tantrum_until = -1.f;          // stomp-bounce deadline (time_s)
         std::uint64_t last_puff = 0;         // ripple throttle (frames)
         float z_at = -10.f;                  // last "z" particle (time_s)
     };
@@ -1671,6 +1672,16 @@ struct Viewer {
             SDL_FRect pu{exx + gaze_x - pr, eyy + gaze_y - pr, pr * 2.f, pr * 2.f};
             set_color(ren, 0xFF241A12); SDL_RenderFillRect(ren, &pu);
         }
+        // rosy cheeks: dopamine/joy spike (lovin', sharing, feasting)
+        if (an.joy > 0.5f && an.fear < 0.4f) {
+            const float cr = std::max(1.2f, sw * 0.05f);
+            for (int i = 0; i < 2; ++i) {
+                const float cx = hx + (i ? ex * 0.85f : -ex * 0.85f);
+                SDL_FRect ch{cx - cr, hy + er * 1.9f - cr, cr * 2.f, cr * 2.f};
+                set_color(ren, 0xFFE89090, int(150 + an.joy * 80));
+                SDL_RenderFillRect(ren, &ch);
+            }
+        }
         if (eating) {                                           // open mouth
             SDL_FRect mo{hx - er, hy + er * 2.4f, er * 2.f, er * 1.2f};
             set_color(ren, 0xFF5A1E1E); SDL_RenderFillRect(ren, &mo);
@@ -1768,6 +1779,14 @@ struct Viewer {
                     rings.push_back({fx, fy - cam.zoom, 2.f, 16.f, 0.8f, 0.8f, 0xFF7FC8E8});
                 }
             }
+            // ---- comedy body-states (viewer-only) -------------------------
+            const bool just_ate = an && an->until > c_tick &&
+                (an->verb == "consume" || an->verb == "eat" || an->verb == "forage");
+            const bool tantrum_now = an && float(time_s) < an->tantrum_until;
+            const bool starving = an && an->tired > 0.85f;   // hunger/thirst critical
+            const float bounce = tantrum_now
+                ? std::fabs(std::sin(float(time_s) * 18.f + float(e.id % 5))) * 3.f * cam.zoom
+                : 0.f;                                       // stomp hop
             // motion memory -> bob / flip (viewer-side, never World state)
             auto lp = last_pos.find(e.id);
             if (lp != last_pos.end() && (lp->second.x != e.pos.x || lp->second.y != e.pos.y)) {
@@ -1797,6 +1816,7 @@ struct Viewer {
             float sw = sp->w * cam.zoom, sh = sp->h * cam.zoom;
             float squash = 1.f, ox = 0, sox = 0;
             const bool moving = gliding || (bob_until.count(e.id) && bob_until[e.id] > time_s);
+            if (just_ate) { sw *= 1.13f; sh *= 1.05f; }        // food baby belly
             if (creature && e.alive && moving) {               // squash & stretch hop
                 const float ph = std::sin(float(time_s) * 12.f + float(e.id % 17));
                 squash = 1.f + 0.08f * ph; sh *= squash; sw /= squash;
@@ -1805,9 +1825,9 @@ struct Viewer {
             }
             if (e.flora && !creature && e.alive && e.fog != Fog::Shrouded)   // foliage sway (frozen memory under the shroud)
                 sox = std::sin(float(time_s) * 1.25f + float((e.id * 2654435761u >> 8) % 1024) / 163.f) * 1.4f * cam.zoom;
-            if (creature && (e.infected || e.toxin > 300 || e.temperature > 385))   // fever tremor
-                ox = std::sin(float(time_s) * 40.f + float(e.id)) * 1.2f * cam.zoom;
-            SDL_FRect dst{fx - sw / 2 + ox + sox, fy - sh + (lying ? sh * 0.22f : 0.f), sw, sh};
+            if (creature && (e.infected || e.toxin > 300 || e.temperature > 385 || starving))
+                ox = std::sin(float(time_s) * 40.f + float(e.id)) * 1.2f * cam.zoom;   // fever / hunger shiver
+            SDL_FRect dst{fx - sw / 2 + ox + sox, fy - sh + (lying ? sh * 0.22f : 0.f) - bounce, sw, sh};
             // ground shadow, slanted by the sun
             const float sun = float((snap.day_phase - 12)) / 12.f;
             SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
@@ -1818,7 +1838,8 @@ struct Viewer {
             if (an && std::fabs(std::cos(an->ang)) > 0.25f) flip = std::cos(an->ang) < 0.f;
             SDL_Texture* t = tex.get(*sp, flip);                   // paper flip, pre-mirrored
             if (e.fog == Fog::Shrouded) SDL_SetTextureColorMod(t, 120, 120, 135);
-            if (!e.alive) SDL_SetTextureColorMod(t, 150, 140, 130);
+            else if (!e.alive) SDL_SetTextureColorMod(t, 150, 140, 130);
+            else if (starving) SDL_SetTextureColorMod(t, 185, 192, 208);   // pale & shaky
             double tilt = !e.alive ? 90.0 : e.routed ? -12.0 : 0.0;
             if (an && e.alive && !e.routed)
                 tilt = lying ? (flip ? -90.0 : 90.0) : lean;      // rest pose / motion lean
@@ -1840,7 +1861,7 @@ struct Viewer {
                 blit(wt, wd, 0.0);
             }
             if (an && show_badges)
-                draw_actor_anim(e, *an, fx, fy, sw, sh, gliding, lying);
+                draw_actor_anim(e, *an, fx, fy - bounce, sw, sh, gliding, lying);
             if (e.leader) {                                    // crown of authority
                 SDL_SetRenderDrawColor(ren, 255, 210, 60, 255);
                 for (int k = 0; k < 3; ++k) {
@@ -2626,7 +2647,7 @@ struct Viewer {
         m.neuro.panic = std::min<std::int64_t>(1000, m.neuro.panic + 700);
         m.neuro.rage = std::min<std::int64_t>(1000, m.neuro.rage + 400);
         god_mod_surge(id, 0, 0, 400, 300, 0);   // cortisol + norepinephrine
-        status_msg = "Panic instilled in " + sid(id) +
+        status_msg = "Drama instilled in " + sid(id) +
                      " — expect paranoia, flight or factional gossip";
     }
     void instill_panic(EntityId id) { post([=, this] { do_instill_panic(id); }); }
@@ -2847,7 +2868,7 @@ struct Viewer {
             // second row: sandbox powers (deterministic world commands)
             power("Cupid", kToolCupid, 15, "Click two sapients: kindle a mutual bond");
             ImGui::SameLine(0, 4);
-            power("Panic", kToolPanic, 10, "Click an agent: cortisol/norepinephrine spike");
+            power("Drama", kToolPanic, 10, "Click an agent: jealousy/paranoia spike — gossip & chaos");
             ImGui::SameLine(0, 4);
             power("Rain", kToolRain, 20, "Click terrain: moisture pulse + drinkable pools");
             ImGui::SameLine(0, 4);
@@ -5194,19 +5215,26 @@ struct Viewer {
                         else if (a == "treaty" || a == "parley" || a == "diplomatic_parley") { label = "Talk"; col = IM_COL32(130, 225, 225, 255); }
                         else if (a == "wield" || a == "don" || a == "doff" || a == "coat")  { label = "Gear";   col = IM_COL32(170, 160, 190, 255); }
                         else { label = a.substr(0, 10); }
-                        if (ev.failed) { label += "!"; col = IM_COL32(150, 155, 165, 255); }
+                        if (ev.failed && (a == "reproduce" || a == "mate")) {
+                            // rejected advance: cooldown / not in the mood
+                            label = "Cooldown!"; col = IM_COL32(205, 185, 225, 255);
+                        } else if (ev.failed) { label += "!"; col = IM_COL32(150, 155, 165, 255); }
                         {
                             ThoughtBadge& b = c_badge[actor];
                             if (b.rank < 3) { b.label = label; b.col = col;
                                 b.until = c_tick + ((a == "reproduce" || a == "mate") ? 50 : 30);
                                 b.rank = 2; }
                         }
-                        // post-coital glow: the partner wears Lovin' too
+                        // post-coital glow: the partner wears Lovin' too —
+                        // or "Not interested!" when the advance was rejected
                         if ((a == "reproduce" || a == "mate") && target != kNoEntity) {
                             ThoughtBadge& tb = c_badge[target];
-                            if (tb.rank < 3) { tb.label = "Lovin'";
-                                tb.col = IM_COL32(255, 140, 210, 255);
-                                tb.until = c_tick + 50; tb.rank = 2; }
+                            if (tb.rank < 3) {
+                                tb.label = ev.failed ? "Not interested!" : "Lovin'";
+                                tb.col = ev.failed ? IM_COL32(170, 165, 185, 255)
+                                                   : IM_COL32(255, 140, 210, 255);
+                                tb.until = c_tick + (ev.failed ? 40 : 50); tb.rank = 2;
+                            }
                         }
                         // intent link: actor -> last interacted target
                         if (target != kNoEntity) {
@@ -5244,9 +5272,13 @@ struct Viewer {
                                            a == "treaty" || a == "parley" || a == "diplomatic_parley") {
                                     if (rings.size() < 40)
                                         rings.push_back({ax, ay - 10.f * cam.zoom, 3.f, 26.f, 0.7f, 0.7f, 0xFF80E0A0});
-                                } else if (a == "reproduce" || a == "mate") {
+                                } else if ((a == "reproduce" || a == "mate") && !ev.failed) {
                                     for (int k = 0; k < 3 && hearts.size() < 60; ++k)
                                         hearts.push_back({ax + float(k - 1) * 5.f, ay - 10.f * cam.zoom, float(k) * 0.12f});
+                                    // nervous sweat — even love is sweaty
+                                    for (int k = 0; k < 2 && parts.size() < 600; ++k)
+                                        parts.push_back({ax + float(k * 2 - 1) * 6.f, ay - 12.f * cam.zoom,
+                                            float(k - 1) * 10.f, -30.f, 0.5f, 0xFFBFE8FF});
                                 } else if (a == "strike" || a == "launch" || a == "attack") {
                                     // victim hit-flash (viewer-side decal)
                                     if (target != kNoEntity) c_anim[target].flash = float(time_s) + 0.18f;
@@ -5290,6 +5322,66 @@ struct Viewer {
                                 resting = vn && std::string(vn) == "rest";
                             }
                         }
+                        // ---- shared drama reads: conspecific engram scan ----
+                        // fresh_neg/stale_grudge feed badges; grudge_id/pos
+                        // feed tantrum facing + bubbles; mate_id feeds the
+                        // affectionate idle line. Read-only, never mutates.
+                        int fresh_neg = 0, stale_grudge = 0;
+                        std::int64_t worst_neg = 0;
+                        EntityId grudge_id = kNoEntity;
+                        Vec2 grudge_pos{};
+                        EntityId mate_id = kNoEntity;
+                        std::int64_t mate_d2 = 260LL * 260;
+                        for (const auto& [kid, s] : m->memory) {
+                            if (kid == e.id) continue;
+                            const bool conspec = s.kind_name == e.kind ||
+                                                 s.kind_name == e.species;
+                            if (!conspec) continue;
+                            const std::int64_t ch = s.engram.emotional_charge;
+                            if (ch <= -450) {
+                                const std::uint64_t age =
+                                    c_tick > s.engram.last_rehearsal
+                                        ? c_tick - s.engram.last_rehearsal : 0;
+                                if (age < 120) {
+                                    ++fresh_neg;
+                                    if (ch < worst_neg) {
+                                        worst_neg = ch; grudge_id = kid;
+                                        grudge_pos = s.pos;
+                                    }
+                                } else if (ch <= -600 && age < 3000) ++stale_grudge;
+                            } else if (ch >= 650 && mate_id == kNoEntity) {
+                                const std::int64_t dx =
+                                    std::int64_t(s.pos.x) - e.pos.x;
+                                const std::int64_t dy =
+                                    std::int64_t(s.pos.y) - e.pos.y;
+                                const std::int64_t d2 = dx * dx + dy * dy;
+                                const Entity* ge = w.find(kid);
+                                if (ge && ge->alive && d2 < mate_d2) {
+                                    mate_id = kid; mate_d2 = d2;
+                                }
+                            }
+                        }
+                        // crowd read: >=2 conspecifics within 128 units while
+                        // hungry+stressed — feeds Secretive badge AND bubble
+                        bool crowded = false;
+                        if (bs && bs->vital.drive_hunger > 600 &&
+                            (bs->vital.mod[kBModCortisol] > 350 ||
+                             m->neuro.panic > 250)) {
+                            int cn = 0;
+                            for (const EntityView& o : snap.entities) {
+                                if (cn >= 2) break;
+                                if (o.id == e.id || !o.alive ||
+                                    o.fog != Fog::Visible) continue;
+                                if (o.kind != e.kind && o.species != e.species)
+                                    continue;
+                                const std::int64_t dx =
+                                    std::int64_t(o.pos.x) - e.pos.x;
+                                const std::int64_t dy =
+                                    std::int64_t(o.pos.y) - e.pos.y;
+                                if (dx * dx + dy * dy < 128 * 128) ++cn;
+                            }
+                            crowded = cn >= 2;
+                        }
                         const bool fear = m->neuro.panic > 550 ||
                                           (bs && bs->vital.emo[kBEmoFear] > 600);
                         if (fear) {
@@ -5320,51 +5412,45 @@ struct Viewer {
                                     const bool any_fresh = iit != c_badge.end() && iit->second.until > c_tick;
                                     if (!any_fresh && e.moved_tick + 30 < c_tick &&
                                         dstate.pending.find(e.id) == dstate.pending.end()) {
-                                        b.label = "..."; b.col = IM_COL32(140, 145, 160, 255);
+                                        // witty thought bubble: synthesized from
+                                        // live drives + engram state (display only)
+                                        const std::int64_t hunger = bs ? bs->vital.drive_hunger : 0;
+                                        const std::int64_t thirst = bs ? bs->vital.drive_thirst : 0;
+                                        const std::int64_t fatigue = bs ? bs->vital.drive_fatigue : 0;
+                                        std::string bub;
+                                        if (thirst > 850) bub = "Water... need water...";
+                                        else if (hunger > 850) bub = "So hungry...";
+                                        else if (fresh_neg >= 2 && grudge_id != kNoEntity)
+                                            bub = "Who is #" +
+                                                std::to_string(grudge_id % 100000) + "?!";
+                                        else if (mate_id != kNoEntity &&
+                                                 m->neuro.panic < 300 && m->neuro.rage < 400)
+                                            bub = "Thinking of #" +
+                                                std::to_string(mate_id % 100000) + " <3";
+                                        else if (fresh_neg == 1 && grudge_id != kNoEntity)
+                                            bub = "#" + std::to_string(grudge_id % 100000) +
+                                                  "... interesting.";
+                                        else if (crowded) bub = "Hiding this berry...";
+                                        else if (m->neuro.panic > 500) bub = "RUN!";
+                                        else if (m->neuro.rage > 500) bub = "Curse you all!";
+                                        else if (fatigue > 800) bub = "So tired...";
+                                        else {
+                                            static const char* kIdle[] = {
+                                                "...", "hm.", "What now?", "*blinks*",
+                                                "(awkward)", "...again."};
+                                            bub = kIdle[(size_t(e.id) +
+                                                         size_t(c_tick / 900)) % 6];
+                                        }
+                                        b.label = bub; b.col = IM_COL32(150, 156, 172, 255);
                                         b.until = c_tick + 30; b.rank = 0;
                                     }
                                 }
                             }
                         }
                         // ---- drama badges: jealousy signature, fresh grudges,
-                        // betrayal wounds, secretive hunger+stress. Reads
-                        // engram charge/freshness only — never mutates.
+                        // betrayal wounds, secretive hunger+stress — reuses
+                        // the shared engram/crowd reads above (never mutates).
                         {
-                            int fresh_neg = 0, stale_grudge = 0;
-                            std::int64_t worst_neg = 0;
-                            for (const auto& [kid, s] : m->memory) {
-                                if (kid == e.id) continue;
-                                if (s.kind_name != e.kind &&
-                                    s.kind_name != e.species) continue;
-                                const std::int64_t ch = s.engram.emotional_charge;
-                                if (ch > -450) continue;
-                                const std::uint64_t age =
-                                    c_tick > s.engram.last_rehearsal
-                                        ? c_tick - s.engram.last_rehearsal : 0;
-                                if (age < 120) { ++fresh_neg;
-                                    if (ch < worst_neg) worst_neg = ch; }
-                                else if (ch <= -600 && age < 3000) ++stale_grudge;
-                            }
-                            // crowd check for the secretive read
-                            bool crowded = false;
-                            if (bs && bs->vital.drive_hunger > 600 &&
-                                (bs->vital.mod[kBModCortisol] > 350 ||
-                                 m->neuro.panic > 250)) {
-                                int cn = 0;
-                                for (const EntityView& o : snap.entities) {
-                                    if (cn >= 2) break;
-                                    if (o.id == e.id || !o.alive ||
-                                        o.fog != Fog::Visible) continue;
-                                    if (o.kind != e.kind &&
-                                        o.species != e.species) continue;
-                                    const std::int64_t dx =
-                                        std::int64_t(o.pos.x) - e.pos.x;
-                                    const std::int64_t dy =
-                                        std::int64_t(o.pos.y) - e.pos.y;
-                                    if (dx * dx + dy * dy < 128 * 128) ++cn;
-                                }
-                                crowded = cn >= 2;
-                            }
                             const char* dl = nullptr; ImU32 dc = 0; int dr = 0;
                             if (fresh_neg >= 2) {
                                 dl = "Jealous!"; dc = IM_COL32(255, 120, 60, 255); dr = 2;
@@ -5383,6 +5469,28 @@ struct Viewer {
                                     b.label = dl; b.col = dc;
                                     b.until = c_tick + 40; b.rank = dr;
                                 }
+                            }
+                            // ---- tantrum: fresh grudge + hot temper -> stomp
+                            // bounce, anger puffs, and a glare at the rival.
+                            // Purely cosmetic state in c_anim/c_badge.
+                            if (fresh_neg >= 1 && grudge_id != kNoEntity &&
+                                (m->neuro.rage > 400 || m->neuro.panic > 400)) {
+                                AnimState& an = c_anim[e.id];
+                                an.tantrum_until = float(time_s) + 0.8f;
+                                if (parts.size() < 600) {
+                                    const float fx = cam.sx(float(e.pos.x));
+                                    const float fy = cam.sy(float(e.pos.y),
+                                                             elev_at(e.pos));
+                                    for (int k = 0; k < 3; ++k)
+                                        parts.push_back({fx + float(k - 1) * 7.f,
+                                            fy - 18.f * cam.zoom,
+                                            float(k - 1) * 22.f, -30.f - float(k) * 8.f,
+                                            0.55f,
+                                            k == 1 ? 0xFFFF5030 : 0xFFFFC040});
+                                }
+                                IntentLink& il = c_intent[e.id];
+                                il.target = grudge_id; il.pos = grudge_pos;
+                                il.label = "argument"; il.until = c_tick + 70;
                             }
                         }
                         // intent link: active journey beats a fresh brain
