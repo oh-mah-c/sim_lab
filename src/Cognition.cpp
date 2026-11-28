@@ -1933,6 +1933,48 @@ void witness_from_event(World& w, EntityId npc, const CausalEvent& ev) {
                 }
             }
         }
+        // Territorial/resource friction (pure physiology — no war rules):
+        // an OUT-GROUP actor consuming or taking near one of our deep
+        // affective focal points (|charge| >= 600 engram — shared sacred
+        // ground or bonded mate alike) amplifies the natural
+        // norepinephrine + cortisol threat response. Whether this becomes
+        // a border skirmish, a glare, or nothing is left to the SNN.
+        if ((ev.action == "consume" || ev.action == "take" ||
+             ev.action == "steal") && !ev.participants.empty()) {
+            const EntityId actor = ev.participants.front();
+            if (actor != npc && actor != kNoEntity &&
+                !share_collective(w, npc, actor)) {
+                // event location ~ the last other participant (the item),
+                // else fall back to the witness's own position
+                Vec2 spot = me->pos;
+                for (auto it = ev.participants.rbegin();
+                     it != ev.participants.rend(); ++it) {
+                    if (*it == npc || *it == kNoEntity) continue;
+                    if (const Entity* te = w.find(*it)) { spot = te->pos; break; }
+                }
+                bool near_focal = false;
+                for (const auto& [kid, s] : mind.memory) {
+                    if (std::llabs(s.engram.emotional_charge) < 600) continue;
+                    const std::int64_t dx =
+                        static_cast<std::int64_t>(s.pos.x) - spot.x;
+                    const std::int64_t dy =
+                        static_cast<std::int64_t>(s.pos.y) - spot.y;
+                    if (dx * dx + dy * dy < 170LL * 170) {
+                        near_focal = true; break;
+                    }
+                }
+                if (near_focal && w.brains_) {
+                    auto sit = w.brains_->slots.find(npc);
+                    if (sit != w.brains_->slots.end()) {
+                        BrainVital& bv = sit->second.vital;
+                        bv.mod[kBModNorepi] = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.mod[kBModNorepi]) + 70, 0, 1000));
+                        bv.mod[kBModCortisol] = static_cast<std::int16_t>(
+                            std::clamp<int>(int(bv.mod[kBModCortisol]) + 50, 0, 1000));
+                    }
+                }
+            }
+        }
         // Reciprocity (Nhịp 5b): witnessing a third party strike down OUR
         // enemy while we are under threat writes a gratitude mark —
         // deep positive engram on the defender, no ledger of favors.

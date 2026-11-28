@@ -189,7 +189,7 @@ struct Viewer {
     PatronJournal journal;             // player knowledge + Resonance (saved as .journal)
     enum Tool { kToolNone = 0, kToolBeacon, kToolBlueprint, kToolFear,
                 kToolCupid, kToolPanic, kToolRain, kToolFeast, kToolPredator,
-                kToolMiracle, kToolBounty };
+                kToolMiracle, kToolBounty, kToolRelic, kToolTempest };
     int tool = kToolNone;
     EntityId cupid_a = kNoEntity;      // first pick of a Cupid's-arrow pair
     bool god_open = true;              // God-Hand toolbar row expanded
@@ -442,6 +442,16 @@ struct Viewer {
                     std::vector<EntityId> members; };
     std::vector<Gather> c_gather;
     std::unordered_map<EntityId, EntityId> gather_of;   // member -> focal
+    // carried items: holder -> [(item, icon color)] rebuilt every ~20 scans
+    struct HeldItem { EntityId id = kNoEntity; std::uint32_t col = 0xFF888888; };
+    std::unordered_map<EntityId, std::vector<HeldItem>> c_held;
+    // wielded equipment: entity -> icon color (from EntityView.w_mat)
+    std::unordered_map<EntityId, std::uint32_t> c_wield_col;
+    // footpath wear: client-side traffic heat per terrain cell
+    std::unordered_map<std::uint64_t, std::uint16_t> path_heat;
+    std::uint64_t path_tick = 0;                       // last heat update (frames)
+    // Tempest flash: screen-space white blink timestamp (time_s)
+    double storm_t0 = -100.0;
     // mind-reader: one outstanding Qwen interrogation per selected NPC
     std::uint64_t mind_ask_key = 0, mind_ask_seq = 0;
     EntityId mind_ask_id = kNoEntity;
@@ -582,6 +592,8 @@ struct Viewer {
         c_badge.clear(); c_intent.clear(); hover_id = kNoEntity;
         c_anim.clear(); rings.clear(); hearts.clear(); zeds.clear();
         syms.clear(); beams.clear(); c_gather.clear(); gather_of.clear();
+        c_held.clear(); c_wield_col.clear(); path_heat.clear();
+        path_tick = 0; storm_t0 = -100.0;
         cupid_a = kNoEntity; god_open = true;
         mind_ask_key = 0; mind_ask_id = kNoEntity; mind_reply.clear();
         mind_ask_busy = false; mind_ask_wait = 0;
@@ -1596,7 +1608,10 @@ struct Viewer {
                 e.sacred ? IM_COL32(255, 210, 120, 255) : IM_COL32(230, 220, 200, 255),
                 (e.function + (lens == kMilitary ? " " + std::to_string(e.integrity) : std::string())).c_str());
         }
-        if (e.sacred && e.fog == Fog::Visible) draw_glow(e.pos, 0xFFC060, 2.0f);
+        // etched stones glow faintly cyan — readable at night like sacred fire
+        if ((e.sacred || !e.text.empty()) && e.fog == Fog::Visible)
+            draw_glow(e.pos, e.sacred ? 0xFFC060 : 0x70C8FF,
+                      e.sacred ? 2.0f : 1.1f);
     }
 
     void draw_glow(Vec2 p, std::uint32_t rgb, float scale) {
@@ -1658,9 +1673,28 @@ struct Viewer {
                 hx += dir * jab * sw * 0.14f * (i ? 0.6f : 1.f);
                 hy -= jab * sh * 0.10f;
             }
-            SDL_FRect hd{hx - hr, hy - hr, hr * 2.f, hr * 2.f};
-            set_color(ren, 0xFFBE9678); SDL_RenderFillRect(ren, &hd);
-            set_color(ren, 0xFF8A6248); SDL_RenderRect(ren, &hd);
+            // carried/wielded item chip rides the right hand — material
+            // tint resolved in poll_world (World Truth, under the lock)
+            std::uint32_t held_col = 0;
+            if (i == 1) {
+                auto wit = c_wield_col.find(e.id);
+                if (wit != c_wield_col.end()) held_col = wit->second;
+                else {
+                    auto hit = c_held.find(e.id);
+                    if (hit != c_held.end() && !hit->second.empty())
+                        held_col = hit->second.front().col;
+                }
+            }
+            if (held_col) {
+                SDL_FRect chip{hx - hr * 0.9f, hy - hr * 1.55f,
+                               hr * 1.8f, hr * 1.35f};
+                set_color(ren, held_col); SDL_RenderFillRect(ren, &chip);
+                set_color(ren, 0xFF202028); SDL_RenderRect(ren, &chip);
+            } else {
+                SDL_FRect hd{hx - hr, hy - hr, hr * 2.f, hr * 2.f};
+                set_color(ren, 0xFFBE9678); SDL_RenderFillRect(ren, &hd);
+                set_color(ren, 0xFF8A6248); SDL_RenderRect(ren, &hd);
+            }
         }
         // ---- face ---------------------------------------------------------
         const float gaze_x = std::cos(an.ang) * hr * 0.9f;
@@ -1925,6 +1959,16 @@ struct Viewer {
                 }
             }
             if (e.epic && lens == kSacred) draw_glow(vpos, 0xFFE090, 0.8f);
+            if (e.kind == "artifact" && e.alive) {              // Relic glints
+                draw_glow(vpos, 0xA0E8FF, 0.9f);
+                if (e.fog == Fog::Visible &&
+                    frames % 45 == std::uint64_t(e.id % 45) && parts.size() < 600) {
+                    const float jx = float((frames / 7 + int(e.id % 5)) % 9 - 4) * 3.f;
+                    const float jy = float((frames / 11 + int(e.id % 3)) % 5) * 0.18f;
+                    parts.push_back({fx + jx, fy - sh * (0.45f + jy),
+                        0.f, -15.f, 0.6f, 0xFFC8F0FF});
+                }
+            }
             draw_entity_lens(e, fx, fy, sw, sh);
             // thought/action badge: DF-style pill floating over the head,
             // fades out over its last ~8 world ticks (viewer-only state)
@@ -2043,6 +2087,16 @@ struct Viewer {
             }
             syms.erase(std::remove_if(syms.begin(), syms.end(),
                 [](const Sym& s) { return s.t > 0.9f; }), syms.end());
+            // ---- tempest lightning flash: brief cold-white blink --------
+            {
+                const double fage = time_s - storm_t0;
+                if (fage >= 0.0 && fage < 0.45) {
+                    const float fa = float(1.0 - fage / 0.45) * 0.55f;
+                    dl->AddRectFilled(ImVec2(0, 0),
+                        ImVec2(float(win_w), float(win_h)),
+                        IM_COL32(220, 235, 255, int(255 * fa)));
+                }
+            }
         }
         // prune aux animation maps: entries for entities that died or left
         // the snapshot would otherwise grow forever.
@@ -2188,6 +2242,39 @@ struct Viewer {
         }
     }
 
+    // Worn footpaths: client-side traffic heat rendered as packed-dirt
+    // cells. Heavily traveled routes between water, groves and focal
+    // points visibly wear smooth; unused cells fade back out.
+    void draw_footpaths() {
+        if (path_heat.empty()) return;
+        const int cell = w.terrain.cell > 0 ? w.terrain.cell : 16;
+        const ViewRect vr = cam.view();   // world-unit bounds (kY-aware)
+        const std::int64_t x0 = vr.x0 / cell - 1, x1 = vr.x1 / cell + 1;
+        const std::int64_t y0 = vr.y0 / cell - 1, y1 = vr.y1 / cell + 1;
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+        for (const auto& [key, heat] : path_heat) {
+            if (heat < 18) continue;
+            const std::int64_t cx = std::int64_t(std::int32_t(key >> 32));
+            const std::int64_t cy = std::int64_t(std::int32_t(key));
+            if (cx < x0 || cx > x1 || cy < y0 || cy > y1) continue;
+            const Vec2 cp{std::int32_t(cx * cell + cell / 2),
+                          std::int32_t(cy * cell + cell / 2)};
+            const float px = cam.sx(float(cp.x));
+            const float py = cam.sy(float(cp.y), elev_at(cp));
+            const float s = float(cell) * cam.zoom;
+            const int a = std::min(105, int(heat / 9));
+            SDL_SetRenderDrawColor(ren, 104, 80, 52, Uint8(a));
+            SDL_FRect r{px - s * 0.5f, py - s * 0.42f, s, s * 0.84f};
+            SDL_RenderFillRect(ren, &r);
+        }
+    }
+    // Warm halos over emergent gatherings — draw_glow already scales its
+    // alpha by the day/night clock, so circles flare at dusk and night.
+    void draw_gather_glow() {
+        for (const Gather& g : c_gather)
+            draw_glow(g.pos, 0xFFC860,
+                      0.7f + 0.12f * float(g.members.size()));
+    }
     void draw_night() {
         const int h = snap.day_phase;
         int a = 0;
@@ -2674,6 +2761,35 @@ struct Viewer {
     // Every command is a deterministic world mutation issued under the lock
     // via post(): same inputs -> same state_hash, headless runs never see
     // them (the toolbar only exists in the GUI).
+    // deterministic icon tint for a material — name-substring palette with
+    // a stable hash fallback. Render-state only, never persisted.
+    std::uint32_t mat_icon_col(MaterialId m) const {
+        const MaterialDef* md = m == kNoMaterial ? nullptr : w.materials.find(m);
+        const std::string& n = md ? md->name : std::string();
+        auto has = [&](const char* s) { return n.find(s) != std::string::npos; };
+        if (has("water") || has("sap")) return 0xFF4FB8E8;
+        if (has("berries") || has("herb") || has("moss") || has("grain") ||
+            has("pulse") || has("sprout") || has("wool")) return 0xFF58B040;
+        if (has("meat") || has("flesh") || has("blood") || has("milk")) return 0xFFE05858;
+        if (has("metal") || has("bronze") || has("iron") || has("copper") ||
+            has("gold") || has("tin") || has("alloy") || has("blade") ||
+            has("plate")) return 0xFFD8A838;
+        if (has("wood") || has("hide") || has("sinew") || has("cloth") ||
+            has("debris") || has("wool")) return 0xFF9A6A3C;
+        if (has("stone") || has("flint") || has("obsidian") || has("ore") ||
+            has("rock") || has("marble") || has("granite") || has("basalt") ||
+            has("host") || has("slate") || has("shale")) return 0xFF9A9AA8;
+        if (has("charcoal") || has("coal") || has("ash") || has("soil") ||
+            has("sand") || has("clay") || has("loam")) return 0xFF6A5A48;
+        if (has("salt") || has("crystal") || has("quartz") || has("gem"))
+            return 0xFFE8F0FF;
+        std::uint32_t h = 2166136261u ^ std::uint32_t(m);
+        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+        const std::uint32_t r = 96 + ((h >> 16) & 0x9F);
+        const std::uint32_t g = 96 + ((h >> 8) & 0x9F);
+        const std::uint32_t b = 96 + (h & 0x9F);
+        return 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
     static AgentMind::MemorySnapshot god_snap(const World& w, const Entity& e) {
         AgentMind::MemorySnapshot s;
         s.tick = w.clock_.tick(); s.pos = e.pos;
@@ -2858,6 +2974,88 @@ struct Viewer {
                      (focal != kNoEntity ? " — a focal point is born" : "");
     }
     void miracle(Vec2 p, EntityId picked) { post([=, this] { do_miracle(p, picked); }); }
+    // Relic: drop a rare obsidian artifact — no props, no nutrition, no
+    // script. Agents perceive it, form engrams, and the SNN decides whether
+    // anyone claims, hoards, gifts or fights over it.
+    void do_relic(Vec2 p) {
+        if (!journal.spend(30)) { status_msg = "Not enough Resonance (30)"; return; }
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        const Vec2 q = god_ring(p, 7, cell, 2);
+        if (!t.contains(q) || t.is_water(q)) {
+            status_msg = "The relic needs dry ground"; return;
+        }
+        MaterialId m = w.materials.id_of("obsidian");
+        if (m == kNoMaterial) m = w.materials.id_of("stone");
+        if (m == kNoMaterial) { status_msg = "No relic material"; return; }
+        PropertyBag pb;
+        const PropId qd = w.props.find_name("quantity")
+            ? w.props.find_name("quantity")->id : kNoProp;
+        if (qd != kNoProp) pb.set(qd, Value::integer(1));
+        if (w.create_entity("artifact", m, q, pb) != kNoEntity)
+            status_msg = "An obsidian relic hums in the dust — who will claim it?";
+        else status_msg = "The relic failed to take form";
+    }
+    void relic(Vec2 p) { post([=, this] { do_relic(p); }); }
+    // Tempest: localized storm shock — a moisture pulse plus thirst/chill
+    // pressure and an acute stress spike for every mind in the radius.
+    // Deterministic integers only; whether the tribe bands together via
+    // focal_buffer co-regulation or fractures is left to the SNN.
+    void do_tempest(Vec2 p) {
+        if (!journal.spend(40)) { status_msg = "Not enough Resonance (40)"; return; }
+        const TerrainGrid& t = w.terrain;
+        const int cell = t.cell > 0 ? t.cell : 16;
+        int wetted = 0;
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                const Vec2 q{p.x + dx * cell, p.y + dy * cell};
+                if (t.contains(q) && !t.is_water(q)) {
+                    w.terrain.add_moisture(q, 90); ++wetted;
+                }
+            }
+        int shocked = 0;
+        for (auto& [mid, mm] : w.minds_) {
+            const Entity* me = w.find(mid);
+            if (!me || !me->alive) continue;
+            if (dist2(me->pos, p) > 340LL * 340) continue;
+            if (w.brains_) {
+                auto sit = w.brains_->slots.find(mid);
+                if (sit != w.brains_->slots.end()) {
+                    BrainVital& bv = sit->second.vital;
+                    bv.drive_thirst = static_cast<std::int16_t>(
+                        std::clamp<int>(int(bv.drive_thirst) + 160, 0, 1000));
+                    bv.drive_temp = static_cast<std::int16_t>(
+                        std::clamp<int>(int(bv.drive_temp) + 120, 0, 1000));
+                    bv.mod[kBModNorepi] = static_cast<std::int16_t>(
+                        std::clamp<int>(int(bv.mod[kBModNorepi]) + 120, 0, 1000));
+                    bv.mod[kBModCortisol] = static_cast<std::int16_t>(
+                        std::clamp<int>(int(bv.mod[kBModCortisol]) + 110, 0, 1000));
+                    bv.emo[kBEmoFear] = static_cast<std::int16_t>(
+                        std::clamp<int>(int(bv.emo[kBEmoFear]) + 90, -1000, 1000));
+                }
+            }
+            mm.neuro.panic = std::min<std::int64_t>(1000, mm.neuro.panic + 80);
+            ++shocked;
+        }
+        status_msg = "Tempest: " + std::to_string(wetted) +
+                     " cells stormed, " + std::to_string(shocked) +
+                     " minds shaken — band together or fracture?";
+    }
+    void tempest(Vec2 p) {
+        post([=, this] { do_tempest(p); });
+        // viewer-side lightning flash + wind streaks (render state only)
+        storm_t0 = time_s;
+        const float cx = cam.sx(float(p.x));
+        const float cy = cam.sy(float(p.y), elev_at(p));
+        for (int k = 0; k < 24 && parts.size() < 600; ++k) {
+            const float j = float(k % 8) / 8.f - 0.5f;
+            const float dir = (k % 2) ? 1.f : -1.f;
+            parts.push_back({cx + j * 120.f * cam.zoom,
+                cy + float(k / 8 - 1) * 40.f * cam.zoom,
+                dir * (140.f + float(k % 5) * 30.f),
+                float((k % 3) - 1) * 20.f, 0.7f, 0xCFE8FF, -20.f});
+        }
+    }
     void do_summon_predator(Vec2 p) {
         if (!journal.spend(40)) { status_msg = "Not enough Resonance (40)"; return; }
         const TerrainGrid& t = w.terrain;
@@ -3024,6 +3222,10 @@ struct Viewer {
             power("Miracle", kToolMiracle, 25, "Click tile/entity: awe impulse — gold beam, nearby minds feel it");
             ImGui::SameLine(0, 4);
             power("Bounty", kToolBounty, 35, "Click terrain: rain + feast caches — sharing vs hoarding");
+            ImGui::SameLine(0, 4);
+            power("Relic", kToolRelic, 30, "Click terrain: drop an obsidian artifact — who claims it?");
+            ImGui::SameLine(0, 4);
+            power("Tempest", kToolTempest, 40, "Click terrain: storm shock — thirst/chill/stress pulse");
         }
         if (tool != kToolNone) {
             const std::string hint =
@@ -4367,6 +4569,8 @@ struct Viewer {
                 tool = kToolNone;
             }
             if (tool == kToolBounty) { bounty(wp); tool = kToolNone; }
+            if (tool == kToolRelic) { relic(wp); tool = kToolNone; }
+            if (tool == kToolTempest) { tempest(wp); tool = kToolNone; }
         }
         if (e.type == SDL_EVENT_MOUSE_MOTION && dragging) drag_b = screen_to_world(e.motion.x / kPix, e.motion.y / kPix);
         if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && dragging && e.button.button == SDL_BUTTON_LEFT) {
@@ -5792,6 +5996,59 @@ struct Viewer {
                             }
                         }
                     }
+                    // ---- carried items + wielded gear (icon state) --------
+                    // possessed_by is World Truth; resolved under the lock,
+                    // drawn as a small material-tinted chip in the hand.
+                    if (frames % 20 == 4) {
+                        c_held.clear(); c_wield_col.clear();
+                        const PropId p_poss =
+                            w.props.find_name("possessed_by")
+                                ? w.props.find_name("possessed_by")->id
+                                : kNoProp;
+                        if (p_poss != kNoProp) {
+                            for (const auto& ep : w.entities) {
+                                const Entity& it = *ep;
+                                if (!it.alive) continue;
+                                const std::int64_t holder =
+                                    w.prop_int(it, p_poss, 0);
+                                if (holder <= 0) continue;
+                                const Entity* he =
+                                    w.find(static_cast<EntityId>(holder));
+                                if (!he || !he->alive) continue;
+                                c_held[static_cast<EntityId>(holder)]
+                                    .push_back({it.id, mat_icon_col(it.material)});
+                            }
+                        }
+                        for (const EntityView& e : snap.entities)
+                            if (e.w_mat != kNoMaterial && e.alive &&
+                                e.fog == Fog::Visible)
+                                c_wield_col[e.id] = mat_icon_col(e.w_mat);
+                    }
+                }
+                // ---- footpath wear: client-side traffic heat ---------------
+                // Every pass adds +1 to the cell each visible entity stands
+                // on; a slow halving lets unused paths fade back to grass.
+                // Pure render state — never touches World.
+                if (frames - path_tick >= 6) {
+                    path_tick = frames;
+                    const int cell = w.terrain.cell > 0 ? w.terrain.cell : 16;
+                    for (const EntityView& e : snap.entities) {
+                        if (!e.alive || e.fog == Fog::Shrouded) continue;
+                        const std::int64_t cx = e.pos.x / cell;
+                        const std::int64_t cy = e.pos.y / cell;
+                        const std::uint64_t key =
+                            (std::uint64_t(std::uint32_t(cx)) << 32) |
+                            std::uint64_t(std::uint32_t(cy));
+                        auto& h = path_heat[key];
+                        if (h < 60000) ++h;
+                    }
+                }
+                if (frames % 900 == 0 && !path_heat.empty()) {
+                    for (auto it = path_heat.begin(); it != path_heat.end();) {
+                        it->second = std::uint16_t(it->second / 2);
+                        if (it->second < 6) it = path_heat.erase(it);
+                        else ++it;
+                    }
                 }
                 wrap_camera();
                 if (is_planet() && frames % 30 == 3) { build_globe_fog(); if (globe) build_globe_icons(); }
@@ -5891,14 +6148,14 @@ struct Viewer {
         } else {
             if (!(skip & 1)) {
                 if (is_planet()) { draw_ground_chunks(); draw_fog_chunks(); }
-                else { draw_terrain(); draw_water_glints(); }
+                else { draw_terrain(); draw_water_glints(); draw_footpaths(); }
             }
             t_ter = ms(t); t = clk::now();
             if (!(skip & 2)) draw_entities(dt);
             draw_links();
             draw_intents();
             draw_callouts();
-            if (!(skip & 4)) draw_night();
+            if (!(skip & 4)) { draw_gather_glow(); draw_night(); }
         }
         SDL_SetRenderTarget(ren, nullptr);
         if (!(skip & 32)) SDL_RenderTexture(ren, world_rt, nullptr, nullptr);     // nearest x kPix
